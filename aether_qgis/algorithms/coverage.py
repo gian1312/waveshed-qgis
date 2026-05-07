@@ -10,8 +10,13 @@ for scripting, batch execution, and model-builder integration.
 from __future__ import annotations
 
 import os
+import platform
 import re
 import subprocess
+
+_SUBPROCESS_FLAGS = (
+    subprocess.CREATE_NO_WINDOW if platform.system() == "Windows" else 0
+)
 from typing import Any, Dict
 
 from qgis.core import (
@@ -25,7 +30,6 @@ from qgis.core import (
     QgsProcessingParameterRasterLayer,
 )
 
-from ..core.api_key import ApiKeyError, check_key_or_raise
 from ..core.binary_manager import find_binary
 from ..core.job_builder import CoverageParams, build_coverage_job, write_job_file
 from ..core.result_loader import add_layer_to_project, load_coverage_result
@@ -213,21 +217,7 @@ class CoverageAlgorithm(QgsProcessingAlgorithm):
         resolution_m = int(self._RESOLUTIONS[resolution_idx])
         backend = self._BACKENDS[backend_idx]
 
-        # ---- 1. Validate API key ----
-        feedback.setProgressText("Validating API key...")
-        feedback.setProgress(0)
-
-        try:
-            check_key_or_raise()
-        except ApiKeyError as exc:
-            raise QgsProcessingException(
-                f"API Key Error: {exc}"
-            ) from exc
-
-        if feedback.isCanceled():
-            return {}
-
-        # ---- 2. Prepare terrain ----
+        # ---- 1. Prepare terrain ----
         feedback.setProgressText("Preparing terrain tiles...")
         feedback.setProgress(5)
 
@@ -289,6 +279,7 @@ class CoverageAlgorithm(QgsProcessingAlgorithm):
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
+            creationflags=_SUBPROCESS_FLAGS,
         )
 
         # Parse stderr for progress (lines like "Wedge 120/360")
@@ -332,11 +323,11 @@ class CoverageAlgorithm(QgsProcessingAlgorithm):
         json_sidecar = os.path.join(output_dir, output_name + ".json")
         tif_path = os.path.join(output_dir, output_name + ".tif")
 
-        # IMPORTANT: use -i/-j/-o flags, NOT positional args
         result = subprocess.run(
             [export_exe, "-i", input_file, "-j", json_sidecar, "-o", tif_path],
             capture_output=True,
             text=True,
+            creationflags=_SUBPROCESS_FLAGS,
         )
 
         if result.returncode != 0:

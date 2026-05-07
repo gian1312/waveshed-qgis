@@ -119,10 +119,18 @@ class AetherMainDialog(QDialog):
         layout.setContentsMargins(0, 0, 0, 0)
 
         self._settings_widget = SettingsDialog(parent=wrapper)
-        # Hide the dialog buttons (OK/Cancel) — settings save inline.
+        # Replace OK/Cancel with a single "Save Settings" button.
         self._settings_widget._button_box.setVisible(False)
         self._settings_widget.setWindowFlags(Qt.Widget)
         layout.addWidget(self._settings_widget)
+
+        from qgis.PyQt.QtWidgets import QPushButton, QHBoxLayout as _HL
+        btn_row = _HL()
+        btn_row.addStretch()
+        btn_save = QPushButton("Save Settings")
+        btn_save.clicked.connect(self._on_save_settings)
+        btn_row.addWidget(btn_save)
+        layout.addLayout(btn_row)
 
         return wrapper
 
@@ -143,6 +151,11 @@ class AetherMainDialog(QDialog):
         self.site_tab.set_mode(mode)
         self.p2p_tab.set_mode(mode)
 
+    def _on_save_settings(self) -> None:
+        self._settings_widget.save_settings()
+        from qgis.PyQt.QtWidgets import QMessageBox
+        QMessageBox.information(self, "Settings", "Settings saved.")
+
     def _on_loss_model_changed(self) -> None:
         # Propagate to tabs that care (site analysis ITM section)
         self.site_tab.set_mode(self.get_mode())
@@ -153,14 +166,14 @@ class AetherMainDialog(QDialog):
 
     def closeEvent(self, event) -> None:
         # Save settings when closing
-        self._settings_widget._on_accept()
+        self._settings_widget.save_settings()
         # Cancel any running workers
         self.site_tab.cancel_worker()
         self.p2p_tab.cancel_worker()
         super().closeEvent(event)
 
     def reject(self) -> None:
-        self._settings_widget._on_accept()
+        self._settings_widget.save_settings()
         self.site_tab.cancel_worker()
         self.p2p_tab.cancel_worker()
         super().reject()

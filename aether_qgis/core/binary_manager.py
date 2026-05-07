@@ -297,9 +297,13 @@ def check_prerequisites(binary_dir: str) -> List[str]:
     if system == "Windows":
         dxc = os.path.join(binary_dir, "dxcompiler.dll")
         if not os.path.isfile(dxc):
-            issues.append(
-                "dxcompiler.dll not found alongside aether_core "
-                "(required for GPU acceleration on Windows)"
+            # Optional — GPU still works via Vulkan backend without it.
+            # Only log, don't report as an issue.
+            QgsMessageLog.logMessage(
+                "dxcompiler.dll not found — DirectX shader compilation "
+                "unavailable, GPU will use Vulkan backend instead",
+                TAG,
+                Qgis.MessageLevel.Info,
             )
 
     if system == "Linux":

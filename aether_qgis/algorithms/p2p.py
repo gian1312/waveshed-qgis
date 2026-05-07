@@ -10,8 +10,13 @@ from __future__ import annotations
 import csv
 import math
 import os
+import platform
 import subprocess
 import tempfile
+
+_SUBPROCESS_FLAGS = (
+    subprocess.CREATE_NO_WINDOW if platform.system() == "Windows" else 0
+)
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -27,7 +32,6 @@ from qgis.core import (
     QgsRasterLayer,
 )
 
-from ..core.api_key import check_key_or_raise, ApiKeyError
 from ..core.binary_manager import find_binary
 from ..core.job_builder import P2PParams, build_p2p_job, write_job_file
 from ..core.terrain_adapter import prepare_terrain
@@ -261,18 +265,7 @@ class P2PAlgorithm(QgsProcessingAlgorithm):
 
         os.makedirs(output_dir, exist_ok=True)
 
-        # ---- 1. Validate API key ----
-        feedback.setProgressText("Validating API key...")
-        feedback.setProgress(0)
-        try:
-            check_key_or_raise()
-        except ApiKeyError as exc:
-            raise QgsProcessingException(f"API Key Error: {exc}") from exc
-
-        if feedback.isCanceled():
-            return {}
-
-        # ---- 2. Determine batch file ----
+        # ---- 1. Determine batch file ----
         is_batch = bool(batch_file and batch_file.strip())
 
         if not is_batch:
@@ -348,6 +341,7 @@ class P2PAlgorithm(QgsProcessingAlgorithm):
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
+            creationflags=_SUBPROCESS_FLAGS,
         )
 
         for line in iter(proc.stderr.readline, ""):
@@ -379,11 +373,11 @@ class P2PAlgorithm(QgsProcessingAlgorithm):
         json_sidecar = os.path.join(output_dir, output_name + ".json")
         output_path = os.path.join(output_dir, output_name + ".csv")
 
-        # IMPORTANT: aether_export uses flag-based args: -i <input> -j <json> -o <output>
         result = subprocess.run(
             [export_exe, "-i", input_file, "-j", json_sidecar, "-o", output_path],
             capture_output=True,
             text=True,
+            creationflags=_SUBPROCESS_FLAGS,
         )
         if result.returncode != 0:
             raise QgsProcessingException(

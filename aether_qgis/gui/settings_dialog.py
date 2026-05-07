@@ -162,7 +162,7 @@ class SettingsDialog(QDialog):
 
         # Action buttons
         row2 = QHBoxLayout()
-        btn_validate = QPushButton("Validate")
+        btn_validate = QPushButton("Save")
         btn_validate.clicked.connect(self._validate_api_key)
         row2.addWidget(btn_validate)
 
@@ -179,6 +179,17 @@ class SettingsDialog(QDialog):
     def _build_defaults_group(self) -> QGroupBox:
         group = QGroupBox("Defaults")
         vbox = QVBoxLayout(group)
+
+        # Local terrain directory (GeoTIFF/DEM files)
+        row_terrain = QHBoxLayout()
+        row_terrain.addWidget(QLabel("Local terrain dir:"))
+        self._terrain_dir_edit = QLineEdit()
+        self._terrain_dir_edit.setPlaceholderText("Optional: directory with GeoTIFF/DEM files")
+        row_terrain.addWidget(self._terrain_dir_edit)
+        btn_terrain = QPushButton("Browse...")
+        btn_terrain.clicked.connect(self._browse_terrain_dir)
+        row_terrain.addWidget(btn_terrain)
+        vbox.addLayout(row_terrain)
 
         # Terrain cache directory
         row = QHBoxLayout()
@@ -211,6 +222,16 @@ class SettingsDialog(QDialog):
         row3.addStretch()
         vbox.addLayout(row3)
 
+        # Download connections
+        row4 = QHBoxLayout()
+        row4.addWidget(QLabel("Download connections:"))
+        self._conn_spin = QSpinBox()
+        self._conn_spin.setRange(16, 1024)
+        self._conn_spin.setValue(256)
+        row4.addWidget(self._conn_spin)
+        row4.addStretch()
+        vbox.addLayout(row4)
+
         return group
 
     # ------------------------------------------------------------- settings IO
@@ -227,51 +248,27 @@ class SettingsDialog(QDialog):
         self._refresh_api_status()
 
         # Defaults
+        self._terrain_dir_edit.setText(s.value("aether/terrain_dir", ""))
         default_cache = os.path.join(str(Path.home()), ".aether", "cache")
         self._cache_dir_edit.setText(s.value("aether/cache_dir", default_cache))
         self._vram_spin.setValue(int(s.value("aether/max_vram_gb", 8)))
         self._ram_spin.setValue(int(s.value("aether/max_ram_gb", 16)))
+        self._conn_spin.setValue(int(s.value("aether/download_connections", 256)))
 
-    def _on_accept(self) -> None:
-        """Validate inputs and persist all settings."""
-        binary_dir = self._binary_dir_edit.text().strip()
-
-        # Validate binary directory if a path was provided
-        if binary_dir:
-            if not os.path.isdir(binary_dir):
-                QMessageBox.warning(
-                    self,
-                    "Invalid Binary Directory",
-                    f"The binary directory does not exist:\n{binary_dir}",
-                )
-                return
-
-            found = sum(
-                1 for b in binary_manager.REQUIRED_BINARIES
-                if binary_manager._dir_has_binary(binary_dir, b)
-            )
-            if found < len(binary_manager.REQUIRED_BINARIES):
-                answer = QMessageBox.question(
-                    self,
-                    "Missing Binaries",
-                    f"Only {found}/{len(binary_manager.REQUIRED_BINARIES)} "
-                    f"binaries found in:\n{binary_dir}\n\nSave anyway?",
-                    QMessageBox.Yes | QMessageBox.No,
-                    QMessageBox.No,
-                )
-                if answer != QMessageBox.Yes:
-                    return
-
-        # Persist
+    def save_settings(self) -> None:
+        """Persist all settings to QgsSettings. Always saves, no validation dialogs."""
         s = self._settings
-        s.setValue("aether/binary_dir", binary_dir)
+        s.setValue("aether/binary_dir", self._binary_dir_edit.text().strip())
+        s.setValue("aether/terrain_dir", self._terrain_dir_edit.text().strip())
         s.setValue("aether/cache_dir", self._cache_dir_edit.text().strip())
         s.setValue("aether/max_vram_gb", self._vram_spin.value())
         s.setValue("aether/max_ram_gb", self._ram_spin.value())
-
+        s.setValue("aether/download_connections", self._conn_spin.value())
         api_key.store_key(self._api_key_edit.text().strip())
 
-        # Only call accept() when running as a standalone dialog
+    def _on_accept(self) -> None:
+        """Save and close (standalone dialog mode)."""
+        self.save_settings()
         if self.windowFlags() & Qt.Dialog:
             self.accept()
 
@@ -392,6 +389,13 @@ class SettingsDialog(QDialog):
             self._api_status_label.setStyleSheet("color: red;")
 
     # ---------------------------------------------------- defaults helpers
+    def _browse_terrain_dir(self) -> None:
+        path = QFileDialog.getExistingDirectory(
+            self, "Select Local Terrain Directory", self._terrain_dir_edit.text()
+        )
+        if path:
+            self._terrain_dir_edit.setText(path)
+
     def _browse_cache_dir(self) -> None:
         path = QFileDialog.getExistingDirectory(
             self, "Select Terrain Cache Directory", self._cache_dir_edit.text()

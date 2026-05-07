@@ -1,10 +1,16 @@
-"""P2P Link Analysis tab widget — embedded in the main dialog.
+"""P2P Link Analysis tab widget -- embedded in the main dialog.
 
-QWidget that replaces the old standalone P2PDialog.  Supports LOS and
-LOSS modes with dynamic label and field visibility.  Single Link mode
-generates a temporary 2-line batch CSV; Batch CSV mode uses the
-user-provided file.  Runs the full P2P pipeline (terrain prep ->
-aether_core -> aether_export) in a background QThread.
+QWidget providing single-link P2P analysis.  Supports LOS and LOSS
+modes with dynamic label and field visibility.  Generates a temporary
+2-line batch CSV from the two endpoints, then runs the P2P pipeline
+(terrain_adapter -> job_builder -> aether_core) in a background QThread.
+
+P2P mode in aether_core produces output files directly (no aether_export):
+  - {output_name}.csv        -- Source_ID, Target_ID, Signal_dBm, Path_Loss_dB
+  - p2p_report.txt           -- human-readable summary
+  - terrain_profile.gp       -- terrain elevations vs distance
+  - height_profile.gp        -- terrain with earth bulge
+  - path_profile.gp          -- cumulative path loss at each distance
 """
 
 from __future__ import annotations
@@ -12,6 +18,7 @@ from __future__ import annotations
 import csv
 import math
 import os
+import platform
 import re
 import subprocess
 import tempfile
@@ -19,46 +26,93 @@ from datetime import datetime
 from typing import List, Optional, Tuple
 
 from qgis.PyQt.QtCore import QThread, pyqtSignal, Qt
+from qgis.PyQt.QtGui import QColor
 from qgis.PyQt.QtWidgets import (
-    QButtonGroup,
     QComboBox,
+    QDialog,
     QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
     QGroupBox,
     QHBoxLayout,
-    QHeaderView,
     QLabel,
     QLineEdit,
     QMessageBox,
     QProgressBar,
     QPushButton,
-    QRadioButton,
-    QStackedWidget,
-    QTableWidget,
-    QTableWidgetItem,
+    QTabWidget,
     QTextEdit,
     QVBoxLayout,
     QWidget,
 )
 from qgis.core import (
     Qgis,
+    QgsCoordinateReferenceSystem,
+    QgsCoordinateTransform,
+    QgsGeometry,
     QgsMessageLog,
+    QgsPointXY,
     QgsProject,
     QgsRasterLayer,
+    QgsWkbTypes,
 )
+from qgis.gui import QgsRubberBand
 
-from ..core.api_key import check_key_or_raise, ApiKeyError
 from ..core.binary_manager import find_binary
 from ..core.job_builder import P2PParams, build_p2p_job, write_job_file
-from ..core.result_loader import add_layer_to_project, load_p2p_result_csv
 from .map_tools import activate_point_capture
 
 TAG = "AETHER"
 
-# Index constants for the mode stacked widget.
-_MODE_SINGLE = 0
-_MODE_BATCH = 1
+_SUBPROCESS_FLAGS = (
+    subprocess.CREATE_NO_WINDOW if platform.system() == "Windows" else 0
+)
+
+
+def _kill_proc(proc: subprocess.Popen) -> None:
+    """Kill a subprocess and all its children (Windows-safe)."""
+    if proc.poll() is not None:
+        return
+    if platform.system() == "Windows":
+        subprocess.run(
+            ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+            capture_output=True,
+            creationflags=_SUBPROCESS_FLAGS,
+        )
+    else:
+        proc.terminate()
+
+
+# ---------------------------------------------------------------------------
+# GP file parser
+# ---------------------------------------------------------------------------
+
+def _parse_gp_file(filepath: str) -> Tuple[List[float], List[float]]:
+    """Parse a .gp (gnuplot data) file into x and y value lists.
+
+    Lines starting with ``#`` or blank lines are skipped.  Each data line
+    is expected to have at least two whitespace-separated float columns.
+
+    Returns (x_values, y_values).  Both lists are empty when the file
+    does not exist or contains no valid data.
+    """
+    x_val: List[float] = []
+    y_val: List[float] = []
+    if not os.path.exists(filepath):
+        return x_val, y_val
+    with open(filepath, "r", encoding="utf-8", errors="replace") as f:
+        for line in f:
+            stripped = line.strip()
+            if stripped.startswith("#") or not stripped:
+                continue
+            parts = stripped.split()
+            if len(parts) >= 2:
+                try:
+                    x_val.append(float(parts[0]))
+                    y_val.append(float(parts[1]))
+                except ValueError:
+                    continue
+    return x_val, y_val
 
 
 # ---------------------------------------------------------------------------
@@ -138,15 +192,238 @@ def _write_temp_batch_csv(
 
 
 # ---------------------------------------------------------------------------
+# P2P Result Viewer Dialog (matplotlib plots)
+# ---------------------------------------------------------------------------
+
+class _P2PResultViewer(QDialog):
+    """Dialog showing P2P result plots with matplotlib.
+
+    Tab 1 -- Combined Link: dual-axis with terrain profile and signal
+    strength overlay.
+
+    Tab 2 -- Curved Earth Profile: terrain on earth bulge, LOS line,
+    and first Fresnel zone.
+    """
+
+    def __init__(
+        self,
+        output_dir: str,
+        output_name: str,
+        freq_mhz: float,
+        tx_height: float,
+        rx_height: float,
+        tx_dbm: float,
+        parent: Optional[QWidget] = None,
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("P2P Link Analysis Plots")
+        self.setMinimumSize(800, 550)
+        self.setAttribute(Qt.WA_DeleteOnClose)
+
+        self._output_dir = output_dir
+        self._output_name = output_name
+        self._freq_mhz = freq_mhz
+        self._tx_height = tx_height
+        self._rx_height = rx_height
+        self._tx_dbm = tx_dbm
+
+        # Deferred matplotlib import with Qt5Agg backend.
+        import matplotlib
+        matplotlib.use("Qt5Agg")
+        from matplotlib.backends.backend_qt5agg import (
+            FigureCanvasQTAgg,
+            NavigationToolbar2QT,
+        )
+        from matplotlib.figure import Figure
+
+        self._FigureCanvasQTAgg = FigureCanvasQTAgg
+        self._NavigationToolbar2QT = NavigationToolbar2QT
+        self._Figure = Figure
+
+        self._build_ui()
+
+    # ---- UI ---------------------------------------------------------------
+
+    def _build_ui(self) -> None:
+        layout = QVBoxLayout(self)
+        tabs = QTabWidget()
+
+        # Tab 1: Combined Link
+        combined_widget = self._build_combined_tab()
+        tabs.addTab(combined_widget, "Terrain Profile")
+
+        # Tab 2: Curved Earth Profile
+        curved_widget = self._build_curved_earth_tab()
+        tabs.addTab(curved_widget, "Curved Earth Profile")
+
+        layout.addWidget(tabs)
+
+    # ---- Tab 1: Combined Link ---------------------------------------------
+
+    def _build_combined_tab(self) -> QWidget:
+        """Dual-axis plot: terrain profile (left) and signal strength (right)."""
+        widget = QWidget()
+        layout = QVBoxLayout(widget)
+
+        fig = self._Figure(figsize=(8, 4), dpi=100)
+        canvas = self._FigureCanvasQTAgg(fig)
+        toolbar = self._NavigationToolbar2QT(canvas, widget)
+        layout.addWidget(toolbar)
+        layout.addWidget(canvas)
+
+        terrain_file = os.path.join(self._output_dir, "terrain_profile.gp")
+        path_file = os.path.join(self._output_dir, "path_profile.gp")
+
+        dist_terrain, elev = _parse_gp_file(terrain_file)
+        dist_path, path_loss = _parse_gp_file(path_file)
+
+        ax1 = fig.add_subplot(111)
+
+        if dist_terrain and elev:
+            ax1.fill_between(dist_terrain, elev, alpha=0.4, color="green",
+                             label="Terrain")
+            ax1.plot(dist_terrain, elev, color="darkgreen", linewidth=0.8)
+            ax1.set_xlabel("Distance (km)")
+            ax1.set_ylabel("Elevation (m)", color="darkgreen")
+            ax1.tick_params(axis="y", labelcolor="darkgreen")
+        else:
+            ax1.set_xlabel("Distance (km)")
+            ax1.set_ylabel("Elevation (m)")
+            ax1.text(0.5, 0.5, "No terrain profile data",
+                     transform=ax1.transAxes, ha="center", va="center",
+                     fontsize=12, color="gray")
+
+        if dist_path and path_loss:
+            # Compute signal: tx_dbm - path_loss
+            signal = [self._tx_dbm - pl for pl in path_loss]
+            ax2 = ax1.twinx()
+            ax2.plot(dist_path, signal, color="red", linewidth=1.5,
+                     label="Signal (dBm)")
+            ax2.set_ylabel("Signal Strength (dBm)", color="red")
+            ax2.tick_params(axis="y", labelcolor="red")
+
+            # Combined legend
+            lines1, labels1 = ax1.get_legend_handles_labels()
+            lines2, labels2 = ax2.get_legend_handles_labels()
+            ax1.legend(lines1 + lines2, labels1 + labels2, loc="upper right",
+                       fontsize=8)
+        elif dist_terrain and elev:
+            ax1.legend(loc="upper right", fontsize=8)
+
+        ax1.set_title("Combined Link Profile")
+        fig.tight_layout()
+        canvas.draw()
+
+        return widget
+
+    # ---- Tab 2: Curved Earth Profile --------------------------------------
+
+    def _build_curved_earth_tab(self) -> QWidget:
+        """Terrain on curved earth with LOS line and Fresnel zone."""
+        widget = QWidget()
+        layout = QVBoxLayout(widget)
+
+        fig = self._Figure(figsize=(8, 4), dpi=100)
+        canvas = self._FigureCanvasQTAgg(fig)
+        toolbar = self._NavigationToolbar2QT(canvas, widget)
+        layout.addWidget(toolbar)
+        layout.addWidget(canvas)
+
+        terrain_file = os.path.join(self._output_dir, "terrain_profile.gp")
+        dist_km, elev = _parse_gp_file(terrain_file)
+
+        ax = fig.add_subplot(111)
+
+        if not dist_km or not elev:
+            ax.text(0.5, 0.5, "No terrain profile data",
+                    transform=ax.transAxes, ha="center", va="center",
+                    fontsize=12, color="gray")
+            ax.set_title("Curved Earth Profile")
+            canvas.draw()
+            return widget
+
+        total_dist_km = dist_km[-1] if dist_km else 1.0
+        r_eff = 6371000.0 * (4.0 / 3.0)  # effective earth radius (m)
+
+        # Compute earth bulge for each sample point
+        h_bulge = []
+        for d in dist_km:
+            d1_m = d * 1000.0
+            d2_m = (total_dist_km - d) * 1000.0
+            bulge = (d1_m * d2_m) / (2.0 * r_eff)
+            h_bulge.append(bulge)
+
+        # Terrain on curved earth
+        terrain_curved = [e + b for e, b in zip(elev, h_bulge)]
+        ax.fill_between(dist_km, terrain_curved, alpha=0.35, color="saddlebrown",
+                        label="Terrain")
+        ax.plot(dist_km, terrain_curved, color="saddlebrown", linewidth=0.8)
+
+        # Antenna tip heights (at endpoints the bulge is 0)
+        tx_tip = elev[0] + self._tx_height + h_bulge[0]
+        rx_tip = elev[-1] + self._rx_height + h_bulge[-1]
+
+        # LOS line
+        ax.plot([dist_km[0], dist_km[-1]], [tx_tip, rx_tip],
+                color="blue", linewidth=1.2, linestyle="--", label="LOS")
+
+        # First Fresnel zone (F1)
+        if self._freq_mhz > 0 and total_dist_km > 0:
+            fresnel_upper = []
+            fresnel_lower = []
+            for d in dist_km:
+                d1_km = d
+                d2_km = total_dist_km - d
+                if d1_km <= 0 or d2_km <= 0:
+                    # At endpoints the Fresnel radius is 0
+                    frac = d / total_dist_km if total_dist_km > 0 else 0
+                    los_h = tx_tip + frac * (rx_tip - tx_tip)
+                    fresnel_upper.append(los_h)
+                    fresnel_lower.append(los_h)
+                    continue
+                f1 = 17.32 * math.sqrt(
+                    d1_km * d2_km / (self._freq_mhz * total_dist_km)
+                )
+                frac = d / total_dist_km
+                los_h = tx_tip + frac * (rx_tip - tx_tip)
+                fresnel_upper.append(los_h + f1)
+                fresnel_lower.append(los_h - f1)
+
+            ax.fill_between(dist_km, fresnel_lower, fresnel_upper,
+                            alpha=0.15, color="orange", label="Fresnel Zone (F1)")
+
+        # Site markers
+        ax.plot(dist_km[0], tx_tip, "rv", markersize=8, label="TX")
+        ax.plot(dist_km[-1], rx_tip, "b^", markersize=8, label="RX")
+
+        ax.set_xlabel("Distance (km)")
+        ax.set_ylabel("Height (m)")
+        ax.set_title("Curved Earth Profile (4/3 earth radius)")
+        ax.legend(loc="upper right", fontsize=7)
+        fig.tight_layout()
+        canvas.draw()
+
+        return widget
+
+
+# ---------------------------------------------------------------------------
 # Worker thread
 # ---------------------------------------------------------------------------
 
 class _P2PWorker(QThread):
-    """Run the full P2P pipeline off the main thread."""
+    """Run the P2P pipeline off the main thread.
+
+    Pipeline: terrain_adapter -> job_builder -> aether_core.
+    P2P mode does NOT use aether_export -- aether_core writes output
+    files directly.
+
+    The ``finished_ok`` signal emits the output directory path (not a
+    single file) so the caller can locate the CSV and .gp files.
+    """
 
     progress = pyqtSignal(int)           # 0-100
     status = pyqtSignal(str)             # human-readable step description
-    finished_ok = pyqtSignal(str, bool)  # (result_path, is_batch)
+    finished_ok = pyqtSignal(str)        # output_dir
     finished_err = pyqtSignal(str)       # error message
 
     def __init__(
@@ -155,7 +432,6 @@ class _P2PWorker(QThread):
         dem_layer: QgsRasterLayer,
         output_dir: str,
         batch_file: str,
-        is_batch: bool,
         parent: Optional[QWidget] = None,
     ) -> None:
         super().__init__(parent)
@@ -163,11 +439,13 @@ class _P2PWorker(QThread):
         self.dem_layer = dem_layer
         self.output_dir = output_dir
         self.batch_file = batch_file
-        self.is_batch = is_batch
         self._canceled = False
+        self._proc: Optional[subprocess.Popen] = None
 
     def cancel(self) -> None:
         self._canceled = True
+        if self._proc is not None:
+            _kill_proc(self._proc)
 
     def _parse_p2p_progress(self, line: str) -> Optional[int]:
         """Extract percentage from P2P progress lines."""
@@ -178,44 +456,38 @@ class _P2PWorker(QThread):
                 return int(current * 100 / total)
         return None
 
-    def run(self) -> None:  # noqa: C901 — sequential pipeline steps
+    def run(self) -> None:  # noqa: C901 -- sequential pipeline steps
         try:
             params = self.params
             output_dir = self.output_dir
             os.makedirs(output_dir, exist_ok=True)
 
-            # ---- 1. Validate API key ----
-            self.status.emit("Validating API key...")
             self.progress.emit(0)
-            check_key_or_raise()
 
-            if self._canceled:
-                return
-
-            # ---- 2. Compute terrain bbox from batch CSV ----
+            # ---- 1. Compute terrain bbox from batch CSV ----
             self.status.emit("Computing terrain extents...")
             self.progress.emit(5)
 
             entries = _parse_batch_csv(self.batch_file)
             min_lat, max_lat, min_lon, max_lon = _compute_bbox_for_entries(entries)
 
-            # Use the centroid as the reference for terrain prep.
+            # Centroid as reference for terrain prep.
             centre_lat = (min_lat + max_lat) / 2.0
             centre_lon = (min_lon + max_lon) / 2.0
 
-            # Compute range that covers the full extent (with margin).
+            # Range that covers the full extent (with margin).
             lat_span_km = (max_lat - min_lat) * 111.0
             cos_lat = math.cos(math.radians(centre_lat))
             if cos_lat < 1e-6:
                 cos_lat = 1e-6
             lon_span_km = (max_lon - min_lon) * 111.0 * cos_lat
             half_diag_km = math.sqrt(lat_span_km**2 + lon_span_km**2) / 2.0
-            max_range_km = max(half_diag_km + 5.0, 10.0)  # minimum 10 km, +5 km margin
+            max_range_km = max(half_diag_km + 5.0, 10.0)
 
             if self._canceled:
                 return
 
-            # ---- 3. Prepare terrain ----
+            # ---- 2. Prepare terrain ----
             self.status.emit("Preparing terrain tiles...")
             self.progress.emit(10)
 
@@ -234,11 +506,10 @@ class _P2PWorker(QThread):
             if self._canceled:
                 return
 
-            # ---- 4. Build job config ----
+            # ---- 3. Build job config ----
             self.status.emit("Building job configuration...")
             self.progress.emit(20)
 
-            # Override max_range_km in params to match the computed range.
             params.max_range_km = int(math.ceil(max_range_km))
 
             job_config = build_p2p_job(
@@ -249,65 +520,72 @@ class _P2PWorker(QThread):
             if self._canceled:
                 return
 
-            # ---- 5. Run aether_core ----
+            # ---- 4. Run aether_core ----
             self.status.emit("Running aether_core...")
             self.progress.emit(25)
 
             core_exe = find_binary("aether_core")
+            env = os.environ.copy()
+            env["RUST_LOG"] = "info"
+
             proc = subprocess.Popen(
                 [core_exe, "--config", job_file],
                 stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
+                env=env,
+                creationflags=_SUBPROCESS_FLAGS,
             )
+            self._proc = proc
 
-            for line in iter(proc.stderr.readline, ""):
+            output_lines: list[str] = []
+            for line in iter(proc.stdout.readline, ""):
                 if self._canceled:
-                    proc.terminate()
+                    _kill_proc(proc)
                     return
+                output_lines.append(line)
                 pct = self._parse_p2p_progress(line)
                 if pct is not None:
-                    self.progress.emit(25 + int(pct * 0.5))
+                    self.progress.emit(25 + int(pct * 0.70))
 
             proc.wait()
+            self._proc = None
             if proc.returncode != 0:
-                stderr_tail = proc.stderr.read() if proc.stderr else ""
+                tail = "".join(output_lines[-20:])
                 raise RuntimeError(
-                    f"aether_core exited with code {proc.returncode}:\n{stderr_tail}"
+                    f"aether_core exited with code {proc.returncode}:\n{tail}"
                 )
 
             if self._canceled:
                 return
 
-            # ---- 6. Run aether_export ----
-            self.status.emit("Exporting results...")
-            self.progress.emit(80)
+            # ---- 5. Verify output files ----
+            # P2P produces output directly -- no aether_export step.
+            self.status.emit("Verifying output files...")
+            self.progress.emit(95)
 
-            export_exe = find_binary("aether_export")
-
-            bit_file = os.path.join(output_dir, params.output_name + ".bit")
-            tiles_file = os.path.join(output_dir, params.output_name + ".tiles")
-            input_file = bit_file if os.path.isfile(bit_file) else tiles_file
-
-            json_sidecar = os.path.join(output_dir, params.output_name + ".json")
-            output_path = os.path.join(output_dir, params.output_name + ".csv")
-
-            # IMPORTANT: use -i/-j/-o flags, NOT positional args
-            result = subprocess.run(
-                [export_exe, "-i", input_file, "-j", json_sidecar, "-o", output_path],
-                capture_output=True,
-                text=True,
-            )
-            if result.returncode != 0:
+            csv_path = os.path.join(output_dir, params.output_name + ".csv")
+            if not os.path.isfile(csv_path):
                 raise RuntimeError(
-                    f"aether_export failed (exit {result.returncode}):\n{result.stderr}"
+                    f"Expected P2P result CSV not found: {csv_path}\n"
+                    "aether_core may have failed to produce output."
                 )
 
-            self.progress.emit(100)
-            self.finished_ok.emit(output_path, self.is_batch)
+            # Log which supplementary files are present.
+            for gp_name in ("terrain_profile.gp", "height_profile.gp", "path_profile.gp"):
+                gp_path = os.path.join(output_dir, gp_name)
+                if os.path.isfile(gp_path):
+                    self.status.emit(f"  Found {gp_name}")
 
-        except ApiKeyError as exc:
-            self.finished_err.emit(f"API Key Error: {exc}")
+            report_path = os.path.join(output_dir, "p2p_report.txt")
+            if os.path.isfile(report_path):
+                self.status.emit("  Found p2p_report.txt")
+
+            self.progress.emit(100)
+            self.finished_ok.emit(output_dir)
+
         except Exception as exc:
             self.finished_err.emit(str(exc))
 
@@ -320,8 +598,8 @@ class P2PTab(QWidget):
     """P2P Link Analysis tab, embedded in the main dialog.
 
     The parent dialog must provide:
-      - ``self.iface``        -- QgisInterface
-      - ``self.get_mode()``   -- returns ``"LOS"`` or ``"LOSS"``
+      - ``self.iface``            -- QgisInterface
+      - ``self.get_mode()``       -- returns ``"LOS"`` or ``"LOSS"``
       - ``self.get_loss_model()`` -- returns ``"SIMPLE_LOSS"`` or ``"ITM"``
     """
 
@@ -331,6 +609,22 @@ class P2PTab(QWidget):
         self.iface = parent.iface
         self._worker: Optional[_P2PWorker] = None
         self._pick_tool = None  # reference kept to prevent GC
+        self._last_output_dir: Optional[str] = None
+        self._last_output_name: Optional[str] = None
+
+        # Rubber bands for map visualisation
+        canvas = self.iface.mapCanvas()
+        self._site_a_rb = QgsRubberBand(canvas, QgsWkbTypes.PointGeometry)
+        self._site_a_rb.setColor(QColor(255, 0, 0, 200))  # Red
+        self._site_a_rb.setIconSize(12)
+
+        self._site_b_rb = QgsRubberBand(canvas, QgsWkbTypes.PointGeometry)
+        self._site_b_rb.setColor(QColor(0, 0, 255, 200))  # Blue
+        self._site_b_rb.setIconSize(12)
+
+        self._link_line_rb = QgsRubberBand(canvas, QgsWkbTypes.LineGeometry)
+        self._link_line_rb.setColor(QColor(255, 255, 0, 255))  # Yellow
+        self._link_line_rb.setWidth(3)
 
         self._build_ui()
         self._connect_signals()
@@ -353,7 +647,6 @@ class P2PTab(QWidget):
         """
         is_loss = mode.upper() != "LOS"
 
-        # Labels
         if is_loss:
             self._lbl_site_a.setText("Transmitter:")
             self._lbl_site_b.setText("Receiver:")
@@ -361,12 +654,82 @@ class P2PTab(QWidget):
             self._lbl_site_a.setText("Site A:")
             self._lbl_site_b.setText("Site B:")
 
-        # Frequency / ERP group visibility
         self._params_group.setVisible(is_loss)
 
     def refresh_layers(self) -> None:
         """Re-populate the DEM layer combo from the current project."""
         self._populate_raster_layers()
+
+    def cancel_worker(self) -> None:
+        """Cancel any running worker thread.  Called by the parent dialog.
+
+        Also resets all rubber bands from the map canvas.
+        """
+        if self._worker is not None and self._worker.isRunning():
+            self._worker.cancel()
+            self._worker.wait(5000)
+
+        self._reset_rubber_bands()
+
+    # ------------------------------------------------------------------
+    # Rubber band management
+    # ------------------------------------------------------------------
+
+    def _has_coords_a(self) -> bool:
+        """Return True if Site A has non-zero coordinates."""
+        return not (self.spin_a_lat.value() == 0.0 and self.spin_a_lon.value() == 0.0)
+
+    def _has_coords_b(self) -> bool:
+        """Return True if Site B has non-zero coordinates."""
+        return not (self.spin_b_lat.value() == 0.0 and self.spin_b_lon.value() == 0.0)
+
+    def _update_visuals(self) -> None:
+        """Update rubber bands on the map canvas from current spinbox values."""
+        canvas = self.iface.mapCanvas()
+        canvas_crs = canvas.mapSettings().destinationCrs()
+        wgs84 = QgsCoordinateReferenceSystem("EPSG:4326")
+        xform = QgsCoordinateTransform(wgs84, canvas_crs, QgsProject.instance())
+
+        lat_a = self.spin_a_lat.value()
+        lon_a = self.spin_a_lon.value()
+        lat_b = self.spin_b_lat.value()
+        lon_b = self.spin_b_lon.value()
+
+        has_a = self._has_coords_a()
+        has_b = self._has_coords_b()
+
+        # Site A marker
+        if has_a:
+            pt_a = xform.transform(QgsPointXY(lon_a, lat_a))
+            self._site_a_rb.setToGeometry(QgsGeometry.fromPointXY(pt_a), None)
+            self._site_a_rb.show()
+        else:
+            self._site_a_rb.reset(QgsWkbTypes.PointGeometry)
+
+        # Site B marker
+        if has_b:
+            pt_b = xform.transform(QgsPointXY(lon_b, lat_b))
+            self._site_b_rb.setToGeometry(QgsGeometry.fromPointXY(pt_b), None)
+            self._site_b_rb.show()
+        else:
+            self._site_b_rb.reset(QgsWkbTypes.PointGeometry)
+
+        # Link line between the two sites
+        if has_a and has_b:
+            pt_a = xform.transform(QgsPointXY(lon_a, lat_a))
+            pt_b = xform.transform(QgsPointXY(lon_b, lat_b))
+            self._link_line_rb.setToGeometry(
+                QgsGeometry.fromPolylineXY([pt_a, pt_b]), None
+            )
+            self._link_line_rb.show()
+        else:
+            self._link_line_rb.reset(QgsWkbTypes.LineGeometry)
+
+    def _reset_rubber_bands(self) -> None:
+        """Clear all rubber bands from the map canvas."""
+        self._site_a_rb.reset(QgsWkbTypes.PointGeometry)
+        self._site_b_rb.reset(QgsWkbTypes.PointGeometry)
+        self._link_line_rb.reset(QgsWkbTypes.LineGeometry)
 
     # ------------------------------------------------------------------
     # UI construction
@@ -375,82 +738,32 @@ class P2PTab(QWidget):
     def _build_ui(self) -> None:
         main_layout = QVBoxLayout(self)
 
-        # ---- Mode selector (Single Link / Batch CSV) ----
-        mode_layout = QHBoxLayout()
-        mode_layout.addWidget(QLabel("Mode:"))
-        self.radio_single = QRadioButton("Single Link")
-        self.radio_batch = QRadioButton("Batch CSV")
-        self.radio_single.setChecked(True)
-        self._mode_group = QButtonGroup(self)
-        self._mode_group.addButton(self.radio_single, _MODE_SINGLE)
-        self._mode_group.addButton(self.radio_batch, _MODE_BATCH)
-        mode_layout.addWidget(self.radio_single)
-        mode_layout.addWidget(self.radio_batch)
-        mode_layout.addStretch()
-        main_layout.addLayout(mode_layout)
-
-        # ---- Stacked widget (Single Link / Batch CSV) ----
-        self.stack = QStackedWidget()
-        self.stack.addWidget(self._build_single_page())   # index 0
-        self.stack.addWidget(self._build_batch_page())     # index 1
-        main_layout.addWidget(self.stack)
-
-        # ---- Parameters group (only shown in LOSS mode) ----
-        main_layout.addWidget(self._build_params_group())
-
-        # ---- Analysis settings ----
-        main_layout.addWidget(self._build_analysis_group())
-
-        # ---- Results area (hidden until analysis completes) ----
-        self.result_area = QTextEdit()
-        self.result_area.setReadOnly(True)
-        self.result_area.setMaximumHeight(140)
-        self.result_area.setVisible(False)
-        main_layout.addWidget(self.result_area)
-
-        # ---- Progress bar + Run button ----
-        bottom_layout = QHBoxLayout()
-        self.progress_bar = QProgressBar()
-        self.progress_bar.setVisible(False)
-        bottom_layout.addWidget(self.progress_bar, stretch=1)
-
-        self.btn_run = QPushButton("Run Analysis")
-        bottom_layout.addWidget(self.btn_run)
-        main_layout.addLayout(bottom_layout)
-
-        self.status_label = QLabel("")
-        self.status_label.setVisible(False)
-        main_layout.addWidget(self.status_label)
-
-    # -- Single Link page --------------------------------------------------
-
-    def _build_single_page(self) -> QWidget:
-        page = QWidget()
-        layout = QVBoxLayout(page)
-
-        # --- Site A / Transmitter ---
-        site_a_layout = QFormLayout()
+        # ---- Site A / Transmitter ----
         self._lbl_site_a = QLabel("Site A:")
         self._lbl_site_a.setStyleSheet("font-weight: bold;")
-        site_a_layout.addRow(self._lbl_site_a)
+        main_layout.addWidget(self._lbl_site_a)
+
+        site_a_form = QFormLayout()
 
         # Location row
         a_loc_layout = QHBoxLayout()
         self.spin_a_lat = QDoubleSpinBox()
         self.spin_a_lat.setRange(-90.0, 90.0)
         self.spin_a_lat.setDecimals(6)
-        self.spin_a_lat.setPrefix("Lat: ")
+        self.spin_a_lat.setPrefix("Lat ")
+        self.spin_a_lat.setMinimumWidth(130)
         a_loc_layout.addWidget(self.spin_a_lat)
 
         self.spin_a_lon = QDoubleSpinBox()
         self.spin_a_lon.setRange(-180.0, 180.0)
         self.spin_a_lon.setDecimals(6)
-        self.spin_a_lon.setPrefix("Lon: ")
+        self.spin_a_lon.setPrefix("Lon ")
+        self.spin_a_lon.setMinimumWidth(130)
         a_loc_layout.addWidget(self.spin_a_lon)
 
         self.btn_pick_a = QPushButton("Pick from Map")
         a_loc_layout.addWidget(self.btn_pick_a)
-        site_a_layout.addRow("Location:", a_loc_layout)
+        site_a_form.addRow("Location:", a_loc_layout)
 
         # Height row
         a_height_layout = QHBoxLayout()
@@ -465,33 +778,36 @@ class P2PTab(QWidget):
         self.combo_a_mode.addItems(["AGL", "AMSL"])
         a_height_layout.addWidget(self.combo_a_mode)
         a_height_layout.addStretch()
-        site_a_layout.addRow("Height:", a_height_layout)
+        site_a_form.addRow("Height:", a_height_layout)
 
-        layout.addLayout(site_a_layout)
+        main_layout.addLayout(site_a_form)
 
-        # --- Site B / Receiver ---
-        site_b_layout = QFormLayout()
+        # ---- Site B / Receiver ----
         self._lbl_site_b = QLabel("Site B:")
         self._lbl_site_b.setStyleSheet("font-weight: bold;")
-        site_b_layout.addRow(self._lbl_site_b)
+        main_layout.addWidget(self._lbl_site_b)
+
+        site_b_form = QFormLayout()
 
         # Location row
         b_loc_layout = QHBoxLayout()
         self.spin_b_lat = QDoubleSpinBox()
         self.spin_b_lat.setRange(-90.0, 90.0)
         self.spin_b_lat.setDecimals(6)
-        self.spin_b_lat.setPrefix("Lat: ")
+        self.spin_b_lat.setPrefix("Lat ")
+        self.spin_b_lat.setMinimumWidth(130)
         b_loc_layout.addWidget(self.spin_b_lat)
 
         self.spin_b_lon = QDoubleSpinBox()
         self.spin_b_lon.setRange(-180.0, 180.0)
         self.spin_b_lon.setDecimals(6)
-        self.spin_b_lon.setPrefix("Lon: ")
+        self.spin_b_lon.setPrefix("Lon ")
+        self.spin_b_lon.setMinimumWidth(130)
         b_loc_layout.addWidget(self.spin_b_lon)
 
         self.btn_pick_b = QPushButton("Pick from Map")
         b_loc_layout.addWidget(self.btn_pick_b)
-        site_b_layout.addRow("Location:", b_loc_layout)
+        site_b_form.addRow("Location:", b_loc_layout)
 
         # Height row
         b_height_layout = QHBoxLayout()
@@ -506,40 +822,40 @@ class P2PTab(QWidget):
         self.combo_b_mode.addItems(["AGL", "AMSL"])
         b_height_layout.addWidget(self.combo_b_mode)
         b_height_layout.addStretch()
-        site_b_layout.addRow("Height:", b_height_layout)
+        site_b_form.addRow("Height:", b_height_layout)
 
-        layout.addLayout(site_b_layout)
-        return page
+        main_layout.addLayout(site_b_form)
 
-    # -- Batch CSV page ----------------------------------------------------
+        # ---- Parameters group (frequency / ERP, visible in LOSS mode only) ----
+        main_layout.addWidget(self._build_params_group())
 
-    def _build_batch_page(self) -> QWidget:
-        page = QWidget()
-        layout = QVBoxLayout(page)
+        # ---- Analysis settings (DEM, resolution, backend, output dir) ----
+        main_layout.addWidget(self._build_analysis_group())
 
-        # File picker row
-        file_layout = QHBoxLayout()
-        file_layout.addWidget(QLabel("File:"))
-        self.line_batch_file = QLineEdit()
-        self.line_batch_file.setPlaceholderText("Select a batch CSV file...")
-        file_layout.addWidget(self.line_batch_file)
-        self.btn_browse_batch = QPushButton("Browse")
-        file_layout.addWidget(self.btn_browse_batch)
-        layout.addLayout(file_layout)
+        # ---- Results area ----
+        results_group = QGroupBox("Results")
+        results_layout = QVBoxLayout(results_group)
+        self.result_area = QTextEdit()
+        self.result_area.setReadOnly(True)
+        results_layout.addWidget(self.result_area)
+        main_layout.addWidget(results_group)
 
-        # Preview table
-        self.table_preview = QTableWidget()
-        self.table_preview.setColumnCount(6)
-        self.table_preview.setHorizontalHeaderLabels(
-            ["Type", "ID", "Lat", "Lon", "Alt (m)", "Mode"]
-        )
-        self.table_preview.horizontalHeader().setSectionResizeMode(
-            QHeaderView.Stretch
-        )
-        self.table_preview.setEditTriggers(QTableWidget.NoEditTriggers)
-        layout.addWidget(self.table_preview)
+        # ---- Progress bar + Run / View Plots buttons ----
+        bottom_layout = QHBoxLayout()
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setVisible(False)
+        bottom_layout.addWidget(self.progress_bar, stretch=1)
 
-        return page
+        self.btn_view_plots = QPushButton("View Plots")
+        self.btn_view_plots.setVisible(False)
+        bottom_layout.addWidget(self.btn_view_plots)
+
+        self.btn_stop = QPushButton("Stop")
+        self.btn_stop.setVisible(False)
+        bottom_layout.addWidget(self.btn_stop)
+        self.btn_run = QPushButton("Run Analysis")
+        bottom_layout.addWidget(self.btn_run)
+        main_layout.addLayout(bottom_layout)
 
     # -- Parameters group (frequency / ERP, visible in LOSS mode only) -----
 
@@ -559,6 +875,9 @@ class P2PTab(QWidget):
         self.spin_erp.setDecimals(3)
         self.spin_erp.setSuffix(" W")
         layout.addRow("ERP (Watts):", self.spin_erp)
+
+        # Hidden by default (LOS mode).
+        self._params_group.setVisible(False)
 
         return self._params_group
 
@@ -601,19 +920,22 @@ class P2PTab(QWidget):
     # ------------------------------------------------------------------
 
     def _connect_signals(self) -> None:
-        # Run button
         self.btn_run.clicked.connect(self._on_run)
-
-        # Mode switching (Single Link / Batch CSV)
-        self._mode_group.buttonClicked.connect(self._on_input_mode_changed)
+        self.btn_stop.clicked.connect(self._on_stop)
+        self.btn_view_plots.clicked.connect(self._on_view_plots)
 
         # Map pick buttons
         self.btn_pick_a.clicked.connect(lambda: self._on_pick_from_map("a"))
         self.btn_pick_b.clicked.connect(lambda: self._on_pick_from_map("b"))
 
-        # Browse buttons
-        self.btn_browse_batch.clicked.connect(self._on_browse_batch)
+        # Browse button
         self.btn_browse_dir.clicked.connect(self._on_browse_dir)
+
+        # Update rubber bands when coordinates change
+        self.spin_a_lat.valueChanged.connect(self._update_visuals)
+        self.spin_a_lon.valueChanged.connect(self._update_visuals)
+        self.spin_b_lat.valueChanged.connect(self._update_visuals)
+        self.spin_b_lon.valueChanged.connect(self._update_visuals)
 
     # ------------------------------------------------------------------
     # Populate raster layers
@@ -636,14 +958,6 @@ class P2PTab(QWidget):
         return None
 
     # ------------------------------------------------------------------
-    # Slot: input mode changed (Single Link / Batch CSV)
-    # ------------------------------------------------------------------
-
-    def _on_input_mode_changed(self) -> None:
-        mode_id = self._mode_group.checkedId()
-        self.stack.setCurrentIndex(mode_id)
-
-    # ------------------------------------------------------------------
     # Slot: Pick from Map
     # ------------------------------------------------------------------
 
@@ -656,8 +970,6 @@ class P2PTab(QWidget):
             ``"a"`` for Site A / Transmitter,
             ``"b"`` for Site B / Receiver.
         """
-        self._pick_target = target
-
         if target == "a":
             callback = self._on_point_picked_a
         else:
@@ -690,16 +1002,8 @@ class P2PTab(QWidget):
             parent.activateWindow()
 
     # ------------------------------------------------------------------
-    # Slot: File browse buttons
+    # Slot: Browse output directory
     # ------------------------------------------------------------------
-
-    def _on_browse_batch(self) -> None:
-        path, _ = QFileDialog.getOpenFileName(
-            self, "Select Batch CSV", "", "CSV Files (*.csv)"
-        )
-        if path:
-            self.line_batch_file.setText(path)
-            self._load_batch_preview(path)
 
     def _on_browse_dir(self) -> None:
         path = QFileDialog.getExistingDirectory(
@@ -709,29 +1013,53 @@ class P2PTab(QWidget):
             self.line_output_dir.setText(path)
 
     # ------------------------------------------------------------------
-    # Batch preview
+    # Slot: View Plots
     # ------------------------------------------------------------------
 
-    def _load_batch_preview(self, path: str) -> None:
-        """Parse a batch CSV and fill the preview table."""
-        self.table_preview.setRowCount(0)
-        try:
-            entries = _parse_batch_csv(path)
-        except Exception as exc:
-            QMessageBox.warning(
-                self, "CSV Parse Error",
-                f"Failed to parse batch CSV:\n{exc}",
+    def _on_view_plots(self) -> None:
+        """Open the P2P result viewer dialog with matplotlib plots."""
+        if not self._last_output_dir or not self._last_output_name:
+            QMessageBox.information(
+                self, "No Results", "Run an analysis first to generate plots."
             )
             return
 
-        self.table_preview.setRowCount(len(entries))
-        for row_idx, (row_type, row_id, lat, lon, alt, mode) in enumerate(entries):
-            self.table_preview.setItem(row_idx, 0, QTableWidgetItem(row_type))
-            self.table_preview.setItem(row_idx, 1, QTableWidgetItem(row_id))
-            self.table_preview.setItem(row_idx, 2, QTableWidgetItem(f"{lat:.6f}"))
-            self.table_preview.setItem(row_idx, 3, QTableWidgetItem(f"{lon:.6f}"))
-            self.table_preview.setItem(row_idx, 4, QTableWidgetItem(f"{alt:.1f}"))
-            self.table_preview.setItem(row_idx, 5, QTableWidgetItem(mode))
+        parent = self._parent_dialog
+        analysis_mode = parent.get_mode() if hasattr(parent, "get_mode") else "LOS"
+
+        if analysis_mode == "LOS":
+            freq_mhz = 0.0
+            tx_dbm = 0.0
+        else:
+            freq_mhz = self.spin_freq.value()
+            erp_watts = self.spin_erp.value()
+            # Convert ERP (Watts) to dBm: P_dBm = 10 * log10(P_mW)
+            if erp_watts > 0:
+                tx_dbm = 10.0 * math.log10(erp_watts * 1000.0)
+            else:
+                tx_dbm = 0.0
+
+        try:
+            viewer = _P2PResultViewer(
+                output_dir=self._last_output_dir,
+                output_name=self._last_output_name,
+                freq_mhz=freq_mhz,
+                tx_height=self.spin_a_height.value(),
+                rx_height=self.spin_b_height.value(),
+                tx_dbm=tx_dbm,
+                parent=self,
+            )
+            viewer.show()
+        except ImportError:
+            QMessageBox.warning(
+                self, "Missing Dependency",
+                "matplotlib is required for P2P plots but is not installed.\n"
+                "Install it with: pip install matplotlib"
+            )
+        except Exception as exc:
+            QMessageBox.critical(
+                self, "Plot Error", f"Failed to open plot viewer:\n{exc}"
+            )
 
     # ------------------------------------------------------------------
     # Collect parameters from widgets
@@ -739,7 +1067,6 @@ class P2PTab(QWidget):
 
     def _collect_params(self) -> P2PParams:
         """Read all widget values into a P2PParams dataclass."""
-        # Determine the propagation model from the parent dialog.
         parent = self._parent_dialog
         analysis_mode = parent.get_mode() if hasattr(parent, "get_mode") else "LOS"
 
@@ -787,22 +1114,15 @@ class P2PTab(QWidget):
         if not output_dir:
             return "Please specify an output directory."
 
-        is_batch = self.radio_batch.isChecked()
+        a_lat = self.spin_a_lat.value()
+        a_lon = self.spin_a_lon.value()
+        b_lat = self.spin_b_lat.value()
+        b_lon = self.spin_b_lon.value()
 
-        if is_batch:
-            batch_file = self.line_batch_file.text().strip()
-            if not batch_file or not os.path.isfile(batch_file):
-                return "Please select a valid batch CSV file."
-        else:
-            a_lat = self.spin_a_lat.value()
-            a_lon = self.spin_a_lon.value()
-            b_lat = self.spin_b_lat.value()
-            b_lon = self.spin_b_lon.value()
-
-            if a_lat == 0.0 and a_lon == 0.0:
-                return "Please set the Site A / Transmitter location."
-            if b_lat == 0.0 and b_lon == 0.0:
-                return "Please set the Site B / Receiver location."
+        if a_lat == 0.0 and a_lon == 0.0:
+            return "Please set the Site A / Transmitter location."
+        if b_lat == 0.0 and b_lon == 0.0:
+            return "Please set the Site B / Receiver location."
 
         return None
 
@@ -822,35 +1142,35 @@ class P2PTab(QWidget):
 
         dem_layer = self._selected_dem_layer()
         output_dir = self.line_output_dir.text().strip()
-        is_batch = self.radio_batch.isChecked()
 
-        if is_batch:
-            batch_file = self.line_batch_file.text().strip()
-        else:
-            # Single-link mode: create a temp 2-line batch CSV.
-            batch_file = _write_temp_batch_csv(
-                tx_lat=self.spin_a_lat.value(),
-                tx_lon=self.spin_a_lon.value(),
-                tx_height=self.spin_a_height.value(),
-                tx_mode=self.combo_a_mode.currentText(),
-                rx_lat=self.spin_b_lat.value(),
-                rx_lon=self.spin_b_lon.value(),
-                rx_height=self.spin_b_height.value(),
-                rx_mode=self.combo_b_mode.currentText(),
-            )
+        # Generate a temp 2-line batch CSV from the two endpoints.
+        batch_file = _write_temp_batch_csv(
+            tx_lat=self.spin_a_lat.value(),
+            tx_lon=self.spin_a_lon.value(),
+            tx_height=self.spin_a_height.value(),
+            tx_mode=self.combo_a_mode.currentText(),
+            rx_lat=self.spin_b_lat.value(),
+            rx_lon=self.spin_b_lon.value(),
+            rx_height=self.spin_b_height.value(),
+            rx_mode=self.combo_b_mode.currentText(),
+        )
 
         params = self._collect_params()
 
         # Switch to running state.
         self.btn_run.setEnabled(False)
+        self.btn_stop.setVisible(True)
+        self.btn_view_plots.setVisible(False)
         self.progress_bar.setVisible(True)
         self.progress_bar.setValue(0)
-        self.status_label.setVisible(True)
-        self.result_area.setVisible(False)
         self.result_area.clear()
 
+        # Store output name for later use by the plot viewer.
+        self._last_output_name = params.output_name
+        self._last_output_dir = None  # reset until success
+
         self._worker = _P2PWorker(
-            params, dem_layer, output_dir, batch_file, is_batch, self,
+            params, dem_layer, output_dir, batch_file, self,
         )
         self._worker.progress.connect(self.progress_bar.setValue)
         self._worker.status.connect(self._on_status)
@@ -858,79 +1178,75 @@ class P2PTab(QWidget):
         self._worker.finished_err.connect(self._on_finished_err)
         self._worker.start()
 
+    def _on_stop(self) -> None:
+        if self._worker and self._worker.isRunning():
+            self.result_area.append("Stopping...")
+            self._worker.cancel()
+            self._worker.wait(5000)
+        self._reset_run_ui()
+
+    def _reset_run_ui(self) -> None:
+        self.btn_run.setEnabled(True)
+        self.btn_stop.setVisible(False)
+        self.progress_bar.setVisible(False)
+
     def _on_status(self, msg: str) -> None:
-        self.status_label.setText(msg)
+        self.result_area.append(msg)
         QgsMessageLog.logMessage(msg, TAG, Qgis.MessageLevel.Info)
 
-    def _on_finished_ok(self, result_path: str, is_batch: bool) -> None:
+    def _on_finished_ok(self, output_dir: str) -> None:
         self.progress_bar.setValue(100)
-        self.status_label.setText("Complete.")
-        self.btn_run.setEnabled(True)
+        self._reset_run_ui()
 
-        if is_batch:
-            # Load the result CSV into QGIS as a table layer.
-            try:
-                layer = load_p2p_result_csv(result_path)
-                add_layer_to_project(layer)
-                QMessageBox.information(
-                    self, "Batch Analysis Complete",
-                    f"Results saved to:\n{result_path}\n\n"
-                    "The result table has been added to your QGIS project.",
-                )
-            except Exception as exc:
-                QgsMessageLog.logMessage(
-                    f"Failed to add result table to map: {exc}",
-                    TAG,
-                    Qgis.MessageLevel.Warning,
-                )
-                QMessageBox.information(
-                    self, "Batch Analysis Complete",
-                    f"Results saved to:\n{result_path}",
-                )
-        else:
-            # Single-link mode: display results in the text area.
-            self._display_single_results(result_path)
+        self._last_output_dir = output_dir
+        self._display_results(output_dir)
 
-    def _display_single_results(self, result_path: str) -> None:
-        """Parse the result CSV and show key metrics in the result area."""
-        self.result_area.setVisible(True)
+        # Show the View Plots button if any .gp files exist.
+        has_gp = any(
+            os.path.isfile(os.path.join(output_dir, name))
+            for name in ("terrain_profile.gp", "height_profile.gp", "path_profile.gp")
+        )
+        self.btn_view_plots.setVisible(has_gp)
+
+    def _display_results(self, output_dir: str) -> None:
+        """Parse the result CSV and report file, show key metrics."""
+        output_name = self._last_output_name or "p2p"
+
+        # --- Show CSV results ---
+        csv_path = os.path.join(output_dir, output_name + ".csv")
         try:
-            with open(result_path, "r", encoding="utf-8") as fh:
+            with open(csv_path, "r", encoding="utf-8") as fh:
                 reader = csv.DictReader(fh)
                 rows = list(reader)
 
             if not rows:
-                self.result_area.setPlainText("No results found in output file.")
-                return
-
-            lines = ["P2P Link Analysis Results", "=" * 35]
-            for row in rows:
-                for key, value in row.items():
-                    lines.append(f"  {key}: {value}")
-                lines.append("")
-
-            self.result_area.setPlainText("\n".join(lines))
+                self.result_area.append("\nNo results found in output file.")
+            else:
+                lines = ["", "P2P Link Analysis Results", "=" * 35]
+                for row in rows:
+                    for key, value in row.items():
+                        lines.append(f"  {key}: {value}")
+                    lines.append("")
+                self.result_area.append("\n".join(lines))
+        except FileNotFoundError:
+            self.result_area.append(f"\nResult CSV not found: {csv_path}")
         except Exception as exc:
-            self.result_area.setPlainText(f"Error reading results: {exc}")
+            self.result_area.append(f"\nError reading CSV results: {exc}")
 
-        QMessageBox.information(
-            self, "Analysis Complete",
-            f"P2P result saved to:\n{result_path}",
-        )
+        # --- Show report file if present ---
+        report_path = os.path.join(output_dir, "p2p_report.txt")
+        if os.path.isfile(report_path):
+            try:
+                with open(report_path, "r", encoding="utf-8", errors="replace") as fh:
+                    report_text = fh.read()
+                if report_text.strip():
+                    self.result_area.append("\n--- P2P Report ---")
+                    self.result_area.append(report_text)
+            except Exception as exc:
+                self.result_area.append(f"\nError reading report: {exc}")
 
     def _on_finished_err(self, message: str) -> None:
-        self.progress_bar.setVisible(False)
-        self.status_label.setVisible(False)
-        self.btn_run.setEnabled(True)
+        self._reset_run_ui()
 
+        self.result_area.append(f"\nAnalysis failed: {message}")
         QMessageBox.critical(self, "Analysis Failed", message)
-
-    # ------------------------------------------------------------------
-    # Cleanup
-    # ------------------------------------------------------------------
-
-    def cancel_worker(self) -> None:
-        """Cancel any running worker thread.  Called by the parent dialog."""
-        if self._worker is not None and self._worker.isRunning():
-            self._worker.cancel()
-            self._worker.wait(5000)

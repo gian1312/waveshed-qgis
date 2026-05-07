@@ -13,6 +13,7 @@ The parent dialog must provide:
 from __future__ import annotations
 
 import os
+import platform
 import re
 import subprocess
 import tempfile
@@ -41,17 +42,28 @@ from qgis.PyQt.QtWidgets import (
 )
 from qgis.core import (
     Qgis,
+    QgsCoordinateReferenceSystem,
+    QgsCoordinateTransform,
+    QgsGeometry,
     QgsMessageLog,
+    QgsPointXY,
     QgsProject,
     QgsRasterLayer,
+    QgsWkbTypes,
 )
+from qgis.gui import QgsRubberBand
+from qgis.PyQt.QtGui import QColor
 
-from ..core.api_key import check_key_or_raise, ApiKeyError
-from ..core.asset_manager import list_assets, load_asset
+from ..core.asset_manager import compute_erp, list_assets, load_asset
 from ..core.binary_manager import find_binary
+
+# Hide console windows on Windows.
+_SUBPROCESS_FLAGS = (
+    subprocess.CREATE_NO_WINDOW if platform.system() == "Windows" else 0
+)
 from ..core.job_builder import CoverageParams, build_coverage_job, write_job_file
 from ..core.result_loader import add_layer_to_project, load_coverage_result
-from ..core.terrain_adapter import prepare_terrain
+from ..core.terrain_adapter import get_source_resolution_info, prepare_terrain
 from .map_tools import activate_point_capture
 
 TAG = "AETHER"
@@ -87,6 +99,20 @@ _ALT_COLUMNS = ["Altitude (m)", "Reference"]
 # Worker thread
 # ---------------------------------------------------------------------------
 
+def _kill_proc(proc: subprocess.Popen) -> None:
+    """Kill a subprocess and all its children (Windows-safe)."""
+    if proc.poll() is not None:
+        return
+    if platform.system() == "Windows":
+        subprocess.run(
+            ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+            capture_output=True,
+            creationflags=_SUBPROCESS_FLAGS,
+        )
+    else:
+        proc.terminate()
+
+
 class _SiteAnalysisWorker(QThread):
     """Run the coverage pipeline for each (site x altitude) combination."""
 
@@ -100,16 +126,21 @@ class _SiteAnalysisWorker(QThread):
         jobs: List[Tuple[CoverageParams, str]],
         dem_layer: QgsRasterLayer,
         output_dir: str,
+        terrain_dir: str = "",
         parent: Optional[QWidget] = None,
     ) -> None:
         super().__init__(parent)
-        self.jobs = jobs            # [(CoverageParams, display_name), ...]
+        self.jobs = jobs
         self.dem_layer = dem_layer
         self.output_dir = output_dir
+        self.terrain_dir = terrain_dir
         self._canceled = False
+        self._proc: Optional[subprocess.Popen] = None
 
     def cancel(self) -> None:
         self._canceled = True
+        if self._proc is not None:
+            _kill_proc(self._proc)
 
     def _parse_wedge_progress(self, line: str) -> Optional[int]:
         """Extract percentage from lines like ``Wedge 120/360``."""
@@ -128,14 +159,7 @@ class _SiteAnalysisWorker(QThread):
             return
 
         try:
-            # ---- 1. Validate API key ----
-            self.status.emit("Validating API key...")
             self.progress.emit(0)
-            check_key_or_raise()
-
-            if self._canceled:
-                return
-
             os.makedirs(self.output_dir, exist_ok=True)
 
             for job_idx, (params, display_name) in enumerate(self.jobs):
@@ -152,7 +176,7 @@ class _SiteAnalysisWorker(QThread):
                 job_label = f"[{job_idx + 1}/{total_jobs}] {display_name}"
 
                 # ---- 2. Prepare terrain ----
-                self.status.emit(f"{job_label}: Preparing terrain...")
+                self.status.emit(f"{job_label}: Downloading terrain...")
                 self.progress.emit(_job_progress(5))
 
                 from ..core import binary_manager as bm
@@ -163,6 +187,7 @@ class _SiteAnalysisWorker(QThread):
                     max_range_km=params.max_range_km,
                     resolution_m=params.resolution_m,
                     binary_manager=bm,
+                    terrain_dir=self.terrain_dir or None,
                 )
 
                 if self._canceled:
@@ -188,27 +213,38 @@ class _SiteAnalysisWorker(QThread):
                 self.progress.emit(_job_progress(20))
 
                 core_exe = find_binary("aether_core")
+                env = os.environ.copy()
+                env["RUST_LOG"] = "info"
+
                 proc = subprocess.Popen(
                     [core_exe, "--config", job_file],
                     stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,  # merge stderr into stdout
                     text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    env=env,
+                    creationflags=_SUBPROCESS_FLAGS,
                 )
+                self._proc = proc  # expose for kill
 
-                for line in iter(proc.stderr.readline, ""):
+                stderr_lines: list[str] = []
+                for line in iter(proc.stdout.readline, ""):
                     if self._canceled:
-                        proc.terminate()
+                        _kill_proc(proc)
                         return
+                    stderr_lines.append(line)
                     pct = self._parse_wedge_progress(line)
                     if pct is not None:
                         self.progress.emit(_job_progress(20 + int(pct * 0.6)))
 
                 proc.wait()
+                self._proc = None
                 if proc.returncode != 0:
-                    stderr_tail = proc.stderr.read() if proc.stderr else ""
+                    tail = "".join(stderr_lines[-20:])
                     raise RuntimeError(
                         f"aether_core exited with code {proc.returncode}"
-                        f" for {display_name}:\n{stderr_tail}"
+                        f" for {display_name}:\n{tail}"
                     )
 
                 if self._canceled:
@@ -237,7 +273,6 @@ class _SiteAnalysisWorker(QThread):
                     job_output_dir, params.output_name + ".tif",
                 )
 
-                # IMPORTANT: use -i/-j/-o flags, NOT positional args
                 result = subprocess.run(
                     [
                         export_exe,
@@ -247,6 +282,7 @@ class _SiteAnalysisWorker(QThread):
                     ],
                     capture_output=True,
                     text=True,
+                    creationflags=_SUBPROCESS_FLAGS,
                 )
                 if result.returncode != 0:
                     raise RuntimeError(
@@ -260,8 +296,6 @@ class _SiteAnalysisWorker(QThread):
             self.progress.emit(100)
             self.finished_ok.emit(results)
 
-        except ApiKeyError as exc:
-            self.finished_err.emit(f"API Key Error: {exc}")
         except Exception as exc:
             self.finished_err.emit(str(exc))
 
@@ -293,10 +327,19 @@ class SiteAnalysisTab(QWidget):
         # Cache of loaded asset dicts, keyed by name.
         self._asset_cache: Dict[str, dict] = {}
 
+        # Rubber band for showing site positions on the map.
+        self._sites_rb = QgsRubberBand(self.iface.mapCanvas(), QgsWkbTypes.PointGeometry)
+        self._sites_rb.setColor(QColor(0, 200, 255, 200))
+        self._sites_rb.setWidth(3)
+        self._sites_rb.setIconSize(12)
+
         self._build_ui()
         self._connect_signals()
         self._populate_raster_layers()
         self._refresh_asset_cache()
+        # Apply initial mode and update DEM info.
+        self.set_mode(self._current_mode)
+        self._on_dem_changed()
 
     # ==================================================================
     # Asset helpers
@@ -349,6 +392,9 @@ class SiteAnalysisTab(QWidget):
 
         run_layout = QHBoxLayout()
         run_layout.addStretch()
+        self.btn_stop = QPushButton("Stop")
+        self.btn_stop.setVisible(False)
+        run_layout.addWidget(self.btn_stop)
         self.btn_run = QPushButton("Run Analysis")
         run_layout.addWidget(self.btn_run)
         main_layout.addLayout(run_layout)
@@ -377,6 +423,7 @@ class SiteAnalysisTab(QWidget):
         self.sites_table.setSelectionBehavior(QTableWidget.SelectRows)
         self.sites_table.setSelectionMode(QTableWidget.SingleSelection)
         self.sites_table.verticalHeader().setVisible(False)
+        self.sites_table.verticalHeader().setDefaultSectionSize(36)
         self._setup_sites_columns()
         layout.addWidget(self.sites_table)
 
@@ -386,8 +433,12 @@ class SiteAnalysisTab(QWidget):
         """Configure sites table columns (same for all modes)."""
         self.sites_table.setColumnCount(len(_SITE_COLUMNS))
         self.sites_table.setHorizontalHeaderLabels(_SITE_COLUMNS)
+        # Location column gets extra space; others resize to content.
         self.sites_table.horizontalHeader().setSectionResizeMode(
-            QHeaderView.Stretch,
+            QHeaderView.ResizeToContents,
+        )
+        self.sites_table.horizontalHeader().setSectionResizeMode(
+            _COL_LOCATION, QHeaderView.Stretch,
         )
 
     # -- Altitudes section -------------------------------------------------
@@ -430,7 +481,13 @@ class SiteAnalysisTab(QWidget):
 
         # DEM Layer
         self.combo_dem = QComboBox()
+        self.combo_dem.currentIndexChanged.connect(self._on_dem_changed)
         layout.addRow("DEM Layer:", self.combo_dem)
+
+        # Source info (read-only)
+        self.lbl_dem_info = QLabel("")
+        self.lbl_dem_info.setStyleSheet("color: gray; font-size: 11px;")
+        layout.addRow("", self.lbl_dem_info)
 
         # Resolution
         self.combo_resolution = QComboBox()
@@ -536,42 +593,75 @@ class SiteAnalysisTab(QWidget):
         self.btn_remove_alt.clicked.connect(self._on_remove_altitude)
         self.btn_browse_dir.clicked.connect(self._on_browse_dir)
         self.btn_run.clicked.connect(self._on_run)
+        self.btn_stop.clicked.connect(self._on_stop)
 
     # ==================================================================
     # Populate raster layers
     # ==================================================================
 
+    _LOCAL_DIR_PREFIX = "Local: "
+
     def _populate_raster_layers(self) -> None:
-        """Fill the DEM combo with raster layers from the current project."""
+        """Fill the DEM combo with raster layers + local terrain dir from settings."""
         self.combo_dem.clear()
-        self._dem_layers: list[QgsRasterLayer] = []
+        self._dem_layers: list = []  # QgsRasterLayer or str (path)
+
+        # Add local terrain directory from settings (if configured).
+        from qgis.core import QgsSettings as _QS
+        terrain_dir = _QS().value("aether/terrain_dir", "").strip()
+        if terrain_dir and os.path.isdir(terrain_dir):
+            self.combo_dem.addItem(f"{self._LOCAL_DIR_PREFIX}{terrain_dir}")
+            self._dem_layers.append(terrain_dir)
+
         for layer in QgsProject.instance().mapLayers().values():
             if isinstance(layer, QgsRasterLayer):
                 self.combo_dem.addItem(layer.name())
                 self._dem_layers.append(layer)
 
-    def refresh_layers(self) -> None:
-        """Public method to refresh the DEM layer list."""
-        self._populate_raster_layers()
-
     def _selected_dem_layer(self) -> Optional[QgsRasterLayer]:
-        """Return the currently selected DEM layer, or None."""
         idx = self.combo_dem.currentIndex()
         if 0 <= idx < len(self._dem_layers):
-            return self._dem_layers[idx]
+            entry = self._dem_layers[idx]
+            if isinstance(entry, str):
+                return None  # local dir, not a layer
+            return entry
         return None
+
+    def _selected_terrain_dir(self) -> Optional[str]:
+        """Return the selected local terrain dir, or None if a QGIS layer is selected."""
+        idx = self.combo_dem.currentIndex()
+        if 0 <= idx < len(self._dem_layers):
+            entry = self._dem_layers[idx]
+            if isinstance(entry, str):
+                return entry
+        return None
+
+    def _on_dem_changed(self) -> None:
+        layer = self._selected_dem_layer()
+        terrain_dir = self._selected_terrain_dir()
+        if terrain_dir:
+            self.lbl_dem_info.setText(f"Local directory: {terrain_dir}")
+        elif layer:
+            info = get_source_resolution_info(layer)
+            self.lbl_dem_info.setText(f"Source resolution: {info}")
+        else:
+            self.lbl_dem_info.setText("")
 
     # ==================================================================
     # Mode switching
     # ==================================================================
 
     def set_mode(self, mode: str) -> None:
-        """Update internal mode and ITM visibility.
+        """Update internal mode, column visibility, and ITM visibility.
 
-        Columns are identical in both modes, so no table rebuild is needed.
-        The mode only affects which propagation model is used at run time.
+        LOS mode hides the AZ Rotation column (antenna rotation is
+        irrelevant for pure geometric line-of-sight).
         """
         self._current_mode = mode
+        is_los = mode == "LOS"
+        # LOS doesn't use assets (no freq/power/patterns) or AZ rotation.
+        self.sites_table.setColumnHidden(_COL_ASSET, is_los)
+        self.sites_table.setColumnHidden(_COL_AZ_ROTATION, is_los)
         self._update_itm_visibility()
 
     def _update_itm_visibility(self) -> None:
@@ -613,7 +703,7 @@ class SiteAnalysisTab(QWidget):
         spin_lat.setDecimals(6)
         spin_lat.setValue(0.0)
         spin_lat.setPrefix("Lat ")
-        spin_lat.setMinimumWidth(80)
+        spin_lat.setMinimumWidth(130)
         spin_lat.valueChanged.connect(
             lambda val, r=row: self._on_coord_spinbox_changed(r),
         )
@@ -625,7 +715,7 @@ class SiteAnalysisTab(QWidget):
         spin_lon.setDecimals(6)
         spin_lon.setValue(0.0)
         spin_lon.setPrefix("Lon ")
-        spin_lon.setMinimumWidth(80)
+        spin_lon.setMinimumWidth(130)
         spin_lon.valueChanged.connect(
             lambda val, r=row: self._on_coord_spinbox_changed(r),
         )
@@ -715,6 +805,21 @@ class SiteAnalysisTab(QWidget):
         spin_lon = loc_container.findChild(QDoubleSpinBox, "spin_lon")
         if spin_lat is not None and spin_lon is not None:
             self._site_coords[row] = (spin_lat.value(), spin_lon.value())
+        self._update_rubber_band()
+
+    def _update_rubber_band(self) -> None:
+        """Redraw site position markers on the map canvas."""
+        self._sites_rb.reset(QgsWkbTypes.PointGeometry)
+        canvas = self.iface.mapCanvas()
+        canvas_crs = canvas.mapSettings().destinationCrs()
+        wgs84 = QgsCoordinateReferenceSystem("EPSG:4326")
+        xform = QgsCoordinateTransform(wgs84, canvas_crs, QgsProject.instance())
+
+        for _row, (lat, lon) in sorted(self._site_coords.items()):
+            if lat == 0.0 and lon == 0.0:
+                continue
+            pt = xform.transform(QgsPointXY(lon, lat))
+            self._sites_rb.addPoint(pt)
 
     def _on_add_site(self) -> None:
         """Add a new site row with default values."""
@@ -802,6 +907,7 @@ class SiteAnalysisTab(QWidget):
         def _callback(lat: float, lon: float) -> None:
             self._site_coords[row] = (lat, lon)
             self._update_location_spinboxes(row, lat, lon)
+            self._update_rubber_band()
 
         # Keep a reference to prevent garbage collection.
         tool = activate_point_capture(self.iface, _callback)
@@ -1022,12 +1128,16 @@ class SiteAnalysisTab(QWidget):
 
             if asset:
                 freq_mhz = asset.get("frequency_mhz", 433.0)
-                # ERP = power_watts * 10^(antenna_gain_dbi / 10)
-                power_w = asset.get("power_watts", 10.0)
-                gain_dbi = asset.get("antenna_gain_dbi", 0.0)
-                erp_watts = power_w * (10.0 ** (gain_dbi / 10.0))
-                az_pattern = asset.get("az_pattern_file") or None
-                el_pattern = asset.get("el_pattern_file") or None
+                erp_watts = asset.get("erp_watts", 10.0)
+                if erp_watts <= 0:
+                    erp_watts = compute_erp(
+                        asset.get("peak_power_watts", 10.0),
+                        asset.get("antenna_gain_dbi", 0.0),
+                    )
+                # Inline patterns are not file paths — aether_core needs
+                # .az/.el files. Leave as None for now (omnidirectional).
+                az_pattern = None
+                el_pattern = None
 
             for alt_idx, (rx_alt, rx_ref) in enumerate(altitudes):
                 output_name = (
@@ -1105,10 +1215,11 @@ class SiteAnalysisTab(QWidget):
             return
 
         dem_layer = self._selected_dem_layer()
-        if dem_layer is None:
+        terrain_dir = self._selected_terrain_dir()
+        if dem_layer is None and not terrain_dir:
             QMessageBox.warning(
-                self, "No DEM Layer",
-                "Please select a DEM raster layer in the Analysis Parameters.",
+                self, "No DEM",
+                "Please select a DEM layer or configure a local terrain directory.",
             )
             return
 
@@ -1134,19 +1245,35 @@ class SiteAnalysisTab(QWidget):
 
         # ---- Launch worker ----
         self.btn_run.setEnabled(False)
+        self.btn_stop.setVisible(True)
         self.progress_bar.setVisible(True)
         self.progress_bar.setValue(0)
         self.status_label.setVisible(True)
         self.status_label.setText("Starting...")
 
+        terrain_dir = self._selected_terrain_dir() or ""
         self._worker = _SiteAnalysisWorker(
-            jobs, dem_layer, output_dir, self,
+            jobs, dem_layer, output_dir, terrain_dir, self,
         )
         self._worker.progress.connect(self.progress_bar.setValue)
         self._worker.status.connect(self._on_status)
         self._worker.finished_ok.connect(self._on_finished_ok)
         self._worker.finished_err.connect(self._on_finished_err)
         self._worker.start()
+
+    def _on_stop(self) -> None:
+        """Stop a running analysis."""
+        if self._worker and self._worker.isRunning():
+            self.status_label.setText("Stopping...")
+            self._worker.cancel()
+            self._worker.wait(5000)
+        self._reset_run_ui()
+
+    def _reset_run_ui(self) -> None:
+        self.btn_run.setEnabled(True)
+        self.btn_stop.setVisible(False)
+        self.progress_bar.setVisible(False)
+        self.status_label.setVisible(False)
 
     def _on_status(self, msg: str) -> None:
         self.status_label.setText(msg)
@@ -1159,7 +1286,7 @@ class SiteAnalysisTab(QWidget):
         """
         self.progress_bar.setValue(100)
         self.status_label.setText("Complete.")
-        self.btn_run.setEnabled(True)
+        self._reset_run_ui()
 
         loaded_count = 0
         for tif_path, model, display_name in results:
@@ -1181,9 +1308,7 @@ class SiteAnalysisTab(QWidget):
         )
 
     def _on_finished_err(self, message: str) -> None:
-        self.progress_bar.setVisible(False)
-        self.status_label.setVisible(False)
-        self.btn_run.setEnabled(True)
+        self._reset_run_ui()
         QMessageBox.critical(self, "Analysis Failed", message)
 
     # ==================================================================
@@ -1191,7 +1316,9 @@ class SiteAnalysisTab(QWidget):
     # ==================================================================
 
     def cancel_worker(self) -> None:
-        """Cancel a running worker, if any."""
+        """Cancel a running worker and clean up map visuals."""
         if self._worker and self._worker.isRunning():
             self._worker.cancel()
             self._worker.wait(5000)
+        # Remove site markers from the canvas.
+        self._sites_rb.reset()
