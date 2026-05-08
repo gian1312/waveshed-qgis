@@ -188,6 +188,8 @@ class _SiteAnalysisWorker(QThread):
                     resolution_m=params.resolution_m,
                     binary_manager=bm,
                     terrain_dir=self.terrain_dir or None,
+                    az_start=params.az_start,
+                    az_end=params.az_end,
                 )
 
                 if self._canceled:

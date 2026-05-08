@@ -86,30 +86,55 @@ def get_source_resolution_info(dem_layer: Any) -> str:
 # Bbox
 # ---------------------------------------------------------------------------
 
-def _compute_bbox(tx_lat: float, tx_lon: float, max_range_km: float) -> Dict[str, float]:
-    range_deg = max_range_km / 111.0
-    cos_lat = max(math.cos(math.radians(tx_lat)), 1e-6)
-    lon_range_deg = range_deg / cos_lat
+def _compute_sector_bbox(
+    tx_lat: float, tx_lon: float, max_range_km: float,
+    az_start: float = 0.0, az_end: float = 360.0,
+) -> Dict[str, float]:
+    """Compute tight bounding box for circular sector.
+
+    Matches aether_core's bbox logic (coverage.rs).  Only includes the
+    area actually covered by the azimuth arc at the given range.
+    """
+    earth_r = 6_371_000.0
+    pi_180 = math.pi / 180.0
+    range_m = max_range_km * 1000.0
+    cos_tx = max(math.cos(math.radians(tx_lat)), 1e-6)
+
+    range_deg_lat = range_m / (earth_r * pi_180)
+    range_deg_lon = range_m / (earth_r * cos_tx * pi_180)
+
+    def in_arc(a: float) -> bool:
+        if az_start <= az_end:
+            return az_start <= a <= az_end
+        return a >= az_start or a <= az_end          # wraps past 360
+
+    # Test arc endpoints + any cardinal direction inside the arc.
+    test_angles = [az_start, az_end]
+    for cardinal in (0.0, 90.0, 180.0, 270.0):
+        if in_arc(cardinal):
+            test_angles.append(cardinal)
+
+    min_dlat = 0.0
+    max_dlat = 0.0
+    min_dlon = 0.0
+    max_dlon = 0.0
+    for a in test_angles:
+        rad = math.radians(a)
+        dlat = range_deg_lat * math.cos(rad)
+        dlon = range_deg_lon * math.sin(rad)
+        min_dlat = min(min_dlat, dlat)
+        max_dlat = max(max_dlat, dlat)
+        min_dlon = min(min_dlon, dlon)
+        max_dlon = max(max_dlon, dlon)
+
+    margin_lat = range_deg_lat * 0.01
+    margin_lon = range_deg_lon * 0.01
     return {
-        "north": tx_lat + range_deg,
-        "south": tx_lat - range_deg,
-        "east": tx_lon + lon_range_deg,
-        "west": tx_lon - lon_range_deg,
+        "north": tx_lat + max_dlat + margin_lat,
+        "south": tx_lat + min_dlat - margin_lat,
+        "east":  tx_lon + max_dlon + margin_lon,
+        "west":  tx_lon + min_dlon - margin_lon,
     }
-
-
-def _square_bbox(bbox: Dict[str, float]) -> Dict[str, float]:
-    lat_span = bbox["north"] - bbox["south"]
-    lon_span = bbox["east"] - bbox["west"]
-    if lon_span > lat_span:
-        pad = (lon_span - lat_span) / 2.0
-        bbox["north"] += pad
-        bbox["south"] -= pad
-    elif lat_span > lon_span:
-        pad = (lat_span - lon_span) / 2.0
-        bbox["east"] += pad
-        bbox["west"] -= pad
-    return bbox
 
 
 # ---------------------------------------------------------------------------
@@ -130,16 +155,70 @@ def _cache_hit(cache_dir: str) -> bool:
 # Sub-tile specs (1-degree grid, matching prepare_data.py)
 # ---------------------------------------------------------------------------
 
-def _compute_subtiles(bbox: Dict[str, float], resolution_m: int) -> List[Dict[str, Any]]:
+def _compute_subtiles(
+    bbox: Dict[str, float],
+    resolution_m: int,
+    tx_lat: float = 0.0,
+    tx_lon: float = 0.0,
+    max_range_km: float = 0.0,
+    az_start: float = 0.0,
+    az_end: float = 360.0,
+) -> List[Dict[str, Any]]:
     tiles = []
     sub = 1.0
     lat_start = math.floor(bbox["south"] / sub) * sub
     lon_start = math.floor(bbox["west"] / sub) * sub
 
+    # Pre-compute for circle/sector test (skip tiles outside the range).
+    earth_r = 6_371_000.0
+    range_m = max_range_km * 1000.0 if max_range_km > 0 else 0.0
+    cos_tx = max(math.cos(math.radians(tx_lat)), 1e-6)
+
+    def in_arc(a: float) -> bool:
+        if az_start <= az_end:
+            return az_start <= a <= az_end
+        return a >= az_start or a <= az_end
+
+    def tile_intersects_sector(t_south: float, t_north: float, t_west: float, t_east: float) -> bool:
+        """Check if a 1-degree tile intersects the circular sector."""
+        if range_m <= 0:
+            return True  # No range filter — keep all.
+
+        # 1. Circle test: nearest point on tile rectangle to TX.
+        clamp_lat = max(t_south, min(tx_lat, t_north))
+        clamp_lon = max(t_west, min(tx_lon, t_east))
+        dlat_m = (clamp_lat - tx_lat) * earth_r * math.pi / 180.0
+        dlon_m = (clamp_lon - tx_lon) * earth_r * cos_tx * math.pi / 180.0
+        dist_m = math.sqrt(dlat_m * dlat_m + dlon_m * dlon_m)
+        if dist_m > range_m * 1.02:  # 2% margin
+            return False
+
+        # 2. Azimuth test (only if not full circle).
+        if az_start == 0.0 and az_end == 360.0:
+            return True
+
+        # Check if any tile corner falls in the arc, or if the arc
+        # passes through the tile.  Test all 4 corners + tile centre.
+        for plat in (t_south, t_north, (t_south + t_north) / 2):
+            for plon in (t_west, t_east, (t_west + t_east) / 2):
+                dy = plat - tx_lat
+                dx = (plon - tx_lon) * cos_tx
+                if abs(dy) < 1e-12 and abs(dx) < 1e-12:
+                    return True  # TX is inside the tile.
+                bearing = math.degrees(math.atan2(dx, dy)) % 360.0
+                if in_arc(bearing):
+                    return True
+
+        return False
+
     lat = lat_start
     while lat < bbox["north"]:
         lon = lon_start
         while lon < bbox["east"]:
+            if not tile_intersects_sector(lat, lat + sub, lon, lon + sub):
+                lon = round(lon + sub, 6)
+                continue
+
             target_deg = resolution_m / 111_111.0
             calc_size = int(round(sub / target_deg))
             calc_size = ((calc_size + 3) // 4) * 4
@@ -155,6 +234,17 @@ def _compute_subtiles(bbox: Dict[str, float], resolution_m: int) -> List[Dict[st
             lon = round(lon + sub, 6)
         lat = round(lat + sub, 6)
     return tiles
+
+
+def _estimate_abt_disk_mb(subtiles: List[Dict[str, Any]]) -> int:
+    """Estimate total disk space needed for .abt output files (MB)."""
+    total = 0
+    for t in subtiles:
+        sz = t["size_px"]
+        bpr = sz * 2
+        stride = (bpr + 255) & ~255
+        total += 44 + stride * sz
+    return total // (1024 * 1024)
 
 
 # ---------------------------------------------------------------------------
@@ -235,20 +325,32 @@ def _try_rust_download(
             creationflags=_SUBPROCESS_FLAGS,
         )
         # Stream stderr for progress (Rust prints to stderr).
+        stderr_lines: List[str] = []
         for line in iter(proc.stderr.readline, ""):
             line = line.strip()
             if line:
                 _log(f"    {line}")
+                stderr_lines.append(line)
         proc.wait()
 
         if os.path.exists(job_file):
-            os.remove(job_file)
+            #os.remove(job_file)
+            pass
         if proc.returncode != 0:
+            stderr_text = " ".join(stderr_lines).lower()
+            # Disk space errors are non-recoverable — don't waste time with fallback
+            if "insufficient disk" in stderr_text or "not enough space" in stderr_text:
+                detail = stderr_lines[-1] if stderr_lines else "unknown"
+                raise RuntimeError(
+                    f"Insufficient disk space for terrain download. {detail}"
+                )
             _log(f"  Rust download failed (exit {proc.returncode})")
             return False
 
         _log(f"  Rust download: {time.perf_counter() - t:.1f}s")
         return _cache_hit(cache_dir)
+    except RuntimeError:
+        raise
     except Exception as exc:
         _log(f"  Rust download error: {exc}")
         return False
@@ -368,23 +470,33 @@ def prepare_terrain(
     binary_manager: Any,
     feedback: Optional[Any] = None,
     terrain_dir: Optional[str] = None,
+    az_start: float = 0.0,
+    az_end: float = 360.0,
 ) -> str:
     """Produce .abt terrain tiles for aether_core. Returns cache directory."""
     t0 = time.perf_counter()
     source = terrain_dir or dem_layer.source()
-    _log(f"prepare_terrain: resolution={resolution_m}m, range={max_range_km}km")
+    _log(f"prepare_terrain: resolution={resolution_m}m, range={max_range_km}km, "
+         f"az={az_start:.1f}-{az_end:.1f}")
 
-    bbox = _square_bbox(_compute_bbox(tx_lat, tx_lon, max_range_km))
+    bbox = _compute_sector_bbox(tx_lat, tx_lon, max_range_km, az_start, az_end)
 
     cache_hash = _cache_key(source, bbox, resolution_m)
+    # Include azimuth in cache key so different sectors don't collide.
+    if not (az_start == 0.0 and az_end == 360.0):
+        cache_hash = hashlib.md5(
+            f"{cache_hash}|{az_start}|{az_end}".encode()
+        ).hexdigest()
     cache_dir = os.path.join(get_cache_dir(), cache_hash)
 
     if _cache_hit(cache_dir):
         _log(f"  cache HIT ({time.perf_counter() - t0:.1f}s)")
         return cache_dir
 
-    subtiles = _compute_subtiles(bbox, resolution_m)
-    _log(f"  cache MISS — {len(subtiles)} sub-tiles, "
+    subtiles = _compute_subtiles(bbox, resolution_m, tx_lat, tx_lon,
+                                  max_range_km, az_start, az_end)
+    disk_mb = _estimate_abt_disk_mb(subtiles)
+    _log(f"  cache MISS — {len(subtiles)} sub-tiles, ~{disk_mb} MB output, "
          f"bbox N={bbox['north']:.3f} S={bbox['south']:.3f} "
          f"E={bbox['east']:.3f} W={bbox['west']:.3f}")
     os.makedirs(cache_dir, exist_ok=True)
