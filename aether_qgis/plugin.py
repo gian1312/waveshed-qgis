@@ -37,9 +37,29 @@ class AetherPlugin:
         self.provider = AetherProvider()
         QgsApplication.processingRegistry().addProvider(self.provider)
 
+    def _is_dialog_alive(self) -> bool:
+        """Check if the dialog reference is still valid (not deleted by Qt)."""
+        if self._main_dialog is None:
+            return False
+        try:
+            # sip.isdeleted is the canonical check, but may not be available.
+            from qgis.PyQt import sip
+            return not sip.isdeleted(self._main_dialog)
+        except (ImportError, AttributeError):
+            pass
+        try:
+            # Fallback: any attribute access on a deleted object raises.
+            self._main_dialog.isVisible()
+            return True
+        except RuntimeError:
+            return False
+
     def unload(self):
-        if self._main_dialog is not None and self._main_dialog.isVisible():
-            self._main_dialog.close()
+        if self._is_dialog_alive():
+            try:
+                self._main_dialog.close()
+            except RuntimeError:
+                pass
         self._main_dialog = None
         for action in self.actions:
             self.iface.removePluginMenu(self.menu_name, action)
@@ -50,10 +70,15 @@ class AetherPlugin:
         self.actions.clear()
 
     def _open_main_dialog(self):
-        if self._main_dialog is not None and self._main_dialog.isVisible():
+        if self._is_dialog_alive() and self._main_dialog.isVisible():
             self._main_dialog.raise_()
             self._main_dialog.activateWindow()
             return
         from .gui.main_dialog import AetherMainDialog
         self._main_dialog = AetherMainDialog(self.iface)
+        # Clear our reference when Qt deletes the dialog (WA_DeleteOnClose).
+        self._main_dialog.destroyed.connect(self._on_dialog_destroyed)
         self._main_dialog.show()
+
+    def _on_dialog_destroyed(self):
+        self._main_dialog = None

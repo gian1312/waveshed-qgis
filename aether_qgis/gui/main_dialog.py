@@ -24,6 +24,7 @@ from qgis.PyQt.QtWidgets import (
 from .site_analysis_tab import SiteAnalysisTab
 from .p2p_tab import P2PTab
 from .asset_manager_tab import AssetManagerTab
+from .map_converter_tab import MapConverterTab
 from .settings_dialog import SettingsDialog
 
 
@@ -102,11 +103,13 @@ class AetherMainDialog(QDialog):
         self.site_tab = SiteAnalysisTab(self)
         self.p2p_tab = P2PTab(self)
         self.asset_tab = AssetManagerTab()
+        self.converter_tab = MapConverterTab(self)
         self.settings_tab = self._build_settings_tab()
 
         self.tabs.addTab(self.site_tab, "360\u00B0")
         self.tabs.addTab(self.p2p_tab, "P2P Link")
         self.tabs.addTab(self.asset_tab, "Assets")
+        self.tabs.addTab(self.converter_tab, "Map Converter")
         self.tabs.addTab(self.settings_tab, "Settings")
 
         layout.addWidget(self.tabs)
@@ -170,10 +173,12 @@ class AetherMainDialog(QDialog):
         # Cancel any running workers
         self.site_tab.cancel_worker()
         self.p2p_tab.cancel_worker()
+        self.converter_tab.cancel_worker()
         super().closeEvent(event)
 
     def reject(self) -> None:
         self._settings_widget.save_settings()
         self.site_tab.cancel_worker()
         self.p2p_tab.cancel_worker()
+        self.converter_tab.cancel_worker()
         super().reject()

@@ -31,6 +31,16 @@ for higher resolutions (e.g. 0.25 deg for 10 m, 0.1 deg for 2 m).
 Verify the resulting .abt headers (size_px, scale_x/y, stride) match
 what aether_core's `io::peek_abt()` expects.
 
+### 1.3 Verify 5 m resolution download performance
+At 5 m resolution the XYZ tile count and .abt output size are roughly 4x
+that of 10 m. Profile a real 5 m download (e.g. 100 km range) and check:
+- Total XYZ tiles vs available server bandwidth (are we saturating S3?).
+- Strip assembly time — 22224-px-wide rows may blow L3 cache.
+- Peak RAM — a single strip at 5 m is ~4x the memory of 10 m.
+- Disk I/O — each .abt tile is ~940 MB; verify sequential write keeps up.
+- Whether sub-tile size should drop to 0.25 deg at 5 m (like
+  prepare_data.py uses 0.5 deg) to keep per-file size manageable.
+
 ---
 
 ## 2. UI / UX Improvements
@@ -57,6 +67,51 @@ When the user selects a local terrain directory, scan it and compare
 coverage against the requested bbox. If tiles are missing (gaps in the
 1-degree or sub-degree grid), show a list of missing tiles and ask for
 confirmation before proceeding. Use GDAL to read extents of each file.
+
+### 2.5 Alert when user selects a non-terrain layer
+Detect when the user picks a map/imagery layer (e.g. satellite, OSM,
+vector tiles) instead of a DEM/elevation layer and show a clear error.
+Heuristics:
+- Band count: DEM is typically single-band; RGB/RGBA = not terrain.
+- Data type: DEM is Float32/Int16; Byte = likely imagery.
+- Layer name / source keywords: "ortho", "satellite", "osm", "street".
+- Raster statistics: if band 1 min/max is 0-255 with 3+ bands, it's
+  almost certainly an image, not elevation data.
+Show: "This looks like a map/image layer, not a DEM. Elevation data is
+required for propagation analysis."
+
+### 2.6 Create Help system
+- **In-plugin help**: add a Help button / menu entry that opens a panel
+  or dialog with:
+  - Quick-start guide (add DEM, place TX, run coverage).
+  - Explanation of each parameter (resolution, range, propagation model,
+    azimuth, height modes AGL/AMSL).
+  - Recommended DEM sources (Mapzen Terrarium XYZ, Copernicus 30 m,
+    national high-res DEMs).
+  - Troubleshooting: common errors, what "Rust download failed" means,
+    how to check terrain coverage.
+- **Tooltips**: add `setToolTip()` on all input widgets with a one-line
+  description.
+- **Context help**: link specific error dialogs to the relevant help
+  section.
+- Consider shipping a bundled HTML/Markdown help file that also works
+  offline.
+
+### 2.7 Implement buildings connection
+Expose the converter's building overlay capability in the plugin:
+- Let the user select a building footprint layer (FlatGeobuf, Shapefile,
+  GeoPackage, or a directory of .fgb parts).
+- The layer must have 3D geometry (Z = roof elevation) or a height
+  attribute.
+- Pass the buildings path as `buildings_file` in the converter ingest
+  job JSON.
+- In the Site Analysis / P2P tabs, add an optional "Buildings" layer
+  picker (QgsMapLayerComboBox filtered to vector polygon layers).
+- For XYZ download path (Path 1): buildings can't be fused during
+  download — need a post-processing step that re-runs the converter
+  with the downloaded .abt as base + buildings overlay.
+- Warn if the building layer CRS differs from WGS84 (converter expects
+  WGS84 or LV95 geometries).
 
 ---
 
@@ -156,6 +211,8 @@ Each layer entry needs:
   detection, URL template extraction for known XYZ source strings.
 - **Sub-tile size logic** (once variable sub-tile sizes are implemented):
   verify that resolution-to-subtile-degree mapping matches prepare_data.py.
+- **Non-terrain layer detection**: verify heuristics correctly reject
+  RGB imagery, vector tiles, and OSM layers.
 
 ### 4.2 Integration tests (require QGIS environment)
 
@@ -169,7 +226,27 @@ Each layer entry needs:
   row.
 - **Resolution warning**: set 2 m / 500 km, verify warning fires.
 
-### 4.3 Map Converter tab tests (once implemented)
+### 4.3 Geographic diversity tests
+
+Test at different locations on earth to catch projection, tile boundary,
+and data availability edge cases:
+
+| Location | Lat | Lon | Why |
+|----------|-----|-----|-----|
+| Central Europe (Zurich) | 47.4 | 8.5 | Baseline, high-res Swiss data |
+| Equator (Quito) | -0.2 | -78.5 | cos(lat)~1, lon_range_deg = lat_range_deg |
+| High latitude (Tromsoe) | 69.6 | 19.0 | cos(lat)~0.35, extreme lon stretch |
+| Southern hemisphere (Cape Town) | -34.0 | 18.5 | Negative lat, different tile naming |
+| Antimeridian (Fiji) | -17.8 | 178.0 | Bbox wraps past 180 deg |
+| Prime meridian (London) | 51.5 | 0.0 | Lon near zero, bbox crosses 0 |
+| High altitude (La Paz) | -16.5 | -68.1 | Extreme elevation range |
+| Flat terrain (Netherlands) | 52.1 | 5.1 | Near-zero elevation, sea level |
+| Small island (Reunion) | -21.1 | 55.5 | Mostly ocean tiles, sparse data |
+
+For each: run prepare_terrain at 30 m / 50 km, verify .abt files are
+created, elevation values are sane, no crashes or coordinate overflows.
+
+### 4.4 Map Converter tab tests (once implemented)
 
 - **Layer stack ordering**: verify priority (overlay > high-res > base).
 - **CRS auto-detection**: provide layers with known CRS, verify correct
@@ -178,3 +255,61 @@ Each layer entry needs:
 - **Batch job JSON generation**: verify output matches `IngestJob` schema.
 - **Multi-resolution generation**: verify correct sub-tile sizes and
   calc_size per resolution.
+
+### 4.5 Buildings integration tests (once implemented)
+
+- **FlatGeobuf overlay**: provide a small .fgb with 3D buildings, verify
+  roof elevations appear in .abt output above terrain baseline.
+- **CRS mismatch**: provide buildings in LV95, verify converter handles
+  the reprojection (or plugin warns).
+- **Empty area**: provide buildings file that doesn't overlap the tile,
+  verify terrain is unchanged.
+
+---
+
+## 5. Licence Tracking
+
+### 5.1 Licence inventory
+
+Track all dependencies and data sources to avoid licence issues.
+
+| Component | Licence | Notes |
+|-----------|---------|-------|
+| **QGIS Plugin code** | ? | Define plugin licence (GPLv2+ to match QGIS?) |
+| **PyQt5** | GPLv3 / commercial | Bundled with QGIS, no separate distribution |
+| **osgeo / GDAL** | MIT/X | Bundled with QGIS |
+| **pynacl** | Apache 2.0 | Bundled with plugin for Ed25519 key validation |
+| **aether_core** | Proprietary | Binary only, not distributed with plugin |
+| **aether_converter** | Proprietary | Binary only, not distributed with plugin |
+| **aether_export** | Proprietary | Binary only, not distributed with plugin |
+| **reqwest** (Rust) | MIT/Apache 2.0 | Statically linked into converter |
+| **tokio** (Rust) | MIT | Statically linked into converter |
+| **rayon** (Rust) | MIT/Apache 2.0 | Statically linked into converter |
+| **png** (Rust) | MIT/Apache 2.0 | Statically linked into converter |
+| **serde** (Rust) | MIT/Apache 2.0 | Statically linked into converter |
+| **sysinfo** (Rust) | MIT | Statically linked into converter |
+| **image_dds** (Rust) | MIT/Apache 2.0 | Optional, BC6H feature |
+| **wgpu** (Rust) | MIT/Apache 2.0 | In aether_core |
+
+### 5.2 Data source licences
+
+| Source | Licence | Attribution required? |
+|--------|---------|----------------------|
+| Mapzen Terrarium tiles (S3) | ODbL + various | Yes — Mapzen, OSM contributors, various national agencies |
+| Mapbox Terrain tiles | Mapbox ToS | Yes — requires Mapbox attribution |
+| Copernicus DEM (COP30) | Copernicus licence | Yes — "contains Copernicus data" |
+| SwissALTI3D | Open Government Data (OGD) | Yes — swisstopo |
+| OpenTopography API | Free tier ToS | API key required, rate limits |
+
+### 5.3 Action items
+
+- [ ] Decide on plugin licence (GPLv2+ recommended for QGIS plugin repo).
+- [ ] Add LICENCE file to plugin root.
+- [ ] Add attribution notices for bundled dependencies.
+- [ ] Verify all Rust crate licences are compatible with proprietary
+      binary distribution (MIT/Apache 2.0 = OK).
+- [ ] Add data source attribution to plugin About dialog.
+- [ ] Check if Mapzen S3 tiles have usage limits or require attribution
+      display in the output.
+- [ ] Check Mapbox ToS if Mapbox encoding is used — may require visible
+      Mapbox logo on map output.
