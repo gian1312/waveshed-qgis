@@ -32,7 +32,11 @@ from qgis.core import (
 
 from ..core.binary_manager import find_binary
 from ..core.job_builder import CoverageParams, build_coverage_job, write_job_file
-from ..core.result_loader import add_layer_to_project, load_coverage_result
+from ..core.result_loader import (
+    GROUP_COVERAGE,
+    add_layer_to_project,
+    load_coverage_result,
+)
 from ..core.terrain_adapter import prepare_terrain
 from ..core import binary_manager as bm
 
@@ -277,16 +281,25 @@ class CoverageAlgorithm(QgsProcessingAlgorithm):
         proc = subprocess.Popen(
             [core_exe, "--config", job_file],
             stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            stderr=subprocess.STDOUT,  # aether_core logs everything to stdout
             text=True,
             creationflags=_SUBPROCESS_FLAGS,
         )
 
-        # Parse stderr for progress (lines like "Wedge 120/360")
-        for line in iter(proc.stderr.readline, ""):
+        # aether_core writes all its diagnostics ([Core] tile-grid / bounds,
+        # [P:NN] progress) to stdout — surface every line in the Processing
+        # log and keep a tail for the error message. (Previously only stderr
+        # was read, so none of this was visible and stdout could deadlock.)
+        output_lines: list[str] = []
+        for line in iter(proc.stdout.readline, ""):
             if feedback.isCanceled():
                 proc.terminate()
                 return {}
+            line = line.rstrip()
+            if not line:
+                continue
+            output_lines.append(line)
+            feedback.pushInfo(line)
             m = re.search(r"Wedge\s+(\d+)/(\d+)", line)
             if m:
                 current, total = int(m.group(1)), int(m.group(2))
@@ -298,9 +311,9 @@ class CoverageAlgorithm(QgsProcessingAlgorithm):
         proc.wait()
 
         if proc.returncode != 0:
-            stderr_output = proc.stderr.read() if proc.stderr else ""
+            tail = "\n".join(output_lines[-20:])
             raise QgsProcessingException(
-                f"aether_core failed (exit {proc.returncode}):\n{stderr_output}"
+                f"aether_core failed (exit {proc.returncode}):\n{tail}"
             )
 
         if feedback.isCanceled():
@@ -341,7 +354,7 @@ class CoverageAlgorithm(QgsProcessingAlgorithm):
 
         try:
             layer = load_coverage_result(tif_path, model)
-            add_layer_to_project(layer)
+            add_layer_to_project(layer, GROUP_COVERAGE)
         except Exception as exc:
             # Non-fatal — the output file still exists
             feedback.reportError(f"Could not add result to map: {exc}")

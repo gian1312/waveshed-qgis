@@ -47,6 +47,15 @@ tests/fixtures/output/
 *.tmp
 *.bak
 
+# Downloaded test terrain data (large, fetched from swisstopo)
+data/swissaltiregio_tiles/
+# Converted GeoTIFFs / mosaic produced by tools/xyz_to_geotiff.py (large)
+data/swissaltiregio_tif/
+*.vrt
+
+# Local scratch (logs, screenshots)
+tmp/
+
 # Local deploy config (machine-specific paths)
 deploy.local.ini
 

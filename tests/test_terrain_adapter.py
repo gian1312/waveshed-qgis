@@ -8,14 +8,92 @@ provided by conftest.py.
 import conftest  # noqa: F401 — installs QGIS/PyQt stubs into sys.modules
 
 import math
+import os
+import struct
+import tempfile
 import unittest
+from unittest import mock
 
+import numpy as np
+
+import aether_qgis.core.terrain_adapter as ta
 from aether_qgis.core.terrain_adapter import (
     _compute_sector_bbox,
     _compute_subtiles,
     _estimate_abt_disk_mb,
     _cache_key,
+    _parse_download_completeness,
+    _subtile_degrees,
+    _tile_params,
+    _warn_if_bbox_exceeds_source,
+    reset_terrain_warnings,
 )
+
+
+def _abt_row_stride(size_px: int) -> int:
+    """Mirror the converter's stride math: size_px*2 aligned up to 256."""
+    return (size_px * 2 + 255) & ~255
+
+
+class TestSubtileStrideFitsU16(unittest.TestCase):
+    """The .abt writer stores row_stride as u16; sub-tiles must keep it < 65536.
+
+    A 1-degree tile at 2 m overflows (stride 111360 -> wraps), shearing the
+    terrain into bands, so _subtile_degrees shrinks the tile at fine res.
+    """
+
+    def test_two_metre_base_dem_shrinks_for_u16(self):
+        # Base-DEM path: 1 deg would overflow u16 at 2 m, so it drops to 0.5.
+        self.assertEqual(_subtile_degrees(2), 0.5)
+
+    def test_coarse_base_dem_uses_full_degree(self):
+        for res in (5, 10, 30):
+            self.assertEqual(_subtile_degrees(res), 1.0)
+
+    def test_high_res_matches_prepare_data_sub_size_macro(self):
+        # Mirror prepare_data.py: 0.1 deg at <=3 m, else 0.5 deg, with Swiss data.
+        self.assertEqual(_subtile_degrees(2, high_res=True), 0.1)
+        self.assertEqual(_subtile_degrees(3, high_res=True), 0.1)
+        self.assertEqual(_subtile_degrees(5, high_res=True), 0.5)
+        self.assertEqual(_subtile_degrees(10, high_res=True), 0.5)
+        self.assertEqual(_subtile_degrees(30, high_res=True), 0.5)
+
+    def test_stride_fits_u16_for_all_valid_resolutions(self):
+        bbox = {"north": 47.6, "south": 47.0, "east": 8.6, "west": 8.0}
+        for res in (2, 5, 10, 30):
+            tiles = _compute_subtiles(bbox, res)
+            self.assertTrue(tiles, f"no tiles for res={res}")
+            for t in tiles:
+                stride = _abt_row_stride(t["size_px"])
+                self.assertLess(
+                    stride, 65536,
+                    f"res={res} size_px={t['size_px']} stride={stride} "
+                    f"overflows u16",
+                )
+
+
+class TestTileParamsMatchPrepareData(unittest.TestCase):
+    """_tile_params must reproduce prepare_data.py's calc_size / exact_res / ul."""
+
+    @staticmethod
+    def _prepare_data_formula(sub, lat, lon, res):
+        # Verbatim from python/drivers/prepare_data.py:349-358.
+        target_deg_per_px = res / 111111.0
+        calc_size = int(round(sub / target_deg_per_px))
+        calc_size = (calc_size + 3) // 4 * 4
+        exact_res_m = (sub / calc_size) * 111111.0
+        return calc_size, exact_res_m, lat + sub, lon
+
+    def test_matches_reference_for_all_sub_and_res(self):
+        for sub in (0.1, 0.5, 1.0):
+            for res in (2, 5, 10, 30):
+                cs, exact, ul_lat, ul_lon = self._prepare_data_formula(
+                    sub, 47.0, 8.0, res)
+                got = _tile_params(sub, 47.0, 8.0, res)
+                self.assertEqual(got["size_px"], cs, f"sub={sub} res={res}")
+                self.assertAlmostEqual(got["exact_res_m"], exact, places=6)
+                self.assertAlmostEqual(got["ul_lat"], ul_lat, places=6)
+                self.assertAlmostEqual(got["ul_lon"], ul_lon, places=6)
 
 
 class TestComputeSectorBbox(unittest.TestCase):
@@ -224,6 +302,149 @@ class TestSectorBboxMatchesAetherCore(unittest.TestCase):
 
     def test_wrapping(self):
         self._check(47.0, 8.0, 100.0, 350.0, 10.0)
+
+
+class TestParseDownloadCompleteness(unittest.TestCase):
+    """Tests for parsing the converter's `[Stats] Tiles: X/Y OK` line."""
+
+    def test_complete(self):
+        lines = [
+            "[Download] 100% (500/500) — 12.3 MB/s, 0 errors, 0 in-flight",
+            "[Stats] Tiles: 500/500 OK (100.0% success)",
+        ]
+        self.assertEqual(_parse_download_completeness(lines), (500, 500))
+
+    def test_incomplete(self):
+        lines = [
+            "[Stats] Tiles: 697340/697343 OK (100.0% success)",
+            "[Stats] ERRORS (3): timeout x3",
+        ]
+        ok, total = _parse_download_completeness(lines)
+        self.assertEqual((ok, total), (697340, 697343))
+        self.assertLess(ok, total)  # -> triggers a retry
+
+    def test_missing_stats_line(self):
+        self.assertEqual(
+            _parse_download_completeness(["[Download] Batch processing..."]),
+            (-1, -1),
+        )
+
+    def test_last_line_wins(self):
+        # A retry pass appends a second stats line; the latest one is authoritative.
+        lines = [
+            "[Stats] Tiles: 498/500 OK (99.6% success)",
+            "[Stats] Tiles: 500/500 OK (100.0% success)",
+        ]
+        self.assertEqual(_parse_download_completeness(lines), (500, 500))
+
+
+class TestExtentWarningOncePerRun(unittest.TestCase):
+    """The 'range exceeds DEM extent' notice must fire once per run per source."""
+
+    # DEM covering 8.0–8.5 E, 47.0–47.5 N.
+    _EXTENT = {"wgs84Extent": {"coordinates": [[
+        [8.0, 47.0], [8.5, 47.0], [8.5, 47.5], [8.0, 47.5], [8.0, 47.0]]]}}
+    _BBOX_OUT = {"west": 7.0, "south": 47.0, "east": 8.5, "north": 47.5}
+    _BBOX_IN = {"west": 8.1, "south": 47.1, "east": 8.4, "north": 47.4}
+
+    @staticmethod
+    def _warns(logs):
+        return sum(1 for m in logs if "extends beyond the DEM coverage" in m)
+
+    def test_dedup_per_source_and_reset(self):
+        reset_terrain_warnings()
+        logs = []
+        with mock.patch.object(ta.gdal, "Info", create=True,
+                               return_value=self._EXTENT), \
+                mock.patch.object(ta, "_log", side_effect=logs.append):
+            _warn_if_bbox_exceeds_source(None, self._BBOX_OUT, "srcA")
+            _warn_if_bbox_exceeds_source(None, self._BBOX_OUT, "srcA")  # dedup
+            self.assertEqual(self._warns(logs), 1)
+            _warn_if_bbox_exceeds_source(None, self._BBOX_OUT, "srcB")  # new src
+            self.assertEqual(self._warns(logs), 2)
+        # A fresh run resets the dedup.
+        reset_terrain_warnings()
+        logs2 = []
+        with mock.patch.object(ta.gdal, "Info", create=True,
+                               return_value=self._EXTENT), \
+                mock.patch.object(ta, "_log", side_effect=logs2.append):
+            _warn_if_bbox_exceeds_source(None, self._BBOX_OUT, "srcA")
+            self.assertEqual(self._warns(logs2), 1)
+
+    def test_no_warning_when_inside_extent(self):
+        reset_terrain_warnings()
+        logs = []
+        with mock.patch.object(ta.gdal, "Info", create=True,
+                               return_value=self._EXTENT), \
+                mock.patch.object(ta, "_log", side_effect=logs.append):
+            _warn_if_bbox_exceeds_source(None, self._BBOX_IN, "srcA")
+            self.assertEqual(self._warns(logs), 0)
+
+
+def _write_abt(path, size=128, zero_block=None):
+    """Write a minimal valid .abt (44-byte header + int16 rows padded to stride).
+
+    zero_block = (row0, col0, n) zeroes an n×n region; else all pixels = 500 m.
+    """
+    stride = (size * 2 + 255) & ~255
+    hdr = (b"AETH" + struct.pack("<HH", 1, size)
+           + struct.pack("<dddd", 47.0, 8.0, 1.0 / size, 1.0 / size)
+           + struct.pack("<hH", 0, stride))
+    assert len(hdr) == 44, len(hdr)
+    elev = np.full((size, size), 500, dtype=np.int16)
+    if zero_block:
+        r0, c0, n = zero_block
+        elev[r0:r0 + n, c0:c0 + n] = 0
+    body = np.zeros((size, stride), dtype=np.uint8)
+    body[:, : size * 2] = np.ascontiguousarray(elev).view(np.uint8).reshape(
+        size, size * 2)
+    with open(path, "wb") as fh:
+        fh.write(hdr)
+        fh.write(body.tobytes())
+
+
+class TestDownloadGapDetection(unittest.TestCase):
+    """_abt_has_gaps flags the zero block a failed XYZ tile leaves."""
+
+    def test_aligned_zero_block_is_a_gap(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "t.abt")
+            _write_abt(p, size=128, zero_block=(64, 64, 64))
+            self.assertTrue(ta._abt_has_gaps(p, block=64))
+
+    def test_large_unaligned_zero_region_is_a_gap(self):
+        # A real failed tile (~150 px) is bigger than the 64-block, so it always
+        # fully contains an aligned block regardless of offset.
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "t.abt")
+            _write_abt(p, size=256, zero_block=(30, 30, 130))
+            self.assertTrue(ta._abt_has_gaps(p, block=64))
+
+    def test_all_nonzero_is_clean(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "t.abt")
+            _write_abt(p, size=128, zero_block=None)
+            self.assertFalse(ta._abt_has_gaps(p, block=64))
+
+    def test_non_abt_is_not_a_gap(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "x.abt")
+            with open(p, "wb") as fh:
+                fh.write(b"not an abt file")
+            self.assertFalse(ta._abt_has_gaps(p))
+
+
+class TestIncompleteMarker(unittest.TestCase):
+    """An incomplete download must not be reused as a valid cache."""
+
+    def test_marker_blocks_cache_hit_until_cleared(self):
+        with tempfile.TemporaryDirectory() as d:
+            _write_abt(os.path.join(d, "t.abt"))
+            self.assertTrue(ta._cache_hit(d))
+            ta._mark_incomplete(d)
+            self.assertFalse(ta._cache_hit(d))
+            ta._clear_incomplete(d)
+            self.assertTrue(ta._cache_hit(d))
 
 
 if __name__ == "__main__":

@@ -62,8 +62,17 @@ _SUBPROCESS_FLAGS = (
     subprocess.CREATE_NO_WINDOW if platform.system() == "Windows" else 0
 )
 from ..core.job_builder import CoverageParams, build_coverage_job, write_job_file
-from ..core.result_loader import add_layer_to_project, load_coverage_result
-from ..core.terrain_adapter import get_source_resolution_info, prepare_terrain
+from ..core.layer_utils import dem_layer_warning, hide_from_dem_picker
+from ..core.result_loader import (
+    GROUP_COVERAGE,
+    add_layer_to_project,
+    load_coverage_result,
+)
+from ..core.terrain_adapter import (
+    get_source_resolution_info,
+    prepare_terrain,
+    reset_terrain_warnings,
+)
 from .map_tools import activate_point_capture
 
 TAG = "AETHER"
@@ -161,6 +170,9 @@ class _SiteAnalysisWorker(QThread):
         try:
             self.progress.emit(0)
             os.makedirs(self.output_dir, exist_ok=True)
+            # Once per run, so the "range exceeds DEM extent" notice is shown a
+            # single time rather than once per site/height.
+            reset_terrain_warnings()
 
             for job_idx, (params, display_name) in enumerate(self.jobs):
                 if self._canceled:
@@ -218,7 +230,9 @@ class _SiteAnalysisWorker(QThread):
                 env = os.environ.copy()
                 env["RUST_LOG"] = "info"
 
-                proc = subprocess.Popen(
+                # `with` closes the stdout pipe (and waits) on exit so we don't
+                # leak a file handle (the ResourceWarning).
+                with subprocess.Popen(
                     [core_exe, "--config", job_file],
                     stdout=subprocess.PIPE,
                     stderr=subprocess.STDOUT,  # merge stderr into stdout
@@ -227,20 +241,25 @@ class _SiteAnalysisWorker(QThread):
                     errors="replace",
                     env=env,
                     creationflags=_SUBPROCESS_FLAGS,
-                )
-                self._proc = proc  # expose for kill
+                ) as proc:
+                    self._proc = proc  # expose for kill
 
-                stderr_lines: list[str] = []
-                for line in iter(proc.stdout.readline, ""):
-                    if self._canceled:
-                        _kill_proc(proc)
-                        return
-                    stderr_lines.append(line)
-                    pct = self._parse_wedge_progress(line)
-                    if pct is not None:
-                        self.progress.emit(_job_progress(20 + int(pct * 0.6)))
+                    stderr_lines: list[str] = []
+                    for line in iter(proc.stdout.readline, ""):
+                        if self._canceled:
+                            _kill_proc(proc)
+                            return
+                        stderr_lines.append(line)
+                        # Surface aether_core's own log (it writes its [Core]
+                        # tile-grid / bounds diagnostics to stdout) in the QGIS
+                        # Log Messages panel under the AETHER tag.
+                        s = line.rstrip()
+                        if s:
+                            QgsMessageLog.logMessage(s, TAG, Qgis.MessageLevel.Info)
+                        pct = self._parse_wedge_progress(line)
+                        if pct is not None:
+                            self.progress.emit(_job_progress(20 + int(pct * 0.6)))
 
-                proc.wait()
                 self._proc = None
                 if proc.returncode != 0:
                     tail = "".join(stderr_lines[-20:])
@@ -338,6 +357,11 @@ class SiteAnalysisTab(QWidget):
         self._build_ui()
         self._connect_signals()
         self._populate_raster_layers()
+        # Keep the DEM combo in sync as project layers are added/removed, so a
+        # DEM loaded after this dialog opens becomes selectable immediately.
+        _proj = QgsProject.instance()
+        _proj.layersAdded.connect(self._on_project_layers_changed)
+        _proj.layersRemoved.connect(self._on_project_layers_changed)
         self._refresh_asset_cache()
         # Apply initial mode and update DEM info.
         self.set_mode(self._current_mode)
@@ -502,6 +526,18 @@ class SiteAnalysisTab(QWidget):
         self.combo_backend.addItems(["AUTO", "GPU", "CPU"])
         layout.addRow("Backend:", self.combo_backend)
 
+        # Earth Radius Mode — applies to all propagation models (LOS included),
+        # not just ITM. FOUR_THIRDS (normal) is the default; ADVANCED enables
+        # the refractivity-based effective-radius model.
+        self.combo_earth_radius = QComboBox()
+        self.combo_earth_radius.addItems(["FOUR_THIRDS", "ADVANCED"])
+        self.combo_earth_radius.setToolTip(
+            "Earth-curvature model for horizon/diffraction geometry.\n"
+            "FOUR_THIRDS: standard 4/3-earth refraction (normal, recommended).\n"
+            "ADVANCED: derive effective radius from surface refractivity."
+        )
+        layout.addRow("Earth Radius Mode:", self.combo_earth_radius)
+
         # Output Directory
         dir_layout = QHBoxLayout()
         self.line_output_dir = QLineEdit()
@@ -577,11 +613,6 @@ class SiteAnalysisTab(QWidget):
         self.spin_rel.setSingleStep(0.05)
         layout.addRow("Reliability:", self.spin_rel)
 
-        # Earth Radius Mode
-        self.combo_earth_radius = QComboBox()
-        self.combo_earth_radius.addItems(["FOUR_THIRDS", "ADVANCED"])
-        layout.addRow("Earth Radius Mode:", self.combo_earth_radius)
-
         return self.itm_group
 
     # ==================================================================
@@ -603,8 +634,32 @@ class SiteAnalysisTab(QWidget):
 
     _LOCAL_DIR_PREFIX = "Local: "
 
+    @staticmethod
+    def _dem_entry_key(entry) -> str:
+        """Stable identity for a combo entry (layer id, or dir path string)."""
+        if isinstance(entry, str):
+            return entry
+        try:
+            return entry.id()
+        except Exception:
+            return entry.name()
+
+    def _current_dem_key(self) -> Optional[str]:
+        idx = self.combo_dem.currentIndex()
+        if getattr(self, "_dem_layers", None) and 0 <= idx < len(self._dem_layers):
+            return self._dem_entry_key(self._dem_layers[idx])
+        return None
+
     def _populate_raster_layers(self) -> None:
-        """Fill the DEM combo with raster layers + local terrain dir from settings."""
+        """Fill the DEM combo with raster layers + local terrain dir from settings.
+
+        Preserves the current selection across refills so a live update (a
+        layer added or removed in the project) does not reset the user's
+        choice.
+        """
+        prev_key = self._current_dem_key()
+
+        self.combo_dem.blockSignals(True)
         self.combo_dem.clear()
         self._dem_layers: list = []  # QgsRasterLayer or str (path)
 
@@ -616,9 +671,25 @@ class SiteAnalysisTab(QWidget):
             self._dem_layers.append(terrain_dir)
 
         for layer in QgsProject.instance().mapLayers().values():
-            if isinstance(layer, QgsRasterLayer):
+            # Skip our own result rasters (coverage/P2P) — they are never valid
+            # DEM inputs and only clutter the picker. Terrain we generated is
+            # kept (it IS elevation data).
+            if isinstance(layer, QgsRasterLayer) and not hide_from_dem_picker(layer):
                 self.combo_dem.addItem(layer.name())
                 self._dem_layers.append(layer)
+
+        # Restore the previous selection if it still exists.
+        if prev_key is not None:
+            for i, entry in enumerate(self._dem_layers):
+                if self._dem_entry_key(entry) == prev_key:
+                    self.combo_dem.setCurrentIndex(i)
+                    break
+        self.combo_dem.blockSignals(False)
+        self._on_dem_changed()
+
+    def _on_project_layers_changed(self, *args) -> None:
+        """Repopulate the DEM combo when project layers are added/removed."""
+        self._populate_raster_layers()
 
     def _selected_dem_layer(self) -> Optional[QgsRasterLayer]:
         idx = self.combo_dem.currentIndex()
@@ -645,7 +716,12 @@ class SiteAnalysisTab(QWidget):
             self.lbl_dem_info.setText(f"Local directory: {terrain_dir}")
         elif layer:
             info = get_source_resolution_info(layer)
-            self.lbl_dem_info.setText(f"Source resolution: {info}")
+            if dem_layer_warning(layer):
+                self.lbl_dem_info.setText(
+                    f"⚠ Not elevation data (looks like imagery) — {info}"
+                )
+            else:
+                self.lbl_dem_info.setText(f"Source resolution: {info}")
         else:
             self.lbl_dem_info.setText("")
 
@@ -852,6 +928,9 @@ class SiteAnalysisTab(QWidget):
 
         # Rebind pick buttons and spinbox callbacks to updated row indices.
         self._rebind_row_callbacks()
+
+        # Redraw the canvas markers so the removed site's dot disappears.
+        self._update_rubber_band()
 
     def _rebind_row_callbacks(self) -> None:
         """Reconnect row-indexed callbacks after row removal."""
@@ -1225,6 +1304,16 @@ class SiteAnalysisTab(QWidget):
             )
             return
 
+        # Guard against picking a basemap/imagery layer (e.g. OpenStreetMap)
+        # as the terrain source — elevation data is required.
+        if dem_layer is not None:
+            warn = dem_layer_warning(dem_layer)
+            if warn and QMessageBox.warning(
+                self, "Not a DEM?", warn + "\n\nUse it anyway?",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+            ) != QMessageBox.Yes:
+                return
+
         output_dir = self.line_output_dir.text().strip()
         if not output_dir:
             QMessageBox.warning(
@@ -1291,10 +1380,13 @@ class SiteAnalysisTab(QWidget):
         self._reset_run_ui()
 
         loaded_count = 0
+        # Group each run under its own timestamped subgroup so repeated
+        # analyses don't pile up identically-named layers at one tree level.
+        run_group = GROUP_COVERAGE + (f"Run {datetime.now():%Y-%m-%d %H:%M:%S}",)
         for tif_path, model, display_name in results:
             try:
                 layer = load_coverage_result(tif_path, model, display_name)
-                add_layer_to_project(layer)
+                add_layer_to_project(layer, run_group)
                 loaded_count += 1
             except Exception as exc:
                 QgsMessageLog.logMessage(

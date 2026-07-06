@@ -60,6 +60,7 @@ from qgis.gui import QgsRubberBand
 
 from ..core.binary_manager import find_binary
 from ..core.job_builder import P2PParams, build_p2p_job, write_job_file
+from ..core.layer_utils import dem_layer_warning, hide_from_dem_picker
 from .map_tools import activate_point_capture
 
 TAG = "AETHER"
@@ -546,6 +547,11 @@ class _P2PWorker(QThread):
                     _kill_proc(proc)
                     return
                 output_lines.append(line)
+                # Surface aether_core's own stdout log in the QGIS Log
+                # Messages panel under the AETHER tag.
+                s = line.rstrip()
+                if s:
+                    QgsMessageLog.logMessage(s, TAG, Qgis.MessageLevel.Info)
                 pct = self._parse_p2p_progress(line)
                 if pct is not None:
                     self.progress.emit(25 + int(pct * 0.70))
@@ -629,6 +635,10 @@ class P2PTab(QWidget):
         self._build_ui()
         self._connect_signals()
         self._populate_raster_layers()
+        # Keep the DEM combo in sync as project layers are added/removed.
+        _proj = QgsProject.instance()
+        _proj.layersAdded.connect(self._on_project_layers_changed)
+        _proj.layersRemoved.connect(self._on_project_layers_changed)
 
     # ------------------------------------------------------------------
     # Public API
@@ -913,6 +923,16 @@ class P2PTab(QWidget):
         backend_row.addWidget(self.btn_browse_dir)
         layout.addRow("Backend:", backend_row)
 
+        # Earth Radius Mode — applies to LOS and ITM alike (horizon geometry).
+        self.combo_earth_radius = QComboBox()
+        self.combo_earth_radius.addItems(["FOUR_THIRDS", "ADVANCED"])
+        self.combo_earth_radius.setToolTip(
+            "Earth-curvature model for horizon/diffraction geometry.\n"
+            "FOUR_THIRDS: standard 4/3-earth refraction (normal, recommended).\n"
+            "ADVANCED: derive effective radius from surface refractivity."
+        )
+        layout.addRow("Earth Radius Mode:", self.combo_earth_radius)
+
         return group
 
     # ------------------------------------------------------------------
@@ -942,13 +962,42 @@ class P2PTab(QWidget):
     # ------------------------------------------------------------------
 
     def _populate_raster_layers(self) -> None:
-        """Fill the DEM combo with raster layers from the current project."""
+        """Fill the DEM combo with raster layers from the current project.
+
+        Preserves the current selection across refills so a live update (a
+        layer added or removed) does not reset the user's choice.
+        """
+        idx = self.combo_dem.currentIndex()
+        prev_id = None
+        if getattr(self, "_dem_layers", None) and 0 <= idx < len(self._dem_layers):
+            try:
+                prev_id = self._dem_layers[idx].id()
+            except Exception:
+                prev_id = None
+
+        self.combo_dem.blockSignals(True)
         self.combo_dem.clear()
         self._dem_layers: list[QgsRasterLayer] = []
         for layer in QgsProject.instance().mapLayers().values():
-            if isinstance(layer, QgsRasterLayer):
+            # Skip our own result rasters (coverage/P2P); keep terrain we made.
+            if isinstance(layer, QgsRasterLayer) and not hide_from_dem_picker(layer):
                 self.combo_dem.addItem(layer.name())
                 self._dem_layers.append(layer)
+
+        if prev_id is not None:
+            for i, layer in enumerate(self._dem_layers):
+                try:
+                    same = layer.id() == prev_id
+                except Exception:
+                    same = False
+                if same:
+                    self.combo_dem.setCurrentIndex(i)
+                    break
+        self.combo_dem.blockSignals(False)
+
+    def _on_project_layers_changed(self, *args) -> None:
+        """Repopulate the DEM combo when project layers are added/removed."""
+        self._populate_raster_layers()
 
     def _selected_dem_layer(self) -> Optional[QgsRasterLayer]:
         """Return the currently selected DEM layer, or None."""
@@ -1094,6 +1143,7 @@ class P2PTab(QWidget):
             model=model,
             resolution_m=int(self.combo_resolution.currentText()),
             backend=self.combo_backend.currentText(),
+            earth_radius=self.combo_earth_radius.currentText(),
             # Output
             output_name=f"p2p_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
         )
@@ -1141,6 +1191,16 @@ class P2PTab(QWidget):
             return
 
         dem_layer = self._selected_dem_layer()
+
+        # Guard against a basemap/imagery layer (e.g. OpenStreetMap) being
+        # used as the terrain source — elevation data is required.
+        warn = dem_layer_warning(dem_layer)
+        if warn and QMessageBox.warning(
+            self, "Not a DEM?", warn + "\n\nUse it anyway?",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+        ) != QMessageBox.Yes:
+            return
+
         output_dir = self.line_output_dir.text().strip()
 
         # Generate a temp 2-line batch CSV from the two endpoints.

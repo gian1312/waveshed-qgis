@@ -339,22 +339,30 @@ class P2PAlgorithm(QgsProcessingAlgorithm):
         proc = subprocess.Popen(
             [core_exe, "--config", job_file],
             stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            stderr=subprocess.STDOUT,  # aether_core logs everything to stdout
             text=True,
             creationflags=_SUBPROCESS_FLAGS,
         )
 
-        for line in iter(proc.stderr.readline, ""):
+        # aether_core writes all its diagnostics to stdout — surface every
+        # line and keep a tail for the error message. (Previously only stderr
+        # was read, so none of it was visible and stdout could deadlock.)
+        output_lines: list[str] = []
+        for line in iter(proc.stdout.readline, ""):
             if feedback.isCanceled():
                 proc.terminate()
                 return {}
-            feedback.pushInfo(line.strip())
+            line = line.rstrip()
+            if not line:
+                continue
+            output_lines.append(line)
+            feedback.pushInfo(line)
 
         proc.wait()
         if proc.returncode != 0:
-            stderr_tail = proc.stderr.read() if proc.stderr else ""
+            tail = "\n".join(output_lines[-20:])
             raise QgsProcessingException(
-                f"aether_core exited with code {proc.returncode}:\n{stderr_tail}"
+                f"aether_core exited with code {proc.returncode}:\n{tail}"
             )
 
         if feedback.isCanceled():

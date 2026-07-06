@@ -58,6 +58,7 @@ from qgis.core import (
 from qgis.gui import QgsMapLayerComboBox, QgsRubberBand
 
 from ..core.binary_manager import find_binary
+from ..core.layer_utils import classify_raster_layer
 
 TAG = "AETHER"
 
@@ -160,15 +161,10 @@ def _detect_layer_type(layer) -> str:
         return "vector"
     if not isinstance(layer, QgsRasterLayer):
         return "unknown"
-    provider = layer.dataProvider()
-    if provider is None:
-        return "unknown"
-    if provider.bandCount() >= 3:
-        return "imagery"
-    dt = provider.dataType(1)
-    if dt == Qgis.DataType.Byte:
-        return "imagery"
-    return "terrain"
+    # Shared, XYZ-aware classifier: elevation-encoded XYZ tiles (Terrarium,
+    # Mapbox Terrain-RGB) count as terrain even though they are RGB.
+    kind = classify_raster_layer(layer)
+    return "terrain" if kind == "dem" else kind
 
 
 def _detect_folder_crs(folder: str) -> Optional[str]:
@@ -1334,15 +1330,19 @@ class MapConverterTab(QWidget):
         ))
         self._rebuild_table()
         self._log_msg(
-            "Added deferred OSM building download. "
-            "Select the row and use 'Draw Extent for Layer' to define the "
-            "download area. Buildings will be downloaded when you click Convert."
+            "Added deferred OSM building download. Select the row and set the "
+            "download area with 'Draw Extent for Layer' (draw on the map) or "
+            "'Extent from Layer' (reuse a loaded layer's extent, e.g. your DEM). "
+            "Buildings will be downloaded when you click Convert."
         )
         QMessageBox.information(
             self, "OSM Buildings Added",
             "A placeholder entry has been added.\n\n"
             "1. Select the new row in the table.\n"
-            "2. Click 'Draw Extent for Layer' to define the download area.\n"
+            "2. Define the download area, either:\n"
+            "   • 'Draw Extent for Layer' — draw a rectangle on the map, or\n"
+            "   • 'Extent from Layer' — reuse a loaded layer's extent "
+            "(e.g. your DEM).\n"
             "3. Click 'Convert' — buildings will be downloaded automatically."
         )
 
@@ -1531,6 +1531,48 @@ class MapConverterTab(QWidget):
             parent.raise_()
             parent.activateWindow()
 
+    def _choose_project_layer_for_extent(self, preferred=None):
+        """Prompt for a loaded project layer to source an extent from.
+
+        *preferred*, when given, is preselected in the list (e.g. the row's
+        own layer) — but the user can still pick any other loaded layer.
+        Returns the chosen QgsRasterLayer/QgsVectorLayer, or None if cancelled
+        or no suitable layer is loaded.
+        """
+        from qgis.PyQt.QtWidgets import QInputDialog
+
+        layers = [
+            lyr for lyr in QgsProject.instance().mapLayers().values()
+            if isinstance(lyr, (QgsRasterLayer, QgsVectorLayer))
+        ]
+        if not layers:
+            QMessageBox.information(
+                self, "No Layers",
+                "No raster or vector layers are loaded to take an extent "
+                "from.\nLoad a layer (e.g. your DEM), or use 'Draw Extent "
+                "for Layer' to draw the area on the map."
+            )
+            return None
+
+        names = [lyr.name() for lyr in layers]
+        preselect = 0
+        if preferred is not None:
+            try:
+                preselect = layers.index(preferred)
+            except ValueError:
+                preselect = 0
+        name, ok = QInputDialog.getItem(
+            self, "Extent from Layer",
+            "Use the geographic extent of which layer?",
+            names, preselect, False,
+        )
+        if not ok or not name:
+            return None
+        for lyr in layers:
+            if lyr.name() == name:
+                return lyr
+        return None
+
     def _on_set_layer_extent(self):
         row = self._table.currentRow()
         if row < 0:
@@ -1538,20 +1580,12 @@ class MapConverterTab(QWidget):
                                     "Select a layer row first.")
             return
         entry = self._layers[row]
-        layer = entry.qgis_layer
+        # Always let the user choose which layer's extent to use, preselecting
+        # this row's own layer when it has one. This makes the button useful
+        # for every row type — a building/folder row can borrow the DEM's
+        # extent, and any row can be re-bounded to a different layer.
+        layer = self._choose_project_layer_for_extent(preferred=entry.qgis_layer)
         if layer is None:
-            if os.path.isdir(entry.source_path):
-                QMessageBox.information(
-                    self, "Folder Source",
-                    "Cannot auto-detect extent from a folder.\n"
-                    "Use 'Draw Extent for Layer' instead."
-                )
-                return
-            QMessageBox.information(
-                self, "No QGIS Layer",
-                "This source has no QGIS layer reference.\n"
-                "Use 'Draw Extent for Layer' instead."
-            )
             return
 
         ext = layer.extent()
@@ -1943,7 +1977,13 @@ class MapConverterTab(QWidget):
             layer_name = f"Terrain: {os.path.basename(folder)}"
             rl = QgsRasterLayer(out_tif, layer_name)
             if rl.isValid():
-                QgsProject.instance().addMapLayer(rl)
+                # Local import: result_loader pulls heavy rendering classes that
+                # the test stubs don't provide; only needed on this code path.
+                from ..core.result_loader import (
+                    GROUP_TERRAIN,
+                    add_layer_to_project,
+                )
+                add_layer_to_project(rl, GROUP_TERRAIN)
                 self._log_msg(f"Added terrain layer: {layer_name}")
             else:
                 self._log_msg(f"Failed to load mosaic as QGIS layer.")

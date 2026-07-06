@@ -1,5 +1,60 @@
 # AETHER QGIS Plugin — TODO
 
+## 0. HIGH PRIORITY — OPEN (NOT fixed)
+
+Two issues remain broken after several attempts this session. The plugin changes
+made so far did NOT fix them and are unverified against the real binaries. Both
+need a fresh diagnosis.
+
+### 0.1 [A] Terrain download leaves permanent "stripe" gaps — NOT FIXED
+**Symptom.** With an XYZ elevation source (Mapzen Terrarium), a few tiles fail
+and the coverage shows bands/stripes — always at the **same spot**, persisting
+**even after deleting the cache**. Deterministic: the failing tiles are the
+largest (high-detail mountain PNGs, e.g. clustered ~47.5N 10.2E). Fresh runs of
+other areas succeed 100%.
+
+**Verified facts** (`aether_converter/src/download.rs`, read-only agent):
+- A failed XYZ tile is written as **elevation 0** (grid init ~`:1211`), so the
+  stripe is a flat-0 band.
+- Failing run logs a few `FAILED` with `connection closed before message
+  completed` under `connections=625` (the plugin's `aether/download_connections`,
+  honored verbatim ~`:958` — not self-scaled).
+- The internal 3×/tile retry does NOT fire for "connection closed"
+  (`Retries: 0`).
+- The converter CANNOT retry individual XYZ tiles, cannot patch an existing
+  `.abt`, never lists failed tile coords (only first-of-category + counts), no
+  resume/skip-existing — every run truncates & rewrites each `.abt`. Smallest
+  re-fetch unit = one whole `.abt` sub-tile.
+
+**Tried and did NOT fix it (plugin):** re-download only sub-tiles whose `.abt`
+shows a zero-block, at halved `max_connections` per pass; mark incomplete caches
+so they re-download. Still broken as before.
+
+**Leads:** (a) confirm/deny concurrency as the cause — run the failing area at a
+low `aether/download_connections` (e.g. 64) and check it reaches Y/Y; (b) if a
+converter change is later allowed, add a failed-tile list + tile-subset patch so
+only the actually-failed tiles are refetched.
+
+### 0.2 [B] No coverage when the range crosses a local DEM's border — NOT FIXED
+**Symptom.** With a local GeoTIFF DEM (e.g. swissALTIRegio), when the analysis
+range extends past the DEM extent there is **no coverage** in the beyond-DEM
+area. Small radii (fully inside the DEM) work.
+
+**Cause NOT yet correctly identified.** A prior analysis blamed the beyond-DEM
+`.abt` pixels being `-9999` instead of `0` — **that is WRONG**: aether_core would
+produce coverage there even with `-9999`, so the missing coverage is NOT about
+the fill value. `scan_abt.py` on the failing cache showed 0 zero-bands / 0
+stride-overflow (11 tiles) — the written tiles look clean. aether_core is
+confirmed to handle proper tiles.
+
+**Tried and did NOT fix it (plugin):** GDAL warp `INIT_DEST=0` + delete-nodata
+(0-fill beyond the DEM), size cap, warn-once. "Behaves as before."
+
+**Leads:** find what aether_core actually needs beyond the DEM edge that it isn't
+getting. Diff a working in-DEM run against a border-crossing run: are the correct
+`.abt` sub-tiles for the beyond-DEM area generated and handed to aether_core, and
+how does the job's analysis area map to the terrain tiles it loads?
+
 ## 1. Bug Fixes
 
 ### 1.1 Log size estimate is misleading
