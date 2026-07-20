@@ -1,11 +1,11 @@
-# AETHER QGIS Plugin - Claude Code Guide
+# Waveshed QGIS Plugin - Claude Code Guide
 
-QGIS plugin providing GUI access to the AETHER RF propagation engine. Pure Python wrapper — all computation is done by external Rust binaries (aether_core, aether_converter, aether_export).
+Waveshed is a QGIS plugin providing GUI access to the AETHER RF propagation engine. Pure Python wrapper — all computation is done by external Rust binaries (aether_core, aether_converter, aether_export). The plugin (product) is "Waveshed"; the engine keeps its "Aether" name.
 
 ## Architecture
 
 ```
-aether_qgis/          Plugin package (installed into QGIS plugins dir)
+waveshed/             Plugin package (installed into QGIS plugins dir)
   __init__.py          classFactory() entry point
   metadata.txt         QGIS plugin registry metadata
   plugin.py            Menu/toolbar integration, init/unload lifecycle
@@ -73,7 +73,7 @@ These are covered by `.gitignore`. The plugin only embeds the **public** verific
 - snake_case everywhere (Python, JSON keys, file names)
 - PyQt5 for all GUI (QGIS bundles it)
 - GDAL access via `osgeo` (QGIS bundles it) — never add GDAL as a pip dependency
-- Use `QgsSettings("aether/...")` for persistent plugin settings
+- Use `QgsSettings("waveshed/...")` for persistent plugin settings (the engine env var `AETHER_BIN_DIR` keeps its `AETHER` name)
 - Use `QgsMessageLog` for debug logging, `QgsMessageBar` for user-facing messages
 - Type hints on all public functions
 - No external pip dependencies beyond what QGIS provides (PyQt5, osgeo/GDAL, numpy)
@@ -89,4 +89,4 @@ Unit tests mock QGIS APIs. Integration tests require QGIS environment.
 
 ## Build / Package
 
-Plugin is distributed as a ZIP for QGIS Plugin Manager. Binaries are distributed separately via GitHub Releases.
+Plugin is distributed as a ZIP for QGIS Plugin Manager (build with `python3 package.py` → `dist/waveshed.<version>.zip`). The Aether engine binaries are distributed separately via the waveshed.io release manifest (`https://waveshed.io/releases/latest.json`) and downloaded on demand by the plugin's Settings dialog.
