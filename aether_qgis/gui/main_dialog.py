@@ -50,7 +50,9 @@ class AetherMainDialog(QDialog):
     # ------------------------------------------------------------------
 
     def get_mode(self) -> str:
-        """Return 'LOS' or 'LOSS' based on the top radio buttons."""
+        """Return 'LOS', 'LOSS', or 'MIN_ALT' based on the top radio buttons."""
+        if self.radio_min_alt.isChecked():
+            return "MIN_ALT"
         return "LOS" if self.radio_los.isChecked() else "LOSS"
 
     def get_loss_model(self) -> str:
@@ -73,14 +75,23 @@ class AetherMainDialog(QDialog):
 
         self.radio_los = QRadioButton("Line of Sight (LOS)")
         self.radio_loss = QRadioButton("Propagation Loss")
+        self.radio_min_alt = QRadioButton("Min Altitude")
+        self.radio_min_alt.setToolTip(
+            "Minimum-LOS-altitude map: for every location, the lowest altitude "
+            "(AGL) at which it first gains line-of-sight to the transmitter.\n"
+            "One run answers coverage at *any* altitude — explore it live with "
+            "the Altitude Explorer."
+        )
         self.radio_los.setChecked(True)
 
         self._mode_group = QButtonGroup(self)
         self._mode_group.addButton(self.radio_los, 0)
         self._mode_group.addButton(self.radio_loss, 1)
+        self._mode_group.addButton(self.radio_min_alt, 2)
 
         mode_row.addWidget(self.radio_los)
         mode_row.addWidget(self.radio_loss)
+        mode_row.addWidget(self.radio_min_alt)
 
         # Loss sub-model (only visible when Loss is selected)
         mode_row.addSpacing(16)
@@ -152,7 +163,16 @@ class AetherMainDialog(QDialog):
 
         mode = self.get_mode()
         self.site_tab.set_mode(mode)
-        self.p2p_tab.set_mode(mode)
+        # MIN_ALT is a coverage-only (SINGLE) output — there is no per-link
+        # minimum-altitude, so the P2P tab is disabled and the link tab falls
+        # back to plain geometric LOS labelling.
+        is_min_alt = mode == "MIN_ALT"
+        p2p_index = self.tabs.indexOf(self.p2p_tab)
+        if p2p_index != -1:
+            self.tabs.setTabEnabled(p2p_index, not is_min_alt)
+            if is_min_alt and self.tabs.currentIndex() == p2p_index:
+                self.tabs.setCurrentWidget(self.site_tab)
+        self.p2p_tab.set_mode("LOS" if is_min_alt else mode)
 
     def _on_save_settings(self) -> None:
         self._settings_widget.save_settings()

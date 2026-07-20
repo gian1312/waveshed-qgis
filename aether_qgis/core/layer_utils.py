@@ -14,6 +14,7 @@ from typing import Optional
 # mosaics we create (role "terrain") ARE valid DEMs, so they are kept.
 _OUTPUT_PROP = "aether/output"
 _ROLE_PROP = "aether/role"
+_MODEL_PROP = "aether/model"
 
 
 def mark_aether_output(layer, role: str = "") -> None:
@@ -25,6 +26,30 @@ def mark_aether_output(layer, role: str = "") -> None:
             layer.setCustomProperty(_ROLE_PROP, role)
     except Exception:
         pass
+
+
+def mark_aether_model(layer, model: str) -> None:
+    """Stamp the propagation model (``LOS`` / ``ITM`` / ``MIN_ALT`` …) that
+    produced *layer* so downstream tools (e.g. the Altitude Explorer) can find
+    the layers they know how to drive."""
+    try:
+        if model:
+            layer.setCustomProperty(_MODEL_PROP, str(model).upper())
+    except Exception:
+        pass
+
+
+def aether_model(layer) -> str:
+    """Return the propagation model stamped on *layer* (upper-case), or ""."""
+    try:
+        return str(layer.customProperty(_MODEL_PROP, "") or "").upper()
+    except Exception:
+        return ""
+
+
+def is_min_alt_layer(layer) -> bool:
+    """True if *layer* is a plugin MIN_ALT (minimum-LOS-altitude) raster."""
+    return aether_model(layer) == "MIN_ALT"
 
 
 def is_aether_output(layer) -> bool:

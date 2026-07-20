@@ -32,6 +32,15 @@ class AetherPlugin:
         self.toolbar.addAction(self.action_main)
         self.actions.append(self.action_main)
 
+        # Altitude Explorer dock toggle — drives Min-Altitude result layers.
+        self.action_explorer = QAction(
+            icon, "Altitude Explorer", self.iface.mainWindow(),
+        )
+        self.action_explorer.triggered.connect(self._open_altitude_explorer)
+        self.iface.addPluginToMenu(self.menu_name, self.action_explorer)
+        self.toolbar.addAction(self.action_explorer)
+        self.actions.append(self.action_explorer)
+
         # Register processing provider
         from .provider import AetherProvider
         self.provider = AetherProvider()
@@ -54,6 +63,10 @@ class AetherPlugin:
         except RuntimeError:
             return False
 
+    def _open_altitude_explorer(self):
+        from .gui.altitude_explorer import show_altitude_explorer
+        show_altitude_explorer(self.iface)
+
     def unload(self):
         if self._is_dialog_alive():
             try:
@@ -61,6 +74,11 @@ class AetherPlugin:
             except RuntimeError:
                 pass
         self._main_dialog = None
+        try:
+            from .gui.altitude_explorer import remove_altitude_explorer
+            remove_altitude_explorer(self.iface)
+        except Exception:
+            pass
         for action in self.actions:
             self.iface.removePluginMenu(self.menu_name, action)
         if self.toolbar:

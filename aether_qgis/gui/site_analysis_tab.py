@@ -494,9 +494,22 @@ class SiteAnalysisTab(QWidget):
         self.alt_table.verticalHeader().setVisible(False)
         layout.addWidget(self.alt_table)
 
+        # Shown instead of the table in MIN_ALT mode, where a single run already
+        # covers every altitude so per-altitude rows would only duplicate work.
+        self.lbl_alt_min_alt_note = QLabel(
+            "Min Altitude mode computes the minimum LOS altitude for every "
+            "location in one pass — receiver altitudes are not needed here. "
+            "Use the Altitude Explorer to view any altitude afterwards."
+        )
+        self.lbl_alt_min_alt_note.setWordWrap(True)
+        self.lbl_alt_min_alt_note.setStyleSheet("color: gray; font-size: 11px;")
+        self.lbl_alt_min_alt_note.setVisible(False)
+        layout.addWidget(self.lbl_alt_min_alt_note)
+
         # Add the default altitude row (1.5 m AGL).
         self._add_altitude_row(1.5, "AGL")
 
+        self._altitudes_container = container
         return container
 
     # -- Analysis parameters -----------------------------------------------
@@ -736,10 +749,18 @@ class SiteAnalysisTab(QWidget):
         irrelevant for pure geometric line-of-sight).
         """
         self._current_mode = mode
-        is_los = mode == "LOS"
-        # LOS doesn't use assets (no freq/power/patterns) or AZ rotation.
-        self.sites_table.setColumnHidden(_COL_ASSET, is_los)
-        self.sites_table.setColumnHidden(_COL_AZ_ROTATION, is_los)
+        # LOS and MIN_ALT are both purely geometric — no assets
+        # (freq/power/patterns) and no antenna AZ rotation.
+        is_geometric = mode in ("LOS", "MIN_ALT")
+        is_min_alt = mode == "MIN_ALT"
+        self.sites_table.setColumnHidden(_COL_ASSET, is_geometric)
+        self.sites_table.setColumnHidden(_COL_AZ_ROTATION, is_geometric)
+        # In MIN_ALT mode the per-altitude table is replaced by an explanatory
+        # note (the single run already spans all altitudes).
+        self.alt_table.setVisible(not is_min_alt)
+        self.btn_add_alt.setVisible(not is_min_alt)
+        self.btn_remove_alt.setVisible(not is_min_alt)
+        self.lbl_alt_min_alt_note.setVisible(is_min_alt)
         self._update_itm_visibility()
 
     def _update_itm_visibility(self) -> None:
@@ -1168,8 +1189,12 @@ class SiteAnalysisTab(QWidget):
         fails (the caller should not proceed).
         """
         mode = self._dialog.get_mode()
-        loss_model = self._dialog.get_loss_model() if mode == "LOSS" else "LOS"
-        model = "LOS" if mode == "LOS" else loss_model
+        if mode == "LOSS":
+            model = self._dialog.get_loss_model()
+        elif mode == "MIN_ALT":
+            model = "MIN_ALT"
+        else:
+            model = "LOS"
 
         resolution = int(self.combo_resolution.currentText())
         backend = self.combo_backend.currentText()
@@ -1178,7 +1203,13 @@ class SiteAnalysisTab(QWidget):
         climate_value = self.combo_climate.currentIndex() + 1
 
         sites = self._read_sites()
-        altitudes = self._read_altitudes()
+        # MIN_ALT sweeps every altitude internally (the result is independent of
+        # the receiver height), so one job per site suffices — using the whole
+        # altitude table would just recompute identical rasters.
+        if model == "MIN_ALT":
+            altitudes = [(1.5, "AGL")]
+        else:
+            altitudes = self._read_altitudes()
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
         jobs: List[Tuple[CoverageParams, str]] = []
@@ -1224,11 +1255,18 @@ class SiteAnalysisTab(QWidget):
                 output_name = (
                     f"site{site_idx + 1}_alt{alt_idx + 1}_{timestamp}"
                 )
-                display_name = (
-                    f"Site {site_idx + 1} "
-                    f"({tx_lat:.4f}, {tx_lon:.4f}) "
-                    f"@ {rx_alt:.1f}m {rx_ref}"
-                )
+                if model == "MIN_ALT":
+                    display_name = (
+                        f"Site {site_idx + 1} "
+                        f"({tx_lat:.4f}, {tx_lon:.4f}) "
+                        f"— Min Altitude"
+                    )
+                else:
+                    display_name = (
+                        f"Site {site_idx + 1} "
+                        f"({tx_lat:.4f}, {tx_lon:.4f}) "
+                        f"@ {rx_alt:.1f}m {rx_ref}"
+                    )
 
                 params = CoverageParams(
                     tx_lat=tx_lat,
@@ -1395,11 +1433,33 @@ class SiteAnalysisTab(QWidget):
                     Qgis.MessageLevel.Warning,
                 )
 
-        QMessageBox.information(
-            self, "Analysis Complete",
-            f"Completed {len(results)} analysis job(s).\n"
-            f"{loaded_count} result(s) loaded into QGIS.",
+        has_min_alt = any(
+            str(model).upper() == "MIN_ALT" for _, model, _ in results
         )
+        if has_min_alt:
+            reply = QMessageBox.question(
+                self, "Analysis Complete",
+                f"Completed {len(results)} Min-Altitude job(s).\n"
+                f"{loaded_count} result(s) loaded into QGIS.\n\n"
+                "Open the Altitude Explorer to pick a preferred altitude and "
+                "see the reachable area live?",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes,
+            )
+            if reply == QMessageBox.Yes:
+                try:
+                    from .altitude_explorer import show_altitude_explorer
+                    show_altitude_explorer(self.iface)
+                except Exception as exc:
+                    QgsMessageLog.logMessage(
+                        f"Could not open Altitude Explorer: {exc}",
+                        TAG, Qgis.MessageLevel.Warning,
+                    )
+        else:
+            QMessageBox.information(
+                self, "Analysis Complete",
+                f"Completed {len(results)} analysis job(s).\n"
+                f"{loaded_count} result(s) loaded into QGIS.",
+            )
 
     def _on_finished_err(self, message: str) -> None:
         self._reset_run_ui()

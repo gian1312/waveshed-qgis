@@ -368,3 +368,128 @@ Track all dependencies and data sources to avoid licence issues.
       display in the output.
 - [ ] Check Mapbox ToS if Mapbox encoding is used — may require visible
       Mapbox logo on map output.
+
+---
+
+## 6. Publishing to the QGIS Plugin Repository
+
+Reference: https://plugins.qgis.org/docs/publish (official publishing
+guidelines) and https://plugins.qgis.org/docs/approval (approval workflow).
+
+Only the **plugin** (pure-Python `aether_qgis/`) is published here. The AETHER
+engine binaries are a *stated external dependency*, downloaded at runtime — they
+are NOT part of the uploaded package (see §7 for the source/repo split).
+
+### 6.1 Prerequisites (do these first)
+- [ ] Finish the licence action items in §5.3 (add `LICENSE`, attributions).
+- [ ] Create an **OSGeo ID** (OSGeo web account at osgeo.org) — required to
+      upload at https://plugins.qgis.org/plugins/add/.
+- [ ] Publish the plugin in a **public** Git repo whose URL exactly matches
+      `repository=` in `metadata.txt` (currently mismatched — see §6.3). The
+      repo must be real version control with browsable source (no zipped files).
+
+### 6.2 Package rules (from the guidelines)
+- **Licence must be GPLv2-or-later compatible.** The plugin is a thin Python
+  wrapper, so GPLv2+ is fine and is what the repo expects. Invoking the
+  separately-distributed proprietary binaries via subprocess is arms-length
+  (not static/dynamic linking), so it does **not** force those binaries under
+  the GPL — but confirm this against the QGIS licensing note linked from the
+  docs before release.
+- **Don't include binaries.** ✅ already satisfied — `bin/` is gitignored and
+  fetched on first run. Verify the packaged ZIP contains no `.exe`/`.dll`.
+- **Package ≤ 25 MB.** ✅ pure Python is < 1 MB.
+- **State the external dependency in the `about=` field.** It must say the
+  plugin requires the AETHER engine binaries (auto-downloaded on first run) and
+  an API key. It currently does not — see §6.3.
+- **Clean repo/package**: no `__pycache__/`, `.idea/`, `.venv/`, `tmp/`,
+  `*_rc.py`, `deploy.local.ini`, test artifacts or other hidden/generated files
+  inside the ZIP.
+- **Don't rename** the plugin or its folder between versions. The ZIP's top
+  folder must stay `aether_qgis` (matches the package name).
+- **Minimal documentation** required (a README covering use + requirements).
+- **Test on Windows, Linux, macOS** before submitting (see §9.3 in the plan).
+
+### 6.3 metadata.txt fixes needed before upload
+Current `aether_qgis/metadata.txt` has issues that will fail review:
+- `repository=https://github.com/aether-rf/aether-qgis` and
+  `tracker=…/issues` point at a repo that must (a) exist, (b) be public, and
+  (c) contain exactly this source. The real remote is
+  `github.com/gian1312/qgis_plugin`. Reconcile these — either publish under
+  `aether-rf/aether-qgis` and push there, or point metadata at the real repo.
+  The guidelines explicitly check that the stated repo == the uploaded source.
+- `about=` must name the external dependency (engine binaries + API key).
+- Keep `experimental=True` for the first upload; drop to `False` once stable.
+- Confirm `author=`/`email=` are valid — used for approval correspondence.
+
+### 6.4 Build the distributable ZIP
+There is no package step yet (only `deploy.py`, a local dev-deploy). Add a
+`package.py` (or a `deploy.py --package` mode) that:
+1. Copies `aether_qgis/` into a temp dir, excluding the `SKIP_DIRS`/`SKIP_EXTS`
+   already defined in `deploy.py`, plus `*_rc.py` and i18n build junk.
+2. Zips it with the **top-level folder named `aether_qgis`**.
+3. Verifies: no binaries, no secrets (`*.key`, `vendor_keys.json`,
+   `api_*key*`), total size < 25 MB.
+
+   Output: `aether_qgis-<version>.zip`.
+
+### 6.5 Upload & approval
+1. Upload the ZIP at https://plugins.qgis.org/plugins/add/.
+2. First-time authors: the plugin lands in the **approval queue** — a QGIS
+   staff/trusted member reviews it (see /docs/approval). Nothing is public
+   until approved.
+3. After the first approval you typically become a trusted author and can
+   upload new versions directly.
+4. Bump `version=` in `metadata.txt` for every upload; never re-upload the same
+   version number.
+
+---
+
+## 7. Source / Repository Split
+
+Goal: publish the plugin (required by QGIS) and ship runnable binaries to users
+**without** exposing `aether_core` source. Verified crate deps make a clean
+split possible — the three tool crates are fully standalone (none depend on
+`aether_core`; only `aether_core` carries the licensing/crypto deps).
+
+### 7.1 What must be public vs private
+| Component | Visibility | Why |
+|-----------|-----------|-----|
+| `aether_qgis` plugin (Python) | **PUBLIC** (required) | QGIS needs public, GPLv2+ source matching the upload |
+| `aether_core` (GPU engine, WGSL shaders, licensing/vendor keys, `aether_core_wasm`) | **PRIVATE** | The proprietary IP — never published |
+| Compiled binaries (core/converter/export + `dxcompiler.dll`) | **PUBLIC download, no source** | Plugin fetches them on first run |
+| `aether_converter`, `aether_export` (export_geotiff), `aether_aggregate` | **UNDECIDED** — open-sourceable | Standalone generic geo tools, permissive deps, no propagation IP and no licensing/crypto code |
+
+### 7.2 Recommended topology
+```
+gian1312/aether-qgis    PUBLIC    plugin → plugins.qgis.org (rename qgis_plugin, or make metadata match)
+gian1312/aether-core    PRIVATE   aether_core + shaders + licensing + *_wasm (the IP)
+gian1312/aether-dist    PUBLIC    binary Releases only — NO source; binary_manager.py downloads from here
+gian1312/aether-tools   PUBLIC*   converter + export + aggregate (Cargo workspace)   [*only if opened]
+```
+- **Why a separate `aether-dist` repo:** GitHub Releases inherit the repo's
+  visibility. If the engine lives in a *private* repo, its Releases are private
+  too and the plugin can't download them. A tiny **public** releases-only repo
+  (README + LICENSE + release assets, pushed by the private repo's CI) gives a
+  public download URL without exposing source. Alternative: host binaries on
+  aether-rf.com (the plan already allows a fixed URL in `binary_manager.py`),
+  in which case `aether-dist` isn't needed.
+
+### 7.3 If you open-source the tools
+- Extract them out of the AETHER monorepo so opening them doesn't drag
+  `aether_core` history along. History-preserving:
+  `git subtree split -P rust/aether_converter -b conv` (repeat per crate) then
+  push to the new repo; or `git filter-repo --path rust/aether_converter …`.
+  If history doesn't matter, just copy the dirs into a fresh workspace.
+- Move each crate's `*_wasm` sibling with it (`aether_converter_wasm`,
+  `export_geotiff_wasm`).
+- They compile standalone today (verified — no `aether_core` dep), so no code
+  changes are needed, only a workspace `Cargo.toml` listing the moved crates.
+- Opening `aether_converter` documents the `.abt` tile format (a plain int16
+  terrain container) — no propagation IP is exposed by that.
+- Pick a licence: keep them proprietary-but-source-available, or a permissive
+  OSS licence (MIT/Apache-2.0, matching their deps) to allow contributions.
+
+### 7.4 Decision needed
+Whether `aether_converter` / `aether_export` / `aether_aggregate` go public
+(→ `aether-tools`) or stay in the private engine repo. `aether_core` stays
+private either way.

@@ -58,7 +58,7 @@ class CoverageAlgorithm(QgsProcessingAlgorithm):
     OUTPUT_DIR = "OUTPUT_DIR"
 
     # Enum value lists (order matters — index is the value)
-    _MODELS = ["LOS", "SIMPLE_LOSS", "ITM"]
+    _MODELS = ["LOS", "SIMPLE_LOSS", "ITM", "MIN_ALT"]
     _RESOLUTIONS = ["2", "5", "10", "30"]
     _BACKENDS = ["AUTO", "GPU", "CPU"]
 
