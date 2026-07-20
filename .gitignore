@@ -61,3 +61,5 @@ deploy.local.ini
 
 # Claude
 .claude/
+/abt_diag_report.json
+/data/ch.swisstopo.swissaltiregio-4EKtpOb5.csv
