@@ -21,7 +21,7 @@ NO_LAUNCH   = False   # True = deploy only, don't start QGIS
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 CONFIG_FILE = SCRIPT_DIR / "deploy.local.ini"
-SOURCE_DIR = SCRIPT_DIR / "aether_qgis"
+SOURCE_DIR = SCRIPT_DIR / "waveshed"
 
 BINARIES = [
     "aether_core.exe", "aether_converter.exe", "aether_export.exe",
@@ -219,7 +219,7 @@ def main():
         sys.exit(1)
 
     plugin_dir = resolve_plugin_dir(cfg["plugin_dir"])
-    target_dir = plugin_dir / "aether_qgis"
+    target_dir = plugin_dir / "waveshed"
 
     print("=== AETHER QGIS Plugin Deploy ===")
     print(f"  Source:    {SOURCE_DIR}")

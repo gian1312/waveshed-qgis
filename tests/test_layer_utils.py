@@ -8,7 +8,7 @@ import conftest  # noqa: F401 — installs QGIS/PyQt stubs into sys.modules
 import unittest
 from unittest import mock
 
-from aether_qgis.core.layer_utils import (
+from waveshed.core.layer_utils import (
     aether_role,
     classify_raster_layer,
     dem_layer_warning,

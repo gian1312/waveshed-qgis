@@ -16,8 +16,8 @@ from unittest import mock
 
 import numpy as np
 
-import aether_qgis.core.terrain_adapter as ta
-from aether_qgis.core.terrain_adapter import (
+import waveshed.core.terrain_adapter as ta
+from waveshed.core.terrain_adapter import (
     _compute_sector_bbox,
     _compute_subtiles,
     _estimate_abt_disk_mb,

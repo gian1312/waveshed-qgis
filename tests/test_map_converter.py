@@ -12,7 +12,7 @@ import re
 import tempfile
 import unittest
 
-from aether_qgis.gui.map_converter_tab import (
+from waveshed.gui.map_converter_tab import (
     _estimate_tile_count_and_mb,
     _abt_size_px,
     _ABT_EXTENT_DEG,
@@ -161,7 +161,7 @@ class TestDetectXyzResolution(unittest.TestCase):
 class TestOverpassToGeojson(unittest.TestCase):
 
     def test_basic_conversion(self):
-        from aether_qgis.gui.map_converter_tab import MapConverterTab
+        from waveshed.gui.map_converter_tab import MapConverterTab
         data = {
             "elements": [
                 {"type": "node", "id": 1, "lat": 47.0, "lon": 8.0},
@@ -183,7 +183,7 @@ class TestOverpassToGeojson(unittest.TestCase):
         )
 
     def test_empty(self):
-        from aether_qgis.gui.map_converter_tab import MapConverterTab
+        from waveshed.gui.map_converter_tab import MapConverterTab
         geojson = MapConverterTab._overpass_to_geojson({"elements": []})
         self.assertEqual(len(geojson["features"]), 0)
 

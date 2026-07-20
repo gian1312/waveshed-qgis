@@ -12,9 +12,9 @@ import conftest  # noqa: F401 — installs QGIS/PyQt stubs into sys.modules
 import math
 import unittest
 
-from aether_qgis.core import min_alt as ma
-from aether_qgis.core.job_builder import CoverageParams, build_coverage_job
-from aether_qgis.core.layer_utils import (
+from waveshed.core import min_alt as ma
+from waveshed.core.job_builder import CoverageParams, build_coverage_job
+from waveshed.core.layer_utils import (
     aether_model,
     is_min_alt_layer,
     mark_aether_model,
@@ -107,7 +107,7 @@ class TestProcessingModelList(unittest.TestCase):
         import os
         path = os.path.join(
             os.path.dirname(os.path.dirname(__file__)),
-            "aether_qgis", "algorithms", "coverage.py",
+            "waveshed", "algorithms", "coverage.py",
         )
         with open(path, encoding="utf-8") as f:
             src = f.read()
@@ -137,7 +137,7 @@ except ImportError:
 @unittest.skipUnless(_HAVE_NUMPY, "numpy not available")
 class TestBestSiteReduction(unittest.TestCase):
     def _reduce(self, arrays):
-        from aether_qgis.core.raster_tools import reduce_best_site
+        from waveshed.core.raster_tools import reduce_best_site
         return reduce_best_site([np.array(a, dtype=np.uint16) for a in arrays])
 
     def test_lowest_altitude_and_argmin_win(self):
@@ -150,7 +150,7 @@ class TestBestSiteReduction(unittest.TestCase):
         self.assertEqual(best_site.tolist(), [[1, 0]])
 
     def test_sentinel_never_wins(self):
-        from aether_qgis.core.raster_tools import BEST_SITE_NODATA
+        from waveshed.core.raster_tools import BEST_SITE_NODATA
         S = ma.MIN_ALT_SENTINEL
         best_alt, best_site = self._reduce([
             [[S, 50]],
@@ -160,7 +160,7 @@ class TestBestSiteReduction(unittest.TestCase):
         self.assertEqual(best_site.tolist(), [[1, 0]])
 
     def test_all_uncovered_stays_nodata(self):
-        from aether_qgis.core.raster_tools import BEST_SITE_NODATA
+        from waveshed.core.raster_tools import BEST_SITE_NODATA
         S = ma.MIN_ALT_SENTINEL
         best_alt, best_site = self._reduce([[[S]], [[S]]])
         self.assertEqual(best_alt.tolist(), [[S]])
