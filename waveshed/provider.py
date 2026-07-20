@@ -8,13 +8,13 @@ import os
 class AetherProvider(QgsProcessingProvider):
 
     def id(self):
-        return "aether"
+        return "waveshed"
 
     def name(self):
-        return "AETHER"
+        return "Waveshed"
 
     def longName(self):
-        return "AETHER RF Propagation Engine"
+        return "Waveshed RF Propagation"
 
     def icon(self):
         icon_path = os.path.join(os.path.dirname(__file__), "resources", "icon.png")

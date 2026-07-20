@@ -72,11 +72,11 @@ def compute_erp(peak_power_watts: float, antenna_gain_dbi: float) -> float:
 def get_assets_dir() -> str:
     """Return the assets directory path, creating it if it does not exist.
 
-    The path is read from ``QgsSettings("aether/assets_dir")``.  When no
+    The path is read from ``QgsSettings("waveshed/assets_dir")``.  When no
     setting has been stored, ``~/.aether/assets/`` is used as the default.
     """
     settings = QgsSettings()
-    assets_dir = settings.value("aether/assets_dir", _DEFAULT_ASSETS_DIR)
+    assets_dir = settings.value("waveshed/assets_dir", _DEFAULT_ASSETS_DIR)
     if not assets_dir:
         assets_dir = _DEFAULT_ASSETS_DIR
     os.makedirs(assets_dir, exist_ok=True)

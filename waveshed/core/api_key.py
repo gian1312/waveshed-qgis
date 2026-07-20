@@ -52,7 +52,7 @@ def validate_api_key(key_string: str) -> tuple[bool, str, datetime.date | None]:
 # Settings helpers
 # ---------------------------------------------------------------------------
 
-_SETTINGS_KEY = "aether/api_key"
+_SETTINGS_KEY = "waveshed/api_key"
 
 
 def get_stored_key() -> str:
@@ -78,7 +78,7 @@ def check_key_or_raise() -> datetime.date | None:
     key = get_stored_key()
     if not key:
         raise ApiKeyError(
-            "No API key configured. Please enter your key in AETHER Settings."
+            "No API key configured. Please enter your key in Waveshed Settings."
         )
 
     is_valid, message, expiry = validate_api_key(key)

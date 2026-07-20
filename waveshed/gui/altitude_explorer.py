@@ -57,7 +57,7 @@ from ..core.result_loader import (
     load_contour_result,
 )
 
-TAG = "AETHER"
+TAG = "Waveshed"
 
 _LAYER_ID_ROLE = Qt.UserRole
 
@@ -87,8 +87,8 @@ class AltitudeExplorerDock(QgsDockWidget):
     """Dock widget with a live altitude threshold slider for MIN_ALT layers."""
 
     def __init__(self, iface, parent: Optional[QWidget] = None) -> None:
-        super().__init__("AETHER Altitude Explorer", parent)
-        self.setObjectName("AetherAltitudeExplorer")
+        super().__init__("Waveshed Altitude Explorer", parent)
+        self.setObjectName("WaveshedAltitudeExplorer")
         self.iface = iface
         self._updating = False  # guard against slider<->spin feedback loops
 
@@ -395,7 +395,7 @@ class AltitudeExplorerDock(QgsDockWidget):
             src = layer.source().split("|")[0]
             if not os.path.isfile(src):
                 QMessageBox.warning(
-                    self, "AETHER",
+                    self, "Waveshed",
                     f"Layer '{layer.name()}' is not a file on disk, so it "
                     "cannot be processed. Re-run the analysis to a file first.",
                 )
@@ -510,7 +510,7 @@ class AltitudeExplorerDock(QgsDockWidget):
             )
         if made:
             self.iface.messageBar().pushSuccess(
-                "AETHER", f"Generated contours for {made} layer(s).",
+                "Waveshed", f"Generated contours for {made} layer(s).",
             )
         elif errors:
             QMessageBox.critical(

@@ -63,7 +63,7 @@ from ..core.job_builder import P2PParams, build_p2p_job, write_job_file
 from ..core.layer_utils import dem_layer_warning, hide_from_dem_picker
 from .map_tools import activate_point_capture
 
-TAG = "AETHER"
+TAG = "Waveshed"
 
 _SUBPROCESS_FLAGS = (
     subprocess.CREATE_NO_WINDOW if platform.system() == "Windows" else 0

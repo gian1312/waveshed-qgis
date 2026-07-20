@@ -24,7 +24,7 @@ from qgis.core import Qgis, QgsMessageLog, QgsSettings
 # Constants
 # ---------------------------------------------------------------------------
 
-TAG = "AETHER"  # QgsMessageLog tag
+TAG = "Waveshed"  # QgsMessageLog tag
 
 REQUIRED_BINARIES = ("aether_core", "aether_converter", "aether_export")
 
@@ -85,7 +85,7 @@ def discover_binary_dir() -> Optional[str]:
 
     The search order (first match wins):
 
-    1. User-configured path in QgsSettings (``aether/binary_dir``).
+    1. User-configured path in QgsSettings (``waveshed/binary_dir``).
     2. ``AETHER_BIN_DIR`` environment variable.
     3. System ``PATH`` (looks for ``aether_core``).
     4. Default install location ``~/.aether/bin/``.
@@ -96,7 +96,7 @@ def discover_binary_dir() -> Optional[str]:
     """
     candidates: list[Optional[str]] = [
         # 1. Plugin settings
-        QgsSettings().value("aether/binary_dir", None),
+        QgsSettings().value("waveshed/binary_dir", None),
         # 2. Environment variable
         os.environ.get("AETHER_BIN_DIR"),
         # 3. PATH – locate via the primary binary
@@ -247,7 +247,7 @@ def download_binaries(
                 os.chmod(path, current | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
 
     # 4. Persist the path in plugin settings
-    QgsSettings().setValue("aether/binary_dir", target_dir)
+    QgsSettings().setValue("waveshed/binary_dir", target_dir)
 
     QgsMessageLog.logMessage(
         f"Binaries extracted to {target_dir}", TAG, Qgis.MessageLevel.Info

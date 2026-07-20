@@ -60,7 +60,7 @@ from qgis.gui import QgsMapLayerComboBox, QgsRubberBand
 from ..core.binary_manager import find_binary
 from ..core.layer_utils import classify_raster_layer
 
-TAG = "AETHER"
+TAG = "Waveshed"
 
 _SUBPROCESS_FLAGS = (
     subprocess.CREATE_NO_WINDOW if platform.system() == "Windows" else 0
@@ -810,7 +810,7 @@ class _MapConverterWorker(QThread):
             data = urllib.parse.urlencode({"data": query}).encode()
             req = urllib.request.Request(
                 url, data=data,
-                headers={"User-Agent": "AETHER-QGIS-Plugin/1.0"},
+                headers={"User-Agent": "Waveshed-QGIS-Plugin/0.1"},
             )
             with urllib.request.urlopen(req, timeout=300) as resp:
                 raw = resp.read()

@@ -28,11 +28,11 @@ from qgis.PyQt.QtGui import QColor
 from . import min_alt as _ma
 from .layer_utils import mark_aether_model, mark_aether_output
 
-TAG = "AETHER"
+TAG = "Waveshed"
 
 # Layer-tree group paths so AETHER outputs stay organised instead of piling up
 # at the top level of the Layers panel.
-GROUP_ROOT = "AETHER"
+GROUP_ROOT = "Waveshed"
 GROUP_COVERAGE = (GROUP_ROOT, "Coverage")
 GROUP_P2P = (GROUP_ROOT, "P2P")
 GROUP_TERRAIN = (GROUP_ROOT, "Terrain")
@@ -434,11 +434,11 @@ def load_p2p_result_csv(csv_path: str) -> QgsVectorLayer:
 def _ensure_layer_group(*names: str):
     """Return the nested layer-tree group for *names*, creating it if needed.
 
-    ``_ensure_layer_group("AETHER", "Coverage")`` returns the ``Coverage``
-    group nested under a top-level ``AETHER`` group, creating either level
+    ``_ensure_layer_group("Waveshed", "Coverage")`` returns the ``Coverage``
+    group nested under a top-level ``Waveshed`` group, creating either level
     that does not yet exist. With no names, returns the tree root.
 
-    The top-level AETHER group is inserted at the *top* of the Layers panel
+    The top-level Waveshed group is inserted at the *top* of the Layers panel
     (index 0) so results sit above basemaps/DEMs instead of being buried at
     the bottom. Nested groups are appended in creation order.
     """
@@ -467,7 +467,7 @@ def add_layer_to_project(
         A QgsRasterLayer or QgsVectorLayer to register with the project.
     group_path:
         Optional tuple of nested layer-tree group names to place the layer
-        under (e.g. ``("AETHER", "Coverage")``). The groups are created if
+        under (e.g. ``("Waveshed", "Coverage")``). The groups are created if
         absent. When ``None`` the layer is added at the top level, preserving
         the previous behaviour.
 

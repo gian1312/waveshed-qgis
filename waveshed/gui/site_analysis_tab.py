@@ -75,7 +75,7 @@ from ..core.terrain_adapter import (
 )
 from .map_tools import activate_point_capture
 
-TAG = "AETHER"
+TAG = "Waveshed"
 
 # Column definitions -- identical for both LOS and LOSS modes.
 # Freq / ERP come from the selected asset, not from separate table columns.
@@ -678,7 +678,7 @@ class SiteAnalysisTab(QWidget):
 
         # Add local terrain directory from settings (if configured).
         from qgis.core import QgsSettings as _QS
-        terrain_dir = _QS().value("aether/terrain_dir", "").strip()
+        terrain_dir = _QS().value("waveshed/terrain_dir", "").strip()
         if terrain_dir and os.path.isdir(terrain_dir):
             self.combo_dem.addItem(f"{self._LOCAL_DIR_PREFIX}{terrain_dir}")
             self._dem_layers.append(terrain_dir)

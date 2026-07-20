@@ -13,20 +13,20 @@ class AetherPlugin:
         self.iface = iface
         self.plugin_dir = os.path.dirname(__file__)
         self.actions = []
-        self.menu_name = "&AETHER"
+        self.menu_name = "&Waveshed"
         self.toolbar = None
         self.provider = None
         self._main_dialog = None
 
     def initGui(self):
-        self.toolbar = self.iface.addToolBar("AETHER")
-        self.toolbar.setObjectName("AetherToolbar")
+        self.toolbar = self.iface.addToolBar("Waveshed")
+        self.toolbar.setObjectName("WaveshedToolbar")
 
         icon_path = os.path.join(self.plugin_dir, "resources", "icon.png")
         icon = QIcon(icon_path) if os.path.exists(icon_path) else QIcon()
 
         # Single menu entry
-        self.action_main = QAction(icon, "AETHER Analysis", self.iface.mainWindow())
+        self.action_main = QAction(icon, "Waveshed Analysis", self.iface.mainWindow())
         self.action_main.triggered.connect(self._open_main_dialog)
         self.iface.addPluginToMenu(self.menu_name, self.action_main)
         self.toolbar.addAction(self.action_main)

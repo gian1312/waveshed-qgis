@@ -32,7 +32,7 @@ _SUBPROCESS_FLAGS = (
 def _log(msg: str) -> None:
     try:
         from qgis.core import Qgis, QgsMessageLog
-        QgsMessageLog.logMessage(msg, "AETHER-Terrain", Qgis.MessageLevel.Info)
+        QgsMessageLog.logMessage(msg, "Waveshed-Terrain", Qgis.MessageLevel.Info)
     except Exception:
         pass
 
@@ -51,12 +51,12 @@ def reset_terrain_warnings() -> None:
 
 def get_cache_dir() -> str:
     from qgis.core import QgsSettings
-    return QgsSettings().value("aether/cache_dir", os.path.expanduser("~/.aether/cache"))
+    return QgsSettings().value("waveshed/cache_dir", os.path.expanduser("~/.aether/cache"))
 
 
 def _get_download_connections() -> int:
     from qgis.core import QgsSettings
-    return int(QgsSettings().value("aether/download_connections", 256))
+    return int(QgsSettings().value("waveshed/download_connections", 256))
 
 
 def _get_download_max_passes() -> int:
@@ -65,11 +65,11 @@ def _get_download_max_passes() -> int:
     Default 4: the first pass downloads everything; each retry re-fetches ONLY
     the sub-tiles that ended up with a gap, at half the connections, so retries
     are cheap (not a full re-download). Set to 1 via QgsSettings
-    ("aether/download_max_passes") to disable retries.
+    ("waveshed/download_max_passes") to disable retries.
     """
     from qgis.core import QgsSettings
     try:
-        return max(1, int(QgsSettings().value("aether/download_max_passes", 4)))
+        return max(1, int(QgsSettings().value("waveshed/download_max_passes", 4)))
     except (TypeError, ValueError):
         return 4
 
@@ -783,7 +783,7 @@ def prepare_terrain(
     cache_dir = os.path.join(get_cache_dir(), cache_hash)
     # Log the resolved cache path so the user can inspect the .abt tiles
     # directly (e.g. to check for missing tiles that show up as empty stripes
-    # through a line-of-sight). Set QgsSettings "aether/cache_dir" to relocate.
+    # through a line-of-sight). Set QgsSettings "waveshed/cache_dir" to relocate.
     _log(f"  .abt cache dir: {cache_dir}")
 
     if _cache_hit(cache_dir):

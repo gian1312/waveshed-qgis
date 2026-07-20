@@ -71,7 +71,7 @@ class SettingsDialog(QDialog):
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
-        self.setWindowTitle("AETHER Settings")
+        self.setWindowTitle("Waveshed Settings")
         self.setMinimumWidth(560)
 
         self._download_thread: _DownloadThread | None = None
@@ -147,7 +147,7 @@ class SettingsDialog(QDialog):
         row.addWidget(QLabel("API key:"))
         self._api_key_edit = QLineEdit()
         self._api_key_edit.setEchoMode(QLineEdit.Password)
-        self._api_key_edit.setPlaceholderText("Paste your AETHER API key")
+        self._api_key_edit.setPlaceholderText("Paste your Waveshed API key")
         row.addWidget(self._api_key_edit)
 
         self._btn_show_key = QPushButton("Show")
@@ -240,7 +240,7 @@ class SettingsDialog(QDialog):
         s = self._settings
 
         # Binaries
-        self._binary_dir_edit.setText(s.value("aether/binary_dir", ""))
+        self._binary_dir_edit.setText(s.value("waveshed/binary_dir", ""))
         self._refresh_binary_status()
 
         # API key
@@ -248,22 +248,22 @@ class SettingsDialog(QDialog):
         self._refresh_api_status()
 
         # Defaults
-        self._terrain_dir_edit.setText(s.value("aether/terrain_dir", ""))
+        self._terrain_dir_edit.setText(s.value("waveshed/terrain_dir", ""))
         default_cache = os.path.join(str(Path.home()), ".aether", "cache")
-        self._cache_dir_edit.setText(s.value("aether/cache_dir", default_cache))
-        self._vram_spin.setValue(int(s.value("aether/max_vram_gb", 8)))
-        self._ram_spin.setValue(int(s.value("aether/max_ram_gb", 16)))
-        self._conn_spin.setValue(int(s.value("aether/download_connections", 256)))
+        self._cache_dir_edit.setText(s.value("waveshed/cache_dir", default_cache))
+        self._vram_spin.setValue(int(s.value("waveshed/max_vram_gb", 8)))
+        self._ram_spin.setValue(int(s.value("waveshed/max_ram_gb", 16)))
+        self._conn_spin.setValue(int(s.value("waveshed/download_connections", 256)))
 
     def save_settings(self) -> None:
         """Persist all settings to QgsSettings. Always saves, no validation dialogs."""
         s = self._settings
-        s.setValue("aether/binary_dir", self._binary_dir_edit.text().strip())
-        s.setValue("aether/terrain_dir", self._terrain_dir_edit.text().strip())
-        s.setValue("aether/cache_dir", self._cache_dir_edit.text().strip())
-        s.setValue("aether/max_vram_gb", self._vram_spin.value())
-        s.setValue("aether/max_ram_gb", self._ram_spin.value())
-        s.setValue("aether/download_connections", self._conn_spin.value())
+        s.setValue("waveshed/binary_dir", self._binary_dir_edit.text().strip())
+        s.setValue("waveshed/terrain_dir", self._terrain_dir_edit.text().strip())
+        s.setValue("waveshed/cache_dir", self._cache_dir_edit.text().strip())
+        s.setValue("waveshed/max_vram_gb", self._vram_spin.value())
+        s.setValue("waveshed/max_ram_gb", self._ram_spin.value())
+        s.setValue("waveshed/download_connections", self._conn_spin.value())
         api_key.store_key(self._api_key_edit.text().strip())
 
     def _on_accept(self) -> None:
