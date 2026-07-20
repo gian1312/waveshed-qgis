@@ -35,25 +35,49 @@ from ..core import api_key, binary_manager
 # Background worker for binary download
 # ---------------------------------------------------------------------------
 
+class _ManifestThread(QThread):
+    """Fetch the release manifest and select the platform asset off-thread."""
+
+    ready = pyqtSignal(object, object)   # (manifest dict, asset dict)
+    error = pyqtSignal(str)              # error message on failure
+
+    def run(self) -> None:  # noqa: D401 – Qt override
+        try:
+            manifest = binary_manager.fetch_manifest()
+            asset = binary_manager.select_asset(manifest)
+            self.ready.emit(manifest, asset)
+        except Exception as exc:
+            self.error.emit(str(exc))
+
+
 class _DownloadThread(QThread):
-    """Run binary_manager.download_binaries() off the main thread."""
+    """Run binary_manager.download_engine() off the main thread."""
 
     progress = pyqtSignal(int)        # percentage 0-100
     finished_ok = pyqtSignal(str)     # target directory on success
     finished_err = pyqtSignal(str)    # error message on failure
 
-    def __init__(self, target_dir: str, parent: QWidget | None = None) -> None:
+    def __init__(
+        self,
+        manifest: dict,
+        asset: dict,
+        target_dir: str,
+        parent: QWidget | None = None,
+    ) -> None:
         super().__init__(parent)
+        self._manifest = manifest
+        self._asset = asset
         self._target_dir = target_dir
 
     def run(self) -> None:  # noqa: D401 – Qt override
-        def _progress_cb(block_num: int, block_size: int, total_size: int) -> None:
-            if total_size > 0:
-                pct = min(100, int(block_num * block_size * 100 / total_size))
-                self.progress.emit(pct)
+        def _progress_cb(received: int, total: int) -> None:
+            if total > 0:
+                self.progress.emit(min(100, int(received * 100 / total)))
 
         try:
-            result_dir = binary_manager.download_binaries(
+            result_dir = binary_manager.download_engine(
+                self._manifest,
+                self._asset,
                 target_dir=self._target_dir,
                 progress_cb=_progress_cb,
             )
@@ -67,13 +91,14 @@ class _DownloadThread(QThread):
 # ---------------------------------------------------------------------------
 
 class SettingsDialog(QDialog):
-    """AETHER plugin settings dialog."""
+    """Waveshed plugin settings dialog."""
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.setWindowTitle("Waveshed Settings")
         self.setMinimumWidth(560)
 
+        self._manifest_thread: _ManifestThread | None = None
         self._download_thread: _DownloadThread | None = None
         self._settings = QgsSettings()
 
@@ -291,19 +316,89 @@ class SettingsDialog(QDialog):
             self._binary_status_label.setStyleSheet("color: red;")
 
     def _download_binaries(self) -> None:
+        if self._manifest_thread is not None and self._manifest_thread.isRunning():
+            return  # already checking
         if self._download_thread is not None and self._download_thread.isRunning():
-            return  # already in progress
+            return  # already downloading
+
+        # Step 1: fetch the manifest off-thread. Consent + download follow in
+        # _on_manifest_ready once we know the engine version and EULA URL.
+        self._btn_download.setEnabled(False)
+        self._binary_status_label.setText(
+            "Checking waveshed.io for the latest Aether engine..."
+        )
+        self._binary_status_label.setStyleSheet("color: gray;")
+
+        self._manifest_thread = _ManifestThread(parent=self)
+        self._manifest_thread.ready.connect(self._on_manifest_ready)
+        self._manifest_thread.error.connect(self._on_download_err)
+        self._manifest_thread.start()
+
+    def _on_manifest_ready(self, manifest: dict, asset: dict) -> None:
+        version = manifest.get("version", "?")
+        eula_url = manifest.get("eula_url", "")
+
+        # Advisory: the engine release may want a newer plugin. Allow proceeding.
+        if binary_manager.is_plugin_outdated(manifest.get("min_plugin_version")):
+            QMessageBox.warning(
+                self, "Plugin update recommended",
+                f"This Aether engine release recommends Waveshed plugin "
+                f"{manifest.get('min_plugin_version')} or newer. You can "
+                f"continue, but updating the plugin is advised for full "
+                f"compatibility.",
+            )
+
+        # Mandatory consent to the proprietary engine EULA before any download.
+        if not self._confirm_engine_download(version, eula_url):
+            self._btn_download.setEnabled(True)
+            self._refresh_binary_status()
+            return
 
         target = self._binary_dir_edit.text().strip() or binary_manager.DEFAULT_INSTALL_DIR
         self._download_progress.setValue(0)
         self._download_progress.setVisible(True)
-        self._btn_download.setEnabled(False)
 
-        self._download_thread = _DownloadThread(target, parent=self)
+        self._download_thread = _DownloadThread(manifest, asset, target, parent=self)
         self._download_thread.progress.connect(self._download_progress.setValue)
         self._download_thread.finished_ok.connect(self._on_download_ok)
         self._download_thread.finished_err.connect(self._on_download_err)
         self._download_thread.start()
+
+    def _confirm_engine_download(self, version: str, eula_url: str) -> bool:
+        """Modal consent dialog for the proprietary Aether engine download.
+
+        Nothing about the consent is persisted — it is requested every time.
+        """
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Download Aether engine")
+        vbox = QVBoxLayout(dlg)
+
+        msg = QLabel(
+            f"Waveshed will download the proprietary <b>Aether engine "
+            f"(version {version})</b> from waveshed.io.<br><br>"
+            f"The Aether engine is closed-source software, separate from this "
+            f"GPL-licensed plugin, and is provided under its own End User "
+            f"License Agreement (EULA). By choosing <b>Accept &amp; Download</b> "
+            f"you agree to that EULA."
+        )
+        msg.setWordWrap(True)
+        msg.setTextFormat(Qt.RichText)
+        vbox.addWidget(msg)
+
+        if eula_url:
+            link = QLabel(f'<a href="{eula_url}">Read the Aether engine EULA</a>')
+            link.setTextFormat(Qt.RichText)
+            link.setOpenExternalLinks(True)
+            vbox.addWidget(link)
+
+        buttons = QDialogButtonBox()
+        buttons.addButton("Accept && Download", QDialogButtonBox.AcceptRole)
+        buttons.addButton("Cancel", QDialogButtonBox.RejectRole)
+        buttons.accepted.connect(dlg.accept)
+        buttons.rejected.connect(dlg.reject)
+        vbox.addWidget(buttons)
+
+        return dlg.exec_() == QDialog.Accepted
 
     def _on_download_ok(self, result_dir: str) -> None:
         self._download_progress.setVisible(False)
@@ -312,12 +407,13 @@ class SettingsDialog(QDialog):
         self._refresh_binary_status()
         QMessageBox.information(
             self, "Download Complete",
-            f"Binaries installed to:\n{result_dir}",
+            f"Aether engine installed to:\n{result_dir}",
         )
 
     def _on_download_err(self, error: str) -> None:
         self._download_progress.setVisible(False)
         self._btn_download.setEnabled(True)
+        self._refresh_binary_status()
         QMessageBox.critical(self, "Download Failed", error)
 
     def _refresh_binary_status(self) -> None:
