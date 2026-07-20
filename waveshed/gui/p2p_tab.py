@@ -59,6 +59,7 @@ from qgis.core import (
 from qgis.gui import QgsRubberBand
 
 from ..core.binary_manager import find_binary
+from ..core import api_key
 from ..core.job_builder import P2PParams, build_p2p_job, write_job_file
 from ..core.layer_utils import dem_layer_warning, hide_from_dem_picker
 from .map_tools import activate_point_capture
@@ -528,6 +529,9 @@ class _P2PWorker(QThread):
             core_exe = find_binary("aether_core")
             env = os.environ.copy()
             env["RUST_LOG"] = "info"
+            # aether_core is licensed — inject the validated API key
+            # (raises ApiKeyError -> surfaced by the worker on failure).
+            api_key.apply_license_env(env)
 
             proc = subprocess.Popen(
                 [core_exe, "--config", job_file],

@@ -38,6 +38,7 @@ from ..core.result_loader import (
     load_coverage_result,
 )
 from ..core.terrain_adapter import prepare_terrain
+from ..core import api_key
 from ..core import binary_manager as bm
 
 
@@ -278,11 +279,20 @@ class CoverageAlgorithm(QgsProcessingAlgorithm):
         except RuntimeError as exc:
             raise QgsProcessingException(str(exc)) from exc
 
+        # aether_core is licensed — validate the API key and inject it as
+        # AETHER_LICENSE. (aether_converter / aether_export are unlicensed.)
+        core_env = os.environ.copy()
+        try:
+            api_key.apply_license_env(core_env)
+        except api_key.ApiKeyError as exc:
+            raise QgsProcessingException(str(exc)) from exc
+
         proc = subprocess.Popen(
             [core_exe, "--config", job_file],
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,  # aether_core logs everything to stdout
             text=True,
+            env=core_env,
             creationflags=_SUBPROCESS_FLAGS,
         )
 

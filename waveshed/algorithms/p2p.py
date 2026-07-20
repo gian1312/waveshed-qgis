@@ -35,6 +35,7 @@ from qgis.core import (
 from ..core.binary_manager import find_binary
 from ..core.job_builder import P2PParams, build_p2p_job, write_job_file
 from ..core.terrain_adapter import prepare_terrain
+from ..core import api_key
 from ..core import binary_manager as bm
 
 # Enum value lists (index-based for QgsProcessingParameterEnum).
@@ -336,11 +337,21 @@ class P2PAlgorithm(QgsProcessingAlgorithm):
         feedback.setProgress(25)
 
         core_exe = find_binary("aether_core")
+
+        # aether_core is licensed — validate the API key and inject it as
+        # AETHER_LICENSE. (aether_converter / aether_export are unlicensed.)
+        core_env = os.environ.copy()
+        try:
+            api_key.apply_license_env(core_env)
+        except api_key.ApiKeyError as exc:
+            raise QgsProcessingException(str(exc)) from exc
+
         proc = subprocess.Popen(
             [core_exe, "--config", job_file],
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,  # aether_core logs everything to stdout
             text=True,
+            env=core_env,
             creationflags=_SUBPROCESS_FLAGS,
         )
 

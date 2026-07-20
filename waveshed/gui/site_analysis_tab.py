@@ -56,6 +56,7 @@ from qgis.PyQt.QtGui import QColor
 
 from ..core.asset_manager import compute_erp, list_assets, load_asset
 from ..core.binary_manager import find_binary
+from ..core import api_key
 
 # Hide console windows on Windows.
 _SUBPROCESS_FLAGS = (
@@ -229,6 +230,9 @@ class _SiteAnalysisWorker(QThread):
                 core_exe = find_binary("aether_core")
                 env = os.environ.copy()
                 env["RUST_LOG"] = "info"
+                # aether_core is licensed — inject the validated API key
+                # (raises ApiKeyError -> surfaced by the worker on failure).
+                api_key.apply_license_env(env)
 
                 # `with` closes the stdout pipe (and waits) on exit so we don't
                 # leak a file handle (the ResourceWarning).

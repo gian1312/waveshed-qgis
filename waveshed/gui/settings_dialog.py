@@ -193,7 +193,7 @@ class SettingsDialog(QDialog):
 
         btn_register = QPushButton("Get API Key")
         btn_register.clicked.connect(
-            lambda: QDesktopServices.openUrl(QUrl("https://aether-rf.com/register"))
+            lambda: QDesktopServices.openUrl(QUrl(api_key.GET_API_KEY_URL))
         )
         row2.addWidget(btn_register)
         row2.addStretch()
