@@ -155,5 +155,93 @@ class TestVersionComparison(unittest.TestCase):
         self.assertTrue(bm.is_plugin_outdated("99.0.0"))
 
 
+class TestClearQuarantine(unittest.TestCase):
+    """Post-extraction un-quarantine step (best-effort, never fails install)."""
+
+    def _patch_system(self, system: str) -> None:
+        p = mock.patch.object(bm.platform, "system", return_value=system)
+        p.start()
+        self.addCleanup(p.stop)
+
+    # --- macOS ---------------------------------------------------------------
+
+    def test_macos_runs_xattr_cr_on_target_dir(self):
+        self._patch_system("Darwin")
+        with mock.patch.object(bm.subprocess, "run") as run:
+            run.return_value = mock.Mock(returncode=0, stdout="", stderr="")
+            bm._clear_quarantine("/install/dir", ["/install/dir/aether_core"])
+
+        run.assert_called_once()
+        argv, kwargs = run.call_args
+        self.assertEqual(argv[0], ["xattr", "-cr", "/install/dir"])
+        self.assertEqual(kwargs.get("timeout"), 10)
+
+    def test_macos_missing_xattr_does_not_raise(self):
+        self._patch_system("Darwin")
+        # xattr binary absent -> subprocess.run raises FileNotFoundError.
+        with mock.patch.object(
+            bm.subprocess, "run", side_effect=FileNotFoundError("xattr")
+        ):
+            bm._clear_quarantine("/install/dir", [])  # must not raise
+
+    def test_macos_nonzero_exit_does_not_raise(self):
+        self._patch_system("Darwin")
+        with mock.patch.object(bm.subprocess, "run") as run:
+            run.return_value = mock.Mock(returncode=1, stdout="", stderr="nope")
+            bm._clear_quarantine("/install/dir", [])  # must not raise
+
+    def test_macos_timeout_does_not_raise(self):
+        self._patch_system("Darwin")
+        with mock.patch.object(
+            bm.subprocess,
+            "run",
+            side_effect=bm.subprocess.TimeoutExpired("xattr", 10),
+        ):
+            bm._clear_quarantine("/install/dir", [])  # must not raise
+
+    # --- Windows -------------------------------------------------------------
+
+    def test_windows_removes_ads_per_file(self):
+        self._patch_system("Windows")
+        files = [
+            r"C:\bin\aether_core.exe",
+            r"C:\bin\aether_converter.exe",
+            r"C:\bin\aether_export.exe",
+        ]
+        with mock.patch.object(bm.subprocess, "run") as run, \
+                mock.patch.object(bm.os, "remove") as remove:
+            bm._clear_quarantine(r"C:\bin", files)
+
+        self.assertEqual(remove.call_count, len(files))
+        remove.assert_has_calls(
+            [mock.call(f"{f}:Zone.Identifier") for f in files],
+            any_order=True,
+        )
+        run.assert_not_called()  # Windows must not shell out to xattr
+
+    def test_windows_swallows_filenotfound_and_oserror(self):
+        self._patch_system("Windows")
+        files = [r"C:\bin\aether_core.exe", r"C:\bin\aether_export.exe"]
+        with mock.patch.object(
+            bm.os, "remove", side_effect=FileNotFoundError
+        ) as remove:
+            bm._clear_quarantine(r"C:\bin", files)  # must not raise
+        self.assertEqual(remove.call_count, len(files))  # continues past errors
+
+        with mock.patch.object(bm.os, "remove", side_effect=OSError):
+            bm._clear_quarantine(r"C:\bin", files)  # must not raise
+
+    # --- Linux ---------------------------------------------------------------
+
+    def test_linux_is_a_noop(self):
+        self._patch_system("Linux")
+        with mock.patch.object(bm.subprocess, "run") as run, \
+                mock.patch.object(bm.os, "remove") as remove:
+            bm._clear_quarantine("/opt/aether/bin", ["/opt/aether/bin/aether_core"])
+
+        run.assert_not_called()
+        remove.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -37,6 +37,10 @@ dialog: it fetches the engine on demand from [waveshed.io](https://waveshed.io),
 shows the engine **EULA** for your acceptance, and installs the binaries locally.
 This download is always an explicit, user-initiated action.
 
+On **macOS**, the plugin automatically clears the download-quarantine (Gatekeeper)
+attribute from the installed engine after download, so the binaries launch
+without a manual `xattr -cr` step.
+
 Running analyses also requires an **API key** from
 [waveshed.io](https://waveshed.io), entered in the plugin's Settings dialog.
 

@@ -402,8 +402,9 @@ def download_engine(
     the engine EULA first (handled by the Settings dialog).
 
     Pipeline: download -> size check (warn-only) -> SHA-256 (fail-closed) ->
-    extract -> chmod +x (non-Windows) -> persist settings -> check
-    prerequisites -> best-effort ``aether_core --version`` handshake.
+    extract -> chmod +x (non-Windows) -> clear OS download quarantine ->
+    persist settings -> check prerequisites -> best-effort
+    ``aether_core --version`` handshake.
 
     Returns the install directory. Raises :class:`RuntimeError` on any hard
     failure (the partially-downloaded archive is always removed).
@@ -431,6 +432,7 @@ def download_engine(
             os.remove(zip_path)
         raise
 
+    extracted_files: list[str] = []
     try:
         # 2. Size check (warn-only)
         expected_size = asset.get("size_bytes")
@@ -446,10 +448,22 @@ def download_engine(
         # 3. SHA-256 (mandatory, fail-closed)
         verify_sha256(zip_path, asset.get("sha256"))
 
+        # Windows: clear any Mark-of-the-Web on the downloaded zip *before*
+        # extracting, so the extracted files cannot inherit it (covers a zip a
+        # user fetched via a browser and pointed the plugin at). No-op
+        # elsewhere and when the stream is absent.
+        if platform.system() == "Windows":
+            _clear_quarantine(target_dir, [zip_path])
+
         # 4. Extract
         try:
             with zipfile.ZipFile(zip_path, "r") as zf:
                 zf.extractall(target_dir)
+                extracted_files = [
+                    os.path.join(target_dir, name)
+                    for name in zf.namelist()
+                    if not name.endswith("/")
+                ]
         except zipfile.BadZipFile as exc:
             raise RuntimeError(
                 f"Downloaded file is not a valid ZIP archive: {exc}"
@@ -466,7 +480,11 @@ def download_engine(
                 current = os.stat(path).st_mode
                 os.chmod(path, current | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
 
-    # 6. Persist install location and engine version
+    # 6. Clear the OS download quarantine so the fresh binaries launch without
+    #    friction (macOS xattr / Windows Mark-of-the-Web; a no-op on Linux).
+    _clear_quarantine(target_dir, extracted_files)
+
+    # 7. Persist install location and engine version
     settings = QgsSettings()
     settings.setValue("waveshed/binary_dir", target_dir)
     settings.setValue("waveshed/installed_engine_version", version)
@@ -476,7 +494,7 @@ def download_engine(
         TAG, Qgis.MessageLevel.Info,
     )
 
-    # 7. Verify prerequisites
+    # 8. Verify prerequisites
     issues = check_prerequisites(target_dir)
     missing = [i for i in issues if "not found" in i.lower()]
     if missing:
@@ -484,10 +502,70 @@ def download_engine(
             "Download succeeded but verification failed:\n" + "\n".join(missing)
         )
 
-    # 8. Best-effort version handshake (never fails the install)
+    # 9. Best-effort version handshake (never fails the install)
     _version_handshake(target_dir)
 
     return target_dir
+
+
+def _clear_quarantine(target_dir: str, files: list) -> None:
+    """Clear OS download-quarantine marks so freshly downloaded binaries run.
+
+    Strictly best-effort and platform-specific: every failure is logged and
+    swallowed so it can never fail an otherwise-successful install.
+
+    macOS
+        Browsers and Gatekeeper tag downloaded files with a
+        ``com.apple.quarantine`` extended attribute, and a quarantined binary
+        refuses to launch until it is cleared. The Aether Rust binaries are
+        ad-hoc signed, so clearing quarantine is the only blocker between the
+        download and a working engine. ``xattr -cr`` clears it recursively.
+    Windows
+        Strip the Mark-of-the-Web (the NTFS ``Zone.Identifier`` alternate data
+        stream) from each path in *files*; deleting the stream is a no-op when
+        it is absent. Our own download path never sets MotW, but this covers a
+        zip a user fetched via a browser and pointed the plugin at, and costs
+        nothing.
+    Linux
+        Nothing to do beyond the executable bit already set by the caller.
+    """
+    system = platform.system()
+
+    if system == "Darwin":
+        try:
+            result = subprocess.run(
+                ["xattr", "-cr", str(target_dir)],
+                capture_output=True, text=True, timeout=10, check=False,
+            )
+        except Exception as exc:  # noqa: BLE001 - must never fail the install
+            QgsMessageLog.logMessage(
+                f"Could not clear macOS quarantine on {target_dir}: {exc} "
+                f"(run 'xattr -cr' manually if the engine will not launch).",
+                TAG, Qgis.MessageLevel.Warning,
+            )
+            return
+        if result.returncode == 0:
+            QgsMessageLog.logMessage(
+                f"Cleared macOS quarantine attribute on {target_dir}",
+                TAG, Qgis.MessageLevel.Info,
+            )
+        else:
+            QgsMessageLog.logMessage(
+                f"xattr -cr exited {result.returncode} on {target_dir}: "
+                f"{(result.stderr or '').strip()} "
+                f"(run 'xattr -cr' manually if the engine will not launch).",
+                TAG, Qgis.MessageLevel.Warning,
+            )
+
+    elif system == "Windows":
+        for path in files:
+            try:
+                os.remove(f"{path}:Zone.Identifier")
+            except (FileNotFoundError, OSError):
+                # No Mark-of-the-Web stream present (the normal case) — no-op.
+                pass
+
+    # Linux: nothing to do — the executable bit set after extraction suffices.
 
 
 def _version_handshake(binary_dir: str) -> None:
