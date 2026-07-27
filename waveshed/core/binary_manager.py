@@ -160,6 +160,60 @@ def find_binary(name: str) -> str:
     )
 
 
+def read_machine_fingerprint(timeout: float = 10.0) -> str:
+    """Return this machine's Aether engine fingerprint (64-char lowercase hex).
+
+    Locates ``aether_core`` via :func:`find_binary` and runs
+    ``aether_core --fingerprint`` — a probe that prints the hardware
+    fingerprint and exits 0 without needing a license. The fingerprint is what
+    a user sends to request a machine-locked (node-locked) license key.
+
+    Parameters
+    ----------
+    timeout:
+        Seconds to wait for the probe before giving up (default 10).
+
+    Raises
+    ------
+    RuntimeError
+        If the binary cannot be located, the process exits non-zero or times
+        out, or stdout is not a 64-character lowercase-hex string.
+    """
+    exe = find_binary("aether_core")
+    try:
+        result = subprocess.run(
+            [exe, "--fingerprint"],
+            capture_output=True, text=True, timeout=timeout, check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(
+            f"aether_core --fingerprint timed out after {timeout:g}s."
+        ) from exc
+    except OSError as exc:
+        raise RuntimeError(
+            f"Could not run aether_core --fingerprint: {exc}"
+        ) from exc
+
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "").strip()
+        raise RuntimeError(
+            f"aether_core --fingerprint exited with code {result.returncode}"
+            + (f": {detail}" if detail else ".")
+        )
+
+    fingerprint = (result.stdout or "").strip()
+    if len(fingerprint) != 64 or any(c not in "0123456789abcdef" for c in fingerprint):
+        raise RuntimeError(
+            "aether_core --fingerprint did not return a valid 64-character "
+            f"hex fingerprint (got {fingerprint!r})."
+        )
+
+    QgsMessageLog.logMessage(
+        f"Machine fingerprint: {fingerprint}", TAG, Qgis.MessageLevel.Info
+    )
+    return fingerprint
+
+
 # ---------------------------------------------------------------------------
 # Plugin version (for manifest min_plugin_version checks)
 # ---------------------------------------------------------------------------

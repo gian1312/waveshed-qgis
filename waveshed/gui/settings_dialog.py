@@ -17,6 +17,7 @@ from qgis.PyQt.QtWidgets import (
     QFileDialog,
     QGroupBox,
     QHBoxLayout,
+    QInputDialog,
     QLabel,
     QLineEdit,
     QMessageBox,
@@ -196,6 +197,14 @@ class SettingsDialog(QDialog):
             lambda: QDesktopServices.openUrl(QUrl(api_key.GET_API_KEY_URL))
         )
         row2.addWidget(btn_register)
+
+        btn_fingerprint = QPushButton("Show machine fingerprint")
+        btn_fingerprint.setToolTip(
+            "Read this machine's hardware fingerprint, needed to request a "
+            "machine-locked license key."
+        )
+        btn_fingerprint.clicked.connect(self._show_machine_fingerprint)
+        row2.addWidget(btn_fingerprint)
         row2.addStretch()
         vbox.addLayout(row2)
 
@@ -464,6 +473,42 @@ class SettingsDialog(QDialog):
             self._api_status_label.setStyleSheet("color: green;")
         else:
             self._api_status_label.setStyleSheet("color: red;")
+
+    def _show_machine_fingerprint(self) -> None:
+        """Read and display this machine's Aether engine fingerprint.
+
+        Off the main flow — nothing is persisted. If the engine binaries are
+        not installed the user is nudged to download them first; any probe
+        failure surfaces as an error dialog rather than crashing QGIS.
+        """
+        if binary_manager.discover_binary_dir() is None:
+            QMessageBox.information(
+                self,
+                "Aether engine not installed",
+                "The Aether engine binaries are not installed yet. Use "
+                "'Download Binaries' above (or set the binary directory), "
+                "then try again.",
+            )
+            return
+
+        try:
+            fingerprint = binary_manager.read_machine_fingerprint()
+        except Exception as exc:  # noqa: BLE001 - must never crash QGIS
+            QMessageBox.critical(
+                self,
+                "Could not read machine fingerprint",
+                f"Failed to read this machine's fingerprint:\n\n{exc}",
+            )
+            return
+
+        # Copyable text field so the user can select and copy the value.
+        QInputDialog.getText(
+            self,
+            "Machine fingerprint",
+            "Send this fingerprint to get a machine-locked license key:",
+            QLineEdit.Normal,
+            fingerprint,
+        )
 
     def _refresh_api_status(self) -> None:
         """Update the API-key status label from the current field value."""

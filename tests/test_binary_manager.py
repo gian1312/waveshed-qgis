@@ -243,5 +243,79 @@ class TestClearQuarantine(unittest.TestCase):
         remove.assert_not_called()
 
 
+class TestReadMachineFingerprint(unittest.TestCase):
+    """`aether_core --fingerprint` wrapper (subprocess factored out for tests)."""
+
+    _FP = "ab" * 32  # 64-char lowercase hex
+
+    def _run(self, **run_kwargs):
+        """Patch find_binary + subprocess.run; return the patched run mock."""
+        fb = mock.patch.object(bm, "find_binary", return_value="/bin/aether_core")
+        run = mock.patch.object(bm.subprocess, "run", **run_kwargs)
+        fb.start()
+        r = run.start()
+        self.addCleanup(fb.stop)
+        self.addCleanup(run.stop)
+        return r
+
+    def test_success_returns_stripped_fingerprint(self):
+        run = self._run()
+        run.return_value = mock.Mock(returncode=0, stdout=self._FP + "\n", stderr="")
+
+        result = bm.read_machine_fingerprint()
+
+        self.assertEqual(result, self._FP)
+        argv, kwargs = run.call_args
+        self.assertEqual(argv[0], ["/bin/aether_core", "--fingerprint"])
+        self.assertEqual(kwargs.get("timeout"), 10.0)
+        self.assertTrue(kwargs.get("capture_output"))
+
+    def test_custom_timeout_is_passed_through(self):
+        run = self._run()
+        run.return_value = mock.Mock(returncode=0, stdout=self._FP, stderr="")
+        bm.read_machine_fingerprint(timeout=2.5)
+        _argv, kwargs = run.call_args
+        self.assertEqual(kwargs.get("timeout"), 2.5)
+
+    def test_uppercase_hex_is_rejected(self):
+        run = self._run()
+        run.return_value = mock.Mock(returncode=0, stdout=self._FP.upper(), stderr="")
+        with self.assertRaises(RuntimeError):
+            bm.read_machine_fingerprint()
+
+    def test_wrong_length_output_is_rejected(self):
+        run = self._run()
+        run.return_value = mock.Mock(returncode=0, stdout="deadbeef", stderr="")
+        with self.assertRaises(RuntimeError):
+            bm.read_machine_fingerprint()
+
+    def test_nonzero_exit_raises_with_detail(self):
+        run = self._run()
+        run.return_value = mock.Mock(returncode=3, stdout="", stderr="kaboom")
+        with self.assertRaises(RuntimeError) as cm:
+            bm.read_machine_fingerprint()
+        self.assertIn("kaboom", str(cm.exception))
+
+    def test_timeout_raises_runtime_error(self):
+        self._run(side_effect=bm.subprocess.TimeoutExpired("aether_core", 10))
+        with self.assertRaises(RuntimeError) as cm:
+            bm.read_machine_fingerprint()
+        self.assertIn("timed out", str(cm.exception))
+
+    def test_os_error_raises_runtime_error(self):
+        self._run(side_effect=OSError("EACCES"))
+        with self.assertRaises(RuntimeError) as cm:
+            bm.read_machine_fingerprint()
+        self.assertIn("Could not run", str(cm.exception))
+
+    def test_binary_not_found_raises(self):
+        # find_binary raises when the engine is not installed -> propagates.
+        with mock.patch.object(
+            bm, "find_binary", side_effect=RuntimeError("not found")
+        ):
+            with self.assertRaises(RuntimeError):
+                bm.read_machine_fingerprint()
+
+
 if __name__ == "__main__":
     unittest.main()
