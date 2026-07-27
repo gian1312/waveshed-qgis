@@ -1,10 +1,12 @@
 """Waveshed API key storage and validation.
 
-A Waveshed API key is an 84-byte payload encoded with Base58 (the Bitcoin
-alphabet), i.e. roughly 115 characters. Validation here is structural only:
-non-empty, valid Base58 charset, and decodes to exactly 84 bytes. Real
-Ed25519 signature verification against the plugin's embedded public key will
-be added once key issuance is live (see the TODO in :func:`validate_api_key`).
+A Waveshed API key is a Base58 (Bitcoin alphabet) blob whose decoded payload is
+either 84 bytes (v1) or 116 bytes (v2, node-locked — v1 plus a 32-byte machine
+fingerprint), i.e. roughly 115–160 characters. Validation here is structural
+only: non-empty, valid Base58 charset, and a decoded length that is one of the
+accepted payload sizes. Real Ed25519 signature verification against the
+plugin's embedded public key will be added once key issuance is live (see the
+TODO in :func:`validate_api_key`).
 
 Pure standard library — no external dependencies (no PyNaCl / base58 package).
 """
@@ -35,8 +37,13 @@ class ApiKeyError(Exception):
 GET_API_KEY_URL = "https://waveshed.io/downloads"
 _GET_KEY_HINT = f"Get a key at {GET_API_KEY_URL}"
 
-#: Decoded payload length (bytes) of a valid Waveshed API key.
-KEY_PAYLOAD_BYTES = 84
+#: Accepted decoded payload lengths (bytes). v1 keys are 84 bytes; v2
+#: node-locked keys are 116 bytes (v1 payload + a 32-byte machine fingerprint).
+KEY_PAYLOAD_LENGTHS = (84, 116)
+
+#: Epoch for license expiry: the u16 BE value at payload bytes ``[0:2]`` is the
+#: number of days since this date.
+KEY_EPOCH = datetime.date(2026, 1, 1)
 
 #: Environment variable the Aether engine reads the license/key from.
 LICENSE_ENV_VAR = "AETHER_LICENSE"
@@ -82,8 +89,8 @@ def b58decode(text: str) -> bytes:
 def validate_api_key(key_string: str) -> tuple[bool, str, datetime.date | None]:
     """Validate a Waveshed API key structurally.
 
-    A valid key is Base58 text whose payload decodes to exactly
-    :data:`KEY_PAYLOAD_BYTES` bytes.
+    A valid key is Base58 text whose payload decodes to one of the accepted
+    :data:`KEY_PAYLOAD_LENGTHS` (84 bytes for v1, 116 for v2 node-locked).
 
     Returns
     -------
@@ -103,17 +110,63 @@ def validate_api_key(key_string: str) -> tuple[bool, str, datetime.date | None]:
             None,
         )
 
-    if len(raw) != KEY_PAYLOAD_BYTES:
+    if len(raw) not in KEY_PAYLOAD_LENGTHS:
+        accepted = " or ".join(str(n) for n in KEY_PAYLOAD_LENGTHS)
         return (
             False,
             f"Invalid API key: decoded to {len(raw)} bytes, expected "
-            f"{KEY_PAYLOAD_BYTES}. {_GET_KEY_HINT}",
+            f"{accepted}. {_GET_KEY_HINT}",
             None,
         )
 
-    # TODO: verify the 84-byte payload's embedded Ed25519 signature against
-    # the plugin's embedded public key once server-side issuance is live.
+    # TODO: verify the payload's embedded Ed25519 signature against the
+    # plugin's embedded public key once server-side issuance is live.
     return True, "Key accepted", None
+
+
+# ---------------------------------------------------------------------------
+# Structural inspection (public metadata only — NO signature verification)
+# ---------------------------------------------------------------------------
+
+
+def inspect_key(key_string: str) -> dict | None:
+    """Return public metadata decoded from a structurally valid key.
+
+    Pure standard library and **structural only** — this does NOT verify the
+    Ed25519 signature (the verifying public key lives in the engine binary), so
+    treat the result as advisory display metadata, never as proof of validity.
+
+    Returns ``None`` if *key_string* is not structurally valid. Otherwise a
+    dict:
+
+    ``version``
+        ``1`` (84-byte payload) or ``2`` (116-byte node-locked payload).
+    ``expiry``
+        :class:`datetime.date` decoded from payload bytes ``[0:2]`` (u16 BE
+        days since :data:`KEY_EPOCH`).
+    ``locked``
+        ``True`` for a v2 key whose 32-byte fingerprint field (payload bytes
+        ``[20:52]``) is non-zero, i.e. bound to a specific machine.
+    ``fingerprint_hex``
+        Lowercase hex of the v2 fingerprint field, or ``None`` for v1.
+    """
+    is_valid, _message, _ = validate_api_key(key_string)
+    if not is_valid:
+        return None
+
+    raw = b58decode(key_string.strip())
+    version = 2 if len(raw) == 116 else 1
+
+    exp_days = int.from_bytes(raw[0:2], "big")
+    expiry = KEY_EPOCH + datetime.timedelta(days=exp_days)
+
+    fingerprint = raw[20:52] if version == 2 else b""
+    return {
+        "version": version,
+        "expiry": expiry,
+        "locked": any(fingerprint),
+        "fingerprint_hex": fingerprint.hex() if version == 2 else None,
+    }
 
 
 # ---------------------------------------------------------------------------
