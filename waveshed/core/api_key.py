@@ -57,6 +57,19 @@ _B58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
 _B58_INDEX = {ch: i for i, ch in enumerate(_B58_ALPHABET)}
 
 
+def _normalize_key(key_string: str) -> str:
+    """Return *key_string* with every whitespace character removed.
+
+    A Base58 key never contains whitespace, so a genuine key copied out of a
+    wrapped terminal line — which can pick up internal spaces, tabs, or
+    newlines in addition to leading/trailing padding — is still the same key
+    once all whitespace is stripped. Removing it (not just the ends) is
+    therefore lossless and lets such copy artefacts validate correctly.
+    ``str.split()`` treats every Unicode whitespace character as a separator.
+    """
+    return "".join((key_string or "").split())
+
+
 def b58decode(text: str) -> bytes:
     """Decode a Base58 (Bitcoin alphabet) string to raw bytes.
 
@@ -100,13 +113,14 @@ def validate_api_key(key_string: str) -> tuple[bool, str, datetime.date | None]:
     if not key_string or not key_string.strip():
         return False, f"No API key provided. {_GET_KEY_HINT}", None
 
-    key = key_string.strip()
+    key = _normalize_key(key_string)
     try:
         raw = b58decode(key)
     except ValueError:
         return (
             False,
-            f"Invalid API key: not valid Base58 text. {_GET_KEY_HINT}",
+            f"Invalid API key: not valid Base58 text (check for characters "
+            f"accidentally copied from the terminal). {_GET_KEY_HINT}",
             None,
         )
 
@@ -154,7 +168,7 @@ def inspect_key(key_string: str) -> dict | None:
     if not is_valid:
         return None
 
-    raw = b58decode(key_string.strip())
+    raw = b58decode(_normalize_key(key_string))
     version = 2 if len(raw) == 116 else 1
 
     exp_days = int.from_bytes(raw[0:2], "big")
@@ -182,8 +196,13 @@ def get_stored_key() -> str:
 
 
 def store_key(key_string: str) -> None:
-    """Write an API key to persistent QGIS settings."""
-    QgsSettings().setValue(_SETTINGS_KEY, key_string)
+    """Write an API key to persistent QGIS settings.
+
+    The key is normalized (all whitespace removed) before storage so the saved
+    value is a clean, whitespace-free Base58 string regardless of copy-paste
+    artefacts.
+    """
+    QgsSettings().setValue(_SETTINGS_KEY, _normalize_key(key_string))
 
 
 # ---------------------------------------------------------------------------

@@ -154,6 +154,89 @@ class TestInspectKey(unittest.TestCase):
         )
 
 
+def _wrap(key: str, every: int = 20, newline_at: int = 40) -> str:
+    """Simulate a key copied across wrapped terminal lines.
+
+    Inserts a space every *every* characters and a newline every *newline_at*
+    characters, so the result carries both internal spaces and embedded
+    newlines while decoding to the same key once whitespace is removed.
+    """
+    out: list[str] = []
+    for i, ch in enumerate(key):
+        if i and i % newline_at == 0:
+            out.append("\n")
+        elif i and i % every == 0:
+            out.append(" ")
+        out.append(ch)
+    return "".join(out)
+
+
+class TestKeyNormalization(unittest.TestCase):
+    """Keys copied from a wrapped terminal (internal spaces / newlines) must
+    still validate, inspect, and store as the same clean key."""
+
+    def test_normalize_removes_all_whitespace(self):
+        self.assertEqual(ak._normalize_key(" a b\tc\r\nd "), "abcd")
+        self.assertEqual(ak._normalize_key(" x y\n"), "xy")  # unicode ws
+        self.assertEqual(ak._normalize_key(""), "")
+        self.assertEqual(ak._normalize_key(None), "")
+
+    def test_v1_key_with_internal_whitespace_validates(self):
+        key = _b58encode(_v1_raw())
+        wrapped = _wrap(key)
+        self.assertIn(" ", wrapped)
+        self.assertIn("\n", wrapped)
+        self.assertNotEqual(wrapped, key)
+        ok, msg, _ = ak.validate_api_key(wrapped)
+        self.assertTrue(ok, msg)
+
+    def test_v2_key_with_internal_whitespace_validates_and_inspects(self):
+        fp = bytes(range(1, 33))
+        key = _b58encode(_v2_raw(fingerprint=fp))
+        wrapped = _wrap(key)
+        ok, msg, _ = ak.validate_api_key(wrapped)
+        self.assertTrue(ok, msg)
+        info = ak.inspect_key(wrapped)
+        self.assertEqual(info["version"], 2)
+        self.assertTrue(info["locked"])
+        self.assertEqual(info["fingerprint_hex"], fp.hex())
+
+    def test_embedded_newline_only_validates(self):
+        key = _b58encode(_v1_raw())
+        mid = len(key) // 2
+        with_newline = key[:mid] + "\n" + key[mid:]
+        ok, msg, _ = ak.validate_api_key(with_newline)
+        self.assertTrue(ok, msg)
+
+    def test_base58_error_hints_at_copy_issue(self):
+        ok, msg, _ = ak.validate_api_key("has_0_and_O_invalid")
+        self.assertFalse(ok)
+        self.assertIn("Base58", msg)
+        self.assertIn("terminal", msg.lower())  # copy-issue hint
+
+
+class TestStoreKeyNormalization(unittest.TestCase):
+    """store_key persists the normalized (whitespace-free) form."""
+
+    def setUp(self):
+        ak.store_key("")
+
+    def tearDown(self):
+        ak.store_key("")
+
+    def test_store_persists_whitespace_free_form(self):
+        key = _b58encode(_v2_raw())
+        wrapped = _wrap(key)
+        ak.store_key(wrapped)
+        stored = ak.get_stored_key()
+        self.assertEqual(stored, key)          # clean, whitespace-free
+        self.assertNotIn(" ", stored)
+        self.assertNotIn("\n", stored)
+        # ...and the stored form is directly usable.
+        ok, _msg, _ = ak.validate_api_key(stored)
+        self.assertTrue(ok)
+
+
 class TestLicenseEnv(unittest.TestCase):
     def setUp(self):
         ak.store_key("")
