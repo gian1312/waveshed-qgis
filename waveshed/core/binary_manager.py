@@ -160,6 +160,50 @@ def find_binary(name: str) -> str:
     )
 
 
+def _fingerprint_error_message(returncode: int, stdout: str, stderr: str) -> str:
+    """Classify a failed ``aether_core --fingerprint`` run into a user message.
+
+    Pure (no subprocess or IO) so it can be unit-tested directly. It draws the
+    important distinction between an engine that is *too old* to understand the
+    ``--fingerprint`` flag and a genuine fingerprint *computation* failure:
+
+    * Too old — the flag postdates this binary, so clap rejects it as an
+      unknown argument (typically exit code 2, stderr like
+      ``error: unexpected argument '--fingerprint' found``). The fix is to
+      update the engine, so we say exactly that.
+    * Compute failure — the current engine understands the flag but cannot
+      build a fingerprint, reported as exit 1 with ``[E:...]`` on stderr. That
+      message is already actionable, so we surface it verbatim rather than
+      wrongly telling the user to update a binary that is not the problem.
+
+    The ``--help`` heuristic is deliberately paired with a ``fingerprint``
+    mention so it matches clap's "try '--help'" footer without also matching a
+    compute error, whose text mentions "fingerprint" but never ``--help``.
+    """
+    detail = (stderr or stdout or "").strip()
+    blob = f"{stdout}\n{stderr}".lower()
+
+    engine_too_old = (
+        returncode == 2
+        or "unexpected argument" in blob
+        or "unrecognized" in blob
+        or "for more information, try" in blob
+        or ("--help" in blob and "fingerprint" in blob)
+        or ("error:" in blob and "argument" in blob)
+    )
+    if engine_too_old:
+        return (
+            "This Aether engine build does not support fingerprint reporting "
+            "(needs engine v0.4.2 or newer). Update the engine binaries via "
+            "Settings → Download binaries, then try again."
+        )
+
+    return (
+        f"aether_core --fingerprint exited with code {returncode}"
+        + (f": {detail}" if detail else ".")
+    )
+
+
 def read_machine_fingerprint(timeout: float = 10.0) -> str:
     """Return this machine's Aether engine fingerprint (64-char lowercase hex).
 
@@ -195,11 +239,11 @@ def read_machine_fingerprint(timeout: float = 10.0) -> str:
         ) from exc
 
     if result.returncode != 0:
-        detail = (result.stderr or result.stdout or "").strip()
-        raise RuntimeError(
-            f"aether_core --fingerprint exited with code {result.returncode}"
-            + (f": {detail}" if detail else ".")
+        message = _fingerprint_error_message(
+            result.returncode, result.stdout or "", result.stderr or ""
         )
+        QgsMessageLog.logMessage(message, TAG, Qgis.MessageLevel.Warning)
+        raise RuntimeError(message)
 
     fingerprint = (result.stdout or "").strip()
     if len(fingerprint) != 64 or any(c not in "0123456789abcdef" for c in fingerprint):

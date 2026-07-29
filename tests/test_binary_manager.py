@@ -316,6 +316,86 @@ class TestReadMachineFingerprint(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 bm.read_machine_fingerprint()
 
+    def test_old_engine_missing_flag_suggests_update(self):
+        # An engine built before --fingerprint existed: clap exits 2 and
+        # complains about the unknown argument. The user needs to update, not
+        # to read a raw "exited 2".
+        run = self._run()
+        run.return_value = mock.Mock(
+            returncode=2,
+            stdout="",
+            stderr="error: unexpected argument '--fingerprint' found\n"
+                   "For more information, try '--help'.",
+        )
+        with self.assertRaises(RuntimeError) as cm:
+            bm.read_machine_fingerprint()
+        msg = str(cm.exception)
+        self.assertIn("v0.4.2", msg)
+        self.assertIn("update", msg.lower())
+        self.assertNotIn("exited with code", msg)  # not the raw generic error
+
+    def test_compute_error_is_surfaced_not_reported_as_too_old(self):
+        # The current engine understands --fingerprint but cannot compute one
+        # (exit 1, [E:...] on stderr). Surface that message; do NOT tell the
+        # user to update a binary that is not the problem.
+        run = self._run()
+        run.return_value = mock.Mock(
+            returncode=1,
+            stdout="",
+            stderr="[E:could not compute machine fingerprint: no /etc/machine-id]",
+        )
+        with self.assertRaises(RuntimeError) as cm:
+            bm.read_machine_fingerprint()
+        msg = str(cm.exception)
+        self.assertIn("could not compute machine fingerprint", msg)
+        self.assertNotIn("v0.4.2", msg)
+        self.assertNotIn("update", msg.lower())
+
+    def test_happy_path_still_returns_hex(self):
+        # Newest engine: 64-hex on stdout, a hint on stderr, exit 0.
+        run = self._run()
+        run.return_value = mock.Mock(
+            returncode=0, stdout=self._FP + "\n", stderr="(send this to get a license)"
+        )
+        self.assertEqual(bm.read_machine_fingerprint(), self._FP)
+
+
+class TestFingerprintErrorMessage(unittest.TestCase):
+    """Direct unit tests for the pure classifier (no subprocess involved)."""
+
+    _UPDATE = "v0.4.2"  # marker of the "engine too old" message
+
+    def test_too_old_signatures_all_suggest_update(self):
+        cases = [
+            # (returncode, stdout, stderr)
+            (2, "", "error: unexpected argument '--fingerprint' found"),
+            (2, "", "For more information, try '--help'."),
+            (1, "", "error: unexpected argument '--fingerprint' found"),
+            (1, "", "error: Found argument '--fingerprint' which wasn't expected"),
+            (1, "", "unrecognized option '--fingerprint'"),
+            (1, "", "run with '--fingerprint --help' to see usage"),
+        ]
+        for rc, out, err in cases:
+            with self.subTest(returncode=rc, stderr=err):
+                msg = bm._fingerprint_error_message(rc, out, err)
+                self.assertIn(self._UPDATE, msg)
+                self.assertIn("update", msg.lower())
+
+    def test_compute_error_is_not_classified_too_old(self):
+        # Exit 1 [E:...] compute failure must keep its own surfaced message.
+        msg = bm._fingerprint_error_message(
+            1, "", "[E:could not compute machine fingerprint: no /etc/machine-id]"
+        )
+        self.assertIn("could not compute machine fingerprint", msg)
+        self.assertNotIn(self._UPDATE, msg)
+        self.assertNotIn("update", msg.lower())
+
+    def test_generic_nonzero_preserves_detail(self):
+        msg = bm._fingerprint_error_message(3, "", "kaboom")
+        self.assertIn("exited with code 3", msg)
+        self.assertIn("kaboom", msg)
+        self.assertNotIn(self._UPDATE, msg)
+
 
 if __name__ == "__main__":
     unittest.main()
