@@ -7,7 +7,7 @@ from qgis.core import QgsApplication
 
 
 class AetherPlugin:
-    """QGIS Plugin implementation for AETHER RF propagation engine."""
+    """QGIS plugin implementation for Waveshed — GUI for the Aether RF propagation engine."""
 
     def __init__(self, iface):
         self.iface = iface

@@ -1,4 +1,4 @@
-"""AETHER QGIS Plugin — GPU-accelerated RF propagation analysis."""
+"""Waveshed QGIS Plugin — GPU-accelerated RF propagation analysis."""
 
 
 def classFactory(iface):

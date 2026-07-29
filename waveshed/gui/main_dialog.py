@@ -35,7 +35,7 @@ class AetherMainDialog(QDialog):
         super().__init__(parent or iface.mainWindow())
         self.iface = iface
 
-        self.setWindowTitle("AETHER RF Analysis")
+        self.setWindowTitle("Waveshed")
         self.setMinimumSize(640, 580)
 
         # Non-modal: clean up on close and float as a proper window
