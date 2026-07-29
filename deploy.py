@@ -2,8 +2,15 @@
 
 Reads machine-specific paths from deploy.local.ini (gitignored).
 Copy deploy.local.template.ini -> deploy.local.ini and fill in your paths.
+
+Run with no arguments for the interactive install above. Other modes:
+  python deploy.py --status    # report install location / version / binaries
+  python deploy.py --remove    # uninstall the plugin (leaves the source alone)
+  python deploy.py --headless  # install without killing/launching QGIS
+See ``python deploy.py --help`` for the full flag list.
 """
 
+import argparse
 import configparser
 import os
 import shutil
@@ -11,6 +18,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from typing import Optional
 
 # ============================================================================
 # Options — toggle these before hitting Run in PyCharm
@@ -39,11 +47,13 @@ SKIP_DIRS = {"__pycache__", ".pytest_cache", ".git", ".idea"}
 SKIP_EXTS = {".pyc", ".pyo"}
 
 
-def read_config() -> dict:
+def read_config(required: bool = True) -> dict:
     if not CONFIG_FILE.exists():
-        print("[Error] deploy.local.ini not found.")
-        print(f"        Copy deploy.local.template.ini -> deploy.local.ini and fill in your paths.")
-        sys.exit(1)
+        if required:
+            print("[Error] deploy.local.ini not found.")
+            print(f"        Copy deploy.local.template.ini -> deploy.local.ini and fill in your paths.")
+            sys.exit(1)
+        return {"qgis_exe": "", "plugin_dir": "", "aether_bin_dir": ""}
 
     cfg = configparser.ConfigParser()
     cfg.read(CONFIG_FILE, encoding="utf-8")
@@ -75,15 +85,72 @@ def kill_qgis() -> bool:
     return killed
 
 
+def launch_qgis(qgis_exe: str) -> None:
+    """Start QGIS detached from this process."""
+    subprocess.Popen([qgis_exe], creationflags=getattr(subprocess, "DETACHED_PROCESS", 0))
+
+
 def resolve_plugin_dir(override: str) -> Path:
+    """Return the QGIS plugins dir: an existing ``override`` wins, else the
+    per-platform default profile location."""
     if override and Path(override).is_dir():
         return Path(override)
 
-    appdata = os.environ.get("APPDATA", "")
-    if appdata:
-        return Path(appdata) / "QGIS" / "QGIS3" / "profiles" / "default" / "python" / "plugins"
+    if sys.platform == "win32":
+        appdata = os.environ.get("APPDATA", "")
+        if appdata:
+            return Path(appdata) / "QGIS" / "QGIS3" / "profiles" / "default" / "python" / "plugins"
+    elif sys.platform == "darwin":
+        return (Path.home() / "Library" / "Application Support"
+                / "QGIS" / "QGIS3" / "profiles" / "default" / "python" / "plugins")
 
     return Path.home() / ".local" / "share" / "QGIS" / "QGIS3" / "profiles" / "default" / "python" / "plugins"
+
+
+def is_installed(plugin_dir: Path) -> bool:
+    """True when a ``waveshed`` plugin package is present in ``plugin_dir``."""
+    return (plugin_dir / "waveshed").is_dir()
+
+
+def installed_version(plugin_dir: Path) -> Optional[str]:
+    """Return ``version`` from the installed metadata.txt, or None if absent."""
+    meta = plugin_dir / "waveshed" / "metadata.txt"
+    if not meta.is_file():
+        return None
+    cfg = configparser.ConfigParser()
+    try:
+        cfg.read(meta, encoding="utf-8")
+    except configparser.Error:
+        return None
+    return cfg.get("general", "version", fallback=None)
+
+
+def installed_binaries(plugin_dir: Path) -> list:
+    """Report each known engine binary under ``<plugin_dir>/waveshed/bin``.
+
+    Returns one ``{"name", "required", "present"}`` record per binary in
+    ``BINARIES`` (independent of the filesystem's contents otherwise).
+    """
+    bin_dir = plugin_dir / "waveshed" / "bin"
+    return [
+        {"name": name, "required": name in REQUIRED_BINARIES, "present": (bin_dir / name).is_file()}
+        for name in BINARIES
+    ]
+
+
+def remove_plugin(plugin_dir: Path) -> Optional[Path]:
+    """Delete ``<plugin_dir>/waveshed`` (including its bin/) if present.
+
+    Returns the removed path, or None when nothing was installed. Refuses to
+    delete the plugin source tree so a stray ``--plugin-dir`` can never wipe it.
+    """
+    target = plugin_dir / "waveshed"
+    if target.resolve() == SOURCE_DIR.resolve():
+        raise ValueError(f"refusing to remove the plugin source tree: {target}")
+    if not target.exists():
+        return None
+    shutil.rmtree(target)
+    return target
 
 
 def copy_plugin(source: Path, target: Path) -> int:
@@ -210,28 +277,64 @@ def report_binaries(records: list, aether_bin_dir: str) -> list:
     return [n for n in REQUIRED_BINARIES if n not in by_name]
 
 
-def main():
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="deploy.py",
+        description="Test-deploy the Waveshed plugin into the local QGIS plugins dir.",
+    )
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--remove", action="store_true",
+                      help="Uninstall the plugin from the plugins dir (never touches the source).")
+    mode.add_argument("--status", action="store_true",
+                      help="Report install location, version and staged binaries, then exit.")
+
+    parser.add_argument("--plugin-dir", default="", metavar="PATH",
+                        help="Override the target QGIS plugins dir (else config / auto-detect).")
+    parser.add_argument("--binaries", default="", metavar="DIR",
+                        help="Override the engine binary source dir (else aether_bin_dir from config).")
+    parser.add_argument("--no-binaries", action="store_true",
+                        help="Skip copying the engine binaries when installing.")
+    parser.add_argument("--no-kill", action="store_true",
+                        help="Do not close a running QGIS before deploying.")
+    parser.add_argument("--no-launch", action="store_true",
+                        help="Do not launch QGIS after deploying.")
+    parser.add_argument("--headless", "--quiet", action="store_true", dest="headless",
+                        help="Imply --no-kill and --no-launch (no QGIS process is touched).")
+    parser.add_argument("--restart", action="store_true",
+                        help="With --remove, also close QGIS first and relaunch it afterwards.")
+    return parser
+
+
+def run_install(args: argparse.Namespace) -> int:
     cfg = read_config()
 
-    qgis_exe = cfg["qgis_exe"]
-    if not qgis_exe or not Path(qgis_exe).is_file():
-        print(f"[Error] qgis_exe not found: '{qgis_exe}'")
-        sys.exit(1)
+    no_binaries = args.no_binaries or NO_BINARIES
+    no_kill = args.no_kill or args.headless
+    no_launch = args.no_launch or args.headless or NO_LAUNCH
 
-    plugin_dir = resolve_plugin_dir(cfg["plugin_dir"])
+    qgis_exe = cfg["qgis_exe"]
+    if not no_launch and (not qgis_exe or not Path(qgis_exe).is_file()):
+        print(f"[Error] qgis_exe not found: '{qgis_exe}'")
+        return 1
+
+    plugin_dir = resolve_plugin_dir(args.plugin_dir or cfg["plugin_dir"])
     target_dir = plugin_dir / "waveshed"
+    bin_dir = args.binaries or cfg["aether_bin_dir"]
 
     print("=== AETHER QGIS Plugin Deploy ===")
     print(f"  Source:    {SOURCE_DIR}")
     print(f"  Target:    {target_dir}")
-    print(f"  QGIS:      {qgis_exe}")
-    if cfg["aether_bin_dir"]:
-        print(f"  Binaries:  {cfg['aether_bin_dir']}")
+    if qgis_exe:
+        print(f"  QGIS:      {qgis_exe}")
+    if bin_dir:
+        print(f"  Binaries:  {bin_dir}")
     print()
 
     # 1. Kill QGIS
     print("[1/4] Closing QGIS...", end=" ")
-    if kill_qgis():
+    if no_kill:
+        print("skipped.")
+    elif kill_qgis():
         time.sleep(2)
         print("closed.")
     else:
@@ -244,10 +347,10 @@ def main():
 
     # 3. Copy binaries
     missing_required: list = []
-    if not NO_BINARIES and cfg["aether_bin_dir"] and Path(cfg["aether_bin_dir"]).is_dir():
-        print(f"[3/4] Copying binaries from {cfg['aether_bin_dir']} ...")
-        records = copy_binaries(cfg["aether_bin_dir"], target_dir)
-        missing_required = report_binaries(records, cfg["aether_bin_dir"])
+    if not no_binaries and bin_dir and Path(bin_dir).is_dir():
+        print(f"[3/4] Copying binaries from {bin_dir} ...")
+        records = copy_binaries(bin_dir, target_dir)
+        missing_required = report_binaries(records, bin_dir)
         print(f"       {len(records)} binaries copied.")
         if missing_required:
             print()
@@ -255,21 +358,102 @@ def main():
                   + ", ".join(sorted(missing_required)))
             print("       The plugin cannot run analyses without these. Build")
             print("       them in AETHER (rust/deploy.ps1) and re-run deploy.")
-    elif NO_BINARIES:
-        print("[3/4] Skipping binary copy (NO_BINARIES).")
+    elif no_binaries:
+        print("[3/4] Skipping binary copy (--no-binaries).")
     else:
         print("[3/4] Skipping binary copy (aether_bin_dir not set or missing).")
 
     # 4. Launch QGIS
-    if not NO_LAUNCH:
+    if not no_launch:
         print("[4/4] Launching QGIS...", end=" ")
-        subprocess.Popen([qgis_exe], creationflags=getattr(subprocess, "DETACHED_PROCESS", 0))
+        launch_qgis(qgis_exe)
         print("done.")
     else:
         print("[4/4] Skipping QGIS launch.")
 
     print("\nDeploy complete.")
+    return 0
+
+
+def run_status(args: argparse.Namespace) -> int:
+    cfg = read_config(required=False)
+    plugin_dir = resolve_plugin_dir(args.plugin_dir or cfg["plugin_dir"])
+    installed = is_installed(plugin_dir)
+    version = installed_version(plugin_dir) if installed else None
+    binaries = installed_binaries(plugin_dir)
+
+    # Machine-readable (one key=value per line).
+    print(f"plugin_dir={plugin_dir}")
+    print(f"installed={'yes' if installed else 'no'}")
+    print(f"version={version or ''}")
+    for rec in binaries:
+        tag = "REQUIRED" if rec["required"] else "optional"
+        state = "present" if rec["present"] else "missing"
+        print(f"binary.{rec['name']}={state} ({tag})")
+
+    # Human-readable.
+    print()
+    print("=== Waveshed Plugin Status ===")
+    print(f"  Plugin dir: {plugin_dir}")
+    if installed:
+        print(f"  Installed:  yes (version {version or 'unknown'})")
+        print("  Binaries in bin/:")
+        for rec in binaries:
+            tag = "REQUIRED" if rec["required"] else "optional"
+            state = "present" if rec["present"] else "MISSING"
+            print(f"    - {rec['name']}: {state} ({tag})")
+    else:
+        print("  Installed:  no")
+    return 0
+
+
+def run_remove(args: argparse.Namespace) -> int:
+    cfg = read_config(required=False)
+    plugin_dir = resolve_plugin_dir(args.plugin_dir or cfg["plugin_dir"])
+    target = plugin_dir / "waveshed"
+
+    print("=== Waveshed Plugin Remove ===")
+    print(f"  Plugin dir: {plugin_dir}")
+
+    if args.restart:
+        print("Closing QGIS...", end=" ")
+        if kill_qgis():
+            time.sleep(2)
+            print("closed.")
+        else:
+            print("not running.")
+
+    try:
+        removed = remove_plugin(plugin_dir)
+    except ValueError as exc:
+        print(f"[Error] {exc}")
+        return 1
+
+    if removed is None:
+        print(f"Nothing to remove ({target} not present).")
+    else:
+        print(f"Removed {removed}")
+
+    if args.restart:
+        qgis_exe = cfg["qgis_exe"]
+        if qgis_exe and Path(qgis_exe).is_file():
+            print("Relaunching QGIS...", end=" ")
+            launch_qgis(qgis_exe)
+            print("done.")
+        else:
+            print(f"[Warn] cannot relaunch QGIS, qgis_exe not found: '{qgis_exe}'")
+
+    return 0
+
+
+def main(argv: Optional[list] = None) -> int:
+    args = build_parser().parse_args(argv)
+    if args.status:
+        return run_status(args)
+    if args.remove:
+        return run_remove(args)
+    return run_install(args)
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
