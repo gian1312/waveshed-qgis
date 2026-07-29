@@ -213,6 +213,7 @@ _qtcore.Qt = type("Qt", (), {
 _qtcore.QThread = _MockQThread
 _qtcore.pyqtSignal = _MockSignalDescriptor
 _qtcore.QTimer = mock.MagicMock()
+_qtcore.QUrl = type("QUrl", (), {"__init__": lambda self, *a, **kw: None})
 
 # Qt Widgets — create lightweight stubs for all used widgets
 _widget_names = [
@@ -222,7 +223,7 @@ _widget_names = [
     "QMessageBox", "QPlainTextEdit", "QProgressBar", "QPushButton",
     "QRadioButton", "QSizePolicy", "QSpinBox", "QSplitter",
     "QTableWidget", "QTableWidgetItem", "QTabWidget", "QToolButton",
-    "QVBoxLayout", "QWidget", "QInputDialog",
+    "QVBoxLayout", "QWidget", "QInputDialog", "QDialogButtonBox",
 ]
 for name in _widget_names:
     if name in ("QWidget",):
@@ -242,9 +243,17 @@ for name in _widget_names:
     else:
         setattr(_qtwidgets, name, type(name, (), {"__init__": lambda self, *a, **kw: None}))
 
+# Extra widget attributes some dialogs reference at call time.
+_qtwidgets.QInputDialog.getText = staticmethod(lambda *a, **kw: ("", False))
+_qtwidgets.QLineEdit.Normal = 0
+_qtwidgets.QLineEdit.Password = 2
+
 # Qt GUI
 _qtgui.QColor = type("QColor", (), {"__init__": lambda self, *a: None})
 _qtgui.QIcon = type("QIcon", (), {"__init__": lambda self, *a: None})
+_qtgui.QDesktopServices = type(
+    "QDesktopServices", (), {"openUrl": staticmethod(lambda *a, **kw: True)}
+)
 
 # Install module tree
 for mod_name, mod_obj in [

@@ -87,6 +87,25 @@ class _DownloadThread(QThread):
             self.finished_err.emit(str(exc))
 
 
+class _FingerprintThread(QThread):
+    """Read this machine's Aether fingerprint off the main thread.
+
+    ``binary_manager.read_machine_fingerprint()`` spawns ``aether_core``
+    (and, on Windows, ``reg query``) and can block for up to ~10s, so it must
+    not run on the UI thread or the dialog freezes.
+    """
+
+    finished_ok = pyqtSignal(str)     # 64-char hex fingerprint on success
+    finished_err = pyqtSignal(str)    # error message on failure
+
+    def run(self) -> None:  # noqa: D401 – Qt override
+        try:
+            fingerprint = binary_manager.read_machine_fingerprint()
+            self.finished_ok.emit(fingerprint)
+        except Exception as exc:  # noqa: BLE001 – surface any failure to the UI
+            self.finished_err.emit(str(exc))
+
+
 # ---------------------------------------------------------------------------
 # Dialog
 # ---------------------------------------------------------------------------
@@ -101,6 +120,7 @@ class SettingsDialog(QDialog):
 
         self._manifest_thread: _ManifestThread | None = None
         self._download_thread: _DownloadThread | None = None
+        self._fingerprint_thread: _FingerprintThread | None = None
         self._settings = QgsSettings()
 
         # --- Main layout -----------------------------------------------------
@@ -198,13 +218,13 @@ class SettingsDialog(QDialog):
         )
         row2.addWidget(btn_register)
 
-        btn_fingerprint = QPushButton("Show machine fingerprint")
-        btn_fingerprint.setToolTip(
+        self._btn_fingerprint = QPushButton("Show machine fingerprint")
+        self._btn_fingerprint.setToolTip(
             "Read this machine's hardware fingerprint, needed to request a "
             "machine-locked license key."
         )
-        btn_fingerprint.clicked.connect(self._show_machine_fingerprint)
-        row2.addWidget(btn_fingerprint)
+        self._btn_fingerprint.clicked.connect(self._show_machine_fingerprint)
+        row2.addWidget(self._btn_fingerprint)
         row2.addStretch()
         vbox.addLayout(row2)
 
@@ -465,22 +485,41 @@ class SettingsDialog(QDialog):
             self._btn_show_key.setText("Show")
 
     def _validate_api_key(self) -> None:
+        """Validate the entered key and, when valid, persist it immediately.
+
+        This handler is wired to the "Save" button, so a successful validation
+        must write the key to settings. Otherwise a user who clicks "Save" but
+        never clicks the dialog's OK button would lose the key and hit
+        "API key required" at run time. ``store_key`` normalizes the value
+        (removing any whitespace picked up from a wrapped terminal copy) before
+        writing, so the stored key is always clean.
+        """
         key_text = self._api_key_edit.text().strip()
         is_valid, message, _expiry = api_key.validate_api_key(key_text)
 
-        self._api_status_label.setText(message)
         if is_valid:
+            api_key.store_key(key_text)
+            self._api_status_label.setText("✓ Key saved")
             self._api_status_label.setStyleSheet("color: green;")
         else:
+            self._api_status_label.setText(message)
             self._api_status_label.setStyleSheet("color: red;")
 
     def _show_machine_fingerprint(self) -> None:
         """Read and display this machine's Aether engine fingerprint.
 
-        Off the main flow — nothing is persisted. If the engine binaries are
-        not installed the user is nudged to download them first; any probe
-        failure surfaces as an error dialog rather than crashing QGIS.
+        The probe (``aether_core --fingerprint``; on Windows it also spawns
+        ``reg query``) can block for up to ~10s, so it runs on a background
+        thread to keep the dialog responsive instead of freezing it. While the
+        read is in flight the button is disabled and shows a "Reading…" state;
+        it is always restored by the completion slots. Off the main flow —
+        nothing is persisted. If the engine binaries are not installed the user
+        is nudged to download them first; any probe failure surfaces as an
+        error dialog rather than crashing QGIS.
         """
+        if self._fingerprint_thread is not None and self._fingerprint_thread.isRunning():
+            return  # a read is already in progress
+
         if binary_manager.discover_binary_dir() is None:
             QMessageBox.information(
                 self,
@@ -491,16 +530,27 @@ class SettingsDialog(QDialog):
             )
             return
 
-        try:
-            fingerprint = binary_manager.read_machine_fingerprint()
-        except Exception as exc:  # noqa: BLE001 - must never crash QGIS
-            QMessageBox.critical(
-                self,
-                "Could not read machine fingerprint",
-                f"Failed to read this machine's fingerprint:\n\n{exc}",
-            )
-            return
+        # Immediate, visible feedback: disable and relabel the button so the
+        # user sees the read is under way while the dialog stays responsive.
+        self._btn_fingerprint.setEnabled(False)
+        self._btn_fingerprint.setText("Reading…")
 
+        self._fingerprint_thread = _FingerprintThread(parent=self)
+        self._fingerprint_thread.finished_ok.connect(self._on_fingerprint_ok)
+        self._fingerprint_thread.finished_err.connect(self._on_fingerprint_err)
+        self._fingerprint_thread.start()
+
+    def _restore_fingerprint_button(self) -> None:
+        """Re-enable and relabel the fingerprint button.
+
+        Always invoked from the completion slots so the button never gets stuck
+        in the disabled "Reading…" state.
+        """
+        self._btn_fingerprint.setEnabled(True)
+        self._btn_fingerprint.setText("Show machine fingerprint")
+
+    def _on_fingerprint_ok(self, fingerprint: str) -> None:
+        self._restore_fingerprint_button()
         # Copyable text field so the user can select and copy the value.
         QInputDialog.getText(
             self,
@@ -508,6 +558,16 @@ class SettingsDialog(QDialog):
             "Send this fingerprint to get a machine-locked license key:",
             QLineEdit.Normal,
             fingerprint,
+        )
+
+    def _on_fingerprint_err(self, error: str) -> None:
+        # Preserves read_machine_fingerprint's clear messages (incl. the
+        # "engine too old" path) — they arrive here as the error string.
+        self._restore_fingerprint_button()
+        QMessageBox.critical(
+            self,
+            "Could not read machine fingerprint",
+            f"Failed to read this machine's fingerprint:\n\n{error}",
         )
 
     def _refresh_api_status(self) -> None:
