@@ -1,0 +1,18 @@
+[general]
+name=Waveshed
+qgisMinimumVersion=3.28
+version=0.1.0
+author=Gian-Andrea Heinrich
+email=info@waveshed.io
+description=RF propagation analysis (coverage, point-to-point) powered by the Aether GPU engine.
+about=Waveshed provides RF propagation analysis for QGIS - area coverage (Site Analysis) and point-to-point link budgets - using LOS, Free-Space Path Loss, and ITM (Longley-Rice) models. All computation is performed by the proprietary Aether engine, a separate closed-source GPU binary that is NOT bundled with this plugin. The engine is downloaded on demand from https://waveshed.io through the plugin's Download dialog (an explicit, user-initiated action) and is licensed under its own EULA, shown for acceptance before download. Running analyses additionally requires an API key obtained from https://waveshed.io. Supported engine platforms: Windows x64, Linux x64, and macOS arm64.
+tracker=https://github.com/gian1312/waveshed-qgis/issues
+repository=https://github.com/gian1312/waveshed-qgis
+homepage=https://waveshed.io
+license=GPL-2.0-or-later
+tags=rf,propagation,radio,coverage,p2p,gpu,terrain,ITM,LOS,waveshed
+category=Analysis
+icon=resources/icon.png
+experimental=True
+deprecated=False
+hasProcessingProvider=yes

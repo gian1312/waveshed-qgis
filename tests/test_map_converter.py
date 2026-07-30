@@ -12,15 +12,97 @@ import re
 import tempfile
 import unittest
 
-from aether_qgis.gui.map_converter_tab import (
+from waveshed.gui.map_converter_tab import (
     _estimate_tile_count_and_mb,
     _abt_size_px,
     _ABT_EXTENT_DEG,
     _LayerEntry,
     _MapConverterWorker,
+    _fgb_cache_name,
+    _fgb_translate_options,
     _list_terrain_files,
     _detect_xyz_resolution,
 )
+
+
+class TestFgbCacheName(unittest.TestCase):
+    """The conversion cache lives in a shared, session-spanning temp dir, so
+    its file name must pin everything that determines the output."""
+
+    def _write(self, d, name, content="x"):
+        p = os.path.join(d, name)
+        with open(p, "w") as fh:
+            fh.write(content)
+        return p
+
+    def test_same_basename_from_different_dirs_do_not_collide(self):
+        # Regression: `a/buildings.shp` and `b/buildings.shp` used to map onto
+        # one cached .fgb, so the second silently got the first's geometry.
+        with tempfile.TemporaryDirectory() as d:
+            os.makedirs(os.path.join(d, "a"))
+            os.makedirs(os.path.join(d, "b"))
+            p1 = self._write(os.path.join(d, "a"), "buildings.shp", "one")
+            p2 = self._write(os.path.join(d, "b"), "buildings.shp", "two")
+            self.assertNotEqual(_fgb_cache_name(p1), _fgb_cache_name(p2))
+
+    def test_declared_crs_changes_the_name(self):
+        # Regression: the cache was consulted before src_crs, so re-declaring a
+        # source's CRS reused the conversion made under the old one.
+        with tempfile.TemporaryDirectory() as d:
+            p = self._write(d, "b.fgb")
+            self.assertNotEqual(
+                _fgb_cache_name(p, "EPSG:2056"), _fgb_cache_name(p, "EPSG:32632"))
+            self.assertNotEqual(_fgb_cache_name(p, ""), _fgb_cache_name(p, "EPSG:2056"))
+
+    def test_editing_the_source_changes_the_name(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = self._write(d, "b.fgb", "short")
+            before = _fgb_cache_name(p, "EPSG:2056")
+            with open(p, "w") as fh:
+                fh.write("a much longer body")
+            self.assertNotEqual(_fgb_cache_name(p, "EPSG:2056"), before)
+
+    def test_name_is_stable_for_an_unchanged_source(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = self._write(d, "b.fgb")
+            self.assertEqual(
+                _fgb_cache_name(p, "EPSG:2056"), _fgb_cache_name(p, "EPSG:2056"))
+
+    def test_pre_fix_cache_entries_are_unreachable(self):
+        # Conversions cached before -s_srs was honoured were plain
+        # "<basename>.fgb". Those must no longer be returned, or the fix would
+        # never apply to anyone who already has one.
+        with tempfile.TemporaryDirectory() as d:
+            p = self._write(d, "buildings.shp")
+            self.assertNotEqual(_fgb_cache_name(p, "EPSG:2056"), "buildings.fgb")
+
+    def test_name_stays_recognisable_and_is_an_fgb(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = self._write(d, "buildings.shp")
+            name = _fgb_cache_name(p, "EPSG:2056")
+            self.assertTrue(name.startswith("buildings_"), name)
+            self.assertTrue(name.endswith(".fgb"), name)
+
+
+class TestFgbTranslateOptions(unittest.TestCase):
+    """Buildings must always reach the converter in WGS84."""
+
+    def test_always_targets_wgs84_flatgeobuf(self):
+        opts = _fgb_translate_options()
+        self.assertIn("-t_srs", opts)
+        self.assertEqual(opts[opts.index("-t_srs") + 1], "EPSG:4326")
+        self.assertEqual(opts[opts.index("-f") + 1], "FlatGeobuf")
+
+    def test_no_source_crs_leaves_s_srs_off(self):
+        # GDAL should use the file's embedded CRS when we don't know better.
+        self.assertNotIn("-s_srs", _fgb_translate_options(""))
+
+    def test_known_source_crs_is_declared(self):
+        # Regression: src_crs used to be accepted and then ignored, so a file
+        # without an embedded CRS was reprojected from the wrong origin.
+        opts = _fgb_translate_options("EPSG:2056")
+        self.assertIn("-s_srs", opts)
+        self.assertEqual(opts[opts.index("-s_srs") + 1], "EPSG:2056")
 
 
 class TestEstimateTileCountAndMb(unittest.TestCase):
@@ -41,6 +123,11 @@ class TestEstimateTileCountAndMb(unittest.TestCase):
     def test_90m_1deg_tiles(self):
         bbox = {"north": 48.0, "south": 47.0, "east": 9.0, "west": 8.0}
         tiles, _ = _estimate_tile_count_and_mb(bbox, [90])
+        self.assertEqual(tiles, 1)
+
+    def test_250m_2deg_tiles(self):
+        bbox = {"north": 48.0, "south": 47.0, "east": 9.0, "west": 8.0}
+        tiles, _ = _estimate_tile_count_and_mb(bbox, [250])
         self.assertEqual(tiles, 1)
 
     def test_2m_01deg_tiles(self):
@@ -77,13 +164,14 @@ class TestAbtSizePx(unittest.TestCase):
 class TestAbtExtentMapping(unittest.TestCase):
 
     def test_all_resolutions_present(self):
-        for r in [2, 5, 10, 30, 90]:
+        for r in [2, 5, 10, 30, 90, 250]:
             self.assertIn(r, _ABT_EXTENT_DEG)
 
     def test_monotonic(self):
         self.assertLessEqual(_ABT_EXTENT_DEG[2], _ABT_EXTENT_DEG[5])
         self.assertLessEqual(_ABT_EXTENT_DEG[5], _ABT_EXTENT_DEG[30])
         self.assertLessEqual(_ABT_EXTENT_DEG[30], _ABT_EXTENT_DEG[90])
+        self.assertLessEqual(_ABT_EXTENT_DEG[90], _ABT_EXTENT_DEG[250])
 
 
 class TestLayerEntry(unittest.TestCase):
@@ -161,7 +249,7 @@ class TestDetectXyzResolution(unittest.TestCase):
 class TestOverpassToGeojson(unittest.TestCase):
 
     def test_basic_conversion(self):
-        from aether_qgis.gui.map_converter_tab import MapConverterTab
+        from waveshed.gui.map_converter_tab import MapConverterTab
         data = {
             "elements": [
                 {"type": "node", "id": 1, "lat": 47.0, "lon": 8.0},
@@ -183,7 +271,7 @@ class TestOverpassToGeojson(unittest.TestCase):
         )
 
     def test_empty(self):
-        from aether_qgis.gui.map_converter_tab import MapConverterTab
+        from waveshed.gui.map_converter_tab import MapConverterTab
         geojson = MapConverterTab._overpass_to_geojson({"elements": []})
         self.assertEqual(len(geojson["features"]), 0)
 

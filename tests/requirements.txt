@@ -1,0 +1,15 @@
+# Test-only dependencies.
+#
+# The plugin itself adds no pip dependencies beyond what QGIS provides — see
+# CLAUDE.md. These are for running the suite outside QGIS, where the bundled
+# copies are not importable.
+#
+#   python3 -m pip install -r tests/requirements.txt
+#
+# numpy is REQUIRED, not optional. The .abt raster tests exercise real array
+# maths and are guarded only so a broken install cannot abort collection for
+# the entire suite; a run that skips them is not a passing run. `-ra` in
+# pytest.ini surfaces any such skip.
+numpy
+pytest
+pytest-subtests

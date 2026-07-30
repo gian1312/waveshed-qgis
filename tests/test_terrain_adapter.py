@@ -7,6 +7,7 @@ provided by conftest.py.
 # Bootstrap stubs before any plugin import.
 import conftest  # noqa: F401 — installs QGIS/PyQt stubs into sys.modules
 
+import hashlib
 import math
 import os
 import struct
@@ -14,10 +15,16 @@ import tempfile
 import unittest
 from unittest import mock
 
-import numpy as np
+try:
+    import numpy as np
+    _HAVE_NUMPY = True
+except Exception:  # noqa: BLE001 — numpy is optional here (only the .abt
+    # writer below needs it), and a wheel built for another platform raises
+    # AttributeError rather than ImportError. Never let that abort collection.
+    _HAVE_NUMPY = False
 
-import aether_qgis.core.terrain_adapter as ta
-from aether_qgis.core.terrain_adapter import (
+import waveshed.core.terrain_adapter as ta
+from waveshed.core.terrain_adapter import (
     _compute_sector_bbox,
     _compute_subtiles,
     _estimate_abt_disk_mb,
@@ -403,6 +410,7 @@ def _write_abt(path, size=128, zero_block=None):
         fh.write(body.tobytes())
 
 
+@unittest.skipUnless(_HAVE_NUMPY, "numpy not available")
 class TestDownloadGapDetection(unittest.TestCase):
     """_abt_has_gaps flags the zero block a failed XYZ tile leaves."""
 
@@ -434,6 +442,7 @@ class TestDownloadGapDetection(unittest.TestCase):
             self.assertFalse(ta._abt_has_gaps(p))
 
 
+@unittest.skipUnless(_HAVE_NUMPY, "numpy not available")
 class TestIncompleteMarker(unittest.TestCase):
     """An incomplete download must not be reused as a valid cache."""
 
@@ -445,6 +454,196 @@ class TestIncompleteMarker(unittest.TestCase):
             self.assertFalse(ta._cache_hit(d))
             ta._clear_incomplete(d)
             self.assertTrue(ta._cache_hit(d))
+
+
+class TestCacheKeyBuildings(unittest.TestCase):
+    """Buildings are baked into .abt pixels, so they must key the cache."""
+
+    BBOX = {"north": 48.0, "south": 47.0, "east": 9.0, "west": 8.0}
+
+    def _key(self, buildings=None):
+        return ta._cache_key("src", self.BBOX, 30, buildings)
+
+    def test_no_buildings_key_is_unchanged(self):
+        # Adding the dimension must not invalidate every existing cache.
+        legacy = hashlib.md5(f"src|{self.BBOX}|30".encode()).hexdigest()
+        self.assertEqual(self._key(), legacy)
+        self.assertEqual(self._key(None), legacy)
+        self.assertEqual(self._key(""), legacy)
+
+    def test_buildings_change_the_key(self):
+        with tempfile.TemporaryDirectory() as d:
+            b = os.path.join(d, "b.fgb")
+            open(b, "w").close()
+            self.assertNotEqual(self._key(b), self._key())
+
+    def test_different_building_files_differ(self):
+        with tempfile.TemporaryDirectory() as d:
+            a = os.path.join(d, "a.fgb")
+            b = os.path.join(d, "b.fgb")
+            open(a, "w").close()
+            open(b, "w").close()
+            self.assertNotEqual(self._key(a), self._key(b))
+
+    def test_editing_the_file_changes_the_key(self):
+        with tempfile.TemporaryDirectory() as d:
+            b = os.path.join(d, "b.fgb")
+            open(b, "w").close()
+            before = self._key(b)
+            with open(b, "w") as fh:
+                fh.write("more geometry")
+            self.assertNotEqual(self._key(b), before)
+
+    def test_directory_contents_change_the_key(self):
+        # A directory's own mtime does not move when a file inside is
+        # rewritten, so the fingerprint has to walk it.
+        with tempfile.TemporaryDirectory() as d:
+            sub = os.path.join(d, "parts")
+            os.makedirs(sub)
+            with open(os.path.join(sub, "p1.fgb"), "w") as fh:
+                fh.write("a")
+            before = self._key(sub)
+            with open(os.path.join(sub, "p1.fgb"), "w") as fh:
+                fh.write("aa")
+            self.assertNotEqual(self._key(sub), before)
+
+    def test_downloaded_source_keys_by_token_not_by_path(self):
+        # OpenFreeMap has no file to fingerprint; it identifies itself with an
+        # opaque token that must survive into the key unchanged (an earlier
+        # version ran it through abspath, making the key depend on the cwd).
+        tok = ta._OSM_BUILDINGS_TOKEN
+        self.assertEqual(ta.source_fingerprint(tok), tok)
+        self.assertNotEqual(self._key(tok), self._key())
+
+    def test_osm_and_file_sources_are_distinguishable(self):
+        with tempfile.TemporaryDirectory() as d:
+            b = os.path.join(d, "b.fgb")
+            open(b, "w").close()
+            tok = ta._OSM_BUILDINGS_TOKEN
+            combined = f"{ta.source_fingerprint(b)}+{tok}"
+            keys = {self._key(), self._key(b), self._key(tok), self._key(combined)}
+            # none, file-only, osm-only and both must all be separate caches
+            self.assertEqual(len(keys), 4)
+
+    def test_missing_buildings_path_still_keys(self):
+        # An unreadable path must not raise — it just keys on the path.
+        self.assertNotEqual(self._key("/no/such/buildings.fgb"), self._key())
+
+
+class TestTerrainSizeWarning(unittest.TestCase):
+    """Only genuinely huge runs are worth interrupting the user for."""
+
+    def test_ordinary_size_is_silent(self):
+        self.assertIsNone(ta.terrain_size_warning(0))
+        self.assertIsNone(ta.terrain_size_warning(1024))          # 1 GB
+        self.assertIsNone(ta.terrain_size_warning(49 * 1024))     # 49 GB
+
+    def test_50gb_warns_softly(self):
+        got = ta.terrain_size_warning(50 * 1024)
+        self.assertIsNotNone(got)
+        msg, strong = got
+        self.assertFalse(strong)
+        self.assertIn("50 GB", msg)
+
+    def test_200gb_warns_strongly(self):
+        got = ta.terrain_size_warning(200 * 1024)
+        self.assertIsNotNone(got)
+        msg, strong = got
+        self.assertTrue(strong)
+        self.assertIn("extreme", msg)
+
+
+class TestBboxesIntersect(unittest.TestCase):
+    def _bb(self, n, s, e, w):
+        return {"north": n, "south": s, "east": e, "west": w}
+
+    def test_overlapping(self):
+        self.assertTrue(ta.bboxes_intersect(
+            self._bb(48, 47, 9, 8), self._bb(47.5, 46.5, 8.5, 7.5)))
+
+    def test_identical(self):
+        a = self._bb(48, 47, 9, 8)
+        self.assertTrue(ta.bboxes_intersect(a, dict(a)))
+
+    def test_disjoint_in_longitude(self):
+        self.assertFalse(ta.bboxes_intersect(
+            self._bb(48, 47, 9, 8), self._bb(48, 47, 12, 11)))
+
+    def test_disjoint_in_latitude(self):
+        self.assertFalse(ta.bboxes_intersect(
+            self._bb(48, 47, 9, 8), self._bb(51, 50, 9, 8)))
+
+    def test_touching_edges_is_not_an_overlap(self):
+        # Sharing only an edge yields no usable terrain pixels.
+        self.assertFalse(ta.bboxes_intersect(
+            self._bb(48, 47, 9, 8), self._bb(48, 47, 10, 9)))
+
+
+class TestTerrainCoverageWarning(unittest.TestCase):
+    """Fires only when the directory offers no usable terrain at all."""
+
+    BBOX = {"north": 48.0, "south": 47.0, "east": 9.0, "west": 8.0}
+
+    def test_empty_directory_warns(self):
+        with tempfile.TemporaryDirectory() as d:
+            msg = ta.terrain_coverage_warning(d, self.BBOX)
+            self.assertIsNotNone(msg)
+            self.assertIn("No terrain files", msg)
+
+    def test_directory_with_no_terrain_extensions_warns(self):
+        with tempfile.TemporaryDirectory() as d:
+            with open(os.path.join(d, "readme.txt"), "w") as fh:
+                fh.write("not terrain")
+            self.assertIsNotNone(ta.terrain_coverage_warning(d, self.BBOX))
+
+    def _run_with_extent(self, extent):
+        """Invoke the check with GDAL mocked to report *extent* as coverage."""
+        with tempfile.TemporaryDirectory() as d:
+            open(os.path.join(d, "a.tif"), "w").close()
+            with mock.patch.object(ta.gdal, "BuildVRT", create=True,
+                                   return_value=object()), \
+                 mock.patch.object(ta.gdal, "_dummy", create=True):
+                with mock.patch.object(ta, "_dataset_wgs84_bbox",
+                                       return_value=extent):
+                    return ta.terrain_coverage_warning(d, self.BBOX)
+
+    def test_overlapping_terrain_is_silent(self):
+        self.assertIsNone(self._run_with_extent(
+            {"north": 47.5, "south": 46.0, "east": 8.5, "west": 7.0}))
+
+    def test_partial_overlap_is_silent(self):
+        # Deliberate: partial coverage is normal and must not nag.
+        self.assertIsNone(self._run_with_extent(
+            {"north": 47.1, "south": 47.0, "east": 8.1, "west": 8.0}))
+
+    def test_disjoint_terrain_warns(self):
+        msg = self._run_with_extent(
+            {"north": 60.0, "south": 59.0, "east": 20.0, "west": 19.0})
+        self.assertIsNotNone(msg)
+        self.assertIn("does not cover", msg)
+
+    def test_unknown_extent_is_silent(self):
+        self.assertIsNone(self._run_with_extent(None))
+
+    def test_missing_directory_warns(self):
+        msg = ta.terrain_coverage_warning("/no/such/dir/anywhere", self.BBOX)
+        self.assertIsNotNone(msg)
+        self.assertIn("does not exist", msg)
+
+
+class TestEstimateTerrainDiskMb(unittest.TestCase):
+    def test_larger_range_needs_more_disk(self):
+        small = ta.estimate_terrain_disk_mb(47.0, 8.0, 10.0, 30)
+        large = ta.estimate_terrain_disk_mb(47.0, 8.0, 200.0, 30)
+        self.assertGreater(large, small)
+
+    def test_finer_resolution_needs_more_disk(self):
+        coarse = ta.estimate_terrain_disk_mb(47.0, 8.0, 50.0, 90)
+        fine = ta.estimate_terrain_disk_mb(47.0, 8.0, 50.0, 10)
+        self.assertGreater(fine, coarse)
+
+    def test_zero_range_needs_nothing(self):
+        self.assertEqual(ta.estimate_terrain_disk_mb(47.0, 8.0, 0.0, 30), 0)
 
 
 if __name__ == "__main__":

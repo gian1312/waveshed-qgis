@@ -7,6 +7,9 @@ these tests import it directly without the QGIS stubs the other suites need.
 import os
 import sys
 from pathlib import Path
+from unittest import mock
+
+import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -89,3 +92,150 @@ def test_report_no_false_stale_when_stage_current(tmp_path):
     core = next(r for r in records if r["name"] == "aether_core.exe")
 
     assert deploy._newer_build_than(core, str(bin_dir)) is None
+
+
+# ---------------------------------------------------------------------------
+# resolve_plugin_dir — per-platform default locations
+# ---------------------------------------------------------------------------
+
+_TAIL = ("QGIS", "QGIS3", "profiles", "default", "python", "plugins")
+
+
+def test_resolve_plugin_dir_windows(tmp_path, monkeypatch):
+    """On Windows the plugins dir lives under %APPDATA%."""
+    monkeypatch.setattr(sys, "platform", "win32")
+    appdata = tmp_path / "AppData" / "Roaming"
+    monkeypatch.setenv("APPDATA", str(appdata))
+
+    assert deploy.resolve_plugin_dir("") == appdata.joinpath(*_TAIL)
+
+
+def test_resolve_plugin_dir_macos(tmp_path, monkeypatch):
+    """On macOS the plugins dir lives under ~/Library/Application Support."""
+    monkeypatch.setattr(sys, "platform", "darwin")
+    monkeypatch.delenv("APPDATA", raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path))
+
+    expected = tmp_path.joinpath("Library", "Application Support", *_TAIL)
+    assert deploy.resolve_plugin_dir("") == expected
+
+
+def test_resolve_plugin_dir_linux(tmp_path, monkeypatch):
+    """On Linux the plugins dir lives under ~/.local/share."""
+    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.delenv("APPDATA", raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path))
+
+    expected = tmp_path.joinpath(".local", "share", *_TAIL)
+    assert deploy.resolve_plugin_dir("") == expected
+
+
+def test_resolve_plugin_dir_honours_existing_override(tmp_path):
+    """An existing override dir wins over the platform default."""
+    assert deploy.resolve_plugin_dir(str(tmp_path)) == tmp_path
+
+
+# ---------------------------------------------------------------------------
+# Install -> status -> remove round trip (temp fake plugin dir only)
+# ---------------------------------------------------------------------------
+
+def _no_config(monkeypatch):
+    """Neutralise deploy.local.ini so status/remove use only the CLI args."""
+    monkeypatch.setattr(
+        deploy, "read_config",
+        lambda required=True: {"qgis_exe": "", "plugin_dir": "", "aether_bin_dir": ""},
+    )
+
+
+def _stage_fake_plugin(plugins: Path, version: str = "7.7.7") -> Path:
+    """Copy a fake waveshed/ package into the temp plugins dir via copy_plugin."""
+    src = plugins.parent / "fake_src"
+    (src).mkdir(parents=True, exist_ok=True)
+    (src / "__init__.py").write_text("# fake\n")
+    (src / "metadata.txt").write_text(f"[general]\nname=Waveshed\nversion={version}\n")
+    (src / "bin").mkdir()
+    (src / "bin" / "aether_core.exe").write_text("x")
+    deploy.copy_plugin(src, plugins / "waveshed")
+    return src
+
+
+def test_install_status_remove_round_trip(tmp_path, capsys, monkeypatch):
+    _no_config(monkeypatch)
+    plugins = tmp_path / "plugins"
+    plugins.mkdir()
+    src = _stage_fake_plugin(plugins, version="7.7.7")
+
+    # --status reports it installed, with version and the staged binary.
+    assert deploy.main(["--status", "--plugin-dir", str(plugins)]) == 0
+    out = capsys.readouterr().out
+    assert "installed=yes" in out
+    assert "version=7.7.7" in out
+    assert "binary.aether_core.exe=present (REQUIRED)" in out
+
+    # --remove deletes the installed package.
+    assert deploy.main(["--remove", "--plugin-dir", str(plugins)]) == 0
+    out = capsys.readouterr().out
+    assert "Removed" in out
+    assert not (plugins / "waveshed").exists()
+
+    # --status now reports it gone.
+    assert deploy.main(["--status", "--plugin-dir", str(plugins)]) == 0
+    out = capsys.readouterr().out
+    assert "installed=no" in out
+
+    # Neither the fake source nor the real repo source was touched.
+    assert (src / "metadata.txt").is_file()
+    assert deploy.SOURCE_DIR.is_dir()
+
+
+def test_remove_empty_target_is_noop(tmp_path, capsys, monkeypatch):
+    _no_config(monkeypatch)
+    plugins = tmp_path / "plugins"
+    plugins.mkdir()
+
+    assert deploy.main(["--remove", "--plugin-dir", str(plugins)]) == 0
+    out = capsys.readouterr().out
+    assert "Nothing to remove" in out
+
+
+def test_remove_refuses_to_delete_source(capsys):
+    """--plugin-dir pointing at the repo root must not wipe the source tree."""
+    assert deploy.main(["--remove", "--plugin-dir", str(deploy.SCRIPT_DIR)]) == 1
+    out = capsys.readouterr().out
+    assert "refusing to remove the plugin source" in out
+    assert deploy.SOURCE_DIR.is_dir()
+
+
+# ---------------------------------------------------------------------------
+# --no-kill / --no-launch / --headless wiring
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize(
+    "flags, expect_kill, expect_launch",
+    [
+        ([], True, True),                        # default: interactive install
+        (["--no-kill"], False, True),
+        (["--no-launch"], True, False),
+        (["--headless"], False, False),
+        (["--quiet"], False, False),             # alias of --headless
+        (["--no-kill", "--no-launch"], False, False),
+    ],
+)
+def test_flags_control_kill_and_launch(tmp_path, monkeypatch, flags, expect_kill, expect_launch):
+    qgis_exe = tmp_path / "qgis.bin"
+    qgis_exe.write_text("")
+    plugins = tmp_path / "plugins"
+    plugins.mkdir()
+
+    monkeypatch.setattr(deploy, "read_config", lambda required=True: {
+        "qgis_exe": str(qgis_exe), "plugin_dir": str(plugins), "aether_bin_dir": "",
+    })
+    kill = mock.Mock(return_value=False)
+    launch = mock.Mock()
+    monkeypatch.setattr(deploy, "kill_qgis", kill)
+    monkeypatch.setattr(deploy, "launch_qgis", launch)
+    monkeypatch.setattr(deploy, "copy_plugin", mock.Mock(return_value=0))
+
+    assert deploy.main(flags) == 0
+    assert kill.called is expect_kill
+    assert launch.called is expect_launch

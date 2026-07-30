@@ -199,6 +199,22 @@ _core.QgsVectorLayer = type("VL", (), {"__init__": lambda self, *a, **kw: None})
 _core.QgsWkbTypes = _FakeWkbTypes
 _core.QgsGeometry = mock.MagicMock()
 
+# Raster styling classes — enough for core.result_loader to import.
+_core.QgsColorRampShader = type("QgsColorRampShader", (), {
+    "__init__": lambda self, *a, **kw: None,
+    "Exact": 0, "Interpolated": 1,
+    "ColorRampItem": type("ColorRampItem", (), {"__init__": lambda self, *a: None}),
+})
+_core.QgsRasterShader = type("QgsRasterShader", (), {"__init__": lambda self, *a, **kw: None})
+_core.QgsRasterBandStats = type("QgsRasterBandStats", (), {"Max": 4})
+_core.QgsSingleBandPseudoColorRenderer = type(
+    "QgsSingleBandPseudoColorRenderer", (), {"__init__": lambda self, *a, **kw: None},
+)
+_core.QgsPalettedRasterRenderer = type("QgsPalettedRasterRenderer", (), {
+    "__init__": lambda self, *a, **kw: None,
+    "Class": type("Class", (), {"__init__": lambda self, *a: None}),
+})
+
 # GUI classes
 _gui.QgsMapLayerComboBox = type("MLCB", (), {"__init__": lambda self, *a, **kw: None})
 _gui.QgsRubberBand = type("RB", (), {"__init__": lambda self, *a, **kw: None, "reset": lambda self, *a: None, "addPoint": lambda self, *a: None, "setColor": lambda self, *a: None, "setWidth": lambda self, *a: None})
@@ -213,6 +229,7 @@ _qtcore.Qt = type("Qt", (), {
 _qtcore.QThread = _MockQThread
 _qtcore.pyqtSignal = _MockSignalDescriptor
 _qtcore.QTimer = mock.MagicMock()
+_qtcore.QUrl = type("QUrl", (), {"__init__": lambda self, *a, **kw: None})
 
 # Qt Widgets — create lightweight stubs for all used widgets
 _widget_names = [
@@ -222,7 +239,7 @@ _widget_names = [
     "QMessageBox", "QPlainTextEdit", "QProgressBar", "QPushButton",
     "QRadioButton", "QSizePolicy", "QSpinBox", "QSplitter",
     "QTableWidget", "QTableWidgetItem", "QTabWidget", "QToolButton",
-    "QVBoxLayout", "QWidget", "QInputDialog",
+    "QVBoxLayout", "QWidget", "QInputDialog", "QDialogButtonBox",
 ]
 for name in _widget_names:
     if name in ("QWidget",):
@@ -242,9 +259,17 @@ for name in _widget_names:
     else:
         setattr(_qtwidgets, name, type(name, (), {"__init__": lambda self, *a, **kw: None}))
 
+# Extra widget attributes some dialogs reference at call time.
+_qtwidgets.QInputDialog.getText = staticmethod(lambda *a, **kw: ("", False))
+_qtwidgets.QLineEdit.Normal = 0
+_qtwidgets.QLineEdit.Password = 2
+
 # Qt GUI
 _qtgui.QColor = type("QColor", (), {"__init__": lambda self, *a: None})
 _qtgui.QIcon = type("QIcon", (), {"__init__": lambda self, *a: None})
+_qtgui.QDesktopServices = type(
+    "QDesktopServices", (), {"openUrl": staticmethod(lambda *a, **kw: True)}
+)
 
 # Install module tree
 for mod_name, mod_obj in [
