@@ -32,7 +32,7 @@ class AetherPlugin:
         self.toolbar.addAction(self.action_main)
         self.actions.append(self.action_main)
 
-        # Altitude Explorer dock toggle — drives Min-Altitude result layers.
+        # Altitude Explorer dock toggle — drives Minimum LOS Altitude result layers.
         self.action_explorer = QAction(
             icon, "Altitude Explorer", self.iface.mainWindow(),
         )

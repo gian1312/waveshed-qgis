@@ -15,12 +15,17 @@ QgsVectorLayer construction for the outputs lives in ``result_loader``.
 from __future__ import annotations
 
 import os
-from typing import List, Optional, Sequence, Tuple
+from typing import Callable, List, Optional, Sequence, Tuple
 
 from .min_alt import MIN_ALT_SENTINEL, MIN_ALT_STEP_M
 
 #: Byte value used in the best-site map for "no site reaches this pixel".
 BEST_SITE_NODATA: int = 255
+
+
+class MergeCanceled(Exception):
+    """Raised by :func:`merge_best_site` when its ``should_cancel`` hook returns
+    True — lets the GUI stop a long multi-site merge between inputs."""
 
 
 def fold_best_site(best_alt, best_site, arr, idx):
@@ -87,6 +92,7 @@ def merge_best_site(
     inputs: Sequence[Tuple[str, str]],
     out_alt: str,
     out_site: str,
+    should_cancel: Optional[Callable[[], bool]] = None,
 ) -> List[str]:
     """Merge several MIN_ALT rasters into a best-altitude + best-site pair.
 
@@ -100,6 +106,10 @@ def merge_best_site(
     out_site:
         Path for the output Byte *best site index* raster (value = index into
         the returned label list; ``255`` = uncovered).
+    should_cancel:
+        Optional zero-arg predicate polled once per input; when it returns True
+        the merge raises :class:`MergeCanceled` before writing any output (so a
+        GUI can stop a long merge without leaving partial files behind).
 
     Returns
     -------
@@ -119,6 +129,8 @@ def merge_best_site(
 
     if len(inputs) < 2:
         raise ValueError("Best-site merge needs at least two MIN_ALT layers.")
+    if should_cancel is not None and should_cancel():
+        raise MergeCanceled()
 
     gdal.UseExceptions()
     labels = [label for _, label in inputs]
@@ -164,6 +176,8 @@ def merge_best_site(
 
     # ---- 2. Stream each input through the reducer ----
     for idx, (path, _label) in enumerate(inputs):
+        if should_cancel is not None and should_cancel():
+            raise MergeCanceled()
         mem = gdal.Warp("", path, options=warp_opts)
         if mem is None:
             raise RuntimeError(f"Failed to align raster: {path}")
@@ -262,12 +276,20 @@ def generate_contours(
     ])
 
     # Add a metres attribute derived from the raw contour elevation.
+    #
+    # This is done as ONE set-based SQL UPDATE rather than a per-feature
+    # SetFeature() loop.  ContourGenerateEx can emit tens of thousands of line
+    # features on a large coverage raster; writing the metres value back one
+    # feature at a time ran a separate GPKG (SQLite) transaction per feature,
+    # which made this step appear to hang QGIS "forever".  A single UPDATE runs
+    # in one transaction — milliseconds instead of minutes.
     layer.CreateField(ogr.FieldDefn("alt_m", ogr.OFTReal))
-    layer.ResetReading()
-    for feat in layer:
-        elev_raw = feat.GetField("elev_raw")
-        feat.SetField("alt_m", (elev_raw or 0.0) * MIN_ALT_STEP_M)
-        layer.SetFeature(feat)
+    layer.SyncToDisk()
+    result = dst.ExecuteSQL(
+        f"UPDATE contours SET alt_m = COALESCE(elev_raw, 0) * {MIN_ALT_STEP_M}"
+    )
+    if result is not None:  # UPDATE yields no result set; release if one appears
+        dst.ReleaseResultSet(result)
 
     dst = None
     src = None

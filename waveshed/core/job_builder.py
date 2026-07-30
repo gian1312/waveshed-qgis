@@ -8,8 +8,13 @@ import json
 import os
 from typing import Optional
 
-# Valid resolution values accepted by aether_core (resolution_m is f32).
-VALID_RESOLUTIONS = [2, 5, 10, 30]
+# Resolution values (metres) the plugin offers throughout the UI. aether_core
+# takes resolution_m as a plain f32 (clamped to >= 0.1 m) with no fixed set, so
+# this is a plugin-side convenience list, not an engine constraint. The coarse
+# entries suit large-area studies: 90 m ~ SRTM 3-arcsec, 250 m ~ GMTED/MODIS.
+# Keep this in sync with map_converter_tab._ABT_EXTENT_DEG (the converter needs
+# a per-resolution .abt tile extent for each value offered here).
+VALID_RESOLUTIONS = [2, 5, 10, 30, 90, 250]
 
 
 @dataclasses.dataclass

@@ -68,13 +68,17 @@ _SUBPROCESS_FLAGS = (
 
 # .abt tile geographic extent per resolution.  Controls how large each
 # .abt file is on disk (pixels = extent_deg / (res_m / 111111)).
-# aether_core accepts any size; these keep files under ~60 MB.
+# aether_core accepts any size; these keep files small.  The keys are the
+# resolutions the converter offers (kept in sync with the analysis-side
+# job_builder.VALID_RESOLUTIONS); coarser resolutions get a larger tile extent
+# so tile counts stay low.  Extents must be non-decreasing with resolution.
 _ABT_EXTENT_DEG = {
     2: 0.1,
     5: 0.25,
     10: 0.25,
     30: 0.5,
     90: 1.0,
+    250: 2.0,
 }
 
 
@@ -1102,7 +1106,7 @@ class MapConverterTab(QWidget):
         res_lay = QHBoxLayout(res_grp)
         res_lay.addWidget(QLabel("Generate tiles at:"))
         self._res_checks: Dict[int, QCheckBox] = {}
-        for res in [2, 5, 10, 30, 90]:
+        for res in sorted(_ABT_EXTENT_DEG):
             ext = _ABT_EXTENT_DEG.get(res, 1.0)
             sz = _abt_size_px(res, ext)
             cb = QCheckBox(f"{res}m")
@@ -1617,11 +1621,12 @@ class MapConverterTab(QWidget):
             return
 
         from qgis.PyQt.QtWidgets import QInputDialog
+        available = ", ".join(str(r) for r in sorted(_ABT_EXTENT_DEG))
         current = ",".join(str(r) for r in sorted(entry.target_resolutions))
         text, ok = QInputDialog.getText(
             self, "Target Resolutions",
             f"Enter comma-separated resolutions in metres.\n"
-            f"Available: 2, 5, 10, 30, 90\n"
+            f"Available: {available}\n"
             f"Native resolution: {entry.native_res_m or '?'}m",
             text=current,
         )
@@ -1635,7 +1640,7 @@ class MapConverterTab(QWidget):
             QMessageBox.warning(self, "Invalid", "Enter integers only.")
             return
 
-        valid = {2, 5, 10, 30, 90}
+        valid = set(_ABT_EXTENT_DEG)
         bad = [r for r in new_res if r not in valid]
         if bad:
             QMessageBox.warning(

@@ -458,6 +458,12 @@ def _try_rust_download(
     if "mapbox" in params.get("interpretation", "").lower():
         encoding = "mapbox"
 
+    # TODO(waveshed): the live XYZ download path has only been exercised against
+    # Mapzen Global Terrain (Terrarium encoding). Test it end-to-end with other
+    # elevation-tile services too — e.g. AWS Terrain Tiles, Mapbox Terrain-RGB,
+    # and Nextzen — and verify encoding detection, {z}/{x}/{y} URL templating,
+    # per-service zoom limits, and API-key/attribution handling. See TODO.md.
+
     # Zoom: at lat θ, ground resolution at zoom z is:
     #   res = 40075000 * cos(θ) / (2^z * 256)
     # So z = log2(40075000 * cos(θ) / (res * 256))

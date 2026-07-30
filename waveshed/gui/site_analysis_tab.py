@@ -62,7 +62,12 @@ from ..core import api_key
 _SUBPROCESS_FLAGS = (
     subprocess.CREATE_NO_WINDOW if platform.system() == "Windows" else 0
 )
-from ..core.job_builder import CoverageParams, build_coverage_job, write_job_file
+from ..core.job_builder import (
+    VALID_RESOLUTIONS,
+    CoverageParams,
+    build_coverage_job,
+    write_job_file,
+)
 from ..core.layer_utils import dem_layer_warning, hide_from_dem_picker
 from ..core.result_loader import (
     GROUP_COVERAGE,
@@ -501,9 +506,10 @@ class SiteAnalysisTab(QWidget):
         # Shown instead of the table in MIN_ALT mode, where a single run already
         # covers every altitude so per-altitude rows would only duplicate work.
         self.lbl_alt_min_alt_note = QLabel(
-            "Min Altitude mode computes the minimum LOS altitude for every "
-            "location in one pass — receiver altitudes are not needed here. "
-            "Use the Altitude Explorer to view any altitude afterwards."
+            "Minimum LOS Altitude mode computes the lowest line-of-sight "
+            "altitude for every location in one pass — receiver altitudes are "
+            "not needed here. Use the Altitude Explorer to view any altitude "
+            "afterwards."
         )
         self.lbl_alt_min_alt_note.setWordWrap(True)
         self.lbl_alt_min_alt_note.setStyleSheet("color: gray; font-size: 11px;")
@@ -534,7 +540,7 @@ class SiteAnalysisTab(QWidget):
 
         # Resolution
         self.combo_resolution = QComboBox()
-        self.combo_resolution.addItems(["2", "5", "10", "30"])
+        self.combo_resolution.addItems([str(r) for r in VALID_RESOLUTIONS])
         self.combo_resolution.setCurrentIndex(2)  # default 10
         layout.addRow("Resolution (m):", self.combo_resolution)
 
@@ -1263,7 +1269,7 @@ class SiteAnalysisTab(QWidget):
                     display_name = (
                         f"Site {site_idx + 1} "
                         f"({tx_lat:.4f}, {tx_lon:.4f}) "
-                        f"— Min Altitude"
+                        f"— Minimum LOS Altitude"
                     )
                 else:
                     display_name = (
@@ -1443,7 +1449,7 @@ class SiteAnalysisTab(QWidget):
         if has_min_alt:
             reply = QMessageBox.question(
                 self, "Analysis Complete",
-                f"Completed {len(results)} Min-Altitude job(s).\n"
+                f"Completed {len(results)} Minimum LOS Altitude job(s).\n"
                 f"{loaded_count} result(s) loaded into QGIS.\n\n"
                 "Open the Altitude Explorer to pick a preferred altitude and "
                 "see the reachable area live?",

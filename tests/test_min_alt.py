@@ -13,7 +13,13 @@ import math
 import unittest
 
 from waveshed.core import min_alt as ma
-from waveshed.core.job_builder import CoverageParams, build_coverage_job
+from waveshed.core.job_builder import (
+    VALID_RESOLUTIONS,
+    CoverageParams,
+    P2PParams,
+    build_coverage_job,
+    build_p2p_job,
+)
 from waveshed.core.layer_utils import (
     aether_model,
     is_min_alt_layer,
@@ -99,6 +105,51 @@ class TestJobBuilder(unittest.TestCase):
         self.assertEqual(job["analysis"]["task_type"], "SINGLE")
 
 
+class TestResolutions(unittest.TestCase):
+    def test_valid_resolutions_include_coarse(self):
+        # Coarse resolutions were added (90 m, 250 m) alongside the fine set.
+        self.assertEqual(VALID_RESOLUTIONS, [2, 5, 10, 30, 90, 250])
+
+    def test_coarse_resolutions_accepted_by_coverage(self):
+        for r in (90, 250):
+            job = build_coverage_job(
+                CoverageParams(model="MIN_ALT", resolution_m=r), "/abt", "/out",
+            )
+            self.assertEqual(job["analysis"]["resolution_m"], r)
+
+    def test_coarse_resolutions_accepted_by_p2p(self):
+        for r in (90, 250):
+            job = build_p2p_job(P2PParams(resolution_m=r), "/abt", "/out")
+            self.assertEqual(job["analysis"]["resolution_m"], r)
+
+    def test_unsupported_resolution_still_rejected(self):
+        with self.assertRaises(ValueError):
+            build_coverage_job(CoverageParams(resolution_m=45), "/abt", "/out")
+
+
+class TestFeatureRename(unittest.TestCase):
+    """The MIN_ALT feature is shown to users as 'Minimum LOS Altitude', but the
+    engine wire value must stay 'MIN_ALT'. Assert on source (the GUI modules
+    pull in Qt classes the lightweight stubs do not provide)."""
+
+    def _read(self, *parts):
+        import os
+        path = os.path.join(
+            os.path.dirname(os.path.dirname(__file__)), "waveshed", *parts,
+        )
+        with open(path, encoding="utf-8") as f:
+            return f.read()
+
+    def test_mode_radio_uses_new_display_name(self):
+        src = self._read("gui", "main_dialog.py")
+        self.assertIn('QRadioButton("Minimum LOS Altitude")', src)
+        self.assertNotIn('QRadioButton("Min Altitude")', src)
+
+    def test_engine_wire_value_unchanged(self):
+        src = self._read("gui", "main_dialog.py")
+        self.assertIn('return "MIN_ALT"', src)
+
+
 class TestProcessingModelList(unittest.TestCase):
     def test_coverage_algorithm_offers_min_alt(self):
         # The Processing algorithm pulls in the full qgis.core Processing API,
@@ -170,6 +221,17 @@ class TestBestSiteReduction(unittest.TestCase):
         best_alt, best_site = self._reduce([[[100]], [[100]]])
         self.assertEqual(best_alt.tolist(), [[100]])
         self.assertEqual(best_site.tolist(), [[0]])
+
+    def test_merge_cancels_before_touching_gdal(self):
+        # A merge whose should_cancel is already True must raise MergeCanceled
+        # before any GDAL work (no output files, GUI can abort a long merge).
+        from waveshed.core.raster_tools import MergeCanceled, merge_best_site
+        with self.assertRaises(MergeCanceled):
+            merge_best_site(
+                [("/a.tif", "A"), ("/b.tif", "B")],
+                "/out_alt.tif", "/out_site.tif",
+                should_cancel=lambda: True,
+            )
 
 
 if __name__ == "__main__":

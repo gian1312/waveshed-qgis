@@ -75,7 +75,7 @@ class AetherMainDialog(QDialog):
 
         self.radio_los = QRadioButton("Line of Sight (LOS)")
         self.radio_loss = QRadioButton("Propagation Loss")
-        self.radio_min_alt = QRadioButton("Min Altitude")
+        self.radio_min_alt = QRadioButton("Minimum LOS Altitude")
         self.radio_min_alt.setToolTip(
             "Minimum-LOS-altitude map: for every location, the lowest altitude "
             "(AGL) at which it first gains line-of-sight to the transmitter.\n"

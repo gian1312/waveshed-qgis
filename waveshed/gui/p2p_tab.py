@@ -60,7 +60,12 @@ from qgis.gui import QgsRubberBand
 
 from ..core.binary_manager import find_binary
 from ..core import api_key
-from ..core.job_builder import P2PParams, build_p2p_job, write_job_file
+from ..core.job_builder import (
+    VALID_RESOLUTIONS,
+    P2PParams,
+    build_p2p_job,
+    write_job_file,
+)
 from ..core.layer_utils import dem_layer_warning, hide_from_dem_picker
 from .map_tools import activate_point_capture
 
@@ -907,7 +912,7 @@ class P2PTab(QWidget):
         dem_row.addWidget(self.combo_dem, stretch=1)
         dem_row.addWidget(QLabel("Resolution:"))
         self.combo_resolution = QComboBox()
-        self.combo_resolution.addItems(["2", "5", "10", "30"])
+        self.combo_resolution.addItems([str(r) for r in VALID_RESOLUTIONS])
         self.combo_resolution.setCurrentIndex(2)  # default "10"
         dem_row.addWidget(self.combo_resolution)
         layout.addRow("DEM Layer:", dem_row)

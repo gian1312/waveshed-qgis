@@ -36,7 +36,7 @@ All adaptation happens in this plugin. Communication with binaries is exclusivel
 
 Defined in `rust/aether_core/src/config.rs`. Sections: tx, rx, analysis, output, processing, propagation.
 
-- `analysis.resolution_m` must be one of: [2, 5, 10, 30]
+- `analysis.resolution_m` is an f32; the plugin offers [2, 5, 10, 30, 90, 250] (see `job_builder.VALID_RESOLUTIONS`). The engine itself accepts any value ≥ 0.1 m — this list is a plugin-side convenience, kept in sync with `map_converter_tab._ABT_EXTENT_DEG`.
 - `analysis.task_type`: "SINGLE" (coverage), "P2P", "BATCH_P2P"
 - `analysis.propagation_model`: "LOS", "SIMPLE_LOSS", "ITM"
 - `analysis.compute_backend`: "AUTO", "GPU", "CPU"

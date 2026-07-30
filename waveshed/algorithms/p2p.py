@@ -33,14 +33,19 @@ from qgis.core import (
 )
 
 from ..core.binary_manager import find_binary
-from ..core.job_builder import P2PParams, build_p2p_job, write_job_file
+from ..core.job_builder import (
+    VALID_RESOLUTIONS,
+    P2PParams,
+    build_p2p_job,
+    write_job_file,
+)
 from ..core.terrain_adapter import prepare_terrain
 from ..core import api_key
 from ..core import binary_manager as bm
 
 # Enum value lists (index-based for QgsProcessingParameterEnum).
 _MODELS = ["LOS", "SIMPLE_LOSS", "ITM"]
-_RESOLUTIONS = ["2", "5", "10", "30"]
+_RESOLUTIONS = [str(r) for r in VALID_RESOLUTIONS]
 _BACKENDS = ["AUTO", "GPU", "CPU"]
 
 

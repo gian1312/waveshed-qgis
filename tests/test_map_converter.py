@@ -43,6 +43,11 @@ class TestEstimateTileCountAndMb(unittest.TestCase):
         tiles, _ = _estimate_tile_count_and_mb(bbox, [90])
         self.assertEqual(tiles, 1)
 
+    def test_250m_2deg_tiles(self):
+        bbox = {"north": 48.0, "south": 47.0, "east": 9.0, "west": 8.0}
+        tiles, _ = _estimate_tile_count_and_mb(bbox, [250])
+        self.assertEqual(tiles, 1)
+
     def test_2m_01deg_tiles(self):
         bbox = {"north": 47.1, "south": 47.0, "east": 8.1, "west": 8.0}
         tiles, _ = _estimate_tile_count_and_mb(bbox, [2])
@@ -77,13 +82,14 @@ class TestAbtSizePx(unittest.TestCase):
 class TestAbtExtentMapping(unittest.TestCase):
 
     def test_all_resolutions_present(self):
-        for r in [2, 5, 10, 30, 90]:
+        for r in [2, 5, 10, 30, 90, 250]:
             self.assertIn(r, _ABT_EXTENT_DEG)
 
     def test_monotonic(self):
         self.assertLessEqual(_ABT_EXTENT_DEG[2], _ABT_EXTENT_DEG[5])
         self.assertLessEqual(_ABT_EXTENT_DEG[5], _ABT_EXTENT_DEG[30])
         self.assertLessEqual(_ABT_EXTENT_DEG[30], _ABT_EXTENT_DEG[90])
+        self.assertLessEqual(_ABT_EXTENT_DEG[90], _ABT_EXTENT_DEG[250])
 
 
 class TestLayerEntry(unittest.TestCase):

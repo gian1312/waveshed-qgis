@@ -31,7 +31,12 @@ from qgis.core import (
 )
 
 from ..core.binary_manager import find_binary
-from ..core.job_builder import CoverageParams, build_coverage_job, write_job_file
+from ..core.job_builder import (
+    VALID_RESOLUTIONS,
+    CoverageParams,
+    build_coverage_job,
+    write_job_file,
+)
 from ..core.result_loader import (
     GROUP_COVERAGE,
     add_layer_to_project,
@@ -60,7 +65,7 @@ class CoverageAlgorithm(QgsProcessingAlgorithm):
 
     # Enum value lists (order matters — index is the value)
     _MODELS = ["LOS", "SIMPLE_LOSS", "ITM", "MIN_ALT"]
-    _RESOLUTIONS = ["2", "5", "10", "30"]
+    _RESOLUTIONS = [str(r) for r in VALID_RESOLUTIONS]
     _BACKENDS = ["AUTO", "GPU", "CPU"]
 
     # -- Metadata ----------------------------------------------------------

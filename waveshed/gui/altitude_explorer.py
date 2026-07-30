@@ -23,10 +23,8 @@ from typing import List, Optional
 
 from qgis.core import Qgis, QgsMessageLog, QgsProject, QgsRasterLayer
 from qgis.gui import QgsDockWidget
-from qgis.PyQt.QtCore import Qt
-from qgis.PyQt.QtGui import QCursor
+from qgis.PyQt.QtCore import Qt, QThread, pyqtSignal
 from qgis.PyQt.QtWidgets import (
-    QApplication,
     QButtonGroup,
     QCheckBox,
     QGroupBox,
@@ -36,6 +34,7 @@ from qgis.PyQt.QtWidgets import (
     QListWidget,
     QListWidgetItem,
     QMessageBox,
+    QProgressDialog,
     QPushButton,
     QRadioButton,
     QSlider,
@@ -83,6 +82,99 @@ def _is_candidate(layer) -> bool:
         return False
 
 
+class _ContourWorker(QThread):
+    """Generate iso-altitude contours off the GUI thread.
+
+    ``gdal.ContourGenerateEx`` is a single, uninterruptible C call that can take
+    a while on a large coverage raster; running it on the main thread froze
+    QGIS.  This worker runs the (pure GDAL/OGR, no QGIS-object) generation for
+    each input sequentially so the UI stays responsive and the user can cancel
+    between layers.  The resulting GeoPackages are loaded into QGIS by the main
+    thread (QGIS layer construction is main-thread-only).
+    """
+
+    #: (one-based index, layer name) — a layer's contour generation is starting.
+    started_layer = pyqtSignal(int, str)
+    #: (out_gpkg, display name) — a layer finished; load it on the main thread.
+    layer_done = pyqtSignal(str, str)
+    #: (layer name, error message) — a layer failed.
+    layer_failed = pyqtSignal(str, str)
+    #: (layers_made,) — the whole batch finished (or was cancelled).
+    finished_all = pyqtSignal(int)
+
+    def __init__(self, inputs, interval_m, out_dir, stamp, parent=None):
+        super().__init__(parent)
+        self._inputs = list(inputs)
+        self._interval_m = interval_m
+        self._out_dir = out_dir
+        self._stamp = stamp
+        self._canceled = False
+
+    def cancel(self) -> None:
+        self._canceled = True
+
+    def run(self) -> None:
+        # Imported here so the module still imports without GDAL (tests stub it).
+        from ..core import raster_tools
+
+        made = 0
+        for i, (path, name) in enumerate(self._inputs):
+            if self._canceled:
+                break
+            self.started_layer.emit(i + 1, name)
+            out_gpkg = os.path.join(
+                self._out_dir, f"contours_{i + 1}_{self._stamp}.gpkg",
+            )
+            try:
+                raster_tools.generate_contours(path, out_gpkg, self._interval_m)
+                self.layer_done.emit(out_gpkg, name)
+                made += 1
+            except Exception as exc:  # noqa: BLE001 — surfaced to the user
+                self.layer_failed.emit(name, str(exc))
+        self.finished_all.emit(made)
+
+
+class _MergeWorker(QThread):
+    """Compute the best-site merge off the GUI thread.
+
+    ``raster_tools.merge_best_site`` warps and reduces every input raster — a
+    heavy GDAL/numpy pass that froze QGIS when run on the main thread.  This
+    worker runs it in the background; ``cancel()`` stops it between inputs.
+    """
+
+    #: (labels, out_alt, out_site) — merge succeeded; load the results.
+    finished_ok = pyqtSignal(list, str, str)
+    #: (error message,) — merge failed.
+    failed = pyqtSignal(str)
+    #: () — the user cancelled before completion.
+    canceled = pyqtSignal()
+
+    def __init__(self, inputs, out_alt, out_site, parent=None):
+        super().__init__(parent)
+        self._inputs = list(inputs)
+        self._out_alt = out_alt
+        self._out_site = out_site
+        self._canceled = False
+
+    def cancel(self) -> None:
+        self._canceled = True
+
+    def run(self) -> None:
+        from ..core import raster_tools
+
+        try:
+            labels = raster_tools.merge_best_site(
+                self._inputs, self._out_alt, self._out_site,
+                should_cancel=lambda: self._canceled,
+            )
+        except raster_tools.MergeCanceled:
+            self.canceled.emit()
+        except Exception as exc:  # noqa: BLE001 — surfaced to the user
+            self.failed.emit(str(exc))
+        else:
+            self.finished_ok.emit(labels, self._out_alt, self._out_site)
+
+
 class AltitudeExplorerDock(QgsDockWidget):
     """Dock widget with a live altitude threshold slider for MIN_ALT layers."""
 
@@ -91,6 +183,19 @@ class AltitudeExplorerDock(QgsDockWidget):
         self.setObjectName("WaveshedAltitudeExplorer")
         self.iface = iface
         self._updating = False  # guard against slider<->spin feedback loops
+
+        # Background iso-altitude contour generation state.
+        self._contour_worker: Optional[_ContourWorker] = None
+        self._contour_progress: Optional[QProgressDialog] = None
+        self._contour_errors: List[str] = []
+        self._contour_made = 0
+        self._contour_total = 0
+        self._contour_interval_m = 0
+        self._contour_canceled = False
+
+        # Background best-site merge state.
+        self._merge_worker: Optional[_MergeWorker] = None
+        self._merge_progress: Optional[QProgressDialog] = None
 
         self._build_ui()
         self._wire_signals()
@@ -111,7 +216,7 @@ class AltitudeExplorerDock(QgsDockWidget):
         layout.setContentsMargins(8, 8, 8, 8)
 
         intro = QLabel(
-            "Pick your preferred altitude — every selected Min-Altitude layer "
+            "Pick your preferred altitude — every selected Minimum LOS Altitude layer "
             "shows where it can reach the transmitter at that height. "
             "No recomputation needed."
         )
@@ -188,7 +293,7 @@ class AltitudeExplorerDock(QgsDockWidget):
         action_row.addStretch()
         self.btn_reset = QPushButton("Reset to full range")
         self.btn_reset.setToolTip(
-            "Restore the continuous minimum-altitude colour ramp on the "
+            "Restore the continuous Minimum LOS Altitude colour ramp on the "
             "selected layers."
         )
         action_row.addWidget(self.btn_reset)
@@ -201,7 +306,7 @@ class AltitudeExplorerDock(QgsDockWidget):
         self.btn_merge.setToolTip(
             "Across the selected sites, compute the lowest required altitude at "
             "each location and which site provides it. Produces a combined "
-            "min-altitude layer (drivable by the slider) plus a best-site map."
+            "Minimum LOS Altitude layer (drivable by the slider) plus a best-site map."
         )
         self.btn_contours = QPushButton("Iso-altitude contours…")
         self.btn_contours.setToolTip(
@@ -259,7 +364,8 @@ class AltitudeExplorerDock(QgsDockWidget):
 
         if not candidates:
             self.lbl_readout.setText(
-                "No Min-Altitude layers found. Run a Min-Altitude analysis first."
+                "No Minimum LOS Altitude layers found. "
+                "Run a Minimum LOS Altitude analysis first."
             )
         else:
             self._sync_range_to_layers()
@@ -374,7 +480,7 @@ class AltitudeExplorerDock(QgsDockWidget):
             )
         elif layers:
             self.lbl_readout.setText(
-                "Showing full minimum-altitude ramp (all reachable pixels)."
+                "Showing full Minimum LOS Altitude ramp (all reachable pixels)."
             )
 
     # ------------------------------------------------------------------
@@ -404,10 +510,17 @@ class AltitudeExplorerDock(QgsDockWidget):
         return inputs
 
     def _on_merge(self) -> None:
+        if self._merge_worker is not None:
+            QMessageBox.information(
+                self, "Best-site merge",
+                "A merge is already running — wait for it to finish or cancel "
+                "it first.",
+            )
+            return
         if len(self._checked_layers()) < 2:
             QMessageBox.information(
                 self, "Best-site merge",
-                "Tick at least two Min-Altitude layers to merge.",
+                "Tick at least two Minimum LOS Altitude layers to merge.",
             )
             return
         inputs = self._file_inputs()
@@ -419,25 +532,44 @@ class AltitudeExplorerDock(QgsDockWidget):
         out_alt = os.path.join(out_dir, f"best_alt_{stamp}.tif")
         out_site = os.path.join(out_dir, f"best_site_{stamp}.tif")
 
-        from ..core import raster_tools
+        # merge_best_site warps + reduces every input — run it off the GUI
+        # thread so QGIS stays responsive. The pass has no per-pixel progress,
+        # so show a busy dialog; Cancel takes effect between inputs.
+        progress = QProgressDialog(
+            f"Merging {len(inputs)} sites into a best-site map…", "Cancel",
+            0, 0, self,
+        )
+        progress.setWindowTitle("Best-site merge")
+        progress.setWindowModality(Qt.WindowModal)
+        progress.setMinimumDuration(0)
+        progress.setAutoClose(False)
+        progress.setAutoReset(False)
+        progress.setValue(0)
+        self._merge_progress = progress
 
-        error = None
-        labels = None
-        QApplication.setOverrideCursor(QCursor(Qt.WaitCursor))
-        try:
-            labels = raster_tools.merge_best_site(inputs, out_alt, out_site)
-        except Exception as exc:  # noqa: BLE001 — surfaced to the user
-            error = exc
-        finally:
-            QApplication.restoreOverrideCursor()
+        worker = _MergeWorker(inputs, out_alt, out_site, self)
+        self._merge_worker = worker
+        worker.finished_ok.connect(self._on_merge_ok)
+        worker.failed.connect(self._on_merge_failed)
+        worker.canceled.connect(self._on_merge_canceled)
+        progress.canceled.connect(self._on_merge_cancel_requested)
+        worker.start()
 
-        if error is not None:
-            QgsMessageLog.logMessage(
-                f"Best-site merge failed: {error}", TAG, Qgis.MessageLevel.Critical,
-            )
-            QMessageBox.critical(self, "Best-site merge failed", str(error))
-            return
+    # -- Best-site merge callbacks (run on the main thread) ----------------
 
+    def _close_merge(self) -> None:
+        if self._merge_progress is not None:
+            self._merge_progress.reset()
+            self._merge_progress.close()
+            self._merge_progress = None
+        worker = self._merge_worker
+        self._merge_worker = None
+        if worker is not None:
+            worker.wait()
+            worker.deleteLater()
+
+    def _on_merge_ok(self, labels: list, out_alt: str, out_site: str) -> None:
+        self._close_merge()
         try:
             alt_layer = load_best_alt_result(
                 out_alt, f"Best required altitude ({len(labels)} sites)",
@@ -460,10 +592,33 @@ class AltitudeExplorerDock(QgsDockWidget):
             "• 'Best site' — which transmitter serves each location.",
         )
 
+    def _on_merge_failed(self, error: str) -> None:
+        self._close_merge()
+        QgsMessageLog.logMessage(
+            f"Best-site merge failed: {error}", TAG, Qgis.MessageLevel.Critical,
+        )
+        QMessageBox.critical(self, "Best-site merge failed", error)
+
+    def _on_merge_canceled(self) -> None:
+        self._close_merge()
+        self.iface.messageBar().pushInfo("Waveshed", "Best-site merge cancelled.")
+
+    def _on_merge_cancel_requested(self) -> None:
+        if self._merge_worker is not None:
+            self._merge_worker.cancel()
+
     def _on_contours(self) -> None:
+        if self._contour_worker is not None:
+            QMessageBox.information(
+                self, "Contours",
+                "Contour generation is already running — wait for it to finish "
+                "or cancel it first.",
+            )
+            return
         if not self._checked_layers():
             QMessageBox.information(
-                self, "Contours", "Tick at least one Min-Altitude layer.",
+                self, "Contours",
+                "Tick at least one Minimum LOS Altitude layer.",
             )
             return
         inputs = self._file_inputs()
@@ -478,44 +633,120 @@ class AltitudeExplorerDock(QgsDockWidget):
         if not ok:
             return
 
-        from ..core import raster_tools
-
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         out_dir = self._tools_output_dir()
-        made = 0
-        errors: List[str] = []
 
-        QApplication.setOverrideCursor(QCursor(Qt.WaitCursor))
+        # Reset per-run batch state.
+        self._contour_errors = []
+        self._contour_made = 0
+        self._contour_total = len(inputs)
+        self._contour_interval_m = interval_m
+        self._contour_canceled = False
+
+        # The heavy generation runs in a worker thread; this dialog keeps QGIS
+        # responsive and lets the user cancel (effective at the next layer).
+        progress = QProgressDialog(
+            "Generating iso-altitude contours…", "Cancel", 0, len(inputs), self,
+        )
+        progress.setWindowTitle("Iso-altitude contours")
+        progress.setWindowModality(Qt.WindowModal)
+        progress.setMinimumDuration(0)
+        progress.setAutoClose(False)
+        progress.setAutoReset(False)
+        progress.setValue(0)
+        self._contour_progress = progress
+
+        worker = _ContourWorker(inputs, interval_m, out_dir, stamp, self)
+        self._contour_worker = worker
+        worker.started_layer.connect(self._on_contour_started)
+        worker.layer_done.connect(self._on_contour_layer_done)
+        worker.layer_failed.connect(self._on_contour_layer_failed)
+        worker.finished_all.connect(self._on_contours_finished)
+        progress.canceled.connect(self._on_contours_cancel_requested)
+        worker.start()
+
+    # -- Contour worker callbacks (run on the main thread) -----------------
+
+    def _on_contour_started(self, index: int, name: str) -> None:
+        if self._contour_progress is not None:
+            self._contour_progress.setValue(index - 1)
+            self._contour_progress.setLabelText(
+                f"Contouring {name} ({index}/{self._contour_total})…"
+            )
+
+    def _on_contour_layer_done(self, out_gpkg: str, name: str) -> None:
+        # QGIS layer construction must happen on the main thread — hence here,
+        # not in the worker.
         try:
-            for i, (path, name) in enumerate(inputs):
-                out_gpkg = os.path.join(
-                    out_dir, f"contours_{i + 1}_{stamp}.gpkg",
-                )
-                try:
-                    raster_tools.generate_contours(path, out_gpkg, interval_m)
-                    layer = load_contour_result(
-                        out_gpkg, f"Contours — {name} ({interval_m} m)",
-                    )
-                    add_layer_to_project(layer, GROUP_CONTOURS)
-                    made += 1
-                except Exception as exc:  # noqa: BLE001
-                    errors.append(f"{name}: {exc}")
-        finally:
-            QApplication.restoreOverrideCursor()
+            layer = load_contour_result(
+                out_gpkg, f"Contours — {name} ({self._contour_interval_m} m)",
+            )
+            add_layer_to_project(layer, GROUP_CONTOURS)
+            self._contour_made += 1
+        except Exception as exc:  # noqa: BLE001
+            self._contour_errors.append(f"{name}: {exc}")
 
+    def _on_contour_layer_failed(self, name: str, error: str) -> None:
+        self._contour_errors.append(f"{name}: {error}")
+
+    def _on_contours_cancel_requested(self) -> None:
+        self._contour_canceled = True
+        if self._contour_worker is not None:
+            self._contour_worker.cancel()
+
+    def _on_contours_finished(self, made: int) -> None:  # noqa: ARG002
+        if self._contour_progress is not None:
+            self._contour_progress.reset()
+            self._contour_progress.close()
+            self._contour_progress = None
+
+        worker = self._contour_worker
+        self._contour_worker = None
+        if worker is not None:
+            worker.wait()
+            worker.deleteLater()
+
+        errors = self._contour_errors
         if errors:
             QgsMessageLog.logMessage(
                 "Contour errors: " + "; ".join(errors),
                 TAG, Qgis.MessageLevel.Warning,
             )
-        if made:
+        if self._contour_made:
+            self.refresh_layers()
             self.iface.messageBar().pushSuccess(
-                "Waveshed", f"Generated contours for {made} layer(s).",
+                "Waveshed",
+                f"Generated contours for {self._contour_made} layer(s).",
+            )
+        elif self._contour_canceled:
+            self.iface.messageBar().pushInfo(
+                "Waveshed", "Contour generation cancelled.",
             )
         elif errors:
             QMessageBox.critical(
                 self, "Contours failed", "\n".join(errors),
             )
+
+    def _shutdown_workers(self) -> None:
+        """Stop any in-flight background workers — called on plugin unload/close."""
+        for attr in ("_contour_worker", "_merge_worker"):
+            worker = getattr(self, attr, None)
+            if worker is not None:
+                try:
+                    worker.cancel()
+                    worker.wait(5000)
+                except Exception:
+                    pass
+                setattr(self, attr, None)
+        for attr in ("_contour_progress", "_merge_progress"):
+            progress = getattr(self, attr, None)
+            if progress is not None:
+                try:
+                    progress.reset()
+                    progress.close()
+                except Exception:
+                    pass
+                setattr(self, attr, None)
 
 
 # ---------------------------------------------------------------------------
@@ -558,6 +789,7 @@ def remove_altitude_explorer(iface) -> None:
     if _INSTANCE is not None:
         try:
             if not sip.isdeleted(_INSTANCE):
+                _INSTANCE._shutdown_workers()
                 iface.removeDockWidget(_INSTANCE)
                 _INSTANCE.deleteLater()
         except Exception:
