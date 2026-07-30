@@ -199,6 +199,22 @@ _core.QgsVectorLayer = type("VL", (), {"__init__": lambda self, *a, **kw: None})
 _core.QgsWkbTypes = _FakeWkbTypes
 _core.QgsGeometry = mock.MagicMock()
 
+# Raster styling classes — enough for core.result_loader to import.
+_core.QgsColorRampShader = type("QgsColorRampShader", (), {
+    "__init__": lambda self, *a, **kw: None,
+    "Exact": 0, "Interpolated": 1,
+    "ColorRampItem": type("ColorRampItem", (), {"__init__": lambda self, *a: None}),
+})
+_core.QgsRasterShader = type("QgsRasterShader", (), {"__init__": lambda self, *a, **kw: None})
+_core.QgsRasterBandStats = type("QgsRasterBandStats", (), {"Max": 4})
+_core.QgsSingleBandPseudoColorRenderer = type(
+    "QgsSingleBandPseudoColorRenderer", (), {"__init__": lambda self, *a, **kw: None},
+)
+_core.QgsPalettedRasterRenderer = type("QgsPalettedRasterRenderer", (), {
+    "__init__": lambda self, *a, **kw: None,
+    "Class": type("Class", (), {"__init__": lambda self, *a: None}),
+})
+
 # GUI classes
 _gui.QgsMapLayerComboBox = type("MLCB", (), {"__init__": lambda self, *a, **kw: None})
 _gui.QgsRubberBand = type("RB", (), {"__init__": lambda self, *a, **kw: None, "reset": lambda self, *a: None, "addPoint": lambda self, *a: None, "setColor": lambda self, *a: None, "setWidth": lambda self, *a: None})

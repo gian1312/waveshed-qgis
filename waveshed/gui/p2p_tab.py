@@ -67,6 +67,10 @@ from ..core.job_builder import (
     write_job_file,
 )
 from ..core.layer_utils import dem_layer_warning, hide_from_dem_picker
+from ..core.terrain_adapter import (
+    estimate_terrain_disk_mb,
+    terrain_size_warning,
+)
 from .map_tools import activate_point_capture
 
 TAG = "Waveshed"
@@ -169,6 +173,29 @@ def _compute_bbox_for_entries(
     lats = [e[2] for e in entries]
     lons = [e[3] for e in entries]
     return min(lats), max(lats), min(lons), max(lons)
+
+
+def _terrain_extent_for_batch(batch_file: str) -> Tuple[float, float, float]:
+    """Return ``(centre_lat, centre_lon, max_range_km)`` for a batch CSV.
+
+    The centroid and a range covering the full extent (plus margin) are what
+    ``prepare_terrain`` is called with.  Shared by the worker and the pre-run
+    size estimate so the two can never disagree about how much data a run
+    will pull.
+    """
+    entries = _parse_batch_csv(batch_file)
+    min_lat, max_lat, min_lon, max_lon = _compute_bbox_for_entries(entries)
+
+    centre_lat = (min_lat + max_lat) / 2.0
+    centre_lon = (min_lon + max_lon) / 2.0
+
+    lat_span_km = (max_lat - min_lat) * 111.0
+    cos_lat = math.cos(math.radians(centre_lat))
+    if cos_lat < 1e-6:
+        cos_lat = 1e-6
+    lon_span_km = (max_lon - min_lon) * 111.0 * cos_lat
+    half_diag_km = math.sqrt(lat_span_km**2 + lon_span_km**2) / 2.0
+    return centre_lat, centre_lon, max(half_diag_km + 5.0, 10.0)
 
 
 def _write_temp_batch_csv(
@@ -475,21 +502,8 @@ class _P2PWorker(QThread):
             self.status.emit("Computing terrain extents...")
             self.progress.emit(5)
 
-            entries = _parse_batch_csv(self.batch_file)
-            min_lat, max_lat, min_lon, max_lon = _compute_bbox_for_entries(entries)
-
-            # Centroid as reference for terrain prep.
-            centre_lat = (min_lat + max_lat) / 2.0
-            centre_lon = (min_lon + max_lon) / 2.0
-
-            # Range that covers the full extent (with margin).
-            lat_span_km = (max_lat - min_lat) * 111.0
-            cos_lat = math.cos(math.radians(centre_lat))
-            if cos_lat < 1e-6:
-                cos_lat = 1e-6
-            lon_span_km = (max_lon - min_lon) * 111.0 * cos_lat
-            half_diag_km = math.sqrt(lat_span_km**2 + lon_span_km**2) / 2.0
-            max_range_km = max(half_diag_km + 5.0, 10.0)
+            centre_lat, centre_lon, max_range_km = _terrain_extent_for_batch(
+                self.batch_file)
 
             if self._canceled:
                 return
@@ -1225,6 +1239,24 @@ class P2PTab(QWidget):
         )
 
         params = self._collect_params()
+
+        # ---- Confirm an unreasonably large terrain download ----
+        try:
+            c_lat, c_lon, range_km = _terrain_extent_for_batch(batch_file)
+            disk_mb = estimate_terrain_disk_mb(
+                c_lat, c_lon, range_km, params.resolution_m,
+            )
+        except Exception:  # noqa: BLE001 — an estimate must never block a run.
+            disk_mb = 0
+        warn = terrain_size_warning(disk_mb)
+        if warn is not None:
+            msg, strong = warn
+            default = QMessageBox.No if strong else QMessageBox.Yes
+            if QMessageBox.warning(
+                self, "Large terrain download", msg,
+                QMessageBox.Yes | QMessageBox.No, default,
+            ) != QMessageBox.Yes:
+                return
 
         # Switch to running state.
         self.btn_run.setEnabled(False)

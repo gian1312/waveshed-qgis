@@ -10,6 +10,7 @@ The parent dialog must provide ``self.iface`` (QgisInterface).
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import os
@@ -59,6 +60,7 @@ from qgis.gui import QgsMapLayerComboBox, QgsRubberBand
 
 from ..core.binary_manager import find_binary
 from ..core.layer_utils import classify_raster_layer
+from ..core.terrain_adapter import source_fingerprint
 
 TAG = "Waveshed"
 
@@ -275,6 +277,48 @@ def _lv95_to_wgs84_approx(easting: float, northing: float) -> Tuple[float, float
     return lat, lon
 
 
+def _fgb_translate_options(src_crs: str = "") -> List[str]:
+    """GDAL VectorTranslate options for a → FlatGeobuf/WGS84 conversion.
+
+    A file with no embedded CRS reprojects to garbage unless GDAL is told what
+    it is already in, so *src_crs* (the detected or user-supplied CRS) is
+    passed as ``-s_srs`` when known.
+    """
+    options = [
+        "-f", "FlatGeobuf",
+        "-t_srs", "EPSG:4326",
+        "-nlt", "PROMOTE_TO_MULTI",
+        "-lco", "SPATIAL_INDEX=YES",
+        "-skipfailures",
+    ]
+    if src_crs:
+        options += ["-s_srs", src_crs]
+    return options
+
+
+def _fgb_cache_name(src_path: str, src_crs: str = "") -> str:
+    """File name for a cached conversion of *src_path* declared as *src_crs*.
+
+    The conversion cache lives in a shared temp directory that survives across
+    QGIS sessions, so the name has to pin everything that determines the
+    output. Keying on the base name alone caused three separate faults:
+
+    * two sources sharing a base name (``a/buildings.shp``, ``b/buildings.shp``)
+      returned each other's conversion;
+    * re-declaring a source's CRS reused the conversion made under the old one;
+    * a conversion cached before ``-s_srs`` was honoured kept being returned,
+      so the fix silently never applied.
+
+    Including the source fingerprint and the CRS makes each of those a
+    different file, and leaves pre-existing entries unreachable rather than
+    wrong.
+    """
+    basename = os.path.splitext(os.path.basename(src_path))[0]
+    ident = f"{source_fingerprint(src_path)}|{src_crs}"
+    digest = hashlib.md5(ident.encode("utf-8")).hexdigest()[:12]
+    return f"{basename}_{digest}.fgb"
+
+
 def _convert_to_fgb(src_path: str, out_dir: str, src_crs: str = "") -> Optional[str]:
     """Convert a vector file (GDB/SHP/GPKG/GeoJSON) to FlatGeobuf via GDAL.
 
@@ -282,22 +326,25 @@ def _convert_to_fgb(src_path: str, out_dir: str, src_crs: str = "") -> Optional[
     """
     try:
         from osgeo import gdal, ogr
-        basename = os.path.splitext(os.path.basename(src_path))[0]
-        out_path = os.path.join(out_dir, f"{basename}.fgb")
+        out_path = os.path.join(out_dir, _fgb_cache_name(src_path, src_crs))
         if os.path.exists(out_path):
             return out_path
 
-        options = [
-            "-f", "FlatGeobuf",
-            "-t_srs", "EPSG:4326",
-            "-nlt", "PROMOTE_TO_MULTI",
-            "-lco", "SPATIAL_INDEX=YES",
-            "-skipfailures",
-        ]
-        result = gdal.VectorTranslate(out_path, src_path, options=options)
+        # Convert under a temp name and rename on success, so a conversion that
+        # fails or is interrupted cannot leave a partial .fgb behind that the
+        # next run would return straight out of the cache.
+        tmp_path = out_path + ".part"
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+
+        options = _fgb_translate_options(src_crs)
+        result = gdal.VectorTranslate(tmp_path, src_path, options=options)
         if result is None:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
             return None
         result = None  # Close dataset
+        os.replace(tmp_path, out_path)
         return out_path
     except Exception as exc:
         QgsMessageLog.logMessage(
@@ -749,8 +796,14 @@ class _MapConverterWorker(QThread):
         return [os.path.abspath(source)]
 
     def _resolve_buildings(self, entry: dict) -> Optional[str]:
-        """Resolve a buildings entry to an FGB path."""
+        """Resolve a buildings entry to an FGB path.
+
+        The converter only understands WGS84 and LV95 geometry, so anything in
+        another CRS is reprojected here.  ``.fgb`` inputs used to be handed over
+        untouched, which silently placed buildings at the wrong coordinates.
+        """
         path = entry["resolved_source"]
+        src_crs = entry.get("crs_authid", "") or ""
 
         # Deferred OSM download.
         if path.startswith("[OSM Download"):
@@ -771,7 +824,7 @@ class _MapConverterWorker(QThread):
             self._log(f"  Converting GDB → FlatGeobuf: {path}")
             out_dir = os.path.join(tempfile.gettempdir(), "aether_fgb")
             os.makedirs(out_dir, exist_ok=True)
-            fgb = _convert_to_fgb(path, out_dir)
+            fgb = _convert_to_fgb(path, out_dir, src_crs)
             if fgb:
                 return os.path.abspath(fgb)
             self._log("  GDB conversion failed.")
@@ -782,9 +835,23 @@ class _MapConverterWorker(QThread):
             self._log(f"  Converting {ext} → FlatGeobuf...")
             out_dir = os.path.join(tempfile.gettempdir(), "aether_fgb")
             os.makedirs(out_dir, exist_ok=True)
-            fgb = _convert_to_fgb(path, out_dir)
+            fgb = _convert_to_fgb(path, out_dir, src_crs)
             if fgb:
                 return os.path.abspath(fgb)
+
+        # Already FlatGeobuf (or an unrecognised container): only safe to pass
+        # straight through when it is in a CRS the converter reads natively.
+        if self._needs_reproject(src_crs):
+            self._log(f"  Reprojecting buildings {src_crs} → EPSG:4326...")
+            out_dir = os.path.join(tempfile.gettempdir(), "aether_fgb")
+            os.makedirs(out_dir, exist_ok=True)
+            fgb = _convert_to_fgb(path, out_dir, src_crs)
+            if fgb:
+                return os.path.abspath(fgb)
+            self._log(
+                f"  WARNING: could not reproject buildings from {src_crs}; "
+                "they may be placed incorrectly."
+            )
 
         return os.path.abspath(path)
 
@@ -1880,103 +1947,13 @@ class MapConverterTab(QWidget):
         self._log_msg(f"Inspecting {len(abt_files)} .abt files in {folder}")
 
         try:
-            import struct
-            import numpy as np
-            from osgeo import gdal, osr
+            from ..core import abt
 
-            # Read all headers to find bounding box and resolution.
-            tiles = []
-            for path in abt_files:
-                hdr = self._read_abt_header(path)
-                if hdr:
-                    tiles.append(hdr)
-
-            if not tiles:
-                QMessageBox.warning(self, "No Valid Tiles",
-                                    "Could not read any .abt headers.")
-                return
-
-            # Find the finest resolution and compute mosaic extent.
-            ref_res = min(t["pixel_res"] for t in tiles)
-            bb_s = min(t["ul_lat"] - t["size"] * t["pixel_res"] for t in tiles)
-            bb_n = max(t["ul_lat"] for t in tiles)
-            bb_w = min(t["ul_lon"] for t in tiles)
-            bb_e = max(t["ul_lon"] + t["size"] * t["pixel_res"] for t in tiles)
-
-            canvas_w = int(math.ceil((bb_e - bb_w) / ref_res))
-            canvas_h = int(math.ceil((bb_n - bb_s) / ref_res))
-
-            # Limit canvas size to avoid OOM.
-            max_dim = 16384
-            if max(canvas_w, canvas_h) > max_dim:
-                scale = max(canvas_w, canvas_h) / max_dim
-                ref_res *= scale
-                canvas_w = int(math.ceil((bb_e - bb_w) / ref_res))
-                canvas_h = int(math.ceil((bb_n - bb_s) / ref_res))
-                self._log_msg(
-                    f"Downsampled mosaic to {canvas_w}x{canvas_h} "
-                    f"(res={ref_res * 111111:.1f}m)"
-                )
-
-            self._log_msg(
-                f"Mosaic: {canvas_w}x{canvas_h} px, "
-                f"res={ref_res * 111111:.1f}m, "
-                f"bbox S={bb_s:.4f} N={bb_n:.4f} W={bb_w:.4f} E={bb_e:.4f}"
-            )
-
-            mosaic = np.full((canvas_h, canvas_w), -9999.0, dtype=np.float32)
-
-            for i, tile in enumerate(tiles):
-                raw = self._read_abt_data(tile)
-                if raw is None:
-                    continue
-                grid = raw.astype(np.float32) * 0.5  # i16 → metres
-
-                col_off = int(round((tile["ul_lon"] - bb_w) / ref_res))
-                row_off = int(round((bb_n - tile["ul_lat"]) / ref_res))
-
-                tile_deg = tile["size"] * tile["pixel_res"]
-                dst_w = int(round(tile_deg / ref_res))
-                dst_h = dst_w
-
-                # Resample if tile resolution differs from mosaic.
-                if dst_w != tile["size"] or dst_h != tile["size"]:
-                    ri = np.linspace(0, tile["size"] - 1, dst_h).astype(int)
-                    ci = np.linspace(0, tile["size"] - 1, dst_w).astype(int)
-                    grid = grid[ri, :][:, ci]
-
-                # Clip to canvas bounds.
-                sr0, sr1 = 0, dst_h
-                sc0, sc1 = 0, dst_w
-                dr0, dr1 = row_off, row_off + dst_h
-                dc0, dc1 = col_off, col_off + dst_w
-
-                if dr0 < 0: sr0 -= dr0; dr0 = 0
-                if dc0 < 0: sc0 -= dc0; dc0 = 0
-                if dr1 > canvas_h: sr1 -= (dr1 - canvas_h); dr1 = canvas_h
-                if dc1 > canvas_w: sc1 -= (dc1 - canvas_w); dc1 = canvas_w
-
-                if dr1 > dr0 and dc1 > dc0:
-                    src = grid[sr0:sr1, sc0:sc1]
-                    valid = src > -5000
-                    mosaic[dr0:dr1, dc0:dc1][valid] = src[valid]
-
-            # Write to temp GeoTIFF.
             out_tif = os.path.join(
                 tempfile.gettempdir(),
                 f"aether_inspect_{os.path.basename(folder)}.tif",
             )
-            driver = gdal.GetDriverByName("GTiff")
-            ds = driver.Create(out_tif, canvas_w, canvas_h, 1, gdal.GDT_Float32)
-            ds.SetGeoTransform([bb_w, ref_res, 0, bb_n, 0, -ref_res])
-            srs = osr.SpatialReference()
-            srs.ImportFromEPSG(4326)
-            ds.SetProjection(srs.ExportToWkt())
-            band = ds.GetRasterBand(1)
-            band.SetNoDataValue(-9999.0)
-            band.WriteArray(mosaic)
-            ds.FlushCache()
-            ds = None
+            abt.mosaic_to_geotiff(folder, out_tif, on_log=self._log_msg)
 
             # Add to QGIS.
             layer_name = f"Terrain: {os.path.basename(folder)}"
@@ -2003,47 +1980,6 @@ class MapConverterTab(QWidget):
         except Exception as exc:
             self._log_msg(f"Inspect failed: {exc}")
             QMessageBox.critical(self, "Inspect Failed", str(exc))
-
-    @staticmethod
-    def _read_abt_header(path: str) -> Optional[Dict[str, Any]]:
-        """Read the 44-byte .abt header."""
-        import struct
-        try:
-            with open(path, "rb") as f:
-                hdr = f.read(44)
-            if len(hdr) < 44:
-                return None
-            magic, ver, size, ul_lat, ul_lon, sc_y, sc_x, base, stride = \
-                struct.unpack("<4sHHddddhH", hdr)
-            if magic != b"AETH":
-                return None
-            pixel_res = sc_x if sc_x < 0.005 else sc_x / size
-            return {
-                "path": path, "size": size, "ul_lat": ul_lat,
-                "ul_lon": ul_lon, "pixel_res": pixel_res, "stride": stride,
-            }
-        except Exception:
-            return None
-
-    @staticmethod
-    def _read_abt_data(info: Dict[str, Any]):
-        """Read .abt pixel data, handling row-stride padding."""
-        import numpy as np
-        try:
-            size = info["size"]
-            stride = info["stride"]
-            bpr = size * 2
-            with open(info["path"], "rb") as f:
-                f.seek(44)
-                grid = np.zeros((size, size), dtype=np.int16)
-                for i in range(size):
-                    grid[i, :] = np.frombuffer(f.read(bpr), dtype=np.int16)
-                    pad = stride - bpr
-                    if pad > 0:
-                        f.seek(pad, os.SEEK_CUR)
-            return grid
-        except Exception:
-            return None
 
     # ------------------------------------------------------------------
     # Cleanup

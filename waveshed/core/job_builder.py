@@ -276,3 +276,43 @@ def write_job_file(job_config: dict, output_dir: str, name: str) -> str:
     with open(path, "w", encoding="utf-8") as f:
         json.dump(job_config, f, indent=2)
     return os.path.abspath(path)
+
+
+def job_file_for_result(result_path: str) -> Optional[str]:
+    """Return the ``{name}_job.json`` written beside *result_path*, if present.
+
+    A run writes its job config next to the GeoTIFF it produces, which makes
+    the config the one durable record of how that raster was made — it survives
+    the QGIS session, and it is the same file whether the run came from the
+    Site Analysis tab or a Processing algorithm.  Returns None when the file
+    was moved away from its job config (nothing here is load-bearing enough to
+    be worth an error).
+    """
+    if not result_path:
+        return None
+    stem = os.path.splitext(os.path.basename(result_path))[0]
+    path = os.path.join(os.path.dirname(result_path), f"{stem}_job.json")
+    return path if os.path.isfile(path) else None
+
+
+def read_job_terrain_dir(result_path: str) -> Optional[str]:
+    """Return the ``.abt`` terrain directory a result raster was computed over.
+
+    Read back out of the job config beside it (see
+    :func:`job_file_for_result`).  This is what lets the Altitude Explorer's
+    above-sea-level view use *the run's own terrain* rather than asking the
+    user to re-identify a DEM that has to match to the metre.  Returns None if
+    the config or the directory is gone.
+    """
+    job_path = job_file_for_result(result_path)
+    if job_path is None:
+        return None
+    try:
+        with open(job_path, "r", encoding="utf-8") as handle:
+            config = json.load(handle)
+        terrain_dir = config.get("processing", {}).get("terrain_dir")
+    except (OSError, ValueError, AttributeError):
+        return None
+    if terrain_dir and os.path.isdir(terrain_dir):
+        return terrain_dir
+    return None

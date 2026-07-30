@@ -188,8 +188,61 @@ def _compute_sector_bbox(
 # Cache
 # ---------------------------------------------------------------------------
 
-def _cache_key(source: str, bbox: Dict[str, float], resolution_m: int) -> str:
-    return hashlib.md5(f"{source}|{bbox}|{resolution_m}".encode()).hexdigest()
+# Opaque cache identity for the downloaded building source. It does not encode
+# a snapshot date: OpenFreeMap republishes periodically, and pinning that here
+# would invalidate every cached tile on each republish. Clear the terrain cache
+# to pick up newer building data.
+_OSM_BUILDINGS_TOKEN = "openfreemap:z14"
+
+
+def source_fingerprint(buildings: str) -> str:
+    """Stable identity for a data source, for use in a cache key.
+
+    Path alone is not enough — editing the file in place must invalidate the
+    cache — so mtime and size ride along.  For a directory (a set of .fgb
+    parts, or a .gdb) the contents are aggregated, since the directory's own
+    mtime does not change when a file inside it is rewritten.
+    """
+    # Not every buildings source is a file. A downloaded source (OpenFreeMap)
+    # identifies itself with an opaque token, which is already stable — treat
+    # anything that is not an existing path as one.
+    if not os.path.exists(buildings):
+        return buildings
+
+    path = os.path.abspath(buildings)
+    try:
+        if os.path.isdir(path):
+            parts = []
+            for root, _, files in os.walk(path):
+                for f in sorted(files):
+                    fp = os.path.join(root, f)
+                    try:
+                        st = os.stat(fp)
+                    except OSError:
+                        continue
+                    parts.append(f"{os.path.relpath(fp, path)}:"
+                                 f"{int(st.st_mtime)}:{st.st_size}")
+            return f"{path}|" + "|".join(parts)
+        st = os.stat(path)
+        return f"{path}|{int(st.st_mtime)}|{st.st_size}"
+    except OSError:
+        return path
+
+
+def _cache_key(source: str, bbox: Dict[str, float], resolution_m: int,
+               buildings: Optional[str] = None) -> str:
+    """Hash identifying one .abt terrain cache.
+
+    Buildings are baked into the .abt pixels, so a cache built without them
+    must never be reused for a run that wants them (or one that wants a
+    different building set).  The buildings term is appended only when there
+    are buildings, which keeps keys — and therefore existing caches — byte
+    identical to before for the no-buildings case.
+    """
+    key = f"{source}|{bbox}|{resolution_m}"
+    if buildings:
+        key += f"|{source_fingerprint(buildings)}"
+    return hashlib.md5(key.encode()).hexdigest()
 
 
 # Marker file left in a cache dir when the download finished with gaps, so the
@@ -360,6 +413,70 @@ def _estimate_abt_disk_mb(subtiles: List[Dict[str, Any]]) -> int:
     return total // (1024 * 1024)
 
 
+# Estimated .abt cache size (MB) at which a run is worth questioning before it
+# commits the user to a very long download.  Chosen so a routine analysis never
+# nags: 50 GB is already far past anything a normal range/resolution produces.
+_SIZE_WARN_MB = 50 * 1024
+_SIZE_STRONG_WARN_MB = 200 * 1024
+
+
+def analysis_bbox(
+    tx_lat: float,
+    tx_lon: float,
+    max_range_km: float,
+    az_start: float = 0.0,
+    az_end: float = 360.0,
+) -> Dict[str, float]:
+    """Public wrapper: the WGS84 bbox one analysis needs terrain for."""
+    return _compute_sector_bbox(tx_lat, tx_lon, max_range_km, az_start, az_end)
+
+
+def estimate_terrain_disk_mb(
+    tx_lat: float,
+    tx_lon: float,
+    max_range_km: float,
+    resolution_m: int,
+    az_start: float = 0.0,
+    az_end: float = 360.0,
+    high_res: bool = False,
+) -> int:
+    """Estimate the .abt terrain cache (MB) one analysis will generate.
+
+    Runs the same bbox/sub-tile maths ``prepare_terrain`` will, so the GUI can
+    warn *before* a run starts rather than after gigabytes have downloaded.
+    """
+    bbox = _compute_sector_bbox(tx_lat, tx_lon, max_range_km, az_start, az_end)
+    subtiles = _compute_subtiles(bbox, resolution_m, tx_lat, tx_lon,
+                                 max_range_km, az_start, az_end, high_res)
+    return _estimate_abt_disk_mb(subtiles)
+
+
+def terrain_size_warning(disk_mb: int) -> Optional[Tuple[str, bool]]:
+    """Return ``(message, strong)`` when *disk_mb* is big enough to confirm.
+
+    ``strong`` is True past the 200 GB mark, where the caller should default
+    the confirmation to "No".  Returns ``None`` for unremarkable sizes.
+    """
+    if disk_mb < _SIZE_WARN_MB:
+        return None
+    strong = disk_mb >= _SIZE_STRONG_WARN_MB
+    gb = disk_mb / 1024.0
+    msg = (
+        f"This analysis needs about {gb:,.0f} GB of terrain data.\n\n"
+        "Downloading and converting it will take a long time and may fill "
+        "the disk holding the terrain cache."
+    )
+    if strong:
+        msg += (
+            "\n\nThat is an extreme amount. Consider a coarser resolution or "
+            "a shorter range before continuing."
+        )
+    else:
+        msg += "\n\nA coarser resolution or shorter range would reduce it."
+    msg += "\n\nContinue anyway?"
+    return msg, strong
+
+
 # ---------------------------------------------------------------------------
 # Path 1: Rust downloader (XYZ → .abt directly)
 # ---------------------------------------------------------------------------
@@ -513,7 +630,7 @@ def _try_rust_download(
 
     max_passes = _get_download_max_passes()
     conn = _get_download_connections()
-    _log(f"  Rust download: z={zoom}, {len(tile_specs)} tiles, "
+    _log(f"  Rust download: z={zoom}, {len(tile_specs)} output tiles (.abt), "
          f"encoding={encoding}, connections={conn}")
 
     # First pass downloads everything. On failure, re-download ONLY the sub-tiles
@@ -538,8 +655,9 @@ def _try_rust_download(
                 _clear_incomplete(cache_dir)
                 return _cache_hit(cache_dir)
             if ok >= total:
-                _log(f"  Rust download: {elapsed:.1f}s, {ok}/{total} tiles OK "
-                     f"({len(specs)} sub-tile(s) @ {conn} conn)")
+                _log(f"  Rust download: {elapsed:.1f}s, "
+                     f"{ok}/{total} source tiles (XYZ) OK "
+                     f"→ {len(specs)} output tile(s) @ {conn} conn")
                 _clear_incomplete(cache_dir)
                 return True
 
@@ -549,17 +667,18 @@ def _try_rust_download(
                         if _abt_has_gaps(os.path.join(cache_dir, s["filename"]))]
             if (attempt >= max_passes or not affected
                     or conn <= _MIN_DOWNLOAD_CONNECTIONS):
-                _log(f"  WARNING: {missing} tiles still failed after {attempt} "
-                     f"pass(es); {len(affected)} sub-tile(s) left with gaps — "
-                     f"using partial terrain and marking it for re-download.")
+                _log(f"  WARNING: {missing} source tile(s) still failed after "
+                     f"{attempt} pass(es); {len(affected)} output tile(s) left "
+                     f"with gaps — using partial terrain and marking it for "
+                     f"re-download.")
                 _mark_incomplete(cache_dir)
                 return _cache_hit(cache_dir)
 
             conn = max(_MIN_DOWNLOAD_CONNECTIONS, conn // 2)
             specs = affected
-            _log(f"  Rust download incomplete ({missing} tiles): retrying "
-                 f"{len(specs)} affected sub-tile(s) @ {conn} connections "
-                 f"(pass {attempt + 1}/{max_passes})")
+            _log(f"  Rust download incomplete ({missing} source tile(s) "
+                 f"missing): retrying {len(specs)} affected output tile(s) "
+                 f"@ {conn} connections (pass {attempt + 1}/{max_passes})")
         _mark_incomplete(cache_dir)
         return _cache_hit(cache_dir)
     except RuntimeError:
@@ -619,6 +738,90 @@ def _try_gdal_warp(src: str, dest: str, bbox: Dict[str, float],
     return False
 
 
+_TERRAIN_EXTS = (".tif", ".tiff", ".dem", ".hgt")
+
+
+def list_terrain_files(terrain_dir: str) -> List[str]:
+    """Return every terrain raster under *terrain_dir* (recursive)."""
+    found: List[str] = []
+    for root, _, files in os.walk(terrain_dir):
+        for f in files:
+            if f.lower().endswith(_TERRAIN_EXTS):
+                found.append(os.path.join(root, f))
+    return found
+
+
+def _dataset_wgs84_bbox(ds) -> Optional[Dict[str, float]]:
+    """Return a GDAL dataset's WGS84 bounds, or None if GDAL can't report them."""
+    info = gdal.Info(ds, format="json")
+    ext = info.get("wgs84Extent") if isinstance(info, dict) else None
+    if not ext:
+        return None
+    ring = ext["coordinates"][0]
+    lons = [c[0] for c in ring]
+    lats = [c[1] for c in ring]
+    return {"west": min(lons), "east": max(lons),
+            "south": min(lats), "north": max(lats)}
+
+
+def bboxes_intersect(a: Dict[str, float], b: Dict[str, float]) -> bool:
+    """True when two WGS84 bboxes overlap by more than a rounding epsilon."""
+    m = 1e-9
+    return not (a["east"] <= b["west"] + m or a["west"] >= b["east"] - m
+                or a["north"] <= b["south"] + m or a["south"] >= b["north"] - m)
+
+
+def terrain_coverage_warning(terrain_dir: str,
+                             bbox: Dict[str, float]) -> Optional[str]:
+    """Warn only when *terrain_dir* offers no usable terrain for *bbox*.
+
+    Deliberately quiet about partial coverage: a local DEM that covers part of
+    the analysis area is the normal case (the rest falls back to the base DEM
+    or 0 m), and warning about it every run would train the user to click
+    through.  This fires only for the unambiguous mistakes — an empty/unreadable
+    directory, or one whose data lies somewhere else entirely.
+    """
+    try:
+        if not os.path.isdir(terrain_dir):
+            return (
+                f"The terrain directory does not exist:\n{terrain_dir}\n\n"
+                "Check the path in Settings."
+            )
+        tifs = list_terrain_files(terrain_dir)
+        if not tifs:
+            return (
+                f"No terrain files were found in:\n{terrain_dir}\n\n"
+                "Expected GeoTIFF (.tif/.tiff), .dem or .hgt files, searched "
+                "recursively."
+            )
+
+        vrt = gdal.BuildVRT("", tifs)
+        if vrt is None:
+            return (
+                f"The terrain files in:\n{terrain_dir}\n\ncould not be read as "
+                "a single mosaic. They may have mixed projections or be "
+                "corrupt."
+            )
+        src = _dataset_wgs84_bbox(vrt)
+        vrt = None
+        if src is None or bboxes_intersect(src, bbox):
+            return None
+
+        return (
+            f"The terrain data in:\n{terrain_dir}\n\ndoes not cover the "
+            "analysis area at all.\n\n"
+            f"Terrain covers ~ N{src['north']:.3f} S{src['south']:.3f} "
+            f"E{src['east']:.3f} W{src['west']:.3f}\n"
+            f"Analysis needs  ~ N{bbox['north']:.3f} S{bbox['south']:.3f} "
+            f"E{bbox['east']:.3f} W{bbox['west']:.3f}\n\n"
+            "The whole area would be treated as 0 m (sea level), so the "
+            "result would be meaningless."
+        )
+    except Exception as exc:  # noqa: BLE001 — a pre-flight check must not block.
+        _log(f"  (terrain-coverage check skipped: {exc})")
+        return None
+
+
 def _warn_if_bbox_exceeds_source(ds, bbox: Dict[str, float],
                                  source_key: str = "") -> None:
     """Warn (once per run) when *bbox* reaches beyond the source dataset *ds*.
@@ -630,15 +833,11 @@ def _warn_if_bbox_exceeds_source(ds, bbox: Dict[str, float],
     not per terrain build (see :func:`reset_terrain_warnings`).
     """
     try:
-        info = gdal.Info(ds, format="json")
-        ext = info.get("wgs84Extent") if isinstance(info, dict) else None
-        if not ext:
+        src = _dataset_wgs84_bbox(ds)
+        if src is None:
             return
-        ring = ext["coordinates"][0]
-        lons = [c[0] for c in ring]
-        lats = [c[1] for c in ring]
-        src_w, src_e = min(lons), max(lons)
-        src_s, src_n = min(lats), max(lats)
+        src_w, src_e = src["west"], src["east"]
+        src_s, src_n = src["south"], src["north"]
         m = 1e-6
         if (bbox["west"] < src_w - m or bbox["east"] > src_e + m
                 or bbox["south"] < src_s - m or bbox["north"] > src_n + m):
@@ -697,11 +896,7 @@ def _export_via_qgis(dem_layer: Any, dest: str, bbox: Dict[str, float], resoluti
 
 def _extract_from_local_dir(terrain_dir: str, dest: str, bbox: Dict[str, float],
                             resolution_m: Optional[int] = None) -> None:
-    tifs = []
-    for root, _, files in os.walk(terrain_dir):
-        for f in files:
-            if f.lower().endswith((".tif", ".tiff", ".dem", ".hgt")):
-                tifs.append(os.path.join(root, f))
+    tifs = list_terrain_files(terrain_dir)
     if not tifs:
         raise RuntimeError(f"No terrain files in {terrain_dir}")
 
@@ -771,16 +966,36 @@ def prepare_terrain(
     terrain_dir: Optional[str] = None,
     az_start: float = 0.0,
     az_end: float = 360.0,
+    buildings_file: Optional[str] = None,
+    osm_buildings: bool = False,
 ) -> str:
-    """Produce .abt terrain tiles for aether_core. Returns cache directory."""
+    """Produce .abt terrain tiles for aether_core. Returns cache directory.
+
+    Buildings can come from *buildings_file* (FlatGeobuf, absolute roof
+    elevations) and/or *osm_buildings* (OpenFreeMap vector tiles, heights above
+    ground). Either way they are burned into the terrain surface, so the choice
+    is part of the cache identity.
+    """
     t0 = time.perf_counter()
     source = terrain_dir or dem_layer.source()
     _log(f"prepare_terrain: resolution={resolution_m}m, range={max_range_km}km, "
-         f"az={az_start:.1f}-{az_end:.1f}")
+         f"az={az_start:.1f}-{az_end:.1f}"
+         + (f", buildings={os.path.basename(buildings_file)}"
+            if buildings_file else "")
+         + (", buildings=openfreemap" if osm_buildings else ""))
 
     bbox = _compute_sector_bbox(tx_lat, tx_lon, max_range_km, az_start, az_end)
 
-    cache_hash = _cache_key(source, bbox, resolution_m)
+    # One identity covering both sources, so switching either one — or turning
+    # buildings off — lands on a different cache entry.
+    parts = []
+    if buildings_file:
+        parts.append(source_fingerprint(buildings_file))
+    if osm_buildings:
+        parts.append(_OSM_BUILDINGS_TOKEN)
+    buildings_id = "+".join(parts) if parts else None
+
+    cache_hash = _cache_key(source, bbox, resolution_m, buildings_id)
     # Include azimuth in cache key so different sectors don't collide.
     if not (az_start == 0.0 and az_end == 360.0):
         cache_hash = hashlib.md5(
@@ -803,13 +1018,39 @@ def prepare_terrain(
     subtiles = _compute_subtiles(bbox, resolution_m, tx_lat, tx_lon,
                                   max_range_km, az_start, az_end, high_res)
     disk_mb = _estimate_abt_disk_mb(subtiles)
-    _log(f"  cache MISS — {len(subtiles)} sub-tiles, ~{disk_mb} MB output, "
+    # "output tiles" = the .abt files we write. Kept distinct from the "source
+    # tiles" (XYZ web tiles) counted during the download below — the two counts
+    # differ by orders of magnitude and used to be indistinguishable in the log.
+    _log(f"  cache MISS — {len(subtiles)} output tiles (.abt), "
+         f"~{disk_mb} MB on disk, "
          f"bbox N={bbox['north']:.3f} S={bbox['south']:.3f} "
          f"E={bbox['east']:.3f} W={bbox['west']:.3f}")
     os.makedirs(cache_dir, exist_ok=True)
 
+    # Fetch building tiles before the converter runs, so they are on disk when
+    # the ingest jobs reference them.
+    pbf_dir: Optional[str] = None
+    if osm_buildings:
+        pbf_dir = os.path.join(cache_dir, "_buildings")
+        try:
+            from . import openfreemap
+            openfreemap.download_building_tiles(bbox, pbf_dir, log=_log)
+        except Exception as exc:  # noqa: BLE001
+            # Terrain without buildings beats no terrain at all, but the user
+            # must know the result is not what they asked for.
+            _log(f"  WARNING: building download failed ({exc}); "
+                 "continuing without buildings")
+            pbf_dir = None
+
     # Path 1: Rust downloader (XYZ → .abt directly, no intermediate file).
-    if not terrain_dir and "type=xyz" in dem_layer.source():
+    # Skipped when buildings are requested: the downloader writes .abt straight
+    # from the tile stream and has no way to fuse a building overlay, so taking
+    # it here would silently produce terrain with no buildings in it. Path 2/3
+    # is slower but runs the converter's ingest, which does honour them.
+    if (buildings_file or pbf_dir) and not terrain_dir and "type=xyz" in dem_layer.source():
+        _log("  buildings requested — using the converter ingest path "
+             "(the direct XYZ downloader cannot fuse buildings)")
+    elif not terrain_dir and "type=xyz" in dem_layer.source():
         if _try_rust_download(dem_layer.source(), cache_dir, bbox,
                               resolution_m, subtiles, binary_manager):
             _log(f"  TOTAL: {time.perf_counter() - t0:.1f}s")
@@ -849,7 +1090,7 @@ def prepare_terrain(
             _log(f"  extract {t['filename']}: {time.perf_counter() - t1:.1f}s, "
                  f"{os.path.getsize(tile_tif) / 1e6:.0f}MB")
 
-            jobs.append({
+            job = {
                 "output_path": os.path.abspath(os.path.join(cache_dir, t["filename"])),
                 "format": "r16sint",
                 "ul_lat": t["ul_lat"],
@@ -858,7 +1099,14 @@ def prepare_terrain(
                 "size_px": t["size_px"],
                 "base_tif": os.path.abspath(tile_tif),
                 "swiss_tifs": [],
-            })
+            }
+            # Omitted entirely when unset — MPT_SIGMA and older converters must
+            # keep seeing exactly the job shape they do today.
+            if buildings_file:
+                job["buildings_file"] = os.path.abspath(buildings_file)
+            if pbf_dir:
+                job["buildings_pbf_dir"] = os.path.abspath(pbf_dir)
+            jobs.append(job)
 
         job_file = os.path.join(cache_dir, "batch_job.json")
         with open(job_file, "w") as fh:

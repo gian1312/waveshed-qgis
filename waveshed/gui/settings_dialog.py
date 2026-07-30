@@ -30,6 +30,7 @@ from qgis.PyQt.QtWidgets import (
 from qgis.core import QgsSettings
 
 from ..core import api_key, binary_manager
+from ..core.attribution import attribution_lines
 
 
 # ---------------------------------------------------------------------------
@@ -128,6 +129,7 @@ class SettingsDialog(QDialog):
         layout.addWidget(self._build_binaries_group())
         layout.addWidget(self._build_api_key_group())
         layout.addWidget(self._build_defaults_group())
+        layout.addWidget(self._build_attribution_group())
 
         # --- OK / Cancel -----------------------------------------------------
         self._button_box = QDialogButtonBox(
@@ -227,6 +229,31 @@ class SettingsDialog(QDialog):
         row2.addWidget(self._btn_fingerprint)
         row2.addStretch()
         vbox.addLayout(row2)
+
+        return group
+
+    def _build_attribution_group(self) -> QGroupBox:
+        """Credits for the data the plugin downloads on the user's behalf.
+
+        Several sources are ODbL, which obliges us to name them somewhere the
+        user can actually see — the plugin's own GPL notice does not cover
+        third-party data.
+        """
+        group = QGroupBox("Data sources")
+        vbox = QVBoxLayout(group)
+
+        intro = QLabel(
+            "Terrain and building data are downloaded from third parties and "
+            "remain under their own licences:"
+        )
+        intro.setWordWrap(True)
+        vbox.addWidget(intro)
+
+        for line in attribution_lines():
+            lbl = QLabel("• " + line)
+            lbl.setWordWrap(True)
+            lbl.setStyleSheet("color: gray; font-size: 11px;")
+            vbox.addWidget(lbl)
 
         return group
 

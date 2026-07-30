@@ -8,6 +8,8 @@ from __future__ import annotations
 
 from typing import Optional
 
+from .min_alt import REF_AGL, normalize_reference
+
 # Custom-property keys stamped on every layer the plugin itself adds to the
 # project. Used to keep our own *result* outputs (coverage, P2P) out of the DEM
 # source pickers — a coverage raster is never a valid terrain input. Terrain
@@ -15,6 +17,13 @@ from typing import Optional
 _OUTPUT_PROP = "aether/output"
 _ROLE_PROP = "aether/role"
 _MODEL_PROP = "aether/model"
+
+# Custom properties describing a MIN_ALT surface. They survive a project
+# save/reload, which is what lets the Altitude Explorer pick up where it left
+# off in a session it did not start.
+_REF_PROP = "aether/altitude_ref"      # "AGL" | "AMSL"
+_DERIVED_FROM_PROP = "aether/derived_from"  # layer id this was computed from
+_TERRAIN_PROP = "aether/terrain_dir"   # .abt directory the run used
 
 
 def mark_aether_output(layer, role: str = "") -> None:
@@ -50,6 +59,55 @@ def aether_model(layer) -> str:
 def is_min_alt_layer(layer) -> bool:
     """True if *layer* is a plugin MIN_ALT (minimum-LOS-altitude) raster."""
     return aether_model(layer) == "MIN_ALT"
+
+
+def _set_prop(layer, key: str, value: str) -> None:
+    try:
+        if value:
+            layer.setCustomProperty(key, str(value))
+    except Exception:
+        pass
+
+
+def _get_prop(layer, key: str) -> str:
+    try:
+        return str(layer.customProperty(key, "") or "")
+    except Exception:
+        return ""
+
+
+def mark_altitude_reference(layer, reference: str) -> None:
+    """Stamp what a MIN_ALT layer's metres are measured from ("AGL"/"AMSL")."""
+    _set_prop(layer, _REF_PROP, normalize_reference(reference))
+
+
+def altitude_reference(layer) -> str:
+    """Return a MIN_ALT layer's altitude reference, defaulting to ``"AGL"``.
+
+    Layers produced before the above-sea-level view existed carry no stamp, and
+    the solver only ever emitted AGL — so an unstamped layer is an AGL one.
+    """
+    return normalize_reference(_get_prop(layer, _REF_PROP) or REF_AGL)
+
+
+def mark_derived_from(layer, source_layer_id: str) -> None:
+    """Record which layer *layer* was computed from (e.g. its AGL original)."""
+    _set_prop(layer, _DERIVED_FROM_PROP, source_layer_id)
+
+
+def derived_from(layer) -> str:
+    """Return the id of the layer this one was computed from, or ""."""
+    return _get_prop(layer, _DERIVED_FROM_PROP)
+
+
+def mark_terrain_dir(layer, terrain_dir: str) -> None:
+    """Record the ``.abt`` terrain directory a result was computed over."""
+    _set_prop(layer, _TERRAIN_PROP, terrain_dir)
+
+
+def terrain_dir(layer) -> str:
+    """Return the ``.abt`` terrain directory stamped on *layer*, or ""."""
+    return _get_prop(layer, _TERRAIN_PROP)
 
 
 def is_aether_output(layer) -> bool:

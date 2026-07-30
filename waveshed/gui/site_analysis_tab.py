@@ -22,6 +22,7 @@ from typing import Dict, List, Optional, Tuple
 
 from qgis.PyQt.QtCore import QThread, pyqtSignal, Qt
 from qgis.PyQt.QtWidgets import (
+    QCheckBox,
     QComboBox,
     QDoubleSpinBox,
     QFileDialog,
@@ -55,6 +56,7 @@ from qgis.gui import QgsRubberBand
 from qgis.PyQt.QtGui import QColor
 
 from ..core.asset_manager import compute_erp, list_assets, load_asset
+from ..core.attribution import source_credit
 from ..core.binary_manager import find_binary
 from ..core import api_key
 
@@ -75,9 +77,13 @@ from ..core.result_loader import (
     load_coverage_result,
 )
 from ..core.terrain_adapter import (
+    analysis_bbox,
+    estimate_terrain_disk_mb,
     get_source_resolution_info,
     prepare_terrain,
     reset_terrain_warnings,
+    terrain_coverage_warning,
+    terrain_size_warning,
 )
 from .map_tools import activate_point_capture
 
@@ -143,12 +149,14 @@ class _SiteAnalysisWorker(QThread):
         output_dir: str,
         terrain_dir: str = "",
         parent: Optional[QWidget] = None,
+        osm_buildings: bool = False,
     ) -> None:
         super().__init__(parent)
         self.jobs = jobs
         self.dem_layer = dem_layer
         self.output_dir = output_dir
         self.terrain_dir = terrain_dir
+        self.osm_buildings = osm_buildings
         self._canceled = False
         self._proc: Optional[subprocess.Popen] = None
 
@@ -208,6 +216,7 @@ class _SiteAnalysisWorker(QThread):
                     terrain_dir=self.terrain_dir or None,
                     az_start=params.az_start,
                     az_end=params.az_end,
+                    osm_buildings=self.osm_buildings,
                 )
 
                 if self._canceled:
@@ -372,6 +381,11 @@ class SiteAnalysisTab(QWidget):
         _proj.layersAdded.connect(self._on_project_layers_changed)
         _proj.layersRemoved.connect(self._on_project_layers_changed)
         self._refresh_asset_cache()
+        # Start with one empty site row so the user can type coordinates right
+        # away instead of having to press "Add" first.  This must run *after*
+        # _refresh_asset_cache(), or the row's Asset dropdown would be built
+        # from an empty cache.
+        self._add_site_row_internal()
         # Apply initial mode and update DEM info.
         self.set_mode(self._current_mode)
         self._on_dem_changed()
@@ -543,6 +557,18 @@ class SiteAnalysisTab(QWidget):
         self.combo_resolution.addItems([str(r) for r in VALID_RESOLUTIONS])
         self.combo_resolution.setCurrentIndex(2)  # default 10
         layout.addRow("Resolution (m):", self.combo_resolution)
+
+        # Buildings — fetched from OpenFreeMap and burned into the terrain
+        # surface, so they obstruct exactly like terrain does.
+        self.chk_buildings = QCheckBox("Include buildings (OpenFreeMap)")
+        self.chk_buildings.setToolTip(
+            "Download OpenStreetMap building footprints and treat them as part "
+            "of the terrain.\n\n"
+            "Buildings are only published at zoom 14, so this adds a sizeable "
+            "download and is limited to smaller analysis areas.\n\n"
+            + source_credit("OpenFreeMap")
+        )
+        layout.addRow("Buildings:", self.chk_buildings)
 
         # Compute Backend
         self.combo_backend = QComboBox()
@@ -1382,6 +1408,55 @@ class SiteAnalysisTab(QWidget):
             )
             return
 
+        # ---- Confirm an unreasonably large terrain download ----
+        # Jobs that only differ by receiver altitude share one terrain cache,
+        # so dedupe on the parameters the cache key is built from — otherwise
+        # the estimate would multiply by the number of altitudes.
+        high_res = bool(terrain_dir)
+        seen: set = set()
+        total_mb = 0
+        union: Optional[dict] = None
+        for params, _name in jobs:
+            key = (params.tx_lat, params.tx_lon, params.max_range_km,
+                   params.resolution_m, params.az_start, params.az_end)
+            if key in seen:
+                continue
+            seen.add(key)
+            total_mb += estimate_terrain_disk_mb(
+                params.tx_lat, params.tx_lon, params.max_range_km,
+                params.resolution_m, params.az_start, params.az_end, high_res,
+            )
+            bb = analysis_bbox(params.tx_lat, params.tx_lon,
+                               params.max_range_km, params.az_start,
+                               params.az_end)
+            if union is None:
+                union = dict(bb)
+            else:
+                union["north"] = max(union["north"], bb["north"])
+                union["south"] = min(union["south"], bb["south"])
+                union["east"] = max(union["east"], bb["east"])
+                union["west"] = min(union["west"], bb["west"])
+
+        # A local terrain directory that covers none of the analysis area is
+        # always a mistake — everything would come out as sea level.
+        if terrain_dir and union is not None:
+            cov = terrain_coverage_warning(terrain_dir, union)
+            if cov and QMessageBox.warning(
+                self, "No terrain coverage", cov + "\n\nRun anyway?",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+            ) != QMessageBox.Yes:
+                return
+
+        warn = terrain_size_warning(total_mb)
+        if warn is not None:
+            msg, strong = warn
+            default = QMessageBox.No if strong else QMessageBox.Yes
+            if QMessageBox.warning(
+                self, "Large terrain download", msg,
+                QMessageBox.Yes | QMessageBox.No, default,
+            ) != QMessageBox.Yes:
+                return
+
         # ---- Launch worker ----
         self.btn_run.setEnabled(False)
         self.btn_stop.setVisible(True)
@@ -1393,6 +1468,7 @@ class SiteAnalysisTab(QWidget):
         terrain_dir = self._selected_terrain_dir() or ""
         self._worker = _SiteAnalysisWorker(
             jobs, dem_layer, output_dir, terrain_dir, self,
+            osm_buildings=self.chk_buildings.isChecked(),
         )
         self._worker.progress.connect(self.progress_bar.setValue)
         self._worker.status.connect(self._on_status)
