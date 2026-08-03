@@ -397,5 +397,46 @@ class TestFingerprintErrorMessage(unittest.TestCase):
         self.assertNotIn(self._UPDATE, msg)
 
 
+class TestMissingBinaryWarning(unittest.TestCase):
+    """A missing engine must be named up front, not discovered mid-run.
+
+    Terrain preparation falls back to the slow QGIS raster path when
+    aether_converter cannot be found, so an unannounced miss costs the user
+    the whole extract before anything mentions the engine.
+    """
+
+    def test_all_present_is_silent(self):
+        with mock.patch.object(bm, "find_binary", return_value="/bin/x"):
+            self.assertEqual(bm.missing_binaries(), [])
+            self.assertIsNone(bm.binaries_warning())
+
+    def test_missing_names_are_reported_in_order(self):
+        def fake(name):
+            if name == "aether_converter":
+                raise RuntimeError("nope")
+            return "/bin/" + name
+
+        with mock.patch.object(bm, "find_binary", side_effect=fake):
+            self.assertEqual(bm.missing_binaries(), ["aether_converter"])
+
+    def test_warning_names_the_binary_and_where_it_looked(self):
+        with mock.patch.object(bm, "find_binary",
+                               side_effect=RuntimeError("nope")):
+            msg = bm.binaries_warning()
+        self.assertIsNotNone(msg)
+        for name in bm.REQUIRED_BINARIES:
+            self.assertIn(name, msg)
+        # The user needs to know where to point it, not just that it failed.
+        self.assertIn("AETHER_BIN_DIR", msg)
+        self.assertIn(bm.DEFAULT_INSTALL_DIR, msg)
+        self.assertIn("Download Binaries", msg)
+
+    def test_subset_can_be_checked(self):
+        with mock.patch.object(bm, "find_binary",
+                               side_effect=RuntimeError("nope")):
+            self.assertEqual(bm.missing_binaries(["aether_core"]),
+                             ["aether_core"])
+
+
 if __name__ == "__main__":
     unittest.main()

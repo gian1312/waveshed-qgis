@@ -70,13 +70,18 @@ def cache_entries() -> List[str]:
     """
     root = get_cache_dir()
     entries: List[str] = []
-    try:
-        for name in sorted(os.listdir(root)):
-            path = os.path.join(root, name)
-            if _CACHE_ENTRY_RE.match(name) and os.path.isdir(path):
-                entries.append(path)
-    except OSError:
-        return []
+    # The pool holds the tiles, the views hold links to them, and a bare md5
+    # directly under the root is a per-request cache from an older plugin.
+    for parent in (root,
+                   os.path.join(root, _POOL_DIRNAME),
+                   os.path.join(root, _VIEW_DIRNAME)):
+        try:
+            for name in sorted(os.listdir(parent)):
+                path = os.path.join(parent, name)
+                if _CACHE_ENTRY_RE.match(name) and os.path.isdir(path):
+                    entries.append(path)
+        except OSError:
+            continue
     return entries
 
 
@@ -294,11 +299,62 @@ def source_fingerprint(buildings: str) -> str:
         return path
 
 
-# Bumped whenever tile geometry or cache layout changes, so directories built
-# by an older plugin can never be mistaken for a valid cache.
+# Bumped whenever tile geometry, provenance or cache layout changes, so tiles
+# built by an older plugin can never be mistaken for current ones.
 #   v2: tile extent is resolution-keyed (ABT_EXTENT_DEG) instead of a flat 1
 #       degree, and the key is the tile set rather than the request bbox.
-_CACHE_SCHEMA = "v2"
+#   v3: tiles are pooled per tile; source identity is normalised; the XYZ zoom
+#       is computed per tile instead of from the request's bbox centre.
+_CACHE_SCHEMA = "v3"
+
+
+def source_identity(source: str) -> str:
+    """Stable identity for an elevation source, for the pool key.
+
+    ``dem_layer.source()`` is a QGIS URI whose spelling depends on how the user
+    happened to add the layer — parameter order, ``zmin``, ``interpretation``,
+    percent-encoding.  Two spellings of the same Mapzen endpoint must not
+    produce two pools and a full re-download of byte-identical data, so an XYZ
+    URI is reduced to the parts that actually decide the pixels:
+
+    * the tile URL template — which service the elevation comes from;
+    * the encoding — how the PNG channels decode to metres;
+    * ``zmax`` — the cap on the zoom a tile can be built from, which changes
+      the sampled detail (see :func:`tile_zoom`).
+
+    Anything else in the URI is presentation.  Non-XYZ sources (a file, a VRT,
+    a local terrain directory) are already identified by their path.
+    """
+    if "type=xyz" not in source:
+        return source
+    params = dict(urllib.parse.parse_qsl(source))
+    url = urllib.parse.unquote(params.get("url", ""))
+    encoding = ("mapbox" if "mapbox" in params.get("interpretation", "").lower()
+                else "terrarium")
+    return f"xyz|{url}|{encoding}|zmax={params.get('zmax', '15')}"
+
+
+def tile_zoom(lat: float, resolution_m: float, z_max: int) -> int:
+    """XYZ zoom giving *resolution_m* ground sampling at *lat*, capped at z_max.
+
+    At latitude θ a zoom-z tile pixel spans ``40075000*cos(θ)/(2^z * 256)``
+    metres, so ``z = ceil(log2(40075000*cos(θ)/(res*256)))``.
+
+    Take *lat* from the TILE, never from the request's bounding box: a tile
+    shared by two runs whose bboxes are centred at different latitudes would
+    otherwise be built from different source zooms, and its pixels would depend
+    on which run happened to fetch it first.  Keyed on the tile, zoom is a pure
+    function of (source, tile, resolution) and needs no term in the cache key.
+    """
+    cos_lat = max(math.cos(math.radians(lat)), 0.1)
+    z_ideal = math.ceil(math.log2(40_075_000.0 * cos_lat / (resolution_m * 256)))
+    return min(max(z_ideal, 0), z_max)
+
+
+def _tile_center_lat(tile: Dict[str, Any]) -> float:
+    """Latitude of a sub-tile's centre, from its own header parameters."""
+    span_deg = tile["size_px"] * tile["exact_res_m"] / 111_111.0
+    return tile["ul_lat"] - span_deg / 2.0
 
 
 def _cache_key(source: str, subtiles: List[Dict[str, Any]], resolution_m: int,
@@ -327,55 +383,174 @@ def _cache_key(source: str, subtiles: List[Dict[str, Any]], resolution_m: int,
     return hashlib.md5(key.encode()).hexdigest()
 
 
-# Marker file left in a cache dir when the download finished with gaps, so the
-# holed .abt set is NOT reused as a valid cache — the next run re-downloads.
-_INCOMPLETE_MARKER = ".incomplete"
+# ---------------------------------------------------------------------------
+# Tile pool
+# ---------------------------------------------------------------------------
+#
+# Tiles live once, addressed by their own geography, in a per-source pool.
+# Each run then gets a small "view" directory holding links to exactly the
+# tiles it needs.
+#
+# The view is not an optimisation — it is required.  aether_core reads EVERY
+# .abt in the directory it is handed: engines/coverage.rs builds
+# `relevant_tiles` from the whole listing with no bbox filter, so pointing it
+# at the pool would drag every tile ever built for that source into the
+# terrain atlas and the output grid.  abt.list_tiles is flat for the same
+# reason, and job_builder passes exactly one terrain_dir.
+#
+# Keying a whole directory on the request cannot express the common case,
+# which is why the earlier per-directory schemes re-downloaded constantly:
+# shrinking the range, nudging the site or narrowing the sector all yield a
+# SUBSET of tiles that are already on disk.  Set-equality on a directory key
+# calls that a miss and fetches every one of them again.  Membership is a
+# per-tile question, so it is asked per tile.
+_POOL_DIRNAME = "pool"
+_VIEW_DIRNAME = "views"
+
+# Sidecar next to a pooled tile that exists but must not be reused: written
+# with a gap in it, or built without the buildings its pool identity claims.
+# The engine never sees these — it is given the view, and list_tiles only
+# matches .abt.
+_REBUILD_SUFFIX = ".rebuild"
 
 
-def _mark_incomplete(cache_dir: str) -> None:
+def _finish_view(pool_dir: str, view_dir: str, names: List[str],
+                 t0: float) -> None:
+    """Link this run's tiles into its view directory and log the outcome."""
+    gone = _sync_view(pool_dir, view_dir, names)
+    if gone:
+        _log(f"  WARNING: {len(gone)} of {len(names)} tile(s) could not be "
+             f"provided (first: {gone[0]}) — coverage will have holes there")
+    _log(f"  TOTAL: {time.perf_counter() - t0:.1f}s")
+
+
+def _pool_dir(source: str, buildings: Optional[str] = None) -> str:
+    """Directory holding every tile built for this source (+ building set).
+
+    Resolution is not part of the identity: ``_tile_params`` puts it in the
+    filename, so tiles of different resolutions coexist without colliding.
+    """
+    key = f"{_CACHE_SCHEMA}|{source_identity(source)}"
+    if buildings:
+        key += f"|{source_fingerprint(buildings)}"
+    return os.path.join(get_cache_dir(), _POOL_DIRNAME,
+                        hashlib.md5(key.encode()).hexdigest())
+
+
+def _tile_is_whole(path: str) -> bool:
+    """True if *path* is a fully written .abt, by its own declared geometry.
+
+    A tile from a killed run exists and has a valid header over missing rows;
+    the engine would read it as real terrain and the coverage would come out
+    with holes and no error.  Compare the declared size against the file.
+    """
+    from . import abt
+    header = abt.read_header(path)
+    if header is None:
+        return False
     try:
-        open(os.path.join(cache_dir, _INCOMPLETE_MARKER), "w").close()
+        return os.path.getsize(path) >= abt.HEADER_SIZE + header.size * header.stride
+    except OSError:
+        return False
+
+
+def _tile_ready(pool_dir: str, name: str) -> bool:
+    """True if the pool holds a usable copy of tile *name*."""
+    if os.path.exists(os.path.join(pool_dir, name + _REBUILD_SUFFIX)):
+        return False
+    return _tile_is_whole(os.path.join(pool_dir, name))
+
+
+def _set_rebuild_flags(pool_dir: str, names: List[str],
+                       bad: Optional[set] = None) -> None:
+    """Flag *bad* tiles for rebuild and clear the flag on the rest of *names*."""
+    bad = bad or set()
+    for name in names:
+        path = os.path.join(pool_dir, name + _REBUILD_SUFFIX)
+        try:
+            if name in bad:
+                open(path, "w").close()
+            elif os.path.exists(path):
+                os.remove(path)
+        except OSError:
+            pass
+
+
+def _link_pbf_view(pool_dir: str, view_dir: str, names: List[str]) -> None:
+    """Link this run's building tiles out of the pool into its own directory.
+
+    Tiles that 404 (no buildings there — normal over water) simply have no
+    file, which is not an error.  Strangers are pruned because the converter
+    decodes every file in the directory for every output tile it writes.
+    """
+    os.makedirs(view_dir, exist_ok=True)
+    wanted = set(names)
+    try:
+        for stale in os.listdir(view_dir):
+            if stale not in wanted:
+                try:
+                    os.remove(os.path.join(view_dir, stale))
+                except OSError:
+                    pass
+    except OSError:
+        pass
+    for name in names:
+        src = os.path.join(pool_dir, name)
+        dst = os.path.join(view_dir, name)
+        if not os.path.exists(src) or os.path.exists(dst):
+            continue
+        try:
+            os.link(src, dst)
+        except OSError:
+            try:
+                shutil.copy2(src, dst)
+            except OSError:
+                pass
+
+
+def _sync_view(pool_dir: str, view_dir: str, names: List[str]) -> List[str]:
+    """Populate *view_dir* with exactly *names*, linked from the pool.
+
+    Hardlinks cost nothing; where the filesystem refuses one (a different
+    volume, FAT, or Windows without the privilege) we fall back to a copy.
+    Returns the names that could not be provided.
+    """
+    os.makedirs(view_dir, exist_ok=True)
+    wanted = set(names)
+
+    # Anything else in the view would be read as terrain by the engine.
+    try:
+        for stale in os.listdir(view_dir):
+            if stale.lower().endswith(".abt") and stale not in wanted:
+                try:
+                    os.remove(os.path.join(view_dir, stale))
+                except OSError:
+                    pass
     except OSError:
         pass
 
-
-def _clear_incomplete(cache_dir: str) -> None:
-    try:
-        os.remove(os.path.join(cache_dir, _INCOMPLETE_MARKER))
-    except OSError:
-        pass
-
-
-def _has_any_abt(cache_dir: str) -> bool:
-    """True if the directory holds any .abt at all, complete or not.
-
-    Distinct from ``_cache_hit``: this answers "did we produce something
-    usable for *this* run", not "is this a cache we may reuse later".
-    """
-    try:
-        return any(f.endswith(".abt") for f in os.listdir(cache_dir))
-    except OSError:
-        return False
-
-
-def _cache_hit(cache_dir: str, expected: List[str]) -> bool:
-    """True if *cache_dir* is a complete, reusable cache for *expected* tiles.
-
-    *expected* is the list of .abt filenames this run needs.  Accepting "any
-    .abt is present" reported a run killed after tile 1 of 4 as a HIT; the
-    engine resolves terrain by .abt header (``peek_abt``), so the cells with
-    no tile are simply absent and the coverage comes out silently wrong — no
-    error, just holes.  Check every tile, not just one.
-    """
-    if not os.path.isdir(cache_dir):
-        return False
-    try:
-        files = set(os.listdir(cache_dir))
-    except OSError:
-        return False
-    if _INCOMPLETE_MARKER in files:
-        return False  # a prior run left gaps — force a fresh download
-    return bool(expected) and all(name in files for name in expected)
+    unavailable = []
+    for name in names:
+        src = os.path.join(pool_dir, name)
+        dst = os.path.join(view_dir, name)
+        if _tile_is_whole(dst):
+            continue
+        if os.path.exists(dst):
+            try:
+                os.remove(dst)      # truncated leftover from a killed run
+            except OSError:
+                pass
+        if not _tile_is_whole(src):
+            unavailable.append(name)
+            continue
+        try:
+            os.link(src, dst)
+        except OSError:
+            try:
+                shutil.copy2(src, dst)
+            except OSError:
+                unavailable.append(name)
+    return unavailable
 
 
 # ---------------------------------------------------------------------------
@@ -584,21 +759,74 @@ def estimate_terrain_disk_mb(
     return _estimate_abt_disk_mb(subtiles)
 
 
-def terrain_size_warning(disk_mb: int) -> Optional[Tuple[str, bool]]:
+def buildings_identity(buildings_file: Optional[str] = None,
+                       osm_buildings: bool = False) -> Optional[str]:
+    """One identity covering both building sources, or None for plain terrain.
+
+    Shared by ``prepare_terrain`` and the pre-run estimate so the GUI prices
+    the same pool the run will actually use.
+    """
+    parts = []
+    if buildings_file:
+        parts.append(source_fingerprint(buildings_file))
+    if osm_buildings:
+        parts.append(_OSM_BUILDINGS_TOKEN)
+    return "+".join(parts) if parts else None
+
+
+def terrain_plan(
+    source: str,
+    tx_lat: float,
+    tx_lon: float,
+    max_range_km: float,
+    resolution_m: int,
+    az_start: float = 0.0,
+    az_end: float = 360.0,
+    buildings: Optional[str] = None,
+) -> Dict[str, Any]:
+    """What one analysis will actually have to build, given what is pooled.
+
+    The pre-run warning used to price the whole tile set every time, so a run
+    whose terrain was already on disk still announced tens of gigabytes of
+    "download" and trained the user to click through it. Price only the tiles
+    that are genuinely missing.
+    """
+    bbox = _compute_sector_bbox(tx_lat, tx_lon, max_range_km, az_start, az_end)
+    subtiles = _compute_subtiles(bbox, resolution_m, tx_lat, tx_lon,
+                                 max_range_km, az_start, az_end)
+    pool = _pool_dir(source, buildings)
+    missing = [t for t in subtiles if not _tile_ready(pool, t["filename"])]
+    return {
+        "bbox": bbox,
+        "tiles_total": len(subtiles),
+        "tiles_cached": len(subtiles) - len(missing),
+        "tiles_missing": len(missing),
+        "download_mb": _estimate_abt_disk_mb(missing),
+        "total_mb": _estimate_abt_disk_mb(subtiles),
+    }
+
+
+def terrain_size_warning(disk_mb: int,
+                         cached_mb: int = 0) -> Optional[Tuple[str, bool]]:
     """Return ``(message, strong)`` when *disk_mb* is big enough to confirm.
 
-    ``strong`` is True past the 200 GB mark, where the caller should default
-    the confirmation to "No".  Returns ``None`` for unremarkable sizes.
+    *disk_mb* is what still has to be built; *cached_mb* is what is already
+    pooled and is mentioned only so the number is not mistaken for the whole
+    job.  ``strong`` is True past the 200 GB mark, where the caller should
+    default the confirmation to "No".  Returns ``None`` for unremarkable sizes.
     """
     if disk_mb < _SIZE_WARN_MB:
         return None
     strong = disk_mb >= _SIZE_STRONG_WARN_MB
     gb = disk_mb / 1024.0
     msg = (
-        f"This analysis needs about {gb:,.0f} GB of terrain data.\n\n"
+        f"This analysis still needs about {gb:,.0f} GB of terrain data.\n\n"
         "Downloading and converting it will take a long time and may fill "
         "the disk holding the terrain cache."
     )
+    if cached_mb > 0:
+        msg += (f"\n\n({cached_mb / 1024.0:,.0f} GB is already cached and will "
+                "be reused.)")
     if strong:
         msg += (
             "\n\nThat is an extreme amount. Consider a coarser resolution or "
@@ -694,12 +922,21 @@ def _try_rust_download(
     binary_manager: Any,
 ) -> bool:
     """Download XYZ tiles via Rust and produce .abt files directly."""
+    # Each of the three bail-outs below used to return False without a word,
+    # and the caller printed one generic "Rust download unavailable" for all of
+    # them — so a missing engine looked exactly like an unsupported layer, and
+    # the run then spent the whole extract on the slow path before anything
+    # mentioned it. Say which one it was.
     if "type=xyz" not in source:
+        _log("  fast download skipped: the DEM layer is not an XYZ tile "
+             "service (only XYZ can be fetched directly)")
         return False
 
     params = dict(urllib.parse.parse_qsl(source))
     url_raw = params.get("url", "")
     if not url_raw:
+        _log(f"  fast download skipped: no 'url' in the layer source "
+             f"({source[:120]})")
         return False
 
     url_template = urllib.parse.unquote(url_raw)
@@ -718,31 +955,42 @@ def _try_rust_download(
     #   res = 40075000 * cos(θ) / (2^z * 256)
     # So z = log2(40075000 * cos(θ) / (res * 256))
     # We need res <= resolution_m, so: z = ceil(log2(...))
-    center_lat = (bbox["north"] + bbox["south"]) / 2.0
-    cos_lat = max(math.cos(math.radians(center_lat)), 0.1)
     z_max = int(params.get("zmax", "15"))
-    z_ideal = math.ceil(math.log2(40_075_000.0 * cos_lat / (resolution_m * 256)))
-    zoom = min(max(z_ideal, 0), z_max)
 
     try:
         converter_exe = binary_manager.find_binary("aether_converter")
-    except RuntimeError:
+    except RuntimeError as exc:
+        _log(f"  fast download skipped: {exc}")
         return False
 
-    tile_specs = [
-        {
+    # Group by the zoom each tile needs for its OWN latitude. A single job-wide
+    # zoom taken from the request's bbox centre made a tile's pixels depend on
+    # which run fetched it first — two runs sharing a tile but centred at
+    # different latitudes would build it from different source zooms. Grouped
+    # this way, zoom is a pure function of (source, tile, resolution), so the
+    # pool needs no zoom term to stay honest.
+    by_zoom: Dict[int, List[Dict[str, Any]]] = {}
+    for t in subtiles:
+        spec = {
             "filename": t["filename"],
             "ul_lat": t["ul_lat"],
             "ul_lon": t["ul_lon"],
             "size_px": t["size_px"],
             "resolution_m": t["exact_res_m"],
         }
-        for t in subtiles
-    ]
+        z = tile_zoom(_tile_center_lat(t), t["exact_res_m"], z_max)
+        by_zoom.setdefault(z, []).append(spec)
+
+    # *cache_dir* is the tile pool: only the tiles this run is missing were
+    # passed in, and they are written straight into it.
+    all_names = [t["filename"] for t in subtiles]
+
+    def _produced() -> bool:
+        return any(_tile_is_whole(os.path.join(cache_dir, n)) for n in all_names)
 
     job_file = os.path.join(tempfile.gettempdir(), f"aether_dl_{os.getpid()}.json")
 
-    def _run_pass(specs: List[Dict[str, Any]], conn: int):
+    def _run_pass(specs: List[Dict[str, Any]], conn: int, zoom: int):
         """Write + run one download pass for *specs* at *conn* connections.
 
         Returns ``(returncode, ok_tiles, total_tiles)``.
@@ -762,9 +1010,32 @@ def _try_rust_download(
         return rc, ok, total
 
     max_passes = _get_download_max_passes()
-    conn = _get_download_connections()
-    _log(f"  Rust download: z={zoom}, {len(tile_specs)} output tiles (.abt), "
-         f"encoding={encoding}, connections={conn}")
+    base_conn = _get_download_connections()
+    _log(f"  Rust download: {len(all_names)} output tiles (.abt) in "
+         f"{len(by_zoom)} zoom group(s) {sorted(by_zoom)}, "
+         f"encoding={encoding}, connections={base_conn}")
+
+    ok_all = True
+    for zoom in sorted(by_zoom):
+        if not _download_zoom_group(
+                cache_dir, by_zoom[zoom], zoom, base_conn, max_passes,
+                _run_pass, _produced):
+            ok_all = False
+    return ok_all
+
+
+def _download_zoom_group(
+    cache_dir: str,
+    tile_specs: List[Dict[str, Any]],
+    zoom: int,
+    base_conn: int,
+    max_passes: int,
+    _run_pass: Any,
+    _produced: Any,
+) -> bool:
+    """Download one homogeneous-zoom group, with the halving retry."""
+    all_names = [s["filename"] for s in tile_specs]
+    conn = base_conn
 
     # First pass downloads everything. On failure, re-download ONLY the sub-tiles
     # that actually ended up with a gap, and HALVE the connections each pass:
@@ -777,21 +1048,21 @@ def _try_rust_download(
         specs = tile_specs
         for attempt in range(1, max_passes + 1):
             t = time.perf_counter()
-            rc, ok, total = _run_pass(specs, conn)
+            rc, ok, total = _run_pass(specs, conn, zoom)
             elapsed = time.perf_counter() - t
             if rc != 0:
-                _log(f"  Rust download failed (exit {rc})")
+                _log(f"  Rust download failed (exit {rc}) at z={zoom}")
                 return False
             if total < 0:
                 # Older converter without completeness stats — trust exit 0.
-                _log(f"  Rust download: {elapsed:.1f}s")
-                _clear_incomplete(cache_dir)
-                return _has_any_abt(cache_dir)
+                _log(f"  Rust download z={zoom}: {elapsed:.1f}s")
+                _set_rebuild_flags(cache_dir, all_names)
+                return _produced()
             if ok >= total:
-                _log(f"  Rust download: {elapsed:.1f}s, "
+                _log(f"  Rust download z={zoom}: {elapsed:.1f}s, "
                      f"{ok}/{total} source tiles (XYZ) OK "
                      f"→ {len(specs)} output tile(s) @ {conn} conn")
-                _clear_incomplete(cache_dir)
+                _set_rebuild_flags(cache_dir, all_names)
                 return True
 
             missing = total - ok
@@ -818,27 +1089,30 @@ def _try_rust_download(
                 _log(f"  Rust download: {elapsed:.1f}s, {missing} source "
                      f"tile(s) unavailable but every output tile is intact "
                      f"→ complete")
-                _clear_incomplete(cache_dir)
+                _set_rebuild_flags(cache_dir, all_names)
                 return True
 
             if attempt >= max_passes or conn <= _MIN_DOWNLOAD_CONNECTIONS:
                 _log(f"  WARNING: {missing} source tile(s) still failed after "
                      f"{attempt} pass(es); {len(affected)} output tile(s) left "
-                     f"with gaps — using partial terrain and marking it for "
-                     f"re-download.")
-                _mark_incomplete(cache_dir)
-                # Usable-but-gapped terrain is still worth returning: the
-                # caller would otherwise redo the whole preparation through
-                # the far slower extract+convert path in this same run.
-                return _has_any_abt(cache_dir)
+                     f"with gaps — using partial terrain and flagging just "
+                     f"those tiles for rebuild.")
+                # Flag only the gapped tiles, so the next run re-fetches those
+                # and keeps the rest. Usable-but-gapped terrain is still worth
+                # returning: the caller would otherwise redo the whole
+                # preparation through the far slower path in this same run.
+                _set_rebuild_flags(cache_dir, all_names,
+                                   {s["filename"] for s in affected})
+                return _produced()
 
             conn = max(_MIN_DOWNLOAD_CONNECTIONS, conn // 2)
             specs = affected
             _log(f"  Rust download incomplete ({missing} source tile(s) "
                  f"missing): retrying {len(specs)} affected output tile(s) "
                  f"@ {conn} connections (pass {attempt + 1}/{max_passes})")
-        _mark_incomplete(cache_dir)
-        return _has_any_abt(cache_dir)
+        _set_rebuild_flags(cache_dir, all_names,
+                           {s["filename"] for s in specs})
+        return _produced()
     except RuntimeError:
         raise
     except Exception as exc:
@@ -929,15 +1203,42 @@ def bboxes_intersect(a: Dict[str, float], b: Dict[str, float]) -> bool:
                 or a["north"] <= b["south"] + m or a["south"] >= b["north"] - m)
 
 
+# Below this fraction of the analysis area, a local terrain source is worth
+# interrupting the user for. Not 1.0: the analysis bbox carries a 1% margin
+# (_compute_sector_bbox) and tiles rarely line up with a DEM edge exactly, so
+# demanding total coverage would fire on every well-set-up run.
+_COVERAGE_OK_FRACTION = 0.98
+
+
+def bbox_covered_fraction(source: Dict[str, float],
+                          needed: Dict[str, float]) -> float:
+    """Fraction of *needed* that *source* covers, 0.0-1.0.
+
+    Plain lat/lon area: the two boxes are always close together here, so the
+    cos(lat) term cancels and would not change the reported percentage.
+    """
+    want = ((needed["north"] - needed["south"])
+            * (needed["east"] - needed["west"]))
+    if want <= 0:
+        return 1.0
+    dlat = min(source["north"], needed["north"]) - max(source["south"], needed["south"])
+    dlon = min(source["east"], needed["east"]) - max(source["west"], needed["west"])
+    if dlat <= 0 or dlon <= 0:
+        return 0.0
+    return min(1.0, (dlat * dlon) / want)
+
+
 def terrain_coverage_warning(terrain_dir: str,
                              bbox: Dict[str, float]) -> Optional[str]:
-    """Warn only when *terrain_dir* offers no usable terrain for *bbox*.
+    """Warn when *terrain_dir* cannot cover *bbox*.
 
-    Deliberately quiet about partial coverage: a local DEM that covers part of
-    the analysis area is the normal case (the rest falls back to the base DEM
-    or 0 m), and warning about it every run would train the user to click
-    through.  This fires only for the unambiguous mistakes — an empty/unreadable
-    directory, or one whose data lies somewhere else entirely.
+    Fires for the unambiguous mistakes — an empty or unreadable directory, or
+    one whose data lies somewhere else entirely — and also when the terrain
+    covers only part of the analysis area.  Partial coverage is not benign:
+    once a terrain directory is selected it is the *only* source
+    (``_extract_from_local_dir``), with no fall back to the base DEM, so
+    everything past its edge is built as 0 m and the coverage computed there
+    is fiction.  A small tolerance keeps a one-pixel overhang quiet.
     """
     try:
         if not os.path.isdir(terrain_dir):
@@ -962,18 +1263,35 @@ def terrain_coverage_warning(terrain_dir: str,
             )
         src = _dataset_wgs84_bbox(vrt)
         vrt = None
-        if src is None or bboxes_intersect(src, bbox):
+        if src is None:
             return None
 
-        return (
-            f"The terrain data in:\n{terrain_dir}\n\ndoes not cover the "
-            "analysis area at all.\n\n"
+        extents = (
             f"Terrain covers ~ N{src['north']:.3f} S{src['south']:.3f} "
             f"E{src['east']:.3f} W{src['west']:.3f}\n"
             f"Analysis needs  ~ N{bbox['north']:.3f} S{bbox['south']:.3f} "
             f"E{bbox['east']:.3f} W{bbox['west']:.3f}\n\n"
-            "The whole area would be treated as 0 m (sea level), so the "
-            "result would be meaningless."
+        )
+        if not bboxes_intersect(src, bbox):
+            return (
+                f"The terrain data in:\n{terrain_dir}\n\ndoes not cover the "
+                "analysis area at all.\n\n" + extents +
+                "The whole area would be treated as 0 m (sea level), so the "
+                "result would be meaningless."
+            )
+
+        covered = bbox_covered_fraction(src, bbox)
+        if covered >= _COVERAGE_OK_FRACTION:
+            return None
+        return (
+            f"The terrain data in:\n{terrain_dir}\n\nreaches only about "
+            f"{covered * 100:.0f}% of the analysis area.\n\n" + extents +
+            "Once a terrain directory is selected it is the only source — "
+            "there is no fall back to the base DEM — so the remaining "
+            f"{(1 - covered) * 100:.0f}% is built as 0 m (sea level) and any "
+            "coverage shown there is not real.\n\n"
+            "Either shorten the range to what the terrain covers, or add the "
+            "missing tiles to the directory."
         )
     except Exception as exc:  # noqa: BLE001 — a pre-flight check must not block.
         _log(f"  (terrain-coverage check skipped: {exc})")
@@ -1156,44 +1474,72 @@ def prepare_terrain(
         parts.append(_OSM_BUILDINGS_TOKEN)
     buildings_id = "+".join(parts) if parts else None
 
-    # Keyed on the tile set, so the azimuth sector needs no term of its own —
-    # a narrower sector simply selects fewer tiles. See _cache_key.
-    cache_hash = _cache_key(source, subtiles, resolution_m, buildings_id)
-    cache_dir = os.path.join(get_cache_dir(), cache_hash)
-    # Log the resolved cache path so the user can inspect the .abt tiles
-    # directly (e.g. to check for missing tiles that show up as empty stripes
-    # through a line-of-sight). Set QgsSettings "waveshed/cache_dir" to relocate.
-    _log(f"  .abt cache dir: {cache_dir}")
+    # The pool holds tiles for this source; the view is what the engine reads.
+    pool_dir = _pool_dir(source, buildings_id)
+    view_dir = os.path.join(get_cache_dir(), _VIEW_DIRNAME,
+                            _cache_key(source, subtiles, resolution_m,
+                                       buildings_id))
+    os.makedirs(pool_dir, exist_ok=True)
+    # Log the resolved paths so the user can inspect the .abt tiles directly
+    # (e.g. to check for missing tiles that show up as empty stripes through a
+    # line-of-sight). Set QgsSettings "waveshed/cache_dir" to relocate.
+    _log(f"  tile pool: {pool_dir}")
+    _log(f"  .abt view dir: {view_dir}")
 
-    if _cache_hit(cache_dir, expected):
-        _log(f"  cache HIT — {len(expected)} tile(s) "
-             f"({time.perf_counter() - t0:.1f}s)")
-        return cache_dir
+    # Membership is per tile, so a smaller range, a nudged site or a narrower
+    # sector fetches nothing: every tile it needs is already pooled.
+    todo = [t for t in subtiles if not _tile_ready(pool_dir, t["filename"])]
+    if not todo:
+        gone = _sync_view(pool_dir, view_dir, expected)
+        if not gone:
+            _log(f"  cache HIT — {len(expected)} tile(s) from the pool "
+                 f"({time.perf_counter() - t0:.1f}s)")
+            return view_dir
+        _log(f"  {len(gone)} pooled tile(s) vanished between check and link; "
+             f"rebuilding those")
+        todo = [t for t in subtiles if t["filename"] in set(gone)]
 
-    disk_mb = _estimate_abt_disk_mb(subtiles)
+    # Building anything at all needs the converter, so check before the work
+    # rather than after it. Both paths call it, and the fast one falls back
+    # silently when it is absent — without this the user pays the entire slow
+    # extract (tens of minutes) only for the run to then fail on the missing
+    # engine. A full cache hit above needs no binary and never reaches here.
+    try:
+        binary_manager.find_binary("aether_converter")
+    except RuntimeError as exc:
+        raise RuntimeError(
+            f"{exc}\n\nTerrain cannot be prepared without the Aether engine."
+        ) from exc
+
+    disk_mb = _estimate_abt_disk_mb(todo)
     # "output tiles" = the .abt files we write. Kept distinct from the "source
     # tiles" (XYZ web tiles) counted during the download below — the two counts
     # differ by orders of magnitude and used to be indistinguishable in the log.
-    _log(f"  cache MISS — {len(subtiles)} output tiles (.abt), "
-         f"~{disk_mb} MB on disk, "
+    _log(f"  cache MISS — {len(todo)} of {len(subtiles)} output tiles (.abt) "
+         f"need building, ~{disk_mb} MB on disk, "
          f"bbox N={bbox['north']:.3f} S={bbox['south']:.3f} "
          f"E={bbox['east']:.3f} W={bbox['west']:.3f}")
-    os.makedirs(cache_dir, exist_ok=True)
-    # Everything in this directory is provisional until every expected tile has
-    # been written. A run killed midway — or a converter that dies on tile 3 of
-    # 4 — must not read as a valid cache next time. Each path below clears the
-    # marker once it has verified its own output.
-    _mark_incomplete(cache_dir)
 
     # Fetch building tiles before the converter runs, so they are on disk when
     # the ingest jobs reference them.
     pbf_dir: Optional[str] = None
     buildings_missing = False
     if osm_buildings:
-        pbf_dir = os.path.join(cache_dir, "_buildings")
+        # Building tiles pool alongside the terrain tiles — they are globally
+        # addressed (z_x_y.pbf), so 30 km -> 31 km reuses every one of them
+        # instead of re-fetching 1369 tiles.  The converter, though, is handed
+        # a per-run view: ingest.rs re-scans the whole buildings directory for
+        # every output tile it writes, so pointing it at a pool that grows
+        # across runs would make each run slower than the last.
+        pbf_pool = os.path.join(pool_dir, "_buildings")
+        pbf_dir = os.path.join(view_dir, "_buildings")
         try:
             from . import openfreemap
-            openfreemap.download_building_tiles(bbox, pbf_dir, log=_log)
+            openfreemap.download_building_tiles(bbox, pbf_pool, log=_log)
+            _link_pbf_view(pbf_pool, pbf_dir, [
+                openfreemap.tile_filename(*t)
+                for t in openfreemap.tiles_for_bbox(bbox)
+            ])
         except Exception as exc:  # noqa: BLE001
             # Terrain without buildings beats no terrain at all, but the user
             # must know the result is not what they asked for.
@@ -1215,18 +1561,19 @@ def prepare_terrain(
         _log("  buildings requested — using the converter ingest path "
              "(the direct XYZ downloader cannot fuse buildings)")
     elif not terrain_dir and "type=xyz" in dem_layer.source():
-        if _try_rust_download(dem_layer.source(), cache_dir, bbox,
-                              resolution_m, subtiles, binary_manager):
+        if _try_rust_download(dem_layer.source(), pool_dir, bbox,
+                              resolution_m, todo, binary_manager):
             # A failed buildings download leaves pbf_dir None, which is what
             # routed us here rather than to the ingest path — so this branch
-            # has to honour the same rule: the cache identity claims buildings
-            # these tiles do not have, so it must not be reused.
+            # has to honour the same rule: the pool identity claims buildings
+            # these tiles do not have, so they must not be reused.
             if buildings_missing:
-                _mark_incomplete(cache_dir)
-                _log("  buildings were requested but unavailable — cache left "
-                     "marked for rebuild so the next run retries them")
-            _log(f"  TOTAL: {time.perf_counter() - t0:.1f}s")
-            return cache_dir
+                _set_rebuild_flags(pool_dir, [t["filename"] for t in todo],
+                                   {t["filename"] for t in todo})
+                _log("  buildings were requested but unavailable — tiles "
+                     "flagged for rebuild so the next run retries them")
+            _finish_view(pool_dir, view_dir, expected, t0)
+            return view_dir
         _log("  Rust download unavailable, falling back")
 
     # Path 2/3: Extract a GeoTIFF PER sub-tile, then convert. Each .abt tile
@@ -1239,7 +1586,7 @@ def prepare_terrain(
     temp_tifs: List[str] = []
     try:
         jobs = []
-        for t in subtiles:
+        for t in todo:
             res_deg = t["exact_res_m"] / 111_111.0
             # ~4 px halo so the converter's edge sampling has neighbours.
             margin = res_deg * 4.0
@@ -1250,7 +1597,7 @@ def prepare_terrain(
                 "east": t["ul_lon"] + t["size_px"] * res_deg + margin,
             }
             tile_tif = os.path.join(
-                tempfile.gettempdir(), f"aether_{cache_hash}_{t['filename']}.tif"
+                tempfile.gettempdir(), f"aether_{t['filename']}.tif"
             )
             t1 = time.perf_counter()
             if terrain_dir and os.path.isdir(terrain_dir):
@@ -1263,7 +1610,7 @@ def prepare_terrain(
                  f"{os.path.getsize(tile_tif) / 1e6:.0f}MB")
 
             job = {
-                "output_path": os.path.abspath(os.path.join(cache_dir, t["filename"])),
+                "output_path": os.path.abspath(os.path.join(pool_dir, t["filename"])),
                 "format": "r16sint",
                 "ul_lat": t["ul_lat"],
                 "ul_lon": t["ul_lon"],
@@ -1280,7 +1627,8 @@ def prepare_terrain(
                 job["buildings_pbf_dir"] = os.path.abspath(pbf_dir)
             jobs.append(job)
 
-        job_file = os.path.join(cache_dir, "batch_job.json")
+        job_file = os.path.join(view_dir, "batch_job.json")
+        os.makedirs(view_dir, exist_ok=True)
         with open(job_file, "w") as fh:
             json.dump(jobs, fh)
 
@@ -1289,25 +1637,26 @@ def prepare_terrain(
         _run_converter(exe, job_file)
         _log(f"  converter: {time.perf_counter() - t2:.1f}s ({len(jobs)} tiles)")
 
-        # The converter can exit 0 having skipped a tile it could not build.
-        # Only clear the provisional marker once every expected tile is on
-        # disk, so a short set is rebuilt next run instead of being served as
-        # a cache hit with holes in it.
-        absent = [n for n in expected
-                  if not os.path.exists(os.path.join(cache_dir, n))]
-        if absent:
-            _log(f"  WARNING: {len(expected) - len(absent)}/{len(expected)} "
-                 f"tiles written; {len(absent)} missing (first: {absent[0]}) "
-                 f"— cache left marked for rebuild")
-        elif buildings_missing:
-            _log("  buildings were requested but unavailable — cache left "
-                 "marked for rebuild so the next run retries them")
-        else:
-            _clear_incomplete(cache_dir)
+        # The converter can exit 0 having skipped a tile it could not build,
+        # so flag whatever did not land whole. Buildings that were requested
+        # but unavailable flag everything: the pool identity claims buildings
+        # these pixels do not carry.
+        built = [t["filename"] for t in todo]
+        bad = {n for n in built
+               if not _tile_is_whole(os.path.join(pool_dir, n))}
+        if bad:
+            _log(f"  WARNING: {len(built) - len(bad)}/{len(built)} tiles "
+                 f"written whole; {len(bad)} short or missing "
+                 f"(first: {sorted(bad)[0]}) — flagged for rebuild")
+        if buildings_missing:
+            _log("  buildings were requested but unavailable — tiles flagged "
+                 "for rebuild so the next run retries them")
+            bad = set(built)
+        _set_rebuild_flags(pool_dir, built, bad)
     finally:
         for tf in temp_tifs:
             if os.path.exists(tf):
                 os.remove(tf)
 
-    _log(f"  TOTAL: {time.perf_counter() - t0:.1f}s")
-    return cache_dir
+    _finish_view(pool_dir, view_dir, expected, t0)
+    return view_dir

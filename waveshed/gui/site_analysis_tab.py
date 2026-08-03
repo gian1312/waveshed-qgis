@@ -65,9 +65,12 @@ _SUBPROCESS_FLAGS = (
     subprocess.CREATE_NO_WINDOW if platform.system() == "Windows" else 0
 )
 from ..core.job_builder import (
+    INVALID,
     VALID_RESOLUTIONS,
     CoverageParams,
     build_coverage_job,
+    format_model_warnings,
+    model_warnings,
     write_job_file,
 )
 from ..core.layer_utils import dem_layer_warning, hide_from_dem_picker
@@ -76,18 +79,34 @@ from ..core.result_loader import (
     add_layer_to_project,
     load_coverage_result,
 )
+from ..core.binary_manager import binaries_warning
 from ..core.terrain_adapter import (
     analysis_bbox,
-    estimate_terrain_disk_mb,
+    buildings_identity,
     get_source_resolution_info,
     prepare_terrain,
     reset_terrain_warnings,
     terrain_coverage_warning,
+    terrain_plan,
     terrain_size_warning,
 )
 from .map_tools import activate_point_capture
 
 TAG = "Waveshed"
+
+
+def _log_terrain_plan(cached: int, missing: int, download_mb: int,
+                      cached_mb: int) -> None:
+    """Record what the run will reuse vs build, before it starts.
+
+    Without this the log jumps straight to per-tile work and there is no way
+    to tell a cache that is working from one that is silently rebuilding.
+    """
+    QgsMessageLog.logMessage(
+        f"terrain plan: {cached + missing} tile(s) needed — {cached} pooled "
+        f"(~{cached_mb} MB reused), {missing} to build (~{download_mb} MB)",
+        TAG, Qgis.MessageLevel.Info,
+    )
 
 # Column definitions -- identical for both LOS and LOSS modes.
 # Freq / ERP come from the selected asset, not from separate table columns.
@@ -1396,6 +1415,16 @@ class SiteAnalysisTab(QWidget):
             )
             return
 
+        # ---- The engine has to be there ----
+        # Checked before anything else: terrain preparation falls back to the
+        # slow QGIS raster path when aether_converter is missing, so without
+        # this the user waits out the whole extract and only then hits the
+        # error. Blocking, not advisory — the run cannot succeed.
+        engine_warning = binaries_warning()
+        if engine_warning:
+            QMessageBox.critical(self, "Aether engine not found", engine_warning)
+            return
+
         # Refresh asset cache before building jobs so latest data is used.
         self._refresh_asset_cache()
 
@@ -1408,23 +1437,53 @@ class SiteAnalysisTab(QWidget):
             )
             return
 
+        # ---- Confirm parameters that leave the model's validated range ----
+        # Neither AETHER nor Splat surfaces ITM's own kwx indicator in map mode,
+        # so an out-of-range run (0 m receivers, sub-kilometre ranges, high
+        # alpine refractivity) otherwise looks exactly like a valid one.
+        model_issues = [w for job_params, _name in jobs for w in model_warnings(job_params)]
+        if any(w.severity == INVALID for w in model_issues):
+            if QMessageBox.warning(
+                self, "Outside the propagation model's range",
+                "These parameters are outside the range the propagation model is "
+                "defined for. The run will complete, but the numbers it produces "
+                "are probably invalid.\n\n"
+                + format_model_warnings(model_issues)
+                + "\n\nRun anyway?",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+            ) != QMessageBox.Yes:
+                return
+
         # ---- Confirm an unreasonably large terrain download ----
         # Jobs that only differ by receiver altitude share one terrain cache,
         # so dedupe on the parameters the cache key is built from — otherwise
         # the estimate would multiply by the number of altitudes.
         seen: set = set()
         total_mb = 0
+        cached_mb = 0
+        tiles_cached = 0
+        tiles_missing = 0
         union: Optional[dict] = None
+        # Price against the tile pool, not the whole set: terrain that is
+        # already on disk must not be announced as a download.
+        plan_source = terrain_dir or (dem_layer.source() if dem_layer else "")
+        plan_buildings = buildings_identity(
+            osm_buildings=self.chk_buildings.isChecked())
         for params, _name in jobs:
             key = (params.tx_lat, params.tx_lon, params.max_range_km,
                    params.resolution_m, params.az_start, params.az_end)
             if key in seen:
                 continue
             seen.add(key)
-            total_mb += estimate_terrain_disk_mb(
-                params.tx_lat, params.tx_lon, params.max_range_km,
-                params.resolution_m, params.az_start, params.az_end,
+            plan = terrain_plan(
+                plan_source, params.tx_lat, params.tx_lon,
+                params.max_range_km, params.resolution_m,
+                params.az_start, params.az_end, plan_buildings,
             )
+            total_mb += plan["download_mb"]
+            cached_mb += plan["total_mb"] - plan["download_mb"]
+            tiles_cached += plan["tiles_cached"]
+            tiles_missing += plan["tiles_missing"]
             bb = analysis_bbox(params.tx_lat, params.tx_lon,
                                params.max_range_km, params.az_start,
                                params.az_end)
@@ -1436,17 +1495,19 @@ class SiteAnalysisTab(QWidget):
                 union["east"] = max(union["east"], bb["east"])
                 union["west"] = min(union["west"], bb["west"])
 
-        # A local terrain directory that covers none of the analysis area is
-        # always a mistake — everything would come out as sea level.
+        # A local terrain directory that does not reach across the analysis
+        # area is a mistake worth stopping for: it is the only source once
+        # selected, so whatever it misses is computed over 0 m sea level.
         if terrain_dir and union is not None:
             cov = terrain_coverage_warning(terrain_dir, union)
             if cov and QMessageBox.warning(
-                self, "No terrain coverage", cov + "\n\nRun anyway?",
+                self, "Incomplete terrain coverage", cov + "\n\nRun anyway?",
                 QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
             ) != QMessageBox.Yes:
                 return
 
-        warn = terrain_size_warning(total_mb)
+        _log_terrain_plan(tiles_cached, tiles_missing, total_mb, cached_mb)
+        warn = terrain_size_warning(total_mb, cached_mb)
         if warn is not None:
             msg, strong = warn
             default = QMessageBox.No if strong else QMessageBox.Yes

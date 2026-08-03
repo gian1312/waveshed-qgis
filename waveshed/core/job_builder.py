@@ -147,6 +147,176 @@ def _validate_resolution(resolution_m: int) -> None:
         )
 
 
+# ---------------------------------------------------------------------------
+# Model validity checks
+# ---------------------------------------------------------------------------
+
+CAUTION = "CAUTION"  # nearly out of range — usable with care (ITM kwx=1)
+INVALID = "INVALID"  # out of range — probably invalid (ITM kwx=3/4)
+
+
+@dataclasses.dataclass(frozen=True)
+class ModelWarning:
+    """One violated model constraint."""
+
+    severity: str
+    parameter: str
+    message: str
+
+    def __str__(self) -> str:
+        return f"[{self.severity}] {self.parameter}: {self.message}"
+
+
+def model_warnings(params: "CoverageParams | P2PParams") -> "list[ModelWarning]":
+    """Check job parameters against the propagation model's validated envelope.
+
+    Mirror of ``aether_core::config::validate_model_inputs`` (rust/aether_core/
+    src/config.rs) so the user sees the problem in the dialog instead of only in
+    the engine log after the run. The limits are the ones ITM enforces itself in
+    ``lrprop()``/``avar()`` (Splat NG ``itwom3.0.cpp:1250-1310``), where they
+    raise the ``kwx`` indicator that neither engine surfaces in map mode.
+
+    Keep this in sync with the Rust version when either changes.
+    """
+    out: "list[ModelWarning]" = []
+    model = (params.model or "").upper()
+    is_itm = "ITM" in model
+    is_min_alt = "MIN_ALT" in model
+
+    def add(severity: str, parameter: str, message: str) -> None:
+        out.append(ModelWarning(severity, parameter, message))
+
+    # Antenna heights: ITM is validated for 1-1000 m AGL, hard limits 0.5-12000 m.
+    def check_height(label: str, height: float, mode: str) -> None:
+        if (mode or "").upper() != "AGL":
+            return  # AMSL: the AGL height is only known once terrain is sampled
+        if height < 0.5:
+            add(INVALID, label,
+                f"{height:.2f} m AGL is below ITM's 0.5 m hard minimum — the model "
+                f"is not defined at ground level (effective height collapses to zero "
+                f"and the ground-reflection term saturates). Use at least 2 m.")
+        elif height < 1.0:
+            add(CAUTION, label,
+                f"{height:.2f} m AGL is below ITM's 1 m validated minimum. "
+                f"Use at least 2 m.")
+        elif height > 12000.0:
+            add(INVALID, label, f"{height:.0f} m AGL exceeds ITM's 12000 m maximum.")
+        elif height > 1000.0:
+            add(CAUTION, label,
+                f"{height:.0f} m AGL is above ITM's 1000 m validated maximum.")
+
+    if is_itm:
+        check_height("TX height", params.tx_height, params.tx_mode)
+        if not is_min_alt:
+            check_height("RX height", params.rx_height, params.rx_mode)
+
+    # Terrain-sampling floor (applies to every model, not just ITM). At 0 m AGL
+    # the receiver sits exactly on the sampled ground, so the visibility test
+    # becomes "is this sample a strict new maximum" and its margin (rx height in
+    # metres) falls below the 0.5 m .abt vertical quantum — the LOS decision is
+    # then made by rounding, which renders as checkerboard speckle.
+    if not is_min_alt and (params.rx_mode or "").upper() == "AGL" and params.rx_height < 1.0:
+        add(CAUTION, "RX height",
+            f"{params.rx_height:.2f} m AGL is within the terrain quantisation floor: "
+            f"the visibility margin is {params.rx_height:.2f} m while .abt terrain is "
+            f"stored in 0.5 m steps, so the line-of-sight decision is made by rounding "
+            f"rather than geometry (visible as checkerboard speckle). "
+            f"Use at least 1 m, or 2 m for validation work.")
+
+    if is_itm:
+        # Frequency: ITM works on wn = f/47.7, validated 0.838-210, hard 0.419-420.
+        f = params.freq_mhz
+        if f < 20.0 or f > 20000.0:
+            add(INVALID, "Frequency",
+                f"{f:.1f} MHz is outside ITM's 20 MHz - 20 GHz hard range.")
+        elif f < 40.0 or f > 10000.0:
+            add(CAUTION, "Frequency",
+                f"{f:.1f} MHz is outside ITM's 40 MHz - 10 GHz validated range.")
+
+        # Path distance: ITM is undefined below 1 km and above 2000 km. A coverage
+        # map always contains the inner disc, so part of it is always out of range.
+        r_km = params.max_range_km
+        if r_km < 1:
+            add(INVALID, "Range",
+                f"{r_km} km is below ITM's 1 km minimum path length — the entire "
+                f"result is outside the model's range.")
+        else:
+            add(CAUTION, "Range",
+                f"ITM is undefined below 1 km path length, so the innermost 1 km of "
+                f"this {r_km} km result is out of range on every azimuth "
+                f"(the engine substitutes free-space loss below 100 m).")
+        if r_km > 2000:
+            add(INVALID, "Range", f"{r_km} km exceeds ITM's 2000 km maximum path length.")
+        elif r_km > 1000:
+            add(CAUTION, "Range", f"{r_km} km exceeds ITM's 1000 km validated path length.")
+
+        # Atmosphere: ITM needs the height-reduced refractivity in 250-400 N-units.
+        # It reduces the surface value per path as ens = N0 * exp(-zsys / 9460), so
+        # a high site walks out of range even with a textbook sea-level N0.
+        if not 250.0 <= params.ens <= 400.0:
+            add(INVALID, "Surface refractivity",
+                f"{params.ens:.1f} N-units is outside ITM's 250 - 400 range.")
+        else:
+            import math
+            z_limit = 9460.0 * math.log(params.ens / 250.0)
+            add(CAUTION, "Surface refractivity",
+                f"N0 = {params.ens:.1f} reduces to ens = N0*exp(-zsys/9460) along each "
+                f"path, so ITM reports out-of-range wherever the mean terrain height "
+                f"exceeds {z_limit:.0f} m AMSL. Raise N0 for high-altitude scenes.")
+
+        if not 1 <= params.climate <= 7:
+            add(INVALID, "Radio climate",
+                f"{params.climate} is not a valid ITM radio climate (1-7); "
+                f"the model substitutes 5.")
+        if params.pol not in (0, 1):
+            add(INVALID, "Polarization",
+                f"{params.pol} is not valid (0 = horizontal, 1 = vertical).")
+        for label, v in (("Confidence", params.conf), ("Reliability", params.rel)):
+            if not 0.01 <= v <= 0.99:
+                add(CAUTION, label,
+                    f"{v:.3f} is outside the 0.01 - 0.99 range ITM's quantile "
+                    f"inversion is validated for.")
+
+    return out
+
+
+def format_model_warnings(warnings: "list[ModelWarning]") -> str:
+    """Render warnings as dialog text, most severe first, deduplicated.
+
+    String formatting only — ``core`` stays free of GUI imports, so each tab
+    supplies its own QMessageBox around this.
+    """
+    seen = set()
+    lines = []
+    for w in sorted(warnings, key=lambda x: 0 if x.severity == INVALID else 1):
+        key = (w.severity, w.parameter, w.message)
+        if key in seen:
+            continue
+        seen.add(key)
+        lines.append(f"• [{w.severity}] {w.parameter}\n    {w.message}")
+    return "\n\n".join(lines)
+
+
+def log_model_warnings(params: "CoverageParams | P2PParams") -> "list[ModelWarning]":
+    """Write model-validity warnings to the QGIS log and return them.
+
+    Called from the job builders so every entry point (both GUI tabs and both
+    Processing algorithms) records them, even when no dialog is shown.
+    """
+    warnings = model_warnings(params)
+    if not warnings:
+        return warnings
+    try:
+        from qgis.core import Qgis, QgsMessageLog
+        for w in warnings:
+            level = (Qgis.MessageLevel.Warning if w.severity == INVALID
+                     else Qgis.MessageLevel.Info)
+            QgsMessageLog.logMessage(f"model validity: {w}", "Waveshed", level)
+    except Exception:  # noqa: BLE001 — no QGIS available (unit tests)
+        pass
+    return warnings
+
+
 def _build_tx(params: "CoverageParams | P2PParams") -> dict:
     """Build the tx section of the job config."""
     tx = {
@@ -199,6 +369,7 @@ def build_coverage_job(
         ValueError: If resolution_m is not in VALID_RESOLUTIONS.
     """
     _validate_resolution(params.resolution_m)
+    log_model_warnings(params)
 
     return {
         "tx": _build_tx(params),
@@ -250,6 +421,7 @@ def build_p2p_job(
         ValueError: If resolution_m is not in VALID_RESOLUTIONS.
     """
     _validate_resolution(params.resolution_m)
+    log_model_warnings(params)
 
     task_type = "BATCH_P2P" if batch_file else "P2P"
 

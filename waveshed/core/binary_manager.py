@@ -17,7 +17,7 @@ import subprocess
 import tempfile
 import zipfile
 from pathlib import Path
-from typing import Callable, List, Optional
+from typing import Callable, List, Optional, Sequence
 
 from qgis.core import Qgis, QgsMessageLog, QgsSettings
 
@@ -157,6 +157,52 @@ def find_binary(name: str) -> str:
     raise RuntimeError(
         f"AETHER binary '{name}' not found. Please configure the binary "
         f"directory in Settings or run 'Download Binaries'."
+    )
+
+
+def missing_binaries(names: Sequence[str] = REQUIRED_BINARIES) -> List[str]:
+    """Names from *names* that cannot be resolved, in the order given.
+
+    Same resolution order as :func:`find_binary`, so a name absent here is one
+    that a run would fail on.
+    """
+    absent = []
+    for name in names:
+        try:
+            find_binary(name)
+        except RuntimeError:
+            absent.append(name)
+    return absent
+
+
+def _searched_locations() -> List[str]:
+    """The places :func:`discover_binary_dir` looks, for a diagnostic message."""
+    return [
+        f"Settings → engine directory: {QgsSettings().value('waveshed/binary_dir', None) or '(not set)'}",
+        f"AETHER_BIN_DIR: {os.environ.get('AETHER_BIN_DIR') or '(not set)'}",
+        f"Default install: {DEFAULT_INSTALL_DIR}",
+        f"Plugin bin/: {_plugin_bin_dir()}",
+        "System PATH",
+    ]
+
+
+def binaries_warning(names: Sequence[str] = REQUIRED_BINARIES) -> Optional[str]:
+    """A message naming the engine binaries that are missing, or None.
+
+    Worth checking before a run starts rather than when a binary is first
+    needed: terrain preparation silently falls back to the slow QGIS raster
+    path when ``aether_converter`` cannot be found, so without this the user
+    waits through the whole extract before anything mentions a missing engine.
+    """
+    absent = missing_binaries(names)
+    if not absent:
+        return None
+    return (
+        "The Aether engine is not installed, or the plugin cannot find it.\n\n"
+        f"Missing: {', '.join(absent)}\n\n"
+        "Searched:\n  " + "\n  ".join(_searched_locations()) + "\n\n"
+        "Open Settings and use \"Download Binaries\", or point the engine "
+        "directory at an existing install."
     )
 
 

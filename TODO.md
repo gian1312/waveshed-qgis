@@ -120,12 +120,42 @@ are against the tree as of that date.
   left marked for rebuild — on both the ingest and the fast-download path,
   which a failed download reaches because `pbf_dir` goes back to None.
 
-- [ ] **The `.abt` cache never reuses a tile across sites.** *Partly done:*
-  the key is now the tile set, so two requests resolving to the same tiles
-  share one cache directory. The canonical pool + hardlinks — which is what
-  makes a *subset* reuse the tiles of a superset — is still open, and is now
-  much more valuable because tiles are 16x smaller. Original finding:
-  `_cache_key`
+- [x] **The `.abt` cache never reuses a tile across sites.** Done, as the
+  canonical pool the finding describes.
+  **An intermediate attempt keyed the whole directory on its exact tile set;
+  that was still wrong and still re-downloaded constantly** — a smaller range
+  is a *subset* of an existing tile set, and set equality calls a subset a
+  miss. Membership is a per-tile question and is now asked per tile.
+  Layout: `<cache>/pool/<md5(schema|source|buildings)>/` holds each tile once,
+  named by its own geography, and `<cache>/views/<md5(tile set)>/` holds
+  hardlinks (copy fallback) to exactly one run's tiles. The view is not an
+  optimisation: `engines/coverage.rs:574-607` builds `relevant_tiles` from the
+  whole directory listing with **no bbox filter**, so handing the engine the
+  pool would drag every tile ever built into the atlas and the output grid.
+  A tile counts as present only if its declared geometry matches its file
+  length (`_tile_is_whole`) and it carries no `.rebuild` sidecar — so a run
+  killed mid-write, a gapped download, or tiles built without their claimed
+  buildings are re-made per tile instead of poisoning a whole directory.
+
+  Two further identity fixes (schema v3), because a tile's pixels depend on
+  more than its position:
+  * **Source is normalised** (`source_identity`). The pool used to key on the
+    raw `dem_layer.source()` URI, whose spelling depends on how the user added
+    the layer — parameter order, `zmin`, `interpretation`, percent-encoding.
+    Re-adding the same Mapzen endpoint therefore meant a new pool and a full
+    re-download of byte-identical data. An XYZ URI now reduces to
+    `url template | encoding | zmax`, which is what actually decides the
+    pixels. Verified: two spellings of one endpoint share a pool.
+  * **Zoom is computed per tile** (`tile_zoom`), from the tile's own latitude,
+    and downloads are grouped by zoom. It used to come from the request's
+    bbox *centre*, so a tile shared by two runs centred at different latitudes
+    was built from different source zooms and its pixels depended on which run
+    fetched it first. Now zoom is a pure function of (source, tile,
+    resolution), so it needs no term in the key. Note the practical effect is
+    cross-run, not within-run: inside one run `zmax` usually pins every tile
+    to the same zoom anyway.
+
+  Original finding: `_cache_key`
   (`core/terrain_adapter.py:242`) hashes the raw float **bbox dict**, making the
   key a per-*request* identity, while `:330` already emits globally canonical
   per-*tile* names (`tile_N47.00E6.00_5m.abt`) snapped to the global 1° grid by
@@ -142,11 +172,12 @@ are against the tree as of that date.
   are burned into the pixels and re-applying them makes them grow.
 
 - [x] **The bbox floats are unrounded, so near-identical requests always miss.**
-  Done. `_cache_key` now hashes the sorted canonical tile filenames plus a
-  `_CACHE_SCHEMA` version, so a sub-metre site nudge or 30 km vs 31 km lands on
-  the same cache. Azimuth dropped out of the key entirely: a narrower sector
-  selects a strict subset of the tiles and so hashes differently on its own.
-  Original finding:
+  Done — by the tile pool above, not by rounding the bbox. Nothing hashes a
+  bbox any more: the request is resolved to canonical tile names and each is
+  looked up individually, so a sub-metre nudge, 30 km vs 31 km, and a narrowed
+  sector all reuse what is already pooled. (The view directory is still keyed
+  on the tile set, so each run gets its own directory; that key never decides
+  what gets *downloaded*.) Original finding:
   `_compute_sector_bbox` (`:179-184`) returns unsnapped floats stringified at
   full `repr` precision, and the margin is `range_deg * 0.01` — so a sub-metre
   site nudge, or 30 km vs 31 km at the same site, is a total cache miss. Snap
@@ -172,7 +203,16 @@ are against the tree as of that date.
   `cache_entries` / `cache_size_bytes`), which reports the size, confirms, and
   only ever removes md5-named entry directories — the cache root is
   user-configurable and may hold other things. Automatic eviction (LRU/TTL/size
-  cap) is still open. Original finding: nothing in `waveshed/` ever deletes a
+  cap) is still open.
+  The **pre-run estimate is now pool-aware** (`terrain_plan`): it prices only
+  the tiles genuinely missing and reports what is being reused, instead of
+  announcing the whole tile set as a download on every run and training the
+  user to click through the warning. The local-terrain coverage check now
+  fires on **partial** coverage too, not only on none — a terrain directory is
+  the only source once selected (no fall back to the base DEM), so whatever it
+  misses is built as 0 m sea level and displays as real coverage. Tolerance is
+  98%, since the analysis bbox carries a 1% margin of its own.
+  Original finding: nothing in `waveshed/` ever deletes a
   cache directory — no LRU, no TTL, no size cap, and no "Clear cache" button
   (`gui/settings_dialog.py:275-284` is only a path field + Browse). At ~1 GB per
   run with no cross-site reuse, `~/.aether/cache` grows without bound. The only
@@ -184,9 +224,118 @@ are against the tree as of that date.
   "openfreemap:z14"` (`:191-195`) is opaque and date-free, so OFM republishes
   are never picked up — the cache must be cleared by hand.
 
-- [ ] **Map Converter ignores a relocated cache.** `gui/map_converter_tab.py:1196,
+- [ ] **The cache path only governs `.abt` tiles — every heavy intermediate
+  ignores it.** Confirmed on a real run: the pool and views correctly landed
+  under a relocated `G:/…/cache_test`, while the per-tile base GeoTIFFs went to
+  the system temp directory. On Windows that is `C:\Users\…\AppData\Local\Temp`,
+  so a user who deliberately puts the cache on a big drive still fills the
+  system drive — 31 MB × 24 tiles for one 50 km / 10 m run, and that scales
+  with area. Sites:
+  * `core/terrain_adapter.py:1578` — the base GeoTIFF per tile (the big one),
+    and `:981` the download job JSON.
+  * `gui/map_converter_tab.py:1189, 1793, 1801` — hardcode `~/.aether/cache`
+    instead of `get_cache_dir()`, so the Map Converter writes to the old
+    location outright (this was the original finding below).
+  * `gui/map_converter_tab.py:818-885` — `<temp>/aether_fgb`, the FlatGeobuf
+    cache that is also never cleaned.
+  * `gui/site_analysis_tab.py:609`, `gui/p2p_tab.py:942` —
+    `<temp>/aether_output` as the default output directory;
+    `gui/altitude_explorer.py:1556` — `<temp>/aether_tools`.
+  Decide what "Terrain cache" means: today it is "where .abt tiles go", but a
+  user setting it reasonably expects "where this plugin puts its data".
+  Original finding: `gui/map_converter_tab.py:1196,
   1800, 1808` hardcode the `~/.aether/cache` default instead of calling
   `get_cache_dir()` (`core/terrain_adapter.py:52-54`).
+
+- [ ] **Restore the disambiguator on the temp GeoTIFF name.** Regression:
+  `core/terrain_adapter.py:1578` builds `aether_{tile}.tif` in the shared temp
+  directory, having lost the `cache_hash` term when the pool landed. Tile names
+  are now globally canonical (position + resolution only), so the same name
+  means different pixels for different sources — two runs, or Site Analysis and
+  Map Converter together, read and write one another's temp file, and the
+  `finally` deletes it out from under whoever is still using it. Needs the pool
+  identity back in the name.
+
+## MAJOR — buildings are unusably slow, and the target is 500 km
+
+Reported from real runs: **hours at 30 km**, against a target of 500 km, and
+far slower than the same job on waveshed.io. Effectively unusable today. The
+individual findings are itemised in the section below; this is the summary and
+the decision.
+
+**Where the time goes.** Enabling buildings diverts terrain preparation off the
+Rust downloader onto `_export_via_qgis` → `QgsRasterFileWriter::writeRaster`
+(`core/terrain_adapter.py:1050-1052` picks the branch, `:930` lands on it).
+Measured previously: the same 5 m / 30 km area is 22.3 s on the fast path vs
+151.2 s with buildings, 122.1 s of it inside `writeRaster`; at 50 km it is
+1687.5 s, ~1560 s of which is four `writeRaster` calls, while the actual Rust
+converter work is only 108 s. It scales with area, so 500 km is not a longer
+wait — it is out of reach by orders of magnitude.
+
+**Why waveshed.io is fast.** The web app never takes this path. It calls
+`mvt::apply_buildings_to_abt_tiles` on the downloader's in-memory `.abt`
+buffers (`aether_converter_wasm/src/lib.rs:249`). The plugin cannot, only
+because `DownloadJob` has no buildings field — not because the capability is
+missing. `run_download_mem` is not wasm-gated and hands out exactly those
+buffers at `download.rs:1730-1733`.
+
+**Decision: do not optimise `_export_via_qgis`.** Six of the items below
+(`setMaxTileSize`, `setCreateOptions`, GDAL cache config, the `cap = 16384`
+resolution loss, the missing progress/cancel, the main-thread affinity bug)
+only exist on that path, and the engine-side change deletes the path entirely.
+Tuning it means tuning code that is meant to be removed, and even a perfect
+version of it is a QGIS provider pull capped at ~6 concurrent requests per host
+against the Rust path's 256.
+
+**Do this instead** (engine change, then a small plugin change):
+1. Add `buildings_pbf_dir` to `DownloadJob` (`download.rs:43-50`) and call
+   `mvt::apply_buildings_to_abt_tiles` on the `MemAbt` buffers after
+   `download.rs:1733` — ~20 lines against a library function that already
+   exists and is already used by the web build. *Or* expose an
+   `apply-buildings` subcommand (`main.rs:64/68/159` has only Convert / Ingest
+   / Download), ~10 lines, letting the plugin chain fast-download →
+   apply-buildings.
+2. Then delete the buildings branch at `core/terrain_adapter.py:1050-1052` so
+   buildings runs use the same path as everything else.
+
+**Also required for 500 km, engine-side:** `ingest.rs:504` re-scans and
+re-decodes the entire `buildings_pbf_dir` for *every* output tile with no bbox
+filter, and each rayon worker holds a full `Vec<Building>` for the whole area —
+1369 × 4 = 5476 gunzip + protobuf decodes on the 50 km run alone. This grows
+quadratically with range. The plugin now hands the converter a per-run view of
+the building-tile pool (`_link_pbf_view`) so the scan is at least bounded by
+the run rather than by everything ever downloaded, but the real fix is the
+bbox filter in the converter.
+
+**Still capped at 4096 building tiles** (`core/openfreemap.py:47`) — a 100 km
+radius is already ~7000 tiles, so 500 km cannot even start. The limit has to go
+away by chunking per `.abt` tile (see below); there is no z-level fallback
+because the `building` layer only exists at z14.
+
+## Large ranges at high resolution: pick a workable resolution, or refuse
+
+Today nothing reconciles range against resolution, so the user can ask for a
+combination that cannot be built or cannot be solved, and only finds out after
+a long download — or gets a misleading error from the engine. Needed:
+
+- **A pre-flight feasibility check** run when range/resolution change, not
+  after the download: tiles to fetch, disk, and the terrain-atlas allocation
+  the solver will need (tile bytes × tiles per wedge against
+  `0.9 * min(gpu max_buffer_size, 4 GiB)`). The tile-extent ladder now makes
+  the atlas term predictable, so this is computable up front.
+- **Varying resolution across the run.** A 500 km study does not need 5 m
+  everywhere. Allow a coarser resolution beyond some radius (the engine already
+  picks the best-fit tile per grid cell — `engines/coverage.rs:582-607` sorts
+  each tile group by |res - requested| — so mixed-resolution `.abt` tiles in one
+  directory are already handled). The plugin side is choosing the ladder,
+  generating the tiles, and showing the user what they will get.
+- **Refuse clearly when it will not work.** If the combination cannot be built
+  or solved, say which limit is hit and what to change (reduce range, coarsen
+  resolution, narrow the sector) *before* anything is downloaded. Right now the
+  only feedback is the solver's hardcoded VRAM message, which names the wrong
+  cause — see the solver section.
+- **Cap the building-tile count per `.abt` tile** rather than per run, so the
+  4096 limit stops being a global range ceiling.
 
 ## Buildings / terrain preparation performance
 
@@ -271,7 +420,13 @@ are against the tree as of that date.
   an azimuth sector. `_compute_subtiles` (`core/terrain_adapter.py:355-385`)
   already has exact circle + arc intersection tests to reuse.
 
-- [ ] **No shared building-tile cache.** `pbf_dir` lives inside the terrain cache
+- [x] **No shared building-tile cache.** Done. Building tiles now pool next to
+  the terrain tiles (`<pool>/_buildings/`) — they are globally addressed
+  `z_x_y.pbf`, so 30 km → 31 km reuses all 1369 instead of re-fetching them.
+  The converter is handed a per-run *view* of that pool rather than the pool
+  itself, because `ingest.rs:504` re-decodes every file in the directory for
+  every output tile it writes; a shared directory that grows across runs would
+  make each run slower than the last. Original finding: `pbf_dir` lives inside the terrain cache
   (`core/terrain_adapter.py:1034`), which is keyed on bbox — so 30 km -> 31 km
   re-downloads all 1369 z14 tiles.
 

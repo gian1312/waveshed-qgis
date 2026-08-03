@@ -58,12 +58,15 @@ from qgis.core import (
 )
 from qgis.gui import QgsRubberBand
 
-from ..core.binary_manager import find_binary
+from ..core.binary_manager import binaries_warning, find_binary
 from ..core import api_key
 from ..core.job_builder import (
+    INVALID,
     VALID_RESOLUTIONS,
     P2PParams,
     build_p2p_job,
+    format_model_warnings,
+    model_warnings,
     write_job_file,
 )
 from ..core.layer_utils import dem_layer_warning, hide_from_dem_picker
@@ -1213,6 +1216,14 @@ class P2PTab(QWidget):
             QMessageBox.warning(self, "Validation Error", error)
             return
 
+        # The engine has to be there. Terrain preparation falls back to the
+        # slow QGIS raster path when aether_converter is missing, so without
+        # this the user waits out the whole extract before hitting the error.
+        engine_warning = binaries_warning()
+        if engine_warning:
+            QMessageBox.critical(self, "Aether engine not found", engine_warning)
+            return
+
         dem_layer = self._selected_dem_layer()
 
         # Guard against a basemap/imagery layer (e.g. OpenStreetMap) being
@@ -1239,6 +1250,22 @@ class P2PTab(QWidget):
         )
 
         params = self._collect_params()
+
+        # ---- Confirm parameters that leave the model's validated range ----
+        # ITM raises its own kwx indicator for these, but neither AETHER nor
+        # Splat surfaces it, so an out-of-range run looks like a valid one.
+        model_issues = model_warnings(params)
+        if any(w.severity == INVALID for w in model_issues):
+            if QMessageBox.warning(
+                self, "Outside the propagation model's range",
+                "These parameters are outside the range the propagation model is "
+                "defined for. The run will complete, but the numbers it produces "
+                "are probably invalid.\n\n"
+                + format_model_warnings(model_issues)
+                + "\n\nRun anyway?",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+            ) != QMessageBox.Yes:
+                return
 
         # ---- Confirm an unreasonably large terrain download ----
         try:

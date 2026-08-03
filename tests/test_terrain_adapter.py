@@ -309,107 +309,391 @@ class TestCacheKey(unittest.TestCase):
         int(k, 16)
 
 
-class TestCacheCompleteness(unittest.TestCase):
-    """A cache is a hit only when every expected tile is actually present."""
+def _write_pool_abt(path, size=64):
+    """A minimal complete .abt: 44-byte header plus size*stride body bytes.
 
-    def test_partial_tile_set_is_a_miss(self):
-        # aether_core resolves terrain by .abt header, so a missing tile is not
-        # an error — the cells it covered are simply absent and the coverage
-        # comes out silently wrong. Accepting "some .abt is present" reported a
-        # run killed after tile 1 of 3 as a valid cache.
+    Deliberately numpy-free (unlike _write_abt below) so the pool tests run
+    everywhere — they care about presence and length, not pixels.
+    """
+    stride = _abt_row_stride(size)
+    hdr = (b"AETH" + struct.pack("<HH", 1, size)
+           + struct.pack("<dddd", 47.0, 8.0, 1.0 / size, 1.0 / size)
+           + struct.pack("<hH", 0, stride))
+    with open(path, "wb") as fh:
+        fh.write(hdr)
+        fh.write(b"\0" * (size * stride))
+
+
+_XYZ_SOURCE = ("type=xyz&url=https%3A//example.com/%7Bz%7D/%7Bx%7D/%7By%7D.png"
+               "&zmax=15")
+
+
+class TestTileCompleteness(unittest.TestCase):
+    """Membership is per tile, and a short tile is not a member."""
+
+    def test_whole_tile_is_ready(self):
         with tempfile.TemporaryDirectory() as d:
-            expected = ["a.abt", "b.abt", "c.abt"]
-            open(os.path.join(d, "a.abt"), "w").close()
-            self.assertFalse(ta._cache_hit(d, expected))
-            for name in expected[1:]:
-                open(os.path.join(d, name), "w").close()
-            self.assertTrue(ta._cache_hit(d, expected))
+            _write_pool_abt(os.path.join(d, "a.abt"))
+            self.assertTrue(ta._tile_ready(d, "a.abt"))
 
-    def test_incomplete_marker_forces_a_miss(self):
+    def test_truncated_tile_is_not_ready(self):
+        # A run killed mid-write leaves a valid header over missing rows. The
+        # engine would read that as real terrain and the coverage would come
+        # out holed, with no error anywhere.
         with tempfile.TemporaryDirectory() as d:
-            open(os.path.join(d, "a.abt"), "w").close()
-            self.assertTrue(ta._cache_hit(d, ["a.abt"]))
-            ta._mark_incomplete(d)
-            self.assertFalse(ta._cache_hit(d, ["a.abt"]))
-            ta._clear_incomplete(d)
-            self.assertTrue(ta._cache_hit(d, ["a.abt"]))
+            path = os.path.join(d, "a.abt")
+            _write_pool_abt(path)
+            with open(path, "rb") as fh:
+                head = fh.read(44 + 128)
+            with open(path, "wb") as fh:
+                fh.write(head)
+            self.assertFalse(ta._tile_ready(d, "a.abt"))
 
-    def test_missing_dir_is_a_miss(self):
-        self.assertFalse(ta._cache_hit("/no/such/cache/dir", ["a.abt"]))
+    def test_missing_tile_is_not_ready(self):
+        with tempfile.TemporaryDirectory() as d:
+            self.assertFalse(ta._tile_ready(d, "nope.abt"))
+
+    def test_rebuild_flag_hides_a_whole_tile(self):
+        with tempfile.TemporaryDirectory() as d:
+            _write_pool_abt(os.path.join(d, "a.abt"))
+            ta._set_rebuild_flags(d, ["a.abt"], {"a.abt"})
+            self.assertFalse(ta._tile_ready(d, "a.abt"))
+            ta._set_rebuild_flags(d, ["a.abt"])          # cleared on rebuild
+            self.assertTrue(ta._tile_ready(d, "a.abt"))
+
+
+class TestViewDirectory(unittest.TestCase):
+    """The engine reads every .abt in the directory it is handed."""
+
+    def test_view_holds_exactly_the_requested_tiles(self):
+        # engines/coverage.rs builds relevant_tiles from the whole listing with
+        # no bbox filter, so one stray tile enlarges the atlas and the output
+        # grid. The view must be pruned to the run's own tiles.
+        with tempfile.TemporaryDirectory() as pool, \
+                tempfile.TemporaryDirectory() as view:
+            for name in ("a.abt", "b.abt", "c.abt"):
+                _write_pool_abt(os.path.join(pool, name))
+            _write_pool_abt(os.path.join(view, "stale.abt"))
+            gone = ta._sync_view(pool, view, ["a.abt", "b.abt"])
+            self.assertEqual(gone, [])
+            self.assertEqual(sorted(n for n in os.listdir(view)
+                                    if n.endswith(".abt")),
+                             ["a.abt", "b.abt"])
+
+    def test_missing_pool_tile_is_reported(self):
+        with tempfile.TemporaryDirectory() as pool, \
+                tempfile.TemporaryDirectory() as view:
+            _write_pool_abt(os.path.join(pool, "a.abt"))
+            self.assertEqual(ta._sync_view(pool, view, ["a.abt", "b.abt"]),
+                             ["b.abt"])
+
+
+class TestMissingEngineFailsFast(unittest.TestCase):
+    """A missing converter must stop the run before the expensive extract."""
+
+    def test_prepare_terrain_raises_before_extracting(self):
+        # The fast download path returns False when the converter is absent,
+        # which used to drop the run onto the slow QGIS raster path for tens
+        # of minutes before failing on the very same missing binary.
+        layer = mock.Mock()
+        layer.source.return_value = _XYZ_SOURCE
+        bm = mock.Mock()
+        bm.find_binary.side_effect = RuntimeError(
+            "AETHER binary 'aether_converter' not found.")
+
+        with tempfile.TemporaryDirectory() as root:
+            with mock.patch.object(ta, "get_cache_dir", return_value=root), \
+                 mock.patch.object(ta, "_extract_reproject") as extract:
+                with self.assertRaises(RuntimeError) as caught:
+                    ta.prepare_terrain(layer, 47.4, 8.5, 30.0, 30, bm)
+        self.assertIn("aether_converter", str(caught.exception))
+        extract.assert_not_called()
+
+    def test_full_cache_hit_needs_no_engine(self):
+        # Nothing to build means nothing to build it with.
+        layer = mock.Mock()
+        layer.source.return_value = _XYZ_SOURCE
+        bm = mock.Mock()
+        bm.find_binary.side_effect = RuntimeError("not found")
+
+        with tempfile.TemporaryDirectory() as root:
+            with mock.patch.object(ta, "get_cache_dir", return_value=root):
+                pool = ta._pool_dir(_XYZ_SOURCE)
+                os.makedirs(pool, exist_ok=True)
+                bb = ta._compute_sector_bbox(47.4, 8.5, 30.0)
+                for t in ta._compute_subtiles(bb, 30, 47.4, 8.5, 30.0):
+                    _write_pool_abt(os.path.join(pool, t["filename"]))
+                view = ta.prepare_terrain(layer, 47.4, 8.5, 30.0, 30, bm)
+                self.assertTrue(os.path.isdir(view))
+
+    def test_fast_path_logs_why_it_bailed(self):
+        # Three different causes used to share one generic message.
+        logged = []
+        bm = mock.Mock()
+        bm.find_binary.side_effect = RuntimeError("binary 'x' not found")
+        with mock.patch.object(ta, "_log", side_effect=logged.append):
+            ta._try_rust_download("provider=gdal&path=/x.tif", "/tmp/p",
+                                  {"north": 1, "south": 0, "east": 1, "west": 0},
+                                  30, [], bm)
+            ta._try_rust_download("type=xyz&zmax=15", "/tmp/p",
+                                  {"north": 1, "south": 0, "east": 1, "west": 0},
+                                  30, [], bm)
+            ta._try_rust_download(_XYZ_SOURCE, "/tmp/p",
+                                  {"north": 1, "south": 0, "east": 1, "west": 0},
+                                  30, [], bm)
+        self.assertIn("not an XYZ tile service", logged[0])
+        self.assertIn("no 'url'", logged[1])
+        self.assertIn("not found", logged[2])
+
+
+class TestSourceIdentity(unittest.TestCase):
+    """Two spellings of one endpoint must not mean two pools."""
+
+    URL = "https%3A//s3.amazonaws.com/x/%7Bz%7D/%7Bx%7D/%7By%7D.png"
+
+    def test_parameter_order_and_extras_do_not_matter(self):
+        a = f"type=xyz&url={self.URL}&zmax=15&zmin=0"
+        b = f"zmin=0&url={self.URL}&type=xyz&zmax=15"
+        self.assertEqual(ta.source_identity(a), ta.source_identity(b))
+
+    def test_zmax_is_part_of_identity(self):
+        # zmax caps the zoom a tile can be built from, so it changes pixels.
+        a = f"type=xyz&url={self.URL}&zmax=15"
+        b = f"type=xyz&url={self.URL}&zmax=13"
+        self.assertNotEqual(ta.source_identity(a), ta.source_identity(b))
+
+    def test_different_services_differ(self):
+        a = f"type=xyz&url={self.URL}&zmax=15"
+        b = "type=xyz&url=https%3A//other.example/%7Bz%7D.png&zmax=15"
+        self.assertNotEqual(ta.source_identity(a), ta.source_identity(b))
+
+    def test_encoding_is_part_of_identity(self):
+        a = f"type=xyz&url={self.URL}&zmax=15"
+        b = f"type=xyz&url={self.URL}&zmax=15&interpretation=mapboxterrain"
+        self.assertNotEqual(ta.source_identity(a), ta.source_identity(b))
+
+    def test_non_xyz_source_passes_through(self):
+        self.assertEqual(ta.source_identity("/data/dem.tif"), "/data/dem.tif")
+
+    def test_pool_is_shared_across_uri_spellings(self):
+        with mock.patch.object(ta, "get_cache_dir", return_value="/tmp/x"):
+            a = ta._pool_dir(f"type=xyz&url={self.URL}&zmax=15&zmin=0")
+            b = ta._pool_dir(f"zmin=0&zmax=15&url={self.URL}&type=xyz")
+            self.assertEqual(a, b)
+
+
+class TestTileZoom(unittest.TestCase):
+    """Zoom must be a property of the tile, not of the request."""
+
+    def test_finer_resolution_needs_deeper_zoom(self):
+        self.assertGreater(ta.tile_zoom(47.0, 5, 20), ta.tile_zoom(47.0, 30, 20))
+
+    def test_capped_at_service_maximum(self):
+        self.assertEqual(ta.tile_zoom(47.0, 1, 14), 14)
+
+    def test_higher_latitude_needs_less_zoom(self):
+        # Tiles shrink in ground metres towards the poles, so the same target
+        # resolution is reached at a shallower zoom.
+        self.assertLessEqual(ta.tile_zoom(70.0, 10, 20), ta.tile_zoom(0.0, 10, 20))
+
+    def test_same_tile_gets_one_zoom_regardless_of_request(self):
+        # The bug this replaces: zoom came from the request's bbox centre, so
+        # a tile shared by an equatorial-centred run and a polar-centred run
+        # was built from different source data depending on who fetched first.
+        tile = {"ul_lat": 47.25, "ul_lon": 8.5, "size_px": 5556,
+                "exact_res_m": 5.0}
+        lat = ta._tile_center_lat(tile)
+        self.assertEqual(ta.tile_zoom(lat, tile["exact_res_m"], 15),
+                         ta.tile_zoom(lat, tile["exact_res_m"], 15))
+        self.assertLess(abs(lat - 47.25), 0.3)
+
+
+class TestTerrainPlan(unittest.TestCase):
+    """The pre-run estimate must price the pool, not the whole tile set."""
+
+    def test_everything_pooled_costs_nothing(self):
+        with tempfile.TemporaryDirectory() as root:
+            with mock.patch.object(ta, "get_cache_dir", return_value=root):
+                first = ta.terrain_plan(_XYZ_SOURCE, 47.4, 8.5, 30.0, 30)
+                self.assertEqual(first["tiles_cached"], 0)
+                self.assertGreater(first["download_mb"], 0)
+
+                pool = ta._pool_dir(_XYZ_SOURCE)
+                os.makedirs(pool, exist_ok=True)
+                bb = ta._compute_sector_bbox(47.4, 8.5, 30.0)
+                for t in ta._compute_subtiles(bb, 30, 47.4, 8.5, 30.0):
+                    _write_pool_abt(os.path.join(pool, t["filename"]))
+
+                after = ta.terrain_plan(_XYZ_SOURCE, 47.4, 8.5, 30.0, 30)
+        self.assertEqual(after["tiles_missing"], 0)
+        self.assertEqual(after["download_mb"], 0)
+        self.assertEqual(after["tiles_cached"], after["tiles_total"])
+        self.assertGreater(after["total_mb"], 0)   # still reports real size
+
+    def test_buildings_price_separately(self):
+        # Buildings are burned into the pixels, so a plain pool cannot pay for
+        # a buildings run — the estimate must say so.
+        with tempfile.TemporaryDirectory() as root:
+            with mock.patch.object(ta, "get_cache_dir", return_value=root):
+                pool = ta._pool_dir(_XYZ_SOURCE)
+                os.makedirs(pool, exist_ok=True)
+                bb = ta._compute_sector_bbox(47.4, 8.5, 30.0)
+                for t in ta._compute_subtiles(bb, 30, 47.4, 8.5, 30.0):
+                    _write_pool_abt(os.path.join(pool, t["filename"]))
+                with_b = ta.terrain_plan(
+                    _XYZ_SOURCE, 47.4, 8.5, 30.0, 30,
+                    buildings=ta.buildings_identity(osm_buildings=True))
+        self.assertEqual(with_b["tiles_cached"], 0)
+
+    def test_size_warning_mentions_what_is_reused(self):
+        msg, _strong = ta.terrain_size_warning(60 * 1024, cached_mb=40 * 1024)
+        self.assertIn("still needs", msg)
+        self.assertIn("already cached", msg)
+
+
+class TestBboxCoveredFraction(unittest.TestCase):
+
+    NEED = {"north": 48.0, "south": 47.0, "east": 9.0, "west": 8.0}
+
+    def test_full(self):
+        self.assertEqual(ta.bbox_covered_fraction(
+            {"north": 49.0, "south": 46.0, "east": 10.0, "west": 7.0},
+            self.NEED), 1.0)
+
+    def test_none(self):
+        self.assertEqual(ta.bbox_covered_fraction(
+            {"north": 60.0, "south": 59.0, "east": 20.0, "west": 19.0},
+            self.NEED), 0.0)
+
+    def test_quarter(self):
+        self.assertAlmostEqual(ta.bbox_covered_fraction(
+            {"north": 47.5, "south": 46.0, "east": 8.5, "west": 7.0},
+            self.NEED), 0.25)
+
+
+class TestPoolReuse(unittest.TestCase):
+    """The pool exists so a second, smaller run fetches nothing."""
+
+    def _run(self, layer, fetched, root, range_km):
+        def fake_download(source, pool, bbox, res, subtiles, bm):
+            fetched.append([t["filename"] for t in subtiles])
+            for t in subtiles:
+                _write_pool_abt(os.path.join(pool, t["filename"]))
+            return True
+
+        with mock.patch.object(ta, "get_cache_dir", return_value=root), \
+             mock.patch.object(ta, "_try_rust_download",
+                               side_effect=fake_download):
+            return ta.prepare_terrain(layer, 47.4, 8.5, range_km, 30,
+                                      mock.Mock())
+
+    def test_reducing_the_range_fetches_nothing(self):
+        # The reported bug: every run re-downloaded, "even if we just reduced
+        # the range". A key over a whole directory — even over its exact tile
+        # set — cannot express this, because a smaller range is a SUBSET and
+        # set equality calls a subset a miss.
+        layer = mock.Mock()
+        layer.source.return_value = _XYZ_SOURCE
+        fetched = []
+        with tempfile.TemporaryDirectory() as root:
+            big = self._run(layer, fetched, root, 60.0)
+            small = self._run(layer, fetched, root, 20.0)
+
+            self.assertEqual(len(fetched), 1, "the 20 km run fetched again")
+            self.assertTrue(fetched[0])
+            self.assertNotEqual(big, small, "each run needs its own view dir")
+            n_big = len([n for n in os.listdir(big) if n.endswith(".abt")])
+            n_small = len([n for n in os.listdir(small) if n.endswith(".abt")])
+            self.assertLess(n_small, n_big)
+
+    def test_growing_the_range_fetches_only_the_new_tiles(self):
+        layer = mock.Mock()
+        layer.source.return_value = _XYZ_SOURCE
+        fetched = []
+        with tempfile.TemporaryDirectory() as root:
+            self._run(layer, fetched, root, 20.0)
+            self._run(layer, fetched, root, 60.0)
+            self.assertEqual(len(fetched), 2)
+            # Nothing from the first run may be fetched a second time.
+            self.assertFalse(set(fetched[0]) & set(fetched[1]))
 
 
 class TestDownloadCompleteness(unittest.TestCase):
-    """Unfetchable source tiles must not poison a good cache."""
+    """Unfetchable source tiles must not poison good pooled tiles."""
 
-    SOURCE = ("type=xyz&url=https%3A//example.com/%7Bz%7D/%7Bx%7D/%7By%7D.png"
-              "&zmax=15")
     BBOX = {"north": 47.5, "south": 47.0, "east": 8.5, "west": 8.0}
     TILE = "tile_N48.00E8.00_30m.abt"
 
-    def _download(self, cache_dir, ok, total, has_gaps):
+    def _download(self, pool_dir, ok, total, has_gaps):
         subtiles = [{"filename": self.TILE, "ul_lat": 48.0, "ul_lon": 8.0,
                      "size_px": 3704, "exact_res_m": 30.0}]
         bm = mock.Mock()
         bm.find_binary.return_value = "aether_converter"
-        open(os.path.join(cache_dir, self.TILE), "w").close()
+        _write_pool_abt(os.path.join(pool_dir, self.TILE))
         with mock.patch.object(ta, "_run_converter_download_once",
                                return_value=(0, [f"[Stats] Tiles: {ok}/{total} OK"])), \
              mock.patch.object(ta, "_abt_has_gaps", return_value=has_gaps):
-            return ta._try_rust_download(self.SOURCE, cache_dir, self.BBOX, 30,
+            return ta._try_rust_download(_XYZ_SOURCE, pool_dir, self.BBOX, 30,
                                          subtiles, bm)
 
-    def test_missing_sources_without_gaps_is_a_complete_cache(self):
+    def test_missing_sources_without_gaps_is_a_complete_tile(self):
         # The converter reports a run with a handful of unfetchable source
-        # tiles as "100.0% success"; those tiles are usually permanent 404s
-        # (ocean, past zmax) that no retry can fix. If no output tile has a
-        # hole, that is a COMPLETE result. Marking it incomplete meant every
-        # later run re-downloaded the whole set — nothing outside the download
-        # function ever clears the marker — and then landed here again.
+        # tiles as "100.0% success"; those are usually permanent 404s (ocean,
+        # past zmax) that no retry can fix. If no output tile has a hole, that
+        # is a COMPLETE result. Treating it as a failure flagged the tiles for
+        # rebuild on the very first run, so every later run re-fetched them
+        # and landed here again.
         with tempfile.TemporaryDirectory() as d:
             self.assertTrue(self._download(d, ok=999, total=1000, has_gaps=False))
-            self.assertNotIn(ta._INCOMPLETE_MARKER, os.listdir(d))
-            self.assertTrue(ta._cache_hit(d, [self.TILE]))
+            self.assertTrue(ta._tile_ready(d, self.TILE))
 
-    def test_real_gaps_are_marked_but_still_usable_now(self):
+    def test_real_gaps_flag_only_the_gapped_tile(self):
         # Gapped terrain beats redoing the whole preparation through the far
-        # slower extract+convert path in this same run, so it is returned —
-        # and marked, so the next run rebuilds it.
+        # slower path in this same run, so it is returned — and flagged, so
+        # the next run rebuilds that tile and keeps every other one.
         with tempfile.TemporaryDirectory() as d:
             self.assertTrue(self._download(d, ok=999, total=1000, has_gaps=True))
-            self.assertIn(ta._INCOMPLETE_MARKER, os.listdir(d))
-            self.assertFalse(ta._cache_hit(d, [self.TILE]))
+            self.assertFalse(ta._tile_ready(d, self.TILE))
 
-    def test_complete_download_clears_a_stale_marker(self):
+    def test_complete_download_clears_a_stale_flag(self):
         with tempfile.TemporaryDirectory() as d:
-            ta._mark_incomplete(d)
+            ta._set_rebuild_flags(d, [self.TILE], {self.TILE})
             self.assertTrue(self._download(d, ok=1000, total=1000, has_gaps=False))
-            self.assertNotIn(ta._INCOMPLETE_MARKER, os.listdir(d))
+            self.assertTrue(ta._tile_ready(d, self.TILE))
 
 
 class TestBuildingsCacheIdentity(unittest.TestCase):
-    """A cache keyed "with buildings" must never hold building-free tiles."""
+    """A pool keyed "with buildings" must never hold building-free tiles."""
 
-    SOURCE = "type=xyz&url=https%3A//e.com/%7Bz%7D/%7Bx%7D/%7By%7D.png&zmax=15"
-
-    def test_failed_building_download_leaves_the_cache_unreusable(self):
-        # The buildings term is in the cache key, so if the download fails and
-        # we build plain terrain anyway, the directory lies about what is in
-        # it. Left reusable, the next run would hit the cache, skip the
+    def test_failed_building_download_flags_the_tiles_for_rebuild(self):
+        # Buildings are part of the pool identity, so if the download fails
+        # and we build plain terrain anyway, the pool lies about its contents.
+        # Left reusable, the next run would reuse those tiles, skip the
         # download entirely and produce building-free coverage in silence.
         from waveshed.core import openfreemap
 
         layer = mock.Mock()
-        layer.source.return_value = self.SOURCE
+        layer.source.return_value = _XYZ_SOURCE
+        fetched = []
+
+        def fake_download(source, pool, bbox, res, subtiles, bm):
+            fetched.append(len(subtiles))
+            for t in subtiles:
+                _write_pool_abt(os.path.join(pool, t["filename"]))
+            return True
+
         with tempfile.TemporaryDirectory() as root:
             with mock.patch.object(ta, "get_cache_dir", return_value=root), \
                  mock.patch.object(openfreemap, "download_building_tiles",
                                    side_effect=RuntimeError("503 from OFM")), \
-                 mock.patch.object(ta, "_try_rust_download", return_value=True):
-                cache_dir = ta.prepare_terrain(
-                    layer, 47.4, 8.5, 30.0, 30, mock.Mock(),
-                    osm_buildings=True,
-                )
-            self.assertIn(ta._INCOMPLETE_MARKER, os.listdir(cache_dir))
+                 mock.patch.object(ta, "_try_rust_download",
+                                   side_effect=fake_download):
+                ta.prepare_terrain(layer, 47.4, 8.5, 30.0, 30, mock.Mock(),
+                                   osm_buildings=True)
+                # Second run must not reuse the building-free tiles.
+                ta.prepare_terrain(layer, 47.4, 8.5, 30.0, 30, mock.Mock(),
+                                   osm_buildings=True)
+        self.assertEqual(len(fetched), 2, "building-free tiles were reused")
 
 
 class TestSectorBboxMatchesAetherCore(unittest.TestCase):
@@ -738,7 +1022,13 @@ class TestBboxesIntersect(unittest.TestCase):
 
 
 class TestTerrainCoverageWarning(unittest.TestCase):
-    """Fires only when the directory offers no usable terrain at all."""
+    """Fires when the directory cannot cover the analysis area.
+
+    Policy change: partial coverage used to be silent on the grounds that it
+    was normal. It is not benign — a terrain directory is the ONLY source once
+    selected, with no fall back to the base DEM, so whatever it misses is
+    computed over 0 m sea level and looks like real coverage.
+    """
 
     BBOX = {"north": 48.0, "south": 47.0, "east": 9.0, "west": 8.0}
 
@@ -765,14 +1055,29 @@ class TestTerrainCoverageWarning(unittest.TestCase):
                                        return_value=extent):
                     return ta.terrain_coverage_warning(d, self.BBOX)
 
-    def test_overlapping_terrain_is_silent(self):
+    def test_full_coverage_is_silent(self):
         self.assertIsNone(self._run_with_extent(
-            {"north": 47.5, "south": 46.0, "east": 8.5, "west": 7.0}))
+            {"north": 49.0, "south": 46.0, "east": 10.0, "west": 7.0}))
 
-    def test_partial_overlap_is_silent(self):
-        # Deliberate: partial coverage is normal and must not nag.
+    def test_slight_overhang_is_silent(self):
+        # The analysis bbox carries a 1% margin and tiles rarely line up with
+        # a DEM edge, so near-total coverage must not nag.
         self.assertIsNone(self._run_with_extent(
-            {"north": 47.1, "south": 47.0, "east": 8.1, "west": 8.0}))
+            {"north": 47.99, "south": 47.0, "east": 9.0, "west": 8.0}))
+
+    def test_quarter_coverage_warns(self):
+        # Covers lat 47.0-47.5 and lon 8.0-8.5 of a 1x1 degree request = 25%.
+        msg = self._run_with_extent(
+            {"north": 47.5, "south": 46.0, "east": 8.5, "west": 7.0})
+        self.assertIsNotNone(msg)
+        self.assertIn("25%", msg)
+        self.assertIn("0 m", msg)
+
+    def test_sliver_coverage_warns(self):
+        msg = self._run_with_extent(
+            {"north": 47.1, "south": 47.0, "east": 8.1, "west": 8.0})
+        self.assertIsNotNone(msg)
+        self.assertIn("1%", msg)
 
     def test_disjoint_terrain_warns(self):
         msg = self._run_with_extent(
