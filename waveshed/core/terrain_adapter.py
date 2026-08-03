@@ -16,6 +16,7 @@ import math
 import os
 import platform
 import re
+import shutil
 import subprocess
 import tempfile
 import time
@@ -52,6 +53,70 @@ def reset_terrain_warnings() -> None:
 def get_cache_dir() -> str:
     from qgis.core import QgsSettings
     return QgsSettings().value("waveshed/cache_dir", os.path.expanduser("~/.aether/cache"))
+
+
+# A cache entry directory is named by _cache_key, i.e. an md5 hex digest.
+_CACHE_ENTRY_RE = re.compile(r"^[0-9a-f]{32}$")
+
+
+def cache_entries() -> List[str]:
+    """Absolute paths of the terrain cache entries under the cache root.
+
+    Only md5-named directories — the shape ``_cache_key`` produces — count as
+    ours. The cache root is user-configurable (QgsSettings
+    "waveshed/cache_dir") and may well be a directory holding other things, so
+    nothing else is ever reported here, and therefore nothing else can be
+    deleted by ``clear_cache``.
+    """
+    root = get_cache_dir()
+    entries: List[str] = []
+    try:
+        for name in sorted(os.listdir(root)):
+            path = os.path.join(root, name)
+            if _CACHE_ENTRY_RE.match(name) and os.path.isdir(path):
+                entries.append(path)
+    except OSError:
+        return []
+    return entries
+
+
+def dir_size_bytes(path: str) -> int:
+    """Total size of *path* and everything under it. Unreadable files count 0."""
+    total = 0
+    for root, _, files in os.walk(path):
+        for name in files:
+            try:
+                total += os.path.getsize(os.path.join(root, name))
+            except OSError:
+                continue
+    return total
+
+
+def cache_size_bytes() -> int:
+    """Total size on disk of every terrain cache entry."""
+    return sum(dir_size_bytes(p) for p in cache_entries())
+
+
+def clear_cache() -> Tuple[int, int]:
+    """Delete every terrain cache entry. Returns ``(entries removed, bytes freed)``.
+
+    The cache has no eviction of any kind, so this is the only way to reclaim
+    the space — and the only way to pick up republished OpenFreeMap building
+    data, whose cache token is deliberately date-free.
+    """
+    removed = 0
+    freed = 0
+    for path in cache_entries():
+        size = dir_size_bytes(path)
+        try:
+            shutil.rmtree(path)
+        except OSError as exc:  # noqa: PERF203 — report and keep going
+            _log(f"  cache clear: could not remove {path} ({exc})")
+            continue
+        removed += 1
+        freed += size
+    _log(f"  cache clear: removed {removed} entr(ies), freed {freed / 1e6:.0f} MB")
+    return removed, freed
 
 
 def _get_download_connections() -> int:
@@ -229,17 +294,34 @@ def source_fingerprint(buildings: str) -> str:
         return path
 
 
-def _cache_key(source: str, bbox: Dict[str, float], resolution_m: int,
+# Bumped whenever tile geometry or cache layout changes, so directories built
+# by an older plugin can never be mistaken for a valid cache.
+#   v2: tile extent is resolution-keyed (ABT_EXTENT_DEG) instead of a flat 1
+#       degree, and the key is the tile set rather than the request bbox.
+_CACHE_SCHEMA = "v2"
+
+
+def _cache_key(source: str, subtiles: List[Dict[str, Any]], resolution_m: int,
                buildings: Optional[str] = None) -> str:
     """Hash identifying one .abt terrain cache.
 
+    Keyed on the *tile set*, not on the request that produced it.  Tile names
+    from ``_tile_params`` are globally canonical (snapped to the
+    ``ABT_EXTENT_DEG`` grid), so two sites, two ranges or two azimuth sectors
+    needing the same tiles share one cache.  Hashing the raw bbox floats made
+    a sub-metre site nudge — or 30 km vs 31 km at one site — a guaranteed
+    miss, and every run re-downloaded terrain it already had.
+
+    The azimuth sector needs no term of its own: a narrower sector selects a
+    strict subset of the tiles and therefore hashes differently, so a sector
+    cache can never be mistaken for a full-circle one.
+
     Buildings are baked into the .abt pixels, so a cache built without them
     must never be reused for a run that wants them (or one that wants a
-    different building set).  The buildings term is appended only when there
-    are buildings, which keeps keys — and therefore existing caches — byte
-    identical to before for the no-buildings case.
+    different building set).
     """
-    key = f"{source}|{bbox}|{resolution_m}"
+    names = ",".join(sorted(t["filename"] for t in subtiles))
+    key = f"{_CACHE_SCHEMA}|{source}|{names}|{resolution_m}"
     if buildings:
         key += f"|{source_fingerprint(buildings)}"
     return hashlib.md5(key.encode()).hexdigest()
@@ -264,45 +346,98 @@ def _clear_incomplete(cache_dir: str) -> None:
         pass
 
 
-def _cache_hit(cache_dir: str) -> bool:
+def _has_any_abt(cache_dir: str) -> bool:
+    """True if the directory holds any .abt at all, complete or not.
+
+    Distinct from ``_cache_hit``: this answers "did we produce something
+    usable for *this* run", not "is this a cache we may reuse later".
+    """
+    try:
+        return any(f.endswith(".abt") for f in os.listdir(cache_dir))
+    except OSError:
+        return False
+
+
+def _cache_hit(cache_dir: str, expected: List[str]) -> bool:
+    """True if *cache_dir* is a complete, reusable cache for *expected* tiles.
+
+    *expected* is the list of .abt filenames this run needs.  Accepting "any
+    .abt is present" reported a run killed after tile 1 of 4 as a HIT; the
+    engine resolves terrain by .abt header (``peek_abt``), so the cells with
+    no tile are simply absent and the coverage comes out silently wrong — no
+    error, just holes.  Check every tile, not just one.
+    """
     if not os.path.isdir(cache_dir):
         return False
-    files = os.listdir(cache_dir)
+    try:
+        files = set(os.listdir(cache_dir))
+    except OSError:
+        return False
     if _INCOMPLETE_MARKER in files:
         return False  # a prior run left gaps — force a fresh download
-    return any(f.endswith(".abt") for f in files)
+    return bool(expected) and all(name in files for name in expected)
 
 
 # ---------------------------------------------------------------------------
-# Sub-tile specs (1-degree grid, matching prepare_data.py)
+# Sub-tile specs (resolution-keyed grid)
 # ---------------------------------------------------------------------------
 
-# Tile geometry mirrors AETHER's reference pipeline
-# (python/drivers/prepare_data.py) so aether_core reads plugin-generated and
-# prepare_data-generated .abt tiles identically. Two pieces are kept in sync:
-#   * _subtile_degrees  <-> prepare_data's `sub_size_macro`
-#   * _tile_params      <-> prepare_data's calc_size / exact_res / ul_lat block
+# .abt tile extent in degrees per resolution — the single source of truth for
+# every terrain path in the plugin (this module and gui/map_converter_tab).
+# The ladder is the one agreed in AETHER's
+# "Design Documents/qgis_plugin/TODO.md" 3.5: finer resolutions get smaller
+# tiles.  Extents must be non-decreasing with resolution.
+#
+# Tile extent is load-bearing for the engine, not just a disk-size convenience.
+# aether_core's solver loads every tile a wedge touches into ONE contiguous
+# terrain-atlas allocation and rejects the job when that exceeds
+# 0.9 * min(gpu max_buffer_size, 4 GiB) ~= 3.86 GB (solver.rs `single_alloc_ok`
+# against `SystemLimits::max_allocation_bytes`, engines/coverage.rs).  A 1 deg
+# tile at 5 m is 22224 px -> 44544 B stride * 22224 rows = 0.99 GB, so a site
+# whose bbox crosses both a parallel and a meridian needs four of them
+# (3.96 GB) and the run is rejected — with a message blaming VRAM, which
+# cannot help, because that ceiling does not scale with
+# processing.max_vram_usage_gb.  The same layer at 0.25 deg is 62.6 MB.
+ABT_EXTENT_DEG = {
+    2: 0.1,
+    5: 0.25,
+    10: 0.25,
+    30: 0.5,
+    90: 1.0,
+    250: 2.0,
+}
+
+# _tile_params still mirrors prepare_data.py's calc_size / exact_res / ul_lat
+# block, so aether_core reads plugin-generated and prepare_data-generated .abt
+# tiles identically. Only the *extent* ladder above differs — deliberately.
 #
 # u16 safety net: the .abt writer stores the row stride as a u16
 # (aether_converter download.rs `stride as u16`); stride = size_px*2 aligned to
-# 256 must stay < 65536, else a 2 m tile at 1 deg (size_px 55556 -> stride
-# 111360) wraps and shears the terrain into bands. We shrink the tile until it
-# fits — 0.1/0.5 deg high-res tiles are already well under the limit.
+# 256 must stay < 65536, so size_px must stay under ~32000, else the tile wraps
+# and shears the terrain into bands. We shrink the tile until it fits.
 _ABT_MAX_SIZE_PX = 32000  # keeps aligned stride (size_px*2) below the u16 limit
 
 
-def _subtile_degrees(resolution_m: int, high_res: bool = False) -> float:
-    """Sub-tile size in degrees, matching prepare_data.py's ``sub_size_macro``.
+def _extent_for_resolution(resolution_m: float) -> float:
+    """``ABT_EXTENT_DEG`` as a "<=" ladder, for resolutions off the table.
 
-    *high_res* selects the finer tiling AETHER uses when high-resolution local
-    terrain is fused (0.1 deg at <=3 m, else 0.5 deg); otherwise 1 deg, like the
-    base-DEM path. Either way the tile is shrunk further should the .abt row
-    stride overflow the u16 header field.
+    job_builder.VALID_RESOLUTIONS only offers the table's own keys, but the
+    engine accepts any resolution >= 0.1 m, so an off-table value takes the
+    next entry up (and anything coarser than the last entry takes its extent).
     """
-    if high_res:
-        sub = 0.1 if resolution_m <= 3 else 0.5
-    else:
-        sub = 1.0
+    for res in sorted(ABT_EXTENT_DEG):
+        if resolution_m <= res:
+            return ABT_EXTENT_DEG[res]
+    return ABT_EXTENT_DEG[max(ABT_EXTENT_DEG)]
+
+
+def _subtile_degrees(resolution_m: int) -> float:
+    """Sub-tile size in degrees for *resolution_m*, from ``ABT_EXTENT_DEG``.
+
+    The extent is shrunk further should the .abt row stride overflow the u16
+    header field.
+    """
+    sub = _extent_for_resolution(resolution_m)
     while sub > 0.05 and resolution_m > 0 and (
         sub * 111_111.0 / resolution_m
     ) > _ABT_MAX_SIZE_PX:
@@ -339,10 +474,9 @@ def _compute_subtiles(
     max_range_km: float = 0.0,
     az_start: float = 0.0,
     az_end: float = 360.0,
-    high_res: bool = False,
 ) -> List[Dict[str, Any]]:
     tiles = []
-    sub = _subtile_degrees(resolution_m, high_res)
+    sub = _subtile_degrees(resolution_m)
     lat_start = math.floor(bbox["south"] / sub) * sub
     lon_start = math.floor(bbox["west"] / sub) * sub
 
@@ -357,7 +491,7 @@ def _compute_subtiles(
         return a >= az_start or a <= az_end
 
     def tile_intersects_sector(t_south: float, t_north: float, t_west: float, t_east: float) -> bool:
-        """Check if a 1-degree tile intersects the circular sector."""
+        """Check if a tile intersects the circular sector."""
         if range_m <= 0:
             return True  # No range filter — keep all.
 
@@ -438,7 +572,6 @@ def estimate_terrain_disk_mb(
     resolution_m: int,
     az_start: float = 0.0,
     az_end: float = 360.0,
-    high_res: bool = False,
 ) -> int:
     """Estimate the .abt terrain cache (MB) one analysis will generate.
 
@@ -447,7 +580,7 @@ def estimate_terrain_disk_mb(
     """
     bbox = _compute_sector_bbox(tx_lat, tx_lon, max_range_km, az_start, az_end)
     subtiles = _compute_subtiles(bbox, resolution_m, tx_lat, tx_lon,
-                                 max_range_km, az_start, az_end, high_res)
+                                 max_range_km, az_start, az_end)
     return _estimate_abt_disk_mb(subtiles)
 
 
@@ -653,7 +786,7 @@ def _try_rust_download(
                 # Older converter without completeness stats — trust exit 0.
                 _log(f"  Rust download: {elapsed:.1f}s")
                 _clear_incomplete(cache_dir)
-                return _cache_hit(cache_dir)
+                return _has_any_abt(cache_dir)
             if ok >= total:
                 _log(f"  Rust download: {elapsed:.1f}s, "
                      f"{ok}/{total} source tiles (XYZ) OK "
@@ -662,17 +795,42 @@ def _try_rust_download(
                 return True
 
             missing = total - ok
-            # Which sub-tiles actually carry a gap? Re-fetch only those.
-            affected = [s for s in tile_specs
-                        if _abt_has_gaps(os.path.join(cache_dir, s["filename"]))]
-            if (attempt >= max_passes or not affected
-                    or conn <= _MIN_DOWNLOAD_CONNECTIONS):
+            # Which sub-tiles need re-fetching? Ones with a hole in them, and
+            # ones never written at all — _abt_has_gaps cannot see the latter,
+            # since it reports False for a file it cannot open.
+            affected = []
+            for s in tile_specs:
+                path = os.path.join(cache_dir, s["filename"])
+                if not os.path.exists(path) or _abt_has_gaps(path):
+                    affected.append(s)
+            if not affected:
+                # Source tiles were unavailable, but no output tile ended up
+                # with a hole: the server simply has nothing there (ocean,
+                # past zmax, a permanent 404), which no amount of retrying
+                # changes. That is a COMPLETE result, and treating it as a
+                # failure was a standing bug — a single missing source tile
+                # out of hundreds of thousands marked the cache incomplete on
+                # the first run, and since only this function ever clears the
+                # marker, every later run re-downloaded the entire set and
+                # then landed here again. Note the converter reports such a
+                # run as "100.0% success" (see _TILES_OK_RE), so this is the
+                # common case, not an edge case.
+                _log(f"  Rust download: {elapsed:.1f}s, {missing} source "
+                     f"tile(s) unavailable but every output tile is intact "
+                     f"→ complete")
+                _clear_incomplete(cache_dir)
+                return True
+
+            if attempt >= max_passes or conn <= _MIN_DOWNLOAD_CONNECTIONS:
                 _log(f"  WARNING: {missing} source tile(s) still failed after "
                      f"{attempt} pass(es); {len(affected)} output tile(s) left "
                      f"with gaps — using partial terrain and marking it for "
                      f"re-download.")
                 _mark_incomplete(cache_dir)
-                return _cache_hit(cache_dir)
+                # Usable-but-gapped terrain is still worth returning: the
+                # caller would otherwise redo the whole preparation through
+                # the far slower extract+convert path in this same run.
+                return _has_any_abt(cache_dir)
 
             conn = max(_MIN_DOWNLOAD_CONNECTIONS, conn // 2)
             specs = affected
@@ -680,7 +838,7 @@ def _try_rust_download(
                  f"missing): retrying {len(specs)} affected output tile(s) "
                  f"@ {conn} connections (pass {attempt + 1}/{max_passes})")
         _mark_incomplete(cache_dir)
-        return _cache_hit(cache_dir)
+        return _has_any_abt(cache_dir)
     except RuntimeError:
         raise
     except Exception as exc:
@@ -985,6 +1143,9 @@ def prepare_terrain(
          + (", buildings=openfreemap" if osm_buildings else ""))
 
     bbox = _compute_sector_bbox(tx_lat, tx_lon, max_range_km, az_start, az_end)
+    subtiles = _compute_subtiles(bbox, resolution_m, tx_lat, tx_lon,
+                                 max_range_km, az_start, az_end)
+    expected = [t["filename"] for t in subtiles]
 
     # One identity covering both sources, so switching either one — or turning
     # buildings off — lands on a different cache entry.
@@ -995,28 +1156,20 @@ def prepare_terrain(
         parts.append(_OSM_BUILDINGS_TOKEN)
     buildings_id = "+".join(parts) if parts else None
 
-    cache_hash = _cache_key(source, bbox, resolution_m, buildings_id)
-    # Include azimuth in cache key so different sectors don't collide.
-    if not (az_start == 0.0 and az_end == 360.0):
-        cache_hash = hashlib.md5(
-            f"{cache_hash}|{az_start}|{az_end}".encode()
-        ).hexdigest()
+    # Keyed on the tile set, so the azimuth sector needs no term of its own —
+    # a narrower sector simply selects fewer tiles. See _cache_key.
+    cache_hash = _cache_key(source, subtiles, resolution_m, buildings_id)
     cache_dir = os.path.join(get_cache_dir(), cache_hash)
     # Log the resolved cache path so the user can inspect the .abt tiles
     # directly (e.g. to check for missing tiles that show up as empty stripes
     # through a line-of-sight). Set QgsSettings "waveshed/cache_dir" to relocate.
     _log(f"  .abt cache dir: {cache_dir}")
 
-    if _cache_hit(cache_dir):
-        _log(f"  cache HIT ({time.perf_counter() - t0:.1f}s)")
+    if _cache_hit(cache_dir, expected):
+        _log(f"  cache HIT — {len(expected)} tile(s) "
+             f"({time.perf_counter() - t0:.1f}s)")
         return cache_dir
 
-    # A local terrain directory is high-resolution data (swissALTI-style), so
-    # tile it like prepare_data.py's Swiss branch (0.1/0.5 deg); an XYZ base
-    # DEM uses 1 deg. This keeps .abt tiles identical to the reference pipeline.
-    high_res = bool(terrain_dir)
-    subtiles = _compute_subtiles(bbox, resolution_m, tx_lat, tx_lon,
-                                  max_range_km, az_start, az_end, high_res)
     disk_mb = _estimate_abt_disk_mb(subtiles)
     # "output tiles" = the .abt files we write. Kept distinct from the "source
     # tiles" (XYZ web tiles) counted during the download below — the two counts
@@ -1026,10 +1179,16 @@ def prepare_terrain(
          f"bbox N={bbox['north']:.3f} S={bbox['south']:.3f} "
          f"E={bbox['east']:.3f} W={bbox['west']:.3f}")
     os.makedirs(cache_dir, exist_ok=True)
+    # Everything in this directory is provisional until every expected tile has
+    # been written. A run killed midway — or a converter that dies on tile 3 of
+    # 4 — must not read as a valid cache next time. Each path below clears the
+    # marker once it has verified its own output.
+    _mark_incomplete(cache_dir)
 
     # Fetch building tiles before the converter runs, so they are on disk when
     # the ingest jobs reference them.
     pbf_dir: Optional[str] = None
+    buildings_missing = False
     if osm_buildings:
         pbf_dir = os.path.join(cache_dir, "_buildings")
         try:
@@ -1041,6 +1200,11 @@ def prepare_terrain(
             _log(f"  WARNING: building download failed ({exc}); "
                  "continuing without buildings")
             pbf_dir = None
+            # The cache identity says these tiles carry buildings. They do not,
+            # so the directory must not be reused — otherwise the next run
+            # hits the cache, skips the download, and silently produces
+            # building-free terrain with no warning at all.
+            buildings_missing = True
 
     # Path 1: Rust downloader (XYZ → .abt directly, no intermediate file).
     # Skipped when buildings are requested: the downloader writes .abt straight
@@ -1053,6 +1217,14 @@ def prepare_terrain(
     elif not terrain_dir and "type=xyz" in dem_layer.source():
         if _try_rust_download(dem_layer.source(), cache_dir, bbox,
                               resolution_m, subtiles, binary_manager):
+            # A failed buildings download leaves pbf_dir None, which is what
+            # routed us here rather than to the ingest path — so this branch
+            # has to honour the same rule: the cache identity claims buildings
+            # these tiles do not have, so it must not be reused.
+            if buildings_missing:
+                _mark_incomplete(cache_dir)
+                _log("  buildings were requested but unavailable — cache left "
+                     "marked for rebuild so the next run retries them")
             _log(f"  TOTAL: {time.perf_counter() - t0:.1f}s")
             return cache_dir
         _log("  Rust download unavailable, falling back")
@@ -1116,6 +1288,22 @@ def prepare_terrain(
         exe = binary_manager.find_binary("aether_converter")
         _run_converter(exe, job_file)
         _log(f"  converter: {time.perf_counter() - t2:.1f}s ({len(jobs)} tiles)")
+
+        # The converter can exit 0 having skipped a tile it could not build.
+        # Only clear the provisional marker once every expected tile is on
+        # disk, so a short set is rebuilt next run instead of being served as
+        # a cache hit with holes in it.
+        absent = [n for n in expected
+                  if not os.path.exists(os.path.join(cache_dir, n))]
+        if absent:
+            _log(f"  WARNING: {len(expected) - len(absent)}/{len(expected)} "
+                 f"tiles written; {len(absent)} missing (first: {absent[0]}) "
+                 f"— cache left marked for rebuild")
+        elif buildings_missing:
+            _log("  buildings were requested but unavailable — cache left "
+                 "marked for rebuild so the next run retries them")
+        else:
+            _clear_incomplete(cache_dir)
     finally:
         for tf in temp_tifs:
             if os.path.exists(tf):

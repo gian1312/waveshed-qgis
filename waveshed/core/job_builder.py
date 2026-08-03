@@ -12,9 +12,34 @@ from typing import Optional
 # takes resolution_m as a plain f32 (clamped to >= 0.1 m) with no fixed set, so
 # this is a plugin-side convenience list, not an engine constraint. The coarse
 # entries suit large-area studies: 90 m ~ SRTM 3-arcsec, 250 m ~ GMTED/MODIS.
-# Keep this in sync with map_converter_tab._ABT_EXTENT_DEG (the converter needs
-# a per-resolution .abt tile extent for each value offered here).
+# Keep this in sync with terrain_adapter.ABT_EXTENT_DEG (every value offered
+# here needs a per-resolution .abt tile extent).
 VALID_RESOLUTIONS = [2, 5, 10, 30, 90, 250]
+
+
+def _processing_setting(key: str, default: int) -> int:
+    """Read a processing budget (GB) from QgsSettings, falling back to default.
+
+    Used as a dataclass ``default_factory`` rather than as a kwarg at every
+    construction site on purpose: the Settings dialog has written
+    ``waveshed/max_ram_gb`` and ``waveshed/max_vram_gb`` all along, but no
+    construction site ever read them back, so both controls were dead and
+    every job shipped the hardcoded defaults. Defaulting here means a new
+    construction site cannot forget them.
+    """
+    try:
+        from qgis.core import QgsSettings
+        return max(1, int(QgsSettings().value(f"waveshed/{key}", default)))
+    except Exception:  # noqa: BLE001 — no QGIS (unit tests), or a junk value
+        return default
+
+
+def _default_max_ram_gb() -> int:
+    return _processing_setting("max_ram_gb", 16)
+
+
+def _default_max_vram_gb() -> int:
+    return _processing_setting("max_vram_gb", 8)
 
 
 @dataclasses.dataclass
@@ -47,9 +72,9 @@ class CoverageParams:
     # Output
     output_name: str = "coverage"
 
-    # Processing
-    max_ram_gb: int = 16
-    max_vram_gb: int = 8
+    # Processing (defaults come from Settings — see _processing_setting)
+    max_ram_gb: int = dataclasses.field(default_factory=_default_max_ram_gb)
+    max_vram_gb: int = dataclasses.field(default_factory=_default_max_vram_gb)
 
     # Propagation (ITM defaults from config.rs)
     eps: float = 15.0
@@ -95,9 +120,9 @@ class P2PParams:
     # Output
     output_name: str = "p2p"
 
-    # Processing
-    max_ram_gb: int = 16
-    max_vram_gb: int = 8
+    # Processing (defaults come from Settings — see _processing_setting)
+    max_ram_gb: int = dataclasses.field(default_factory=_default_max_ram_gb)
+    max_vram_gb: int = dataclasses.field(default_factory=_default_max_vram_gb)
 
     # Propagation (ITM defaults from config.rs)
     eps: float = 15.0

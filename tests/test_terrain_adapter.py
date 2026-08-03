@@ -43,27 +43,31 @@ def _abt_row_stride(size_px: int) -> int:
 
 
 class TestSubtileStrideFitsU16(unittest.TestCase):
-    """The .abt writer stores row_stride as u16; sub-tiles must keep it < 65536.
+    """Tile extent comes from ABT_EXTENT_DEG, and the stride must fit a u16.
 
-    A 1-degree tile at 2 m overflows (stride 111360 -> wraps), shearing the
-    terrain into bands, so _subtile_degrees shrinks the tile at fine res.
+    The .abt writer stores row_stride as a u16, so a tile whose size_px runs
+    past ~32000 wraps and shears the terrain into bands.
     """
 
-    def test_two_metre_base_dem_shrinks_for_u16(self):
-        # Base-DEM path: 1 deg would overflow u16 at 2 m, so it drops to 0.5.
-        self.assertEqual(_subtile_degrees(2), 0.5)
+    def test_extent_comes_from_the_shared_table(self):
+        # One ladder drives both terrain paths — this one and the Map
+        # Converter tab, which aliases the same dict.
+        for res, extent in ta.ABT_EXTENT_DEG.items():
+            self.assertEqual(_subtile_degrees(res), extent, f"res={res}")
 
-    def test_coarse_base_dem_uses_full_degree(self):
-        for res in (5, 10, 30):
-            self.assertEqual(_subtile_degrees(res), 1.0)
+    def test_fine_resolutions_stay_at_or_below_quarter_degree(self):
+        # Tile extent is an engine constraint, not just a file-size one: a
+        # 1 deg tile at 5 m is 22224 px -> 0.99 GB per terrain-atlas layer, and
+        # a site near a tile corner needs four of them, which blows the
+        # solver's ~3.86 GB single-allocation ceiling and rejects the job.
+        for res in (2, 5, 10):
+            self.assertLessEqual(_subtile_degrees(res), 0.25, f"res={res}")
 
-    def test_high_res_matches_prepare_data_sub_size_macro(self):
-        # Mirror prepare_data.py: 0.1 deg at <=3 m, else 0.5 deg, with Swiss data.
-        self.assertEqual(_subtile_degrees(2, high_res=True), 0.1)
-        self.assertEqual(_subtile_degrees(3, high_res=True), 0.1)
-        self.assertEqual(_subtile_degrees(5, high_res=True), 0.5)
-        self.assertEqual(_subtile_degrees(10, high_res=True), 0.5)
-        self.assertEqual(_subtile_degrees(30, high_res=True), 0.5)
+    def test_off_table_resolution_takes_the_next_entry_up(self):
+        # job_builder only offers the table's keys, but the engine accepts any
+        # resolution >= 0.1 m, so the ladder must still answer for the rest.
+        self.assertEqual(_subtile_degrees(3), ta.ABT_EXTENT_DEG[5])
+        self.assertEqual(_subtile_degrees(500), ta.ABT_EXTENT_DEG[250])
 
     def test_stride_fits_u16_for_all_valid_resolutions(self):
         bbox = {"north": 47.6, "south": 47.0, "east": 8.6, "west": 8.0}
@@ -180,11 +184,16 @@ class TestComputeSubtiles(unittest.TestCase):
         self.assertLess(n, 30)
 
     def test_full_circle_500km_fewer_than_square(self):
+        # Measure the enclosing rectangle in the same sub-tile grid the tiler
+        # uses, so this stays a test of the sector filter rather than of the
+        # tile extent.
+        res = 30
+        sub = _subtile_degrees(res)
         bbox = _compute_sector_bbox(47.0, 8.0, 500.0)
-        lat_count = math.ceil(bbox["north"]) - math.floor(bbox["south"])
-        lon_count = math.ceil(bbox["east"]) - math.floor(bbox["west"])
+        lat_count = math.ceil(bbox["north"] / sub) - math.floor(bbox["south"] / sub)
+        lon_count = math.ceil(bbox["east"] / sub) - math.floor(bbox["west"] / sub)
         square_count = lat_count * lon_count
-        filtered = self._count(max_range_km=500.0)
+        filtered = self._count(max_range_km=500.0, resolution_m=res)
         self.assertLess(filtered, square_count)
 
     def test_90_deg_sector_fewer_than_full(self):
@@ -243,25 +252,164 @@ class TestEstimateAbtDiskMb(unittest.TestCase):
         self.assertAlmostEqual(d, s * 2, delta=1)
 
 
-class TestCacheKey(unittest.TestCase):
+def _tiles(*names):
+    """Minimal sub-tile dicts — _cache_key only reads the filename."""
+    return [{"filename": n} for n in names]
 
-    def test_different_bbox(self):
-        bb1 = {"north": 48, "south": 46, "east": 9, "west": 7}
-        bb2 = {"north": 49, "south": 47, "east": 10, "west": 8}
-        self.assertNotEqual(_cache_key("s", bb1, 30), _cache_key("s", bb2, 30))
+
+class TestCacheKey(unittest.TestCase):
+    """The key identifies a tile SET, not the request that produced it."""
+
+    A = _tiles("tile_N48.00E8.00_30m.abt", "tile_N48.00E9.00_30m.abt")
+    B = _tiles("tile_N49.00E8.00_30m.abt")
+
+    def test_different_tile_sets(self):
+        self.assertNotEqual(_cache_key("s", self.A, 30),
+                            _cache_key("s", self.B, 30))
 
     def test_different_res(self):
-        bb = {"north": 48, "south": 46, "east": 9, "west": 7}
-        self.assertNotEqual(_cache_key("s", bb, 10), _cache_key("s", bb, 30))
+        self.assertNotEqual(_cache_key("s", self.A, 10),
+                            _cache_key("s", self.A, 30))
+
+    def test_different_source(self):
+        self.assertNotEqual(_cache_key("s", self.A, 30),
+                            _cache_key("other", self.A, 30))
 
     def test_deterministic(self):
-        bb = {"north": 48, "south": 46, "east": 9, "west": 7}
-        self.assertEqual(_cache_key("s", bb, 30), _cache_key("s", bb, 30))
+        self.assertEqual(_cache_key("s", self.A, 30),
+                         _cache_key("s", self.A, 30))
+
+    def test_tile_order_does_not_matter(self):
+        # _compute_subtiles emits in grid order; a reordering is the same set.
+        self.assertEqual(_cache_key("s", self.A, 30),
+                         _cache_key("s", list(reversed(self.A)), 30))
+
+    def test_subset_is_a_different_key(self):
+        # A narrowed azimuth sector selects fewer tiles. It must NOT hit the
+        # full-circle cache, or the run gets terrain with holes in it. This is
+        # why the key needs no azimuth term of its own.
+        self.assertNotEqual(_cache_key("s", self.A, 30),
+                            _cache_key("s", self.A[:1], 30))
+
+    def test_same_tiles_from_different_requests_share_a_key(self):
+        # The whole point: two sites a few km apart, or 30 km vs 31 km at one
+        # site, resolve to the same tiles and must reuse the same cache.
+        # Hashing the raw bbox floats made that a guaranteed miss.
+        near = _compute_sector_bbox(47.4, 8.5, 30.0)
+        nudged = _compute_sector_bbox(47.4001, 8.5001, 31.0)
+        t1 = _compute_subtiles(near, 30, 47.4, 8.5, 30.0)
+        t2 = _compute_subtiles(nudged, 30, 47.4001, 8.5001, 31.0)
+        self.assertEqual([t["filename"] for t in t1],
+                         [t["filename"] for t in t2])
+        self.assertEqual(_cache_key("s", t1, 30), _cache_key("s", t2, 30))
 
     def test_hex_digest(self):
-        k = _cache_key("s", {"north": 48, "south": 46, "east": 9, "west": 7}, 30)
+        k = _cache_key("s", self.A, 30)
         self.assertEqual(len(k), 32)
         int(k, 16)
+
+
+class TestCacheCompleteness(unittest.TestCase):
+    """A cache is a hit only when every expected tile is actually present."""
+
+    def test_partial_tile_set_is_a_miss(self):
+        # aether_core resolves terrain by .abt header, so a missing tile is not
+        # an error — the cells it covered are simply absent and the coverage
+        # comes out silently wrong. Accepting "some .abt is present" reported a
+        # run killed after tile 1 of 3 as a valid cache.
+        with tempfile.TemporaryDirectory() as d:
+            expected = ["a.abt", "b.abt", "c.abt"]
+            open(os.path.join(d, "a.abt"), "w").close()
+            self.assertFalse(ta._cache_hit(d, expected))
+            for name in expected[1:]:
+                open(os.path.join(d, name), "w").close()
+            self.assertTrue(ta._cache_hit(d, expected))
+
+    def test_incomplete_marker_forces_a_miss(self):
+        with tempfile.TemporaryDirectory() as d:
+            open(os.path.join(d, "a.abt"), "w").close()
+            self.assertTrue(ta._cache_hit(d, ["a.abt"]))
+            ta._mark_incomplete(d)
+            self.assertFalse(ta._cache_hit(d, ["a.abt"]))
+            ta._clear_incomplete(d)
+            self.assertTrue(ta._cache_hit(d, ["a.abt"]))
+
+    def test_missing_dir_is_a_miss(self):
+        self.assertFalse(ta._cache_hit("/no/such/cache/dir", ["a.abt"]))
+
+
+class TestDownloadCompleteness(unittest.TestCase):
+    """Unfetchable source tiles must not poison a good cache."""
+
+    SOURCE = ("type=xyz&url=https%3A//example.com/%7Bz%7D/%7Bx%7D/%7By%7D.png"
+              "&zmax=15")
+    BBOX = {"north": 47.5, "south": 47.0, "east": 8.5, "west": 8.0}
+    TILE = "tile_N48.00E8.00_30m.abt"
+
+    def _download(self, cache_dir, ok, total, has_gaps):
+        subtiles = [{"filename": self.TILE, "ul_lat": 48.0, "ul_lon": 8.0,
+                     "size_px": 3704, "exact_res_m": 30.0}]
+        bm = mock.Mock()
+        bm.find_binary.return_value = "aether_converter"
+        open(os.path.join(cache_dir, self.TILE), "w").close()
+        with mock.patch.object(ta, "_run_converter_download_once",
+                               return_value=(0, [f"[Stats] Tiles: {ok}/{total} OK"])), \
+             mock.patch.object(ta, "_abt_has_gaps", return_value=has_gaps):
+            return ta._try_rust_download(self.SOURCE, cache_dir, self.BBOX, 30,
+                                         subtiles, bm)
+
+    def test_missing_sources_without_gaps_is_a_complete_cache(self):
+        # The converter reports a run with a handful of unfetchable source
+        # tiles as "100.0% success"; those tiles are usually permanent 404s
+        # (ocean, past zmax) that no retry can fix. If no output tile has a
+        # hole, that is a COMPLETE result. Marking it incomplete meant every
+        # later run re-downloaded the whole set — nothing outside the download
+        # function ever clears the marker — and then landed here again.
+        with tempfile.TemporaryDirectory() as d:
+            self.assertTrue(self._download(d, ok=999, total=1000, has_gaps=False))
+            self.assertNotIn(ta._INCOMPLETE_MARKER, os.listdir(d))
+            self.assertTrue(ta._cache_hit(d, [self.TILE]))
+
+    def test_real_gaps_are_marked_but_still_usable_now(self):
+        # Gapped terrain beats redoing the whole preparation through the far
+        # slower extract+convert path in this same run, so it is returned —
+        # and marked, so the next run rebuilds it.
+        with tempfile.TemporaryDirectory() as d:
+            self.assertTrue(self._download(d, ok=999, total=1000, has_gaps=True))
+            self.assertIn(ta._INCOMPLETE_MARKER, os.listdir(d))
+            self.assertFalse(ta._cache_hit(d, [self.TILE]))
+
+    def test_complete_download_clears_a_stale_marker(self):
+        with tempfile.TemporaryDirectory() as d:
+            ta._mark_incomplete(d)
+            self.assertTrue(self._download(d, ok=1000, total=1000, has_gaps=False))
+            self.assertNotIn(ta._INCOMPLETE_MARKER, os.listdir(d))
+
+
+class TestBuildingsCacheIdentity(unittest.TestCase):
+    """A cache keyed "with buildings" must never hold building-free tiles."""
+
+    SOURCE = "type=xyz&url=https%3A//e.com/%7Bz%7D/%7Bx%7D/%7By%7D.png&zmax=15"
+
+    def test_failed_building_download_leaves_the_cache_unreusable(self):
+        # The buildings term is in the cache key, so if the download fails and
+        # we build plain terrain anyway, the directory lies about what is in
+        # it. Left reusable, the next run would hit the cache, skip the
+        # download entirely and produce building-free coverage in silence.
+        from waveshed.core import openfreemap
+
+        layer = mock.Mock()
+        layer.source.return_value = self.SOURCE
+        with tempfile.TemporaryDirectory() as root:
+            with mock.patch.object(ta, "get_cache_dir", return_value=root), \
+                 mock.patch.object(openfreemap, "download_building_tiles",
+                                   side_effect=RuntimeError("503 from OFM")), \
+                 mock.patch.object(ta, "_try_rust_download", return_value=True):
+                cache_dir = ta.prepare_terrain(
+                    layer, 47.4, 8.5, 30.0, 30, mock.Mock(),
+                    osm_buildings=True,
+                )
+            self.assertIn(ta._INCOMPLETE_MARKER, os.listdir(cache_dir))
 
 
 class TestSectorBboxMatchesAetherCore(unittest.TestCase):
@@ -459,17 +607,27 @@ class TestIncompleteMarker(unittest.TestCase):
 class TestCacheKeyBuildings(unittest.TestCase):
     """Buildings are baked into .abt pixels, so they must key the cache."""
 
-    BBOX = {"north": 48.0, "south": 47.0, "east": 9.0, "west": 8.0}
+    TILES = _tiles("tile_N48.00E8.00_30m.abt")
 
     def _key(self, buildings=None):
-        return ta._cache_key("src", self.BBOX, 30, buildings)
+        return ta._cache_key("src", self.TILES, 30, buildings)
 
-    def test_no_buildings_key_is_unchanged(self):
-        # Adding the dimension must not invalidate every existing cache.
-        legacy = hashlib.md5(f"src|{self.BBOX}|30".encode()).hexdigest()
-        self.assertEqual(self._key(), legacy)
-        self.assertEqual(self._key(None), legacy)
-        self.assertEqual(self._key(""), legacy)
+    def test_no_buildings_omits_the_term(self):
+        # The buildings term is appended only when there are buildings, so
+        # None / "" are the same cache as "no buildings requested".
+        names = ",".join(t["filename"] for t in self.TILES)
+        plain = hashlib.md5(
+            f"{ta._CACHE_SCHEMA}|src|{names}|30".encode()).hexdigest()
+        self.assertEqual(self._key(), plain)
+        self.assertEqual(self._key(None), plain)
+        self.assertEqual(self._key(""), plain)
+
+    def test_schema_version_is_in_the_key(self):
+        # Tile geometry changed with the ABT_EXTENT_DEG migration, so caches
+        # written by an older plugin must never be mistaken for valid ones.
+        names = ",".join(t["filename"] for t in self.TILES)
+        unversioned = hashlib.md5(f"src|{names}|30".encode()).hexdigest()
+        self.assertNotEqual(self._key(), unversioned)
 
     def test_buildings_change_the_key(self):
         with tempfile.TemporaryDirectory() as d:

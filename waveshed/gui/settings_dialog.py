@@ -281,6 +281,15 @@ class SettingsDialog(QDialog):
         btn_browse = QPushButton("Browse...")
         btn_browse.clicked.connect(self._browse_cache_dir)
         row.addWidget(btn_browse)
+        btn_clear_cache = QPushButton("Clear...")
+        btn_clear_cache.setToolTip(
+            "Delete every cached .abt terrain tile.\n"
+            "The cache never evicts anything on its own, so this is how you "
+            "reclaim the space — and how you pick up refreshed OpenStreetMap "
+            "building data, which is otherwise cached indefinitely."
+        )
+        btn_clear_cache.clicked.connect(self._clear_cache)
+        row.addWidget(btn_clear_cache)
         vbox.addLayout(row)
 
         # VRAM budget
@@ -630,3 +639,44 @@ class SettingsDialog(QDialog):
         )
         if path:
             self._cache_dir_edit.setText(path)
+
+    def _clear_cache(self) -> None:
+        """Delete every terrain cache entry, after confirming the size."""
+        from ..core import terrain_adapter
+
+        # Read against the saved cache path, not whatever is in the edit box:
+        # an unsaved path change would otherwise clear a directory the user is
+        # only considering.
+        entries = terrain_adapter.cache_entries()
+        if not entries:
+            QMessageBox.information(
+                self, "Clear Terrain Cache",
+                f"No cached terrain found in\n{terrain_adapter.get_cache_dir()}",
+            )
+            return
+
+        size_mb = terrain_adapter.cache_size_bytes() / 1e6
+        answer = QMessageBox.question(
+            self, "Clear Terrain Cache",
+            f"Delete {len(entries)} cached terrain set(s), freeing "
+            f"{size_mb:,.0f} MB?\n\n{terrain_adapter.get_cache_dir()}\n\n"
+            "Terrain will be re-downloaded or rebuilt on the next run.",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+        )
+        if answer != QMessageBox.Yes:
+            return
+
+        removed, freed = terrain_adapter.clear_cache()
+        if removed < len(entries):
+            QMessageBox.warning(
+                self, "Clear Terrain Cache",
+                f"Removed {removed} of {len(entries)} cached terrain set(s), "
+                f"freeing {freed / 1e6:,.0f} MB.\nThe rest could not be "
+                "deleted — they may be open in QGIS or another program.",
+            )
+        else:
+            QMessageBox.information(
+                self, "Clear Terrain Cache",
+                f"Removed {removed} cached terrain set(s), freeing "
+                f"{freed / 1e6:,.0f} MB.",
+            )

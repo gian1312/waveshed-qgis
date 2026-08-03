@@ -60,7 +60,7 @@ from qgis.gui import QgsMapLayerComboBox, QgsRubberBand
 
 from ..core.binary_manager import find_binary
 from ..core.layer_utils import classify_raster_layer
-from ..core.terrain_adapter import source_fingerprint
+from ..core.terrain_adapter import ABT_EXTENT_DEG, source_fingerprint
 
 TAG = "Waveshed"
 
@@ -69,19 +69,12 @@ _SUBPROCESS_FLAGS = (
 )
 
 # .abt tile geographic extent per resolution.  Controls how large each
-# .abt file is on disk (pixels = extent_deg / (res_m / 111111)).
-# aether_core accepts any size; these keep files small.  The keys are the
-# resolutions the converter offers (kept in sync with the analysis-side
-# job_builder.VALID_RESOLUTIONS); coarser resolutions get a larger tile extent
-# so tile counts stay low.  Extents must be non-decreasing with resolution.
-_ABT_EXTENT_DEG = {
-    2: 0.1,
-    5: 0.25,
-    10: 0.25,
-    30: 0.5,
-    90: 1.0,
-    250: 2.0,
-}
+# .abt file is on disk (pixels = extent_deg / (res_m / 111111)) and, more
+# importantly, how much of aether_core's single terrain-atlas allocation one
+# tile consumes — see core.terrain_adapter.ABT_EXTENT_DEG, which is now the
+# one definition for both this tab and the analysis path.  Aliased under the
+# old private name because this module refers to it throughout.
+_ABT_EXTENT_DEG = ABT_EXTENT_DEG
 
 
 # ---------------------------------------------------------------------------

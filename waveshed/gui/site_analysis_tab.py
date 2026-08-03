@@ -1412,7 +1412,6 @@ class SiteAnalysisTab(QWidget):
         # Jobs that only differ by receiver altitude share one terrain cache,
         # so dedupe on the parameters the cache key is built from — otherwise
         # the estimate would multiply by the number of altitudes.
-        high_res = bool(terrain_dir)
         seen: set = set()
         total_mb = 0
         union: Optional[dict] = None
@@ -1424,7 +1423,7 @@ class SiteAnalysisTab(QWidget):
             seen.add(key)
             total_mb += estimate_terrain_disk_mb(
                 params.tx_lat, params.tx_lon, params.max_range_km,
-                params.resolution_m, params.az_start, params.az_end, high_res,
+                params.resolution_m, params.az_start, params.az_end,
             )
             bb = analysis_bbox(params.tx_lat, params.tx_lon,
                                params.max_range_km, params.az_start,
