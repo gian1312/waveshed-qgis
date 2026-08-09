@@ -64,7 +64,9 @@ class CoverageAlgorithm(QgsProcessingAlgorithm):
     OUTPUT_DIR = "OUTPUT_DIR"
 
     # Enum value lists (order matters — index is the value)
-    _MODELS = ["LOS", "SIMPLE_LOSS", "ITM", "MIN_ALT"]
+    # SIMPLE_LOSS was removed in 0.2.0; anything that stored an index against
+    # the old four-entry list points one slot too high and must be re-picked.
+    _MODELS = ["LOS", "ITM", "MIN_ALT"]
     _RESOLUTIONS = [str(r) for r in VALID_RESOLUTIONS]
     _BACKENDS = ["AUTO", "GPU", "CPU"]
 
@@ -292,38 +294,39 @@ class CoverageAlgorithm(QgsProcessingAlgorithm):
         except api_key.ApiKeyError as exc:
             raise QgsProcessingException(str(exc)) from exc
 
-        proc = subprocess.Popen(
+        # `with` closes the stdout pipe (and waits) on exit so we don't leak a
+        # file handle (the ResourceWarning).
+        with subprocess.Popen(
             [core_exe, "--config", job_file],
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,  # aether_core logs everything to stdout
             text=True,
             env=core_env,
             creationflags=_SUBPROCESS_FLAGS,
-        )
+        ) as proc:
+            # aether_core writes all its diagnostics ([Core] tile-grid / bounds,
+            # [P:NN] progress) to stdout — surface every line in the Processing
+            # log and keep a tail for the error message. (Previously only stderr
+            # was read, so none of this was visible and stdout could deadlock.)
+            output_lines: list[str] = []
+            for line in iter(proc.stdout.readline, ""):
+                if feedback.isCanceled():
+                    proc.terminate()
+                    return {}
+                line = line.rstrip()
+                if not line:
+                    continue
+                output_lines.append(line)
+                feedback.pushInfo(line)
+                m = re.search(r"Wedge\s+(\d+)/(\d+)", line)
+                if m:
+                    current, total = int(m.group(1)), int(m.group(2))
+                    if total > 0:
+                        # Map wedge progress into 20-80% range
+                        pct = 20 + int(current * 60 / total)
+                        feedback.setProgress(pct)
 
-        # aether_core writes all its diagnostics ([Core] tile-grid / bounds,
-        # [P:NN] progress) to stdout — surface every line in the Processing
-        # log and keep a tail for the error message. (Previously only stderr
-        # was read, so none of this was visible and stdout could deadlock.)
-        output_lines: list[str] = []
-        for line in iter(proc.stdout.readline, ""):
-            if feedback.isCanceled():
-                proc.terminate()
-                return {}
-            line = line.rstrip()
-            if not line:
-                continue
-            output_lines.append(line)
-            feedback.pushInfo(line)
-            m = re.search(r"Wedge\s+(\d+)/(\d+)", line)
-            if m:
-                current, total = int(m.group(1)), int(m.group(2))
-                if total > 0:
-                    # Map wedge progress into 20-80% range
-                    pct = 20 + int(current * 60 / total)
-                    feedback.setProgress(pct)
-
-        proc.wait()
+            proc.wait()
 
         if proc.returncode != 0:
             tail = "\n".join(output_lines[-20:])

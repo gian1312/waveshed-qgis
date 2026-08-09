@@ -60,6 +60,7 @@ from qgis.gui import QgsRubberBand
 
 from ..core.binary_manager import binaries_warning, find_binary
 from ..core import api_key
+from ..core.asset_manager import compute_erp, list_assets
 from ..core.job_builder import (
     INVALID,
     VALID_RESOLUTIONS,
@@ -100,6 +101,38 @@ def _kill_proc(proc: subprocess.Popen) -> None:
 # ---------------------------------------------------------------------------
 # GP file parser
 # ---------------------------------------------------------------------------
+
+#: Fraction of the first Fresnel radius that must stay clear for a path to
+#: count as effectively unobstructed. Below roughly this much clearance,
+#: diffraction loss starts to bite; above it, the path is within about a dB of
+#: free space.
+FRESNEL_CLEARANCE = 0.6
+
+
+def fresnel_radius_m(d1_km: float, d2_km: float, freq_mhz: float) -> float:
+    """First Fresnel zone radius, in metres, at a point on the path.
+
+    *d1_km* and *d2_km* are the distances from that point to each endpoint;
+    *freq_mhz* is the frequency in **megahertz**.
+
+        F1 = 547.7 * sqrt(d1 * d2 / (f_MHz * D))      [d in km, F1 in m]
+
+    The constant is frequency-unit specific: 547.7 pairs with MHz, and the
+    equally common 17.32 pairs with GHz (547.7 = 17.32 * sqrt(1000)). Mixing
+    them understates every radius by 31.6x — at 40 km and 100 MHz the midpath
+    radius is 173 m, not 5.5 m.
+
+    547.7 is the literature rounding of ``sqrt(c/1000) = 547.5331``, and is the
+    value waveshed.io's profile chart uses; keeping both products on the same
+    constant is worth more than the 0.03% it costs (5 cm at a 173 m radius).
+
+    Returns 0.0 at either endpoint, where the zone closes to a point.
+    """
+    if d1_km <= 0 or d2_km <= 0 or freq_mhz <= 0:
+        return 0.0
+    total_km = d1_km + d2_km
+    return 547.7 * math.sqrt(d1_km * d2_km / (freq_mhz * total_km))
+
 
 def _parse_gp_file(filepath: str) -> Tuple[List[float], List[float]]:
     """Parse a .gp (gnuplot data) file into x and y value lists.
@@ -404,30 +437,36 @@ class _P2PResultViewer(QDialog):
         ax.plot([dist_km[0], dist_km[-1]], [tx_tip, rx_tip],
                 color="blue", linewidth=1.2, linestyle="--", label="LOS")
 
-        # First Fresnel zone (F1)
+        # Fresnel zone: the full first zone (F1) as an outline, and the 0.6*F1
+        # clearance envelope shaded inside it.
+        #
+        # 0.6*F1 is the criterion that matters: a path is treated as
+        # effectively unobstructed once terrain stays outside 60% of the first
+        # Fresnel radius, which is where diffraction loss returns to roughly
+        # free-space. Shading the *full* F1 overstates the obstruction — terrain
+        # inside F1 but outside 0.6*F1 costs almost nothing. Matches the
+        # waveshed.io profile chart, which shades the same 0.6*F1 band.
         if self._freq_mhz > 0 and total_dist_km > 0:
-            fresnel_upper = []
-            fresnel_lower = []
+            f1_upper, f1_lower = [], []
+            c60_upper, c60_lower = [], []
             for d in dist_km:
                 d1_km = d
                 d2_km = total_dist_km - d
-                if d1_km <= 0 or d2_km <= 0:
-                    # At endpoints the Fresnel radius is 0
-                    frac = d / total_dist_km if total_dist_km > 0 else 0
-                    los_h = tx_tip + frac * (rx_tip - tx_tip)
-                    fresnel_upper.append(los_h)
-                    fresnel_lower.append(los_h)
-                    continue
-                f1 = 17.32 * math.sqrt(
-                    d1_km * d2_km / (self._freq_mhz * total_dist_km)
-                )
-                frac = d / total_dist_km
+                frac = d / total_dist_km if total_dist_km > 0 else 0
                 los_h = tx_tip + frac * (rx_tip - tx_tip)
-                fresnel_upper.append(los_h + f1)
-                fresnel_lower.append(los_h - f1)
+                f1 = fresnel_radius_m(d1_km, d2_km, self._freq_mhz)
+                f1_upper.append(los_h + f1)
+                f1_lower.append(los_h - f1)
+                c60_upper.append(los_h + FRESNEL_CLEARANCE * f1)
+                c60_lower.append(los_h - FRESNEL_CLEARANCE * f1)
 
-            ax.fill_between(dist_km, fresnel_lower, fresnel_upper,
-                            alpha=0.15, color="orange", label="Fresnel Zone (F1)")
+            ax.fill_between(dist_km, c60_lower, c60_upper,
+                            alpha=0.18, color="orange",
+                            label=f"{FRESNEL_CLEARANCE:g} F1 clearance")
+            ax.plot(dist_km, f1_upper, color="orange", linewidth=0.7,
+                    linestyle=":", label="F1")
+            ax.plot(dist_km, f1_lower, color="orange", linewidth=0.7,
+                    linestyle=":")
 
         # Site markers
         ax.plot(dist_km[0], tx_tip, "rv", markersize=8, label="TX")
@@ -555,7 +594,9 @@ class _P2PWorker(QThread):
             # (raises ApiKeyError -> surfaced by the worker on failure).
             api_key.apply_license_env(env)
 
-            proc = subprocess.Popen(
+            # `with` closes the stdout pipe (and waits) on exit so we don't
+            # leak a file handle (the ResourceWarning).
+            with subprocess.Popen(
                 [core_exe, "--config", job_file],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
@@ -564,25 +605,26 @@ class _P2PWorker(QThread):
                 errors="replace",
                 env=env,
                 creationflags=_SUBPROCESS_FLAGS,
-            )
-            self._proc = proc
+            ) as proc:
+                self._proc = proc
 
-            output_lines: list[str] = []
-            for line in iter(proc.stdout.readline, ""):
-                if self._canceled:
-                    _kill_proc(proc)
-                    return
-                output_lines.append(line)
-                # Surface aether_core's own stdout log in the QGIS Log
-                # Messages panel under the AETHER tag.
-                s = line.rstrip()
-                if s:
-                    QgsMessageLog.logMessage(s, TAG, Qgis.MessageLevel.Info)
-                pct = self._parse_p2p_progress(line)
-                if pct is not None:
-                    self.progress.emit(25 + int(pct * 0.70))
+                output_lines: list[str] = []
+                for line in iter(proc.stdout.readline, ""):
+                    if self._canceled:
+                        _kill_proc(proc)
+                        return
+                    output_lines.append(line)
+                    # Surface aether_core's own stdout log in the QGIS Log
+                    # Messages panel under the AETHER tag.
+                    s = line.rstrip()
+                    if s:
+                        QgsMessageLog.logMessage(s, TAG, Qgis.MessageLevel.Info)
+                    pct = self._parse_p2p_progress(line)
+                    if pct is not None:
+                        self.progress.emit(25 + int(pct * 0.70))
 
-            proc.wait()
+                proc.wait()
+
             self._proc = None
             if proc.returncode != 0:
                 tail = "".join(output_lines[-20:])
@@ -632,7 +674,7 @@ class P2PTab(QWidget):
     The parent dialog must provide:
       - ``self.iface``            -- QgisInterface
       - ``self.get_mode()``       -- returns ``"LOS"`` or ``"LOSS"``
-      - ``self.get_loss_model()`` -- returns ``"SIMPLE_LOSS"`` or ``"ITM"``
+      - ``self.get_loss_model()`` -- returns ``"ITM"``
     """
 
     def __init__(self, parent: QWidget) -> None:
@@ -669,6 +711,67 @@ class P2PTab(QWidget):
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
+
+    # ------------------------------------------------------------------
+    # Asset helpers
+    # ------------------------------------------------------------------
+
+    def _asset_names(self) -> List[str]:
+        """Names of the stored emitter definitions, sorted."""
+        names = []
+        try:
+            for asset in list_assets():
+                name = asset.get("name", "")
+                if name:
+                    names.append(name)
+        except Exception as exc:  # noqa: BLE001
+            # A bad asset file must not stop the tab from being built.
+            QgsMessageLog.logMessage(
+                f"Could not list assets: {exc}", TAG, Qgis.MessageLevel.Warning)
+        return sorted(names)
+
+    def _refresh_assets(self) -> None:
+        """Re-read the asset list, keeping the current selection if it lives."""
+        current = self.combo_asset.currentText()
+        blocked = self.combo_asset.blockSignals(True)
+        self.combo_asset.clear()
+        self.combo_asset.addItem("")
+        self.combo_asset.addItems(self._asset_names())
+        idx = self.combo_asset.findText(current)
+        if idx >= 0:
+            self.combo_asset.setCurrentIndex(idx)
+        self.combo_asset.blockSignals(blocked)
+
+    def _on_asset_changed(self, name: str) -> None:
+        """Fill frequency and ERP from the selected asset.
+
+        Blank selection leaves the current values alone, so clearing the combo
+        does not silently reset a link the user typed by hand.
+        """
+        if not name:
+            return
+        asset = None
+        try:
+            for candidate in list_assets():
+                if candidate.get("name") == name:
+                    asset = candidate
+                    break
+        except Exception as exc:  # noqa: BLE001
+            QgsMessageLog.logMessage(
+                f"Could not load asset '{name}': {exc}", TAG,
+                Qgis.MessageLevel.Warning)
+            return
+        if not asset:
+            return
+
+        self.spin_freq.setValue(float(asset.get("frequency_mhz", 433.0)))
+        erp = float(asset.get("erp_watts", 0.0) or 0.0)
+        if erp <= 0:
+            erp = compute_erp(
+                float(asset.get("peak_power_watts", 10.0)),
+                float(asset.get("antenna_gain_dbi", 0.0)),
+            )
+        self.spin_erp.setValue(erp)
 
     def set_mode(self, mode: str) -> None:
         """Switch between LOS and LOSS display modes.
@@ -899,6 +1002,20 @@ class P2PTab(QWidget):
         self._params_group = QGroupBox("Parameters")
         layout = QFormLayout(self._params_group)
 
+        # Asset picker — the same emitter definitions the 360° tab offers.
+        # P2PParams already carried az_pattern/el_pattern/az_rotation; only the
+        # controls were missing, so a P2P link could not use a stored emitter
+        # and every frequency/ERP had to be retyped by hand.
+        self.combo_asset = QComboBox()
+        self.combo_asset.addItem("")  # blank = enter values manually
+        self.combo_asset.addItems(self._asset_names())
+        self.combo_asset.setToolTip(
+            "Emitter definition from the Assets tab. Selecting one fills in "
+            "frequency and ERP below; leave blank to enter them by hand."
+        )
+        self.combo_asset.currentTextChanged.connect(self._on_asset_changed)
+        layout.addRow("Asset:", self.combo_asset)
+
         self.spin_freq = QDoubleSpinBox()
         self.spin_freq.setRange(1.0, 3000.0)
         self.spin_freq.setValue(433.0)
@@ -911,6 +1028,17 @@ class P2PTab(QWidget):
         self.spin_erp.setDecimals(3)
         self.spin_erp.setSuffix(" W")
         layout.addRow("ERP (Watts):", self.spin_erp)
+
+        self.spin_az_rotation = QDoubleSpinBox()
+        self.spin_az_rotation.setRange(0.0, 359.9)
+        self.spin_az_rotation.setDecimals(1)
+        self.spin_az_rotation.setValue(0.0)
+        self.spin_az_rotation.setSuffix("°")
+        self.spin_az_rotation.setToolTip(
+            "Bearing the antenna's pattern is rotated to, clockwise from "
+            "north. Only meaningful for a directional asset."
+        )
+        layout.addRow("AZ Rotation:", self.spin_az_rotation)
 
         # Hidden by default (LOS mode).
         self._params_group.setVisible(False)
@@ -1062,11 +1190,34 @@ class P2PTab(QWidget):
         self.spin_a_lat.setValue(lat)
         self.spin_a_lon.setValue(lon)
         self._restore_after_pick()
+        self._announce_pick()
 
     def _on_point_picked_b(self, lat: float, lon: float) -> None:
         self.spin_b_lat.setValue(lat)
         self.spin_b_lon.setValue(lon)
         self._restore_after_pick()
+        self._announce_pick()
+
+    def _announce_pick(self) -> None:
+        """Tell the dialog a site was placed here, so 360 can drop its own."""
+        notify = getattr(self._parent_dialog, "sites_picked_in", None)
+        if callable(notify):
+            notify(self)
+
+    def clear_sites(self) -> None:
+        """Drop both endpoints.
+
+        Called when the user starts placing sites in the 360 tab instead: the
+        two tabs describe different analyses of the same map, and leaving stale
+        endpoints here means a later P2P run silently uses coordinates the user
+        last touched in another tab.
+        """
+        for spin in (self.spin_a_lat, self.spin_a_lon,
+                     self.spin_b_lat, self.spin_b_lon):
+            blocked = spin.blockSignals(True)
+            spin.setValue(0.0)
+            spin.blockSignals(blocked)
+        self._reset_rubber_bands()
 
     def _restore_after_pick(self) -> None:
         """Restore the parent dialog after a map pick."""
@@ -1149,10 +1300,15 @@ class P2PTab(QWidget):
             model = "LOS"
             freq = 0.0
             erp = 0.0
+            az_rotation = None
         else:
-            model = parent.get_loss_model() if hasattr(parent, "get_loss_model") else "SIMPLE_LOSS"
+            model = parent.get_loss_model() if hasattr(parent, "get_loss_model") else "ITM"
             freq = self.spin_freq.value()
             erp = self.spin_erp.value()
+            # Only meaningful with a directional pattern; harmless otherwise,
+            # and omitted entirely at 0 so the job keeps its current shape.
+            rot = self.spin_az_rotation.value()
+            az_rotation = rot if rot else None
 
         return P2PParams(
             # Site A / Transmitter
@@ -1160,6 +1316,7 @@ class P2PTab(QWidget):
             tx_lon=self.spin_a_lon.value(),
             tx_height=self.spin_a_height.value(),
             tx_mode=self.combo_a_mode.currentText(),
+            az_rotation=az_rotation,
             freq_mhz=freq,
             erp_watts=erp,
             # Site B / Receiver

@@ -11,6 +11,7 @@ import os
 import re
 import tempfile
 import unittest
+from unittest import mock
 
 from waveshed.gui.map_converter_tab import (
     _estimate_tile_count_and_mb,
@@ -278,3 +279,121 @@ class TestOverpassToGeojson(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+
+class TestExportPitchFollowsTargetResolution(unittest.TestCase):
+    """The QGIS export that feeds `aether_converter ingest` must be written at
+    the resolution the user asked for, not at the layer's own resolution.
+
+    ingest.rs point-samples the exported GeoTIFF onto the .abt grid (one source
+    pixel per output cell, no averaging in either direction), so any mismatch
+    between the export pitch and the .abt pitch is resampled at an arbitrary
+    ratio: coarser gives plateaus of repeated cells, finer gives 1-in-N
+    aliasing. Both are lattice-locked terrain error, which the LOS horizon
+    sweep renders as a checkerboard. The direct XYZ download never shows it
+    because `terrain_adapter.tile_zoom` picks its source zoom FROM the target.
+
+    Regression: the export used `_detect_resolution(layer) or 30.0` and the
+    target never reached it — the resolution checkboxes are read in `_on_run`
+    but only handed to the worker, which is built after the export has run.
+    """
+
+    SPAN_DEG = 0.2
+
+    def _run_export(self, target_res_m, target_resolutions=None):
+        from qgis import core as qc
+        from waveshed.gui import map_converter_tab as mct
+
+        seen = {}
+
+        class _Rect:
+            def __init__(self, w, s, e, n):
+                self._box = (w, s, e, n)
+
+            def width(self):
+                return self._box[2] - self._box[0]
+
+            def height(self):
+                return self._box[3] - self._box[1]
+
+        class _Pipe:
+            def set(self, provider):
+                return True
+
+            def size(self):
+                return 1
+
+            def insert(self, idx, obj):
+                return True
+
+        class _Projector:
+            def setCrs(self, *a):
+                pass
+
+        class _Writer:
+            def __init__(self, path):
+                seen["path"] = path
+
+            def setOutputFormat(self, fmt):
+                pass
+
+            def writeRaster(self, pipe, nc, nr, extent, crs, ctx):
+                seen["nc"], seen["nr"] = nc, nr
+                return 0
+
+        patches = {
+            "QgsRectangle": _Rect,
+            "QgsRasterPipe": _Pipe,
+            "QgsRasterProjector": _Projector,
+            "QgsRasterFileWriter": _Writer,
+        }
+        originals = {k: getattr(qc, k, None) for k in patches}
+        for k, v in patches.items():
+            setattr(qc, k, v)
+
+        layer = qc.QgsRasterLayer()
+        layer.source = lambda: "type=xyz&url=https://x/{z}/{x}/{y}.png&zmax=15"
+        layer.dataProvider = lambda: mock.MagicMock()
+        layer.crs = lambda: qc.QgsCoordinateReferenceSystem("EPSG:4326")
+
+        entry = _LayerEntry(
+            layer_type="raster",
+            source_path="type=xyz&url=https://x/{z}/{x}/{y}.png&zmax=15",
+            qgis_layer=layer,
+            extent={"west": 8.0, "east": 8.0 + self.SPAN_DEG,
+                    "south": 47.0, "north": 47.0 + self.SPAN_DEG},
+            target_resolutions=target_resolutions or [30],
+        )
+        try:
+            mct._resolve_source_on_main_thread(entry, target_res_m)
+        finally:
+            for k, v in originals.items():
+                if v is None:
+                    delattr(qc, k)
+                else:
+                    setattr(qc, k, v)
+        return seen
+
+    def _pitch_m(self, seen):
+        self.assertIn("nc", seen, "writeRaster was never reached")
+        return self.SPAN_DEG / seen["nc"] * 111_111.0
+
+    def test_export_pitch_matches_the_requested_2m(self):
+        self.assertAlmostEqual(self._pitch_m(self._run_export(2.0)), 2.0,
+                               delta=0.01)
+
+    def test_export_pitch_matches_the_requested_30m(self):
+        self.assertAlmostEqual(self._pitch_m(self._run_export(30.0)), 30.0,
+                               delta=0.05)
+
+    def test_falls_back_to_the_entry_target_when_caller_passes_nothing(self):
+        seen = self._run_export(None, target_resolutions=[10, 30])
+        self.assertAlmostEqual(self._pitch_m(seen), 10.0, delta=0.02)
+
+    def test_export_is_not_sized_from_the_layer(self):
+        # The old bug: a zmax=15 XYZ layer exported at ~4.8 m, or at the 30 m
+        # `or 30.0` fallback, whatever the user asked for.
+        pitch = self._pitch_m(self._run_export(2.0))
+        self.assertNotAlmostEqual(pitch, 4.8, delta=0.5)
+        self.assertNotAlmostEqual(pitch, 30.0, delta=1.0)

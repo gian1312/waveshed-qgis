@@ -35,8 +35,10 @@ from qgis.PyQt.QtWidgets import (
     QLabel,
     QLineEdit,
     QMessageBox,
+    QApplication,
     QPlainTextEdit,
     QProgressBar,
+    QProgressDialog,
     QPushButton,
     QTableWidget,
     QTableWidgetItem,
@@ -80,6 +82,40 @@ _ABT_EXTENT_DEG = ABT_EXTENT_DEG
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+def _set_layer_filters(combo) -> None:
+    """Restrict *combo* to raster + vector layers, without the deprecation.
+
+    ``setFilters`` has two overloads. The old one takes
+    ``QgsMapLayerProxyModel.Filters`` and is deprecated; the current one takes
+    ``Qgis.LayerFilters``. OR-ing two ``Qgis.LayerFilter`` members can yield a
+    plain int under sip, which then binds to the *deprecated* overload — so
+    passing modern enum members is not by itself enough to avoid the warning.
+    Constructing ``Qgis.LayerFilters`` explicitly pins the modern overload.
+
+    Ordered newest-first; each step falls through on the QGIS versions where
+    that name does not exist.
+    """
+    try:
+        combo.setFilters(
+            Qgis.LayerFilters(
+                Qgis.LayerFilter.RasterLayer | Qgis.LayerFilter.VectorLayer
+            )
+        )
+        return
+    except (AttributeError, TypeError):
+        pass
+    try:
+        combo.setFilters(
+            Qgis.LayerFilter.RasterLayer | Qgis.LayerFilter.VectorLayer
+        )
+        return
+    except (AttributeError, TypeError):
+        pass
+    combo.setFilters(
+        QgsMapLayerProxyModel.RasterLayer | QgsMapLayerProxyModel.VectorLayer
+    )
+
 
 def _abt_size_px(res_m: int, extent_deg: float) -> int:
     """Compute .abt tile pixel width for a given resolution and extent."""
@@ -383,12 +419,26 @@ class _LayerEntry:
 # Worker thread
 # ---------------------------------------------------------------------------
 
-def _resolve_source_on_main_thread(entry: _LayerEntry) -> str:
+def _resolve_source_on_main_thread(entry: _LayerEntry,
+                                   target_res_m: Optional[float] = None) -> str:
     """Extract a file/folder path from a layer entry (must be called on
     the main thread because QgsMapLayer objects are not thread-safe).
 
     For local files/folders, returns the path directly.
     For remote layers (WMS/XYZ), exports to a temp GeoTIFF.
+
+    *target_res_m* is the finest .abt resolution this run will produce. The
+    export MUST be pinned to it: ``ingest.rs`` point-samples the GeoTIFF onto
+    the .abt grid (one source pixel per output cell, no averaging either way),
+    so any mismatch between the export pitch and the .abt pitch is resampled at
+    an arbitrary ratio — coarser gives plateaus of repeated cells, finer gives
+    1-in-N aliasing. Both are lattice-locked terrain error and the LOS sweep
+    renders them as a checkerboard. This mirrors what the analysis path already
+    does with `terrain_adapter._try_gdal_warp`, which pins xRes/yRes to the
+    analysis resolution. Sizing the export from the *layer* instead (the old
+    behaviour) is what made Map-Converter tiles speckle at every resolution
+    while the direct XYZ download — whose zoom is chosen from the target via
+    `terrain_adapter.tile_zoom` — stayed clean.
     """
     if entry.qgis_layer is not None:
         src = entry.qgis_layer.source()
@@ -423,7 +473,13 @@ def _resolve_source_on_main_thread(entry: _LayerEntry) -> str:
                                 QgsProject.instance().transformContext(),
                             )
                             pipe.insert(pipe.size(), proj)
-                        res = _detect_resolution(entry.qgis_layer) or 30.0
+                        # Target pitch first; the layer's own resolution is only
+                        # a fallback for callers that pass nothing.
+                        res = (target_res_m
+                               or (min(entry.target_resolutions)
+                                   if entry.target_resolutions else None)
+                               or _detect_resolution(entry.qgis_layer)
+                               or 30.0)
                         deg = res / 111_111.0
                         nc = max(1, int(round(extent.width() / deg)))
                         nr = max(1, int(round(extent.height() / deg)))
@@ -431,6 +487,21 @@ def _resolve_source_on_main_thread(entry: _LayerEntry) -> str:
                         if max(nc, nr) > cap:
                             ratio = max(nc, nr) / cap
                             nc, nr = int(nc / ratio), int(nr / ratio)
+                            # The cap silently coarsens the export below the
+                            # target, which puts the arbitrary-ratio resample
+                            # back — the whole defect this parameter exists to
+                            # avoid. One export spans the entire AOI here,
+                            # unlike terrain_adapter, which clips one base
+                            # GeoTIFF per tile and never hits this. Say so
+                            # rather than shipping quietly degraded terrain.
+                            got = extent.width() / max(nc, 1) * 111_111.0
+                            QgsMessageLog.logMessage(
+                                f"Export capped at {cap} px: requested "
+                                f"{res:.2f} m, got {got:.2f} m. Tiles finer "
+                                f"than {got:.2f} m will be interpolated from "
+                                f"this. Convert a smaller extent to avoid it.",
+                                TAG, Qgis.MessageLevel.Warning,
+                            )
                         out = os.path.join(
                             tempfile.gettempdir(),
                             f"aether_exp_{id(entry)}_{os.getpid()}.tif",
@@ -460,6 +531,54 @@ def _kill_proc(proc: subprocess.Popen) -> None:
         pass
 
 
+def resolve_sources_with_progress(layers, parent=None, target_res_m=None):
+    """Resolve every layer to a path, on the main thread, but visibly.
+
+    *target_res_m* is forwarded to :func:`_resolve_source_on_main_thread` and
+    must be the finest resolution this run will write. It used to be absent,
+    which is precisely why the export could not see it: the caller reads the
+    resolution checkboxes before this call and only hands them to the worker,
+    which is constructed *after* the export has already run.
+
+    This work cannot move to the worker: it calls ``writeRaster`` through a
+    ``QgsRasterLayer``, and QGIS map layers are main-thread-only. What it can
+    stop doing is happening *invisibly* — it used to run inside
+    ``_MapConverterWorker.__init__``, which is constructed on the GUI thread
+    before ``start()``, so a multi-minute WMS/XYZ export looked like the plugin
+    had hung with no progress, no log and no way out.
+
+    Returns the list of resolved sources, or ``None`` if the user cancelled.
+    The dialog is window-modal so pumping events here cannot re-enter Run.
+    """
+    dlg = QProgressDialog("Preparing layers…", "Cancel", 0, len(layers), parent)
+    dlg.setWindowTitle("Map Converter")
+    dlg.setWindowModality(Qt.WindowModal)
+    # Show at once: the first layer is often the slowest, and a dialog that
+    # only appears after the default 4 s delay is the freeze all over again.
+    dlg.setMinimumDuration(0)
+    dlg.setValue(0)
+    QApplication.processEvents()
+
+    resolved = []
+    try:
+        for i, entry in enumerate(layers):
+            name = os.path.basename(entry.source_path or "") or f"layer {i + 1}"
+            dlg.setLabelText(f"Preparing {name} ({i + 1}/{len(layers)})…")
+            QApplication.processEvents()
+            if dlg.wasCanceled():
+                return None
+            # A single export is one blocking call inside QGIS; the UI can only
+            # come back between layers, not during one.
+            resolved.append(_resolve_source_on_main_thread(entry, target_res_m))
+            dlg.setValue(i + 1)
+            QApplication.processEvents()
+            if dlg.wasCanceled():
+                return None
+    finally:
+        dlg.close()
+    return resolved
+
+
 class _MapConverterWorker(QThread):
     """Background worker — does ALL heavy I/O + runs the converter.
 
@@ -479,9 +598,15 @@ class _MapConverterWorker(QThread):
     finished_ok = pyqtSignal(str)
     finished_err = pyqtSignal(str)
 
-    def __init__(self, layers, output_dir, out_res, parent=None):
+    def __init__(self, layers, output_dir, out_res, resolved_sources,
+                 parent=None, overwrite=False):
         super().__init__(parent)
         # Deep-copy the layer config so the main thread can't mutate it.
+        #
+        # `resolved_sources` is resolved by the caller, on the main thread,
+        # via `resolve_sources_with_progress`. Doing it here instead meant a
+        # potentially multi-minute export ran inside a constructor on the GUI
+        # thread — the plugin looked frozen and could not be cancelled.
         self._layers = [
             {
                 "layer_type": e.layer_type,
@@ -490,14 +615,14 @@ class _MapConverterWorker(QThread):
                 "native_res_m": e.native_res_m,
                 "extent": dict(e.extent) if e.extent else None,
                 "priority": e.priority,
-                # qgis_layer can't be passed to another thread — resolve
-                # the source path on the main thread before constructing.
-                "resolved_source": _resolve_source_on_main_thread(e),
+                # qgis_layer can't be passed to another thread.
+                "resolved_source": src,
             }
-            for e in layers
+            for e, src in zip(layers, resolved_sources)
         ]
         self._output_dir = output_dir
         self._out_res = out_res
+        self._overwrite = overwrite
         self._canceled = False
         self._proc = None
 
@@ -636,7 +761,7 @@ class _MapConverterWorker(QThread):
                         exact_res = ext_deg / sz * 111_111.0
                         fn = f"Tile_N{ul_lat:.2f}E{ul_lon:.2f}_{res}m_r16sint.abt"
                         out = os.path.join(self._output_dir, fn)
-                        if not os.path.exists(out):
+                        if self._overwrite or not os.path.exists(out):
                             job = {
                                 "output_path": os.path.abspath(out),
                                 "format": "r16sint",
@@ -685,7 +810,9 @@ class _MapConverterWorker(QThread):
             env = os.environ.copy()
             env["PYTHONUNBUFFERED"] = "1"
 
-            self._proc = subprocess.Popen(
+            # `with` closes the stdout pipe (and waits) on exit so we don't
+            # leak a file handle (the ResourceWarning).
+            with subprocess.Popen(
                 [converter_exe, "ingest", "--job-file", job_file],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
@@ -693,28 +820,30 @@ class _MapConverterWorker(QThread):
                 text=True, encoding="utf-8", errors="replace",
                 creationflags=_SUBPROCESS_FLAGS,
                 env=env,
-            )
+            ) as proc:
+                self._proc = proc
 
-            for line in iter(self._proc.stdout.readline, ""):
-                if self._canceled:
-                    _kill_proc(self._proc)
-                    self._log("Cancelled by user.")
-                    return
-                line = line.strip()
-                if not line:
-                    continue
-                self._log(line)
+                for line in iter(proc.stdout.readline, ""):
+                    if self._canceled:
+                        _kill_proc(proc)
+                        self._log("Cancelled by user.")
+                        return
+                    line = line.strip()
+                    if not line:
+                        continue
+                    self._log(line)
 
-                prog = self._parse_progress(line)
-                if prog:
-                    curr, tot = prog
-                    # Map converter progress to 40-100% range.
-                    pct = 40 + int(curr * 60 / max(tot, 1))
-                    self.progress.emit(pct)
-                    self.status.emit(f"Tile {curr}/{tot}")
+                    prog = self._parse_progress(line)
+                    if prog:
+                        curr, tot = prog
+                        # Map converter progress to 40-100% range.
+                        pct = 40 + int(curr * 60 / max(tot, 1))
+                        self.progress.emit(pct)
+                        self.status.emit(f"Tile {curr}/{tot}")
 
-            self._proc.wait()
-            rc = self._proc.returncode
+                proc.wait()
+                rc = proc.returncode
+
             self._proc = None
 
             try:
@@ -909,7 +1038,9 @@ class _MapConverterWorker(QThread):
                 tempfile.gettempdir(),
                 f"aether_wgs84_{os.path.basename(path)}"
             )
-            if os.path.exists(out):
+            # Keyed on basename only, so a different source with the same file
+            # name reuses this. "Rebuild existing tiles" discards it too.
+            if os.path.exists(out) and not self._overwrite:
                 return out
             self._log(f"  Reprojecting {os.path.basename(path)} → WGS84")
             r = gdal.Warp(out, path, dstSRS="EPSG:4326", format="GTiff",
@@ -992,8 +1123,10 @@ class _RectangleDrawTool:
             n = max(self._first_point_wgs84.y(), pt2.y())
             w = min(self._first_point_wgs84.x(), pt2.x())
             e = max(self._first_point_wgs84.x(), pt2.x())
-            # Keep the rubber band visible (don't reset it).
-            self._draw_rect(self._first_point_canvas, point)
+            # Clear the preview once the rectangle is committed — the extent
+            # now lives in the layer entry and is shown there, so leaving the
+            # band on the canvas only accumulates stale outlines across draws.
+            self._rb.reset(QgsWkbTypes.PolygonGeometry)
             self._restore()
             self._callback(s, n, w, e)
 
@@ -1084,16 +1217,7 @@ class MapConverterTab(QWidget):
 
         add_row = QHBoxLayout()
         self._combo_add = QgsMapLayerComboBox()
-        try:
-            # QGIS 3.42+: use Qgis.LayerFilter flags.
-            self._combo_add.setFilters(
-                Qgis.LayerFilter.RasterLayer | Qgis.LayerFilter.VectorLayer
-            )
-        except (AttributeError, TypeError):
-            # Older QGIS: use QgsMapLayerProxyModel flags.
-            self._combo_add.setFilters(
-                QgsMapLayerProxyModel.RasterLayer | QgsMapLayerProxyModel.VectorLayer
-            )
+        _set_layer_filters(self._combo_add)
         self._combo_add.setAllowEmptyLayer(True)
         self._combo_add.setShowCrs(True)
         self._combo_add.setMinimumWidth(200)
@@ -1180,6 +1304,17 @@ class MapConverterTab(QWidget):
             self._res_checks[res] = cb
             res_lay.addWidget(cb)
         res_lay.addStretch()
+        self._chk_overwrite = QCheckBox("Rebuild existing tiles")
+        self._chk_overwrite.setToolTip(
+            "Overwrite .abt tiles that already exist in the output directory, "
+            "and discard cached reprojections.\n\n"
+            "Tiles are normally skipped when a file of the same name is "
+            "present, and tile names encode only position and resolution — not "
+            "the source, the export pitch or the plugin version. So after "
+            "changing any of those, an existing tile is silently reused and "
+            "you keep looking at the old pixels. Tick this to force a rebuild."
+        )
+        res_lay.addWidget(self._chk_overwrite)
         root.addWidget(res_grp)
 
         # ---- Output ----
@@ -1873,9 +2008,24 @@ class MapConverterTab(QWidget):
         self._log.clear()
         self._log_msg("Starting conversion...")
 
+        # Remote layers must be exported through QGIS on this thread before the
+        # worker can touch them. Shown with progress and a Cancel rather than a
+        # silent freeze — see resolve_sources_with_progress.
+        self._log_msg("Preparing layers (this can take a while for WMS/XYZ)...")
+        # Export at the FINEST requested resolution: one export feeds every
+        # requested .abt resolution, and ingest.rs can only decimate from it.
+        resolved = resolve_sources_with_progress(
+            self._layers, self, target_res_m=float(min(out_res))
+        )
+        if resolved is None:
+            self._log_msg("Cancelled while preparing layers.")
+            self._lbl_status.setText("Cancelled.")
+            return
+
         self._set_running(True)
         self._worker = _MapConverterWorker(
-            self._layers, output_dir, out_res, self
+            self._layers, output_dir, out_res, resolved, self,
+            overwrite=self._chk_overwrite.isChecked(),
         )
         self._worker.progress.connect(self._progress.setValue)
         self._worker.status.connect(self._lbl_status.setText)

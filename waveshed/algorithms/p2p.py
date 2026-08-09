@@ -44,7 +44,9 @@ from ..core import api_key
 from ..core import binary_manager as bm
 
 # Enum value lists (index-based for QgsProcessingParameterEnum).
-_MODELS = ["LOS", "SIMPLE_LOSS", "ITM"]
+# SIMPLE_LOSS was removed in 0.2.0; anything that stored an index against the
+# old three-entry list points one slot too high and must be re-picked.
+_MODELS = ["LOS", "ITM"]
 _RESOLUTIONS = [str(r) for r in VALID_RESOLUTIONS]
 _BACKENDS = ["AUTO", "GPU", "CPU"]
 
@@ -351,30 +353,32 @@ class P2PAlgorithm(QgsProcessingAlgorithm):
         except api_key.ApiKeyError as exc:
             raise QgsProcessingException(str(exc)) from exc
 
-        proc = subprocess.Popen(
+        # `with` closes the stdout pipe (and waits) on exit so we don't leak a
+        # file handle (the ResourceWarning).
+        with subprocess.Popen(
             [core_exe, "--config", job_file],
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,  # aether_core logs everything to stdout
             text=True,
             env=core_env,
             creationflags=_SUBPROCESS_FLAGS,
-        )
+        ) as proc:
+            # aether_core writes all its diagnostics to stdout — surface every
+            # line and keep a tail for the error message. (Previously only
+            # stderr was read, so none of it was visible and stdout could
+            # deadlock.)
+            output_lines: list[str] = []
+            for line in iter(proc.stdout.readline, ""):
+                if feedback.isCanceled():
+                    proc.terminate()
+                    return {}
+                line = line.rstrip()
+                if not line:
+                    continue
+                output_lines.append(line)
+                feedback.pushInfo(line)
 
-        # aether_core writes all its diagnostics to stdout — surface every
-        # line and keep a tail for the error message. (Previously only stderr
-        # was read, so none of it was visible and stdout could deadlock.)
-        output_lines: list[str] = []
-        for line in iter(proc.stdout.readline, ""):
-            if feedback.isCanceled():
-                proc.terminate()
-                return {}
-            line = line.rstrip()
-            if not line:
-                continue
-            output_lines.append(line)
-            feedback.pushInfo(line)
-
-        proc.wait()
+            proc.wait()
         if proc.returncode != 0:
             tail = "\n".join(output_lines[-20:])
             raise QgsProcessingException(

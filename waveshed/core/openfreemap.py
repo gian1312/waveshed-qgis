@@ -198,10 +198,14 @@ def download_building_tiles(
         os.replace(tmp, dest)
         return True
 
+    # `pool.map` yields in submission order, so one slow tile blocks counting
+    # every tile behind it for up to `timeout`. Results are order-independent
+    # here — only the running total matters — so take them as they land.
     ok = 0
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as pool:
-        for got in pool.map(fetch, tiles):
-            if got:
+        futures = [pool.submit(fetch, t) for t in tiles]
+        for fut in concurrent.futures.as_completed(futures):
+            if fut.result():
                 ok += 1
 
     missing = len(tiles) - ok

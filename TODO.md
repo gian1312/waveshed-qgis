@@ -53,20 +53,328 @@ Running list of follow-up work. Keep items short; link to the code site.
   OpenFreeMap, Copernicus, swisstopo), shown in Settings under "Data sources"
   and in the buildings tooltip. Tests pin that ODbL sources credit
   OpenStreetMap and that we never credit a dataset we do not request.
-- [ ] **Add `changelog=` to `waveshed/metadata.txt`** — reviewers routinely ask
-  for it and it is shown on the plugin page.
-- [ ] **Make the GPL "or later" grant explicit.** `LICENSE` is the bare GPLv2
-  text; the "or at your option any later version" wording currently lives only
-  in `README.md` and `metadata.txt`.
-- [ ] **Make `package.py` exclusions explicit.** `.venv`, `tmp/`, `tests/`,
-  `deploy.local.ini` and `*_rc.py` are excluded only as a side effect of
-  walking `waveshed/` rather than the repo root; a generated `resources_rc.py`
-  inside the package *would* ship.
+- [x] **Add `changelog=` to `waveshed/metadata.txt`** — done 2026-08-03, with a
+  0.2.0 entry covering the tile pool, the buildings pool, the SIMPLE_LOSS
+  removal (including its Processing-index break), attribution, cache clearing
+  and the two silent-cache correctness fixes. Version bumped 0.1.0 → 0.2.0.
+- [x] **Make the GPL "or later" grant explicit.** Done 2026-08-03: `LICENSE`
+  now opens with the standard copyright + "either version 2 …, or (at your
+  option) any later version" notice, the warranty disclaimer, and a statement
+  that the Aether binaries are not part of the program, ahead of the verbatim
+  GPLv2 text. The grant no longer lives only in `README.md`/`metadata.txt`.
+- [x] **Make `package.py` exclusions explicit.** Done 2026-08-03. `SKIP_DIRS`
+  now names `.venv`/`venv`/`tmp`/`tests`/`dist` outright instead of relying on
+  the walk starting at `waveshed/`, and a new `SKIP_GLOBS` excludes generated
+  `*_rc.py` and `deploy.local.ini` — the one case that really could appear
+  *inside* the package. Three tests pin it; `python3 package.py` builds a clean
+  182 KiB zip. (Nothing imports a `*_rc.py` today, and none exists.)
 
 ## UI / UX
 
+- [ ] **Fix the layer legend.** Reported 2026-08-05. The legend QGIS shows for
+  a loaded result does not read correctly — capture what it currently shows
+  versus what it should (band values vs dB, ramp stops, units, the
+  MIN_ALT/LOS/loss variants) before changing `core/result_loader.py`, which
+  builds all three renderers.
+
+- [ ] **Allow setting a minimum dB value.** Reported 2026-08-05. The web app
+  already has this ("Min dB threshold (RF mode)"); the plugin has no
+  equivalent, so a loss result is rendered across its whole range and weak
+  signal dominates the ramp. Needs a control plus a floor applied when the
+  colour ramp is built (`core/result_loader.py`) — and a decision on whether
+  the floor is display-only or also passed to the engine.
+
 - [ ] **Help system.** No Help action or bundled help exists, and only ~19
   widgets have tooltips. Deferred until the rest of the release work is done.
+
+- [x] **P2P had no asset or azimuth controls at all.** Fixed 2026-08-05. The
+  original report ("we cannot select the assets and azimuths in propagation
+  loss mode") was first read as the 360° table's collapsed columns; that was a
+  real and separate bug, but the P2P tab genuinely had **no such controls** —
+  zero hits for `asset` or `azimuth` in the whole file. `P2PParams` already
+  carried `az_pattern`, `el_pattern` and `az_rotation`, so only the UI was
+  missing: a link could not use a stored emitter and every frequency/ERP had
+  to be retyped. Added an Asset picker (fills frequency and ERP from the
+  chosen emitter, blank leaves hand-entered values alone) and an AZ Rotation
+  control, both inside the existing Propagation-Loss-only params group.
+
+- [x] **Pre-built `.abt` tiles could not be used**, even for tiles the Map
+  Converter had just produced ("it doesn't seem to check .abt tiles, only for
+  gtiff etc.", 2026-08-04). Fixed 2026-08-05 by **detection** rather than a
+  second control: a terrain directory holding `.abt` files is recognised for
+  what it is and handed to the engine untouched.
+  * `list_abt_tiles` / `is_abt_tile_dir` — deliberately **non-recursive**: the
+    engine resolves terrain with a plain `read_dir` over the one directory it
+    is given, so tiles in sub-folders are invisible to it, and reporting them
+    would promise coverage the run would not have.
+  * `prepare_terrain` returns the directory immediately. Everything past that
+    point exists to *produce* `.abt` tiles, and the converter would reject a
+    `.abt` as its `base_tif` anyway.
+  * `terrain_coverage_warning` checks `.abt` sets by their **own headers**.
+    GDAL cannot open a `.abt`, so the mosaic path reported a folder of
+    perfectly good tiles as unreadable terrain — which is very likely what
+    "it doesn't seem to check .abt tiles" actually was. Now warns on no
+    overlap, partial coverage (same 98% tolerance as rasters), and tiles whose
+    headers cannot be read.
+  * The "no terrain files found" message now names `.abt` and the
+    no-sub-folders rule, since pointing at Map Converter output one level up
+    is the obvious mistake.
+
+  **Suitability is now checked, not assumed** (2026-08-05, after a real run
+  used 55 pre-built tiles for a 5 m / 50 km analysis without checking
+  anything). Pre-built tiles are finished output: the run cannot change their
+  resolution and cannot add buildings to them, so both mismatches have to be
+  raised or the result is confidently wrong.
+  * **Resolution.** Warns when the finest available tile is more than 1.25x
+    coarser than the requested resolution — 30 m tiles must not silently serve
+    a 5 m analysis, because the run upsamples them and presents the result at
+    5 m, which reads as detail that was never measured. The tolerance absorbs
+    the exact-resolution rounding a tile carries (29.99757 m for a nominal
+    30 m tile). Finer-than-requested is fine: downsampling is honest.
+  * **Buildings.** Requesting buildings against pre-built tiles is now a
+    confirmation dialog, not a log line — heights are baked in when the tile
+    is built, so the checkbox cannot be honoured and silently ignoring it was
+    the failure this exists to prevent.
+  * Both run in `prepare_terrain` too, logged as `WARNING`, because a
+    Processing run never sees the dialog and this path skips every other
+    safeguard in that function.
+
+- [x] **"Include buildings" was unusably slow.** Fixed 2026-08-04 — this was
+  the plugin half of the engine change, and it is what actually delivers the
+  speed-up. The engine gained `buildings_pbf_dir` on `DownloadJob`; the plugin
+  was still diverting every buildings run onto `_export_via_qgis` →
+  `writeRaster` regardless, so nothing changed for the user even after the new
+  binary shipped.
+
+  `prepare_terrain` now passes `pbf_dir` straight to `_try_rust_download`, and
+  the divert survives **only** for a FlatGeobuf `buildings_file` — an IngestJob
+  field with no downloader equivalent. OpenFreeMap runs take the fast path.
+
+  **Guarded against a silent wrong answer.** `buildings_pbf_dir` is additive,
+  so an engine predating it parses the job, ignores the field and writes
+  perfectly good building-*free* terrain — which would then be pooled under an
+  identity claiming buildings and reused forever, exactly the failure mode
+  already fixed once for failed OFM downloads.
+
+  The gate is `_binary_has_buildings_support`: the `[Buildings]` marker is a
+  literal in the executable, so its presence is decided **by inspecting the
+  binary before anything runs**. An unreadable binary is assumed to support it,
+  because a false negative costs the 7-17x slow path.
+
+  **This replaced a first attempt that scraped the converter's output for the
+  `[Buildings]` line, and that attempt was wrong** — it fired against an engine
+  that provably has the feature (2026-08-05: the distributed
+  `bin/windows/aether_converter.exe` contains the marker, and running
+  `bin/linux/aether_converter` with a `buildings_pbf_dir` prints
+  `[Buildings] 0 pbf tile(s), no buildings in extent`), sending a real run down
+  the slow path and reporting "engine too old" about a current engine. Two
+  lessons kept in the tests: gate on what is decidable, not on log text; and
+  note that `[Buildings]` prints *before* `[Stats]`, so it is easy to miss in a
+  tail-pasted log. Covered by `TestBuildingsOnTheFastPath`, including a
+  regression test for the false negative.
+
+---
+
+## Verification backlog — run these against a real QGIS
+
+Nothing below is known broken; these are the checks that have not been done
+because there is no QGIS/GDAL in the dev container. Grouped so a session can
+take one group at a time. Items marked **(regression)** guard a bug that was
+real once.
+
+### V1. Buildings, end to end — the one that matters
+- [ ] Buildings run takes the **fast path**: log shows
+  `buildings fused during download`, then a `[Buildings] N pbf tile(s) → M
+  building(s) → X/Y abt tile(s)` line, and **no** `writeRaster` at all.
+- [ ] Timing is the ~22 s class at 5 m / 30 km, not the ~151 s class.
+  **(regression** — the 7-17x divert.**)**
+- [ ] Buildings are visibly present in the coverage raster.
+- [ ] Re-running the same area reuses the pool and re-downloads nothing.
+- [ ] A 50 km buildings run completes at all (was ~1687 s, ~1560 s of it in
+  `writeRaster`).
+- [ ] Buildings still work through the **ingest** path — force it with a
+  FlatGeobuf `buildings_file`, which has no downloader equivalent.
+- [ ] **(regression)** A run whose OpenFreeMap download fails leaves the tiles
+  flagged, so the *next* run re-fetches instead of silently serving
+  building-free terrain from a buildings-keyed pool.
+
+### V2. Pre-built `.abt` tiles
+- [ ] Point terrain at a Map Converter output folder → log reads
+  `using N pre-built .abt tile(s) — no download or conversion`, and the run
+  completes without invoking the converter.
+- [ ] The same folder in **P2P**, not just 360°.
+- [ ] Tiles one level down → warned that sub-folders are not searched.
+- [ ] A folder whose tiles are somewhere else entirely → "do not overlap".
+- [ ] A folder covering only part of the area → partial-coverage warning
+  (98% tolerance) rather than silent 0 m sea level.
+- [ ] A truncated/corrupt `.abt` → reported as unreadable, not treated as
+  terrain. **(regression** — GDAL cannot open `.abt`, so these used to be
+  reported as "no terrain files found".**)**
+- [ ] Buildings checkbox with pre-built tiles → logs the "used as-is" note.
+
+### V3. P2P
+- [ ] Asset dropdown lists the emitters from the Assets tab and fills
+  frequency + ERP on selection; blank leaves hand-typed values alone.
+- [ ] AZ Rotation reaches the job (non-zero only).
+- [ ] Fresnel band at 40 km / 100 MHz is ~173 m, shaded at 0.6 F1 with the
+  full F1 dotted. **(regression** — was 31.6x too small.**)**
+- [ ] Assets tab changes show up in the P2P dropdown without reopening the
+  plugin (`_refresh_assets` is written but not yet wired to a signal —
+  **known gap**, see below).
+
+### V4. Modes, tabs, window
+- [ ] MIN_ALT radio greys out on the P2P tab and a MIN_ALT selection falls
+  back to LOS when switching there.
+- [ ] Placing a site in 360° clears P2P endpoints and its map markers, and
+  vice versa; 360° heights/ranges/assets survive.
+- [ ] Propagation Loss shows usable Asset and AZ Rotation columns.
+  **(regression** — cell-widget columns collapsed under
+  `ResizeToContents`.**)**
+- [ ] Geometry persists across close **and** Esc. **(regression** — the save
+  lived in a shadowed duplicate `closeEvent`.**)**
+
+### V5. Log hygiene and packaging
+- [ ] No `ResourceWarning: unclosed file` after a P2P or converter run.
+- [ ] No `setFilters` DeprecationWarning on dialog open. **Unverified by
+  design** — the fix depends on how sip binds the flag type on your build.
+- [ ] `python3 package.py` output installs cleanly from the QGIS Plugin
+  Manager ZIP, and the ZIP contains no `*_rc.py`, `tests/` or `.venv`.
+- [ ] Processing algorithms still load, and any saved Processing model has its
+  Propagation Model re-picked (the SIMPLE_LOSS removal shifted enum indices).
+
+### V6a. Engine-copy confusion — the plugin reads a directory nothing distributes
+
+Cost most of a debugging session on 2026-08-05, so it is written down rather
+than rediscovered. The engine exists in several places, updated by **different**
+pipeline actions:
+
+| Path | Updated by | Read by |
+|---|---|---|
+| `AETHER/bin/<platform>/` | Build | the build itself |
+| `AETHER_Web/bin/` | **Distribute** (`targets=("web", …)`) | Waveshed web |
+| `MPT_SIGMA/aether/<dir>/` | **Distribute** (`targets=(…, "mpt")`) | MPT_SIGMA |
+| `~/.aether/bin/` | **"Deploy engine to ~/.aether/bin (local test)"** | **the QGIS plugin** |
+
+`plan_distribute` copies to the web and MPT targets only and never touches
+`~/.aether/bin`, so a build can be correctly built **and** correctly
+distributed while the QGIS plugin still runs a months-old engine — with no
+signal from either side. Confirmed by inspection: both distribute targets
+carried the buildings marker, the plugin's copy did not.
+
+- [ ] **Make the mismatch visible.** Options, cheapest first: have the plugin
+  log the engine path + build identity on every run (path is logged now, build
+  identity is not); add a version/date line to `Settings → Download` showing
+  what is staged versus what the manifest offers; or have the pipeline's
+  Distribute action also refresh `~/.aether/bin` when a local deploy is
+  already present.
+- [ ] **Give the engine a queryable version.** `aether_converter --version`
+  would turn every "is this the new binary?" question into one command, and
+  would let the plugin's capability check read a version instead of scanning
+  the executable for a marker string.
+
+### V6. Known gaps, not yet done
+- [ ] **P2P asset list does not refresh** while the dialog is open.
+  `_refresh_assets` exists but nothing calls it; wire it to the Assets tab's
+  change signal, the same way the 360° tab refreshes its cache.
+- [ ] **Map Converter and Site Analysis still cannot run concurrently** — the
+  layer-preparation dialog is modal. Accepted for now; the real fix is
+  replacing `writeRaster` with a GDAL warp.
+- [ ] **Terrain download tested only against Mapzen Terrarium** — AWS Terrain
+  Tiles, Mapbox Terrain-RGB and Nextzen are untried (encoding detection,
+  `{z}/{x}/{y}` templating, per-service zoom caps, API keys).
+- [ ] **Local-DEM border fix unconfirmed**, and `AETHER/Design Documents/
+  qgis_plugin/TODO.md` §0.2 records the opposite conclusion — that the cause
+  was never identified and `INIT_DEST=0` did **not** fix it. Reconcile the two
+  documents on real evidence before trusting either.
+- [ ] **Terrain "stripe" gaps** (`…/qgis_plugin/TODO.md` §0.1) — deterministic,
+  survives a cache wipe, unrelated to the cache fixes. Next step is the cheap
+  one already written down: rerun the failing area at
+  `aether/download_connections=64` to confirm or kill the concurrency
+  hypothesis.
+- [ ] **Antimeridian (lon ≈ ±180) is untested and unhandled** in
+  `_compute_subtiles`.
+- [ ] Untested code paths: `get_source_resolution_info`, the
+  `_try_rust_download` job JSON, and the buildings resolve/convert path.
+
+---
+
+- [x] **Map Converter froze the whole GUI while preparing layers.** Fixed
+  2026-08-04. `_MapConverterWorker.__init__` called
+  `_resolve_source_on_main_thread` for every layer — and a QThread's
+  constructor runs on the **calling** thread, so the entire WMS/XYZ
+  `writeRaster` export happened on the GUI thread before `start()` was ever
+  reached. The class docstring claimed the worker did this export; it did not.
+  Resolution now happens in `_on_run` via `resolve_sources_with_progress`,
+  a window-modal `QProgressDialog` with a per-layer label and a working Cancel,
+  and the resolved paths are passed into the worker. **Accepted as fixed by the
+  user 2026-08-05** ("the freeze is masked now"), with the limitation
+  understood: the export is still on the main thread — `QgsRasterLayer` is
+  main-thread-only — so the dialog is modal and the plugin still cannot be used
+  for anything else while it runs. Running Map Converter and Site Analysis
+  *concurrently* therefore remains impossible, and the yesterday's-item-5
+  concurrency check is moot. The real fix is dropping `writeRaster` for a GDAL
+  warp, as `terrain_adapter._try_gdal_warp` already does; until then this is
+  visible and interruptible rather than fast.
+
+- [x] **The drawn extent rectangle never disappeared.** Fixed 2026-08-04: the
+  rubber band is reset once the second click commits the rectangle. It was
+  deliberately kept (`"Keep the rubber band visible (don't reset it)"`), but
+  the extent is shown in the layer entry afterwards, so the band only
+  accumulated stale outlines across successive draws.
+
+- [x] **Minimum LOS Altitude was selectable while the P2P tab was open.** Fixed
+  2026-08-04: the radio is disabled (with an explanatory tooltip) whenever the
+  P2P tab is in front, and a MIN_ALT selection falls back to LOS on switching
+  to it. Previously the reverse was implemented — selecting MIN_ALT *disabled
+  the P2P tab*, which reads as the tab being broken rather than the mode being
+  inapplicable.
+
+- [x] **Sites in 360° and P2P were kept independently.** Fixed 2026-08-04:
+  placing a site in either tab clears the other tab's sites, through a new
+  `AetherMainDialog.sites_picked_in` and a `clear_sites()` on both tabs. The
+  360° rows keep their heights, ranges and assets — only the coordinates are
+  dropped — so re-placing a point does not discard the rest of the setup.
+
+- [x] **Asset and AZ Rotation columns were unusable in Propagation Loss mode.**
+  Fixed 2026-08-04, and it was not a visibility bug — `set_mode` unhid them
+  correctly. Every data column holds a **cell widget**, and
+  `QHeaderView.ResizeToContents` sizes from *item data*, which those columns do
+  not have, so it collapsed them to near-zero the moment they were shown.
+  Columns now have declared widths (`_COL_WIDTHS`) with `Interactive` resize
+  and a `_COL_MIN_WIDTH` floor; Location still stretches. The fixed columns
+  total ~785 px, which the old 640 px dialog minimum could never show — hence
+  "squished" — so the dialog minimum is now 900x600. A test pins that the
+  column total stays under the dialog's opening width.
+
+- [x] **The main dialog still did not remember its size** (reported 2026-08-04
+  after the first attempt). The first fix added a *second* `closeEvent` to a
+  class that already had one at line 224 — Python keeps the last definition, so
+  the geometry save was dead code that never ran. Now folded into the existing
+  `closeEvent` **and** `reject()`, because Esc closes through `reject()` and
+  never reaches `closeEvent` at all. Geometry is also read back with an
+  explicit `type=QByteArray`, since only a QByteArray restores and QgsSettings
+  returns whatever it stored.
+
+## Correctness — analysis output
+
+- [x] **The Fresnel zone on the P2P profile was 31.6x too small.** Fixed
+  2026-08-04, reported from a real run ("7 m at 40 km for 100 MHz seems off" —
+  it is: the answer is 173 m). `gui/p2p_tab.py` used
+  `17.32 * sqrt(d1*d2/(f_MHz*D))`, but **17.32 is the constant for frequency in
+  GHz**; the MHz form is **547.7** (= 17.32 x sqrt(1000)). Every Fresnel band
+  ever drawn was understated by sqrt(1000) = 31.6x, which makes obstructed
+  paths look clear. The maths moved into a pure `fresnel_radius_m()` with
+  `tests/test_p2p_fresnel.py` validating it against `F1 = sqrt(lambda d1 d2/D)`
+  derived from *c*, plus an explicit guard on the old wrong value.
+- [x] **The profile shaded the full F1 rather than the 0.6 F1 clearance.** Fixed
+  in the same change: 0.6 F1 is the criterion that matters (terrain outside it
+  costs roughly nothing), so that band is shaded and the full F1 is drawn as a
+  dotted outline. Matches the waveshed.io profile chart, which already used
+  0.6 F1 — the two products now agree on both the constant and the criterion.
+
+  **waveshed.io checked — not affected.** `web/src/lib/utils/profile-chart.ts:383`
+  already uses `547.7 * sqrt(d1*d2/(f*D_km))` with `f` in MHz and shades
+  `0.6 * f1`. The defect was plugin-only; the two now agree.
 
 ## Housekeeping
 
@@ -77,9 +385,9 @@ Running list of follow-up work. Keep items short; link to the code site.
   CRS leaves the previous conversion behind rather than overwriting it. Bounded
   by how often sources change, but worth an age-based sweep.
 
-- [ ] **`CLAUDE.md` is stale on dependencies** — it still lists `pynacl` as a
-  bundled exception, but `waveshed/core/api_key.py` is pure standard library
-  and nothing imports `nacl`.
+- [x] **`CLAUDE.md` is stale on dependencies** — fixed 2026-08-03. The `pynacl`
+  exception is gone; the rule now reads "no exceptions" and says why (a QGIS
+  plugin cannot install a pip dependency). Confirmed nothing imports `nacl`.
 - [ ] **`tests/fixtures/` is empty** — no on-disk fixture data backs any
   integration test.
 - [ ] **Untested paths**: `get_source_resolution_info`, the `_try_rust_download`
@@ -247,14 +555,20 @@ are against the tree as of that date.
   1800, 1808` hardcode the `~/.aether/cache` default instead of calling
   `get_cache_dir()` (`core/terrain_adapter.py:52-54`).
 
-- [ ] **Restore the disambiguator on the temp GeoTIFF name.** Regression:
-  `core/terrain_adapter.py:1578` builds `aether_{tile}.tif` in the shared temp
+- [x] **Restore the disambiguator on the temp GeoTIFF name.** Done 2026-08-03.
+  The name is now `aether_{pool_hash}_{pid}_{tile}.tif` — pool identity covers
+  a different source or building set writing the same canonical tile name, and
+  the pid covers two runs of the *same* source (Site Analysis and Map Converter
+  together, or two windows), which the pool hash alone does not. Noted in the
+  code that the pid is correct only while this stays scratch: caching the
+  extract between runs (the open item below) means dropping the pid *and* the
+  `finally`, not just the `finally`. Original finding:
+  `core/terrain_adapter.py:1578` built `aether_{tile}.tif` in the shared temp
   directory, having lost the `cache_hash` term when the pool landed. Tile names
   are now globally canonical (position + resolution only), so the same name
   means different pixels for different sources — two runs, or Site Analysis and
   Map Converter together, read and write one another's temp file, and the
-  `finally` deletes it out from under whoever is still using it. Needs the pool
-  identity back in the name.
+  `finally` deletes it out from under whoever is still using it.
 
 ## MAJOR — buildings are unusably slow, and the target is 500 km
 
@@ -430,9 +744,11 @@ a long download — or gets a misleading error from the engine. Needed:
   (`core/terrain_adapter.py:1034`), which is keyed on bbox — so 30 km -> 31 km
   re-downloads all 1369 z14 tiles.
 
-- [ ] **`download_building_tiles` uses eager ordered `pool.map`**
-  (`core/openfreemap.py:141, :202-205`) with 8 workers, so one slow tile stalls
-  the result iteration for up to `timeout=30.0`.
+- [x] **`download_building_tiles` uses eager ordered `pool.map`** — fixed
+  2026-08-03: now `submit` + `as_completed`, so results are counted as they
+  land instead of in submission order and one slow tile no longer stalls the
+  ones behind it for up to `timeout=30.0`. Only the running total is used, so
+  ordering was never needed. Worker count unchanged.
 
 ## Terrain source selection
 
@@ -455,9 +771,9 @@ a long download — or gets a misleading error from the engine. Needed:
   only from `QgsProject` rasters (`:1004-1008`) and `_P2PWorker.__init__`
   (`:463-470`) has no `terrain_dir` argument.
 
-- [ ] **`_extract_reproject` takes a `binary_manager` it never uses**
-  (`core/terrain_adapter.py:918`) — a dead hook where the Rust downloader was
-  meant to go.
+- [x] **`_extract_reproject` takes a `binary_manager` it never uses** — dead
+  parameter removed 2026-08-03, along with the argument at its one call site.
+  The Rust downloader it was a placeholder for is reached a different way now.
 
 ## Buildings source selection
 
@@ -586,6 +902,24 @@ a long download — or gets a misleading error from the engine. Needed:
 
 ## Altitude Explorer / Waveshed Explorer
 
+> **Still open in full as of 2026-08-05** — user confirmed the Explorer "still
+> has many issues". All 18 findings below stand; none has been worked on. They
+> come from one code audit of a single 1902-line file and are best done as
+> **one redesign, not 18 tickets** — they overlap heavily (sizing, the missing
+> size policies and the `addStretch` are the same layout problem; the O(n²)
+> twin sync and the undebounced slider are the same responsiveness problem).
+>
+> **Write the test net first.** `No test imports altitude_explorer` (last item
+> in this section), so a redesign currently breaks nothing detectably. The
+> contract to preserve is `band_stops` + `build_band_renderer`, already covered
+> by `tests/test_min_alt.py`.
+>
+> Rough order: (1) the two functional defects — AMSL+AGL together, and
+> half-metre altitudes being unreachable through a `QSpinBox` against a 0.5 m
+> raster quantum; (2) responsiveness — slider debounce, the O(n²)
+> `_sync_twin_visibility`, the `_next_altitude` materialisation; (3) layout and
+> sizing; (4) polish — theming, number formatting, mnemonics, message bar.
+
 - [ ] **AMSL and AGL cannot be shown together.** `_sync_twin_visibility`
   (`gui/altitude_explorer.py:865-885`) explicitly hides whichever surface is not
   selected, and `_driven_layers()` (`:843-854`) returns originals **or** twins.
@@ -672,31 +1006,40 @@ a long download — or gets a misleading error from the engine. Needed:
 
 ## Window sizing
 
-- [ ] **The main dialog opens too small and never remembers a size.**
+- [x] **The main dialog opens too small and never remembers a size.** Done
+  2026-08-03: opens at 980x780 on a first run and restores the user's saved
+  geometry after that, via `QgsSettings` key `waveshed/main_dialog_geometry`,
+  saved in `closeEvent` (which `WA_DeleteOnClose` makes the last chance to read
+  it). The 640x580 minimum stays as a small-screen floor. Original finding:
   `gui/main_dialog.py:39` sets `setMinimumSize(640, 580)` for a QDialog holding
-  five dense tabs (`:120-124`), and **there is no `resize()` call anywhere in
-  the plugin GUI** — so it always opens at its minimum/sizeHint. Add a sensible
-  default and persist geometry to QgsSettings.
+  five dense tabs, and there was no `resize()` call anywhere in the plugin GUI,
+  so it always opened at its minimum.
 
-- [ ] **Per-tab minimums contradict the dialog's.** `gui/p2p_tab.py:254` demands
-  `setMinimumSize(800, 550)` inside a dialog whose own minimum width is 640;
-  `gui/asset_manager_tab.py:663` sets `(550, 550)`,
-  `gui/settings_dialog.py:120` `setMinimumWidth(560)`. The dialog minimum must
-  be at least the largest tab minimum plus chrome.
+- [x] **Per-tab minimums contradict the dialog's.** ~~Finding withdrawn~~ —
+  **not a defect; the premise is wrong.** Checked 2026-08-03: neither cited
+  minimum belongs to a tab. `gui/p2p_tab.py:257` `setMinimumSize(800, 550)` is
+  on `_P2PResultViewer(QDialog)` and `gui/asset_manager_tab.py:663`
+  `(550, 550)` is on `_PatternVisualizerDialog(QDialog)` — both standalone
+  pop-up windows that never sit inside the main dialog, so they are free to be
+  larger than it. The only cited item that *is* a tab is
+  `gui/settings_dialog.py:120` `setMinimumWidth(560)`, and 560 < 640, so it
+  does not contradict the dialog either. Nothing to do.
 
 ## Propagation models
 
-- [ ] **Remove SIMPLE_LOSS as a user-selectable model.**
-  `gui/main_dialog.py:102` (`addItems(["SIMPLE_LOSS", "ITM"])`),
-  `algorithms/coverage.py:67`, `algorithms/p2p.py:47`, plus docstrings at
-  `gui/main_dialog.py:59`, `gui/p2p_tab.py:632`, `gui/site_analysis_tab.py:10`.
-  **Do not miss `gui/p2p_tab.py:1150`** — the fallback default is
-  `"SIMPLE_LOSS"`, so removing the combo without changing it makes P2P silently
-  run the removed model. **Keep** `core/result_loader.py:93, 665, 697` — the
-  loss colour ramp branch is needed to load previously-computed results whose
-  sidecar says `SIMPLE_LOSS`. Note that Processing enum indices are positional,
-  so removing an entry shifts every index after it and silently repoints saved
-  Processing models.
+- [x] **Remove SIMPLE_LOSS as a user-selectable model.** Done 2026-08-03.
+  Removed from the GUI combo (`gui/main_dialog.py`), both Processing enums
+  (`algorithms/coverage.py` → `["LOS", "ITM", "MIN_ALT"]`, `algorithms/p2p.py`
+  → `["LOS", "ITM"]`), every docstring, and the `about=` line in
+  `metadata.txt`, which still advertised "Free-Space Path Loss". The
+  `gui/p2p_tab.py` fallback default was changed to `"ITM"` — left alone it
+  would have made P2P silently run the removed model. `core/result_loader.py`
+  is untouched, so results already computed with SIMPLE_LOSS still load.
+  On the positional-index hazard: the enum shift is real and unavoidable, but
+  the plugin is `version=0.1.0`, `experimental=True` and not yet on
+  plugins.qgis.org, so no third-party saved Processing models exist — this was
+  the last cheap moment to do it. Recorded in the new `changelog=` and version
+  bumped to 0.2.0 so the break is stated rather than silent.
 
 ## Repository hygiene
 
@@ -725,13 +1068,42 @@ These cannot be done from the plugin — `CLAUDE.md`'s "Zero Changes to AETHER
 Binaries" rule means each needs a new engine build shipped through the
 waveshed.io release manifest.
 
-- [ ] **Fuse buildings in the Rust downloader.** `DownloadJob`
-  (`download.rs:43-50`) has no buildings field (zero `buildings|pbf|mvt` hits in
-  the file) and the downloader emits `.abt` only (zero `.tif` hits), while
-  `IngestJob` requires a `base_tif`. That gap is the entire reason the slow
-  QGIS `writeRaster` bridge exists. Add `buildings_pbf_dir` to `DownloadJob` and
-  call `mvt::apply_buildings_to_abt_tiles` on the `MemAbt` buffers after
-  `download.rs:1733`. ~20 lines; the library function already exists.
+- [x] **Fuse buildings in the Rust downloader.** Done engine-side 2026-08-03 in
+  the **aether-tools** working checkout (`crates/aether_converter/src/download.rs`).
+  `DownloadJob` gained an optional `buildings_pbf_dir` (`#[serde(default)]`, so
+  older jobs are unaffected), and a new `apply_buildings_post_pass` fuses the
+  buildings once `run_download_async` has finished writing the tiles.
+
+  Two deviations from the plan above, both deliberate:
+  * **Post-pass over the written files, not the `MemAbt` buffers.** The plan
+    named `download.rs:1733`, which is inside `run_download_mem` — the WASM
+    in-memory path the web app uses. The plugin goes through
+    `run_download_async`, which *streams* each tile to disk row by row, so
+    there is no whole-tile buffer to hand the rasterizer mid-download. The
+    post-pass reads each finished tile back, rasterizes, writes it out.
+  * **Decode once, rasterize per tile.** Rather than calling
+    `mvt::apply_buildings_to_abt_tiles` (which takes every `.abt` at once, so
+    peak memory is the whole run), the pass decodes the PBF set once and then
+    handles one tile at a time. Cost is `O(pbf + abt)` rather than their
+    product, and peak memory is one tile — this is the same trap as
+    `ingest.rs:504`, avoided rather than inherited.
+
+  Mixed-zoom PBF directories are **refused**, not merged: `rasterize_buildings`
+  resolves above-ground heights against the terrain it reads before it writes,
+  so a second pass over a tile would measure new roofs against the first pass's
+  roofs and the buildings would grow. OpenFreeMap is z14-only, so one zoom is
+  the real-world case anyway.
+
+  Contract updated in the same change, per the repo's additive-only policy:
+  `docs/CONTRACT.md` §9b, `schemas/download_job.schema.json`, and
+  `schemas/ingest_job.schema.json` — the last of which was **missing
+  `buildings_pbf_dir` entirely** even though the code and CONTRACT.md §9 both
+  had it. `cargo test --workspace` 81 pass, `validate_fixtures.py` clean.
+
+  **Plugin side landed 2026-08-04**, once the engine was built and distributed
+  — see "Include buildings was unusably slow" under UI/UX. The divert now
+  applies only to FlatGeobuf, and an engine lacking the feature is detected
+  from its own output rather than assumed present.
 
 - [ ] **Or: expose an `apply-buildings` subcommand.** `aether_converter` has
   exactly three (`Convert`, `Ingest`, `Download` — `main.rs:64/68/159`) and none

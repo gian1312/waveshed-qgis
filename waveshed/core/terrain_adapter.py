@@ -913,6 +913,35 @@ def _abt_has_gaps(path: str, block: int = 64) -> bool:
         return False
 
 
+#: Printed by ``aether_converter download`` once per run when it has fused a
+#: ``buildings_pbf_dir``. Its absence is how we detect an engine that predates
+#: the feature — see ``_try_rust_download``.
+_BUILDINGS_APPLIED_MARKER = "[Buildings]"
+
+
+def _buildings_were_applied(lines: List[str]) -> bool:
+    """True if the converter reported fusing buildings during this pass."""
+    return any(_BUILDINGS_APPLIED_MARKER in ln for ln in lines)
+
+
+def _binary_has_buildings_support(exe: str) -> Optional[bool]:
+    """Whether *exe* was compiled with buildings-on-download, by inspection.
+
+    The marker is a literal in the binary, so its presence is decidable without
+    running anything. This exists to tell "the engine is too old" apart from
+    "a different, older engine is first on the search path" — by far the more
+    common cause, and indistinguishable from the log otherwise.
+
+    Returns None if the file cannot be read.
+    """
+    try:
+        with open(exe, "rb") as fh:
+            blob = fh.read()
+    except OSError:
+        return None
+    return _BUILDINGS_APPLIED_MARKER.encode() in blob
+
+
 def _try_rust_download(
     source: str,
     cache_dir: str,
@@ -920,8 +949,21 @@ def _try_rust_download(
     resolution_m: int,
     subtiles: List[Dict[str, Any]],
     binary_manager: Any,
+    pbf_dir: Optional[str] = None,
 ) -> bool:
-    """Download XYZ tiles via Rust and produce .abt files directly."""
+    """Download XYZ tiles via Rust and produce .abt files directly.
+
+    *pbf_dir*, when given, is handed to the converter as ``buildings_pbf_dir``
+    so buildings are fused during the download instead of forcing the whole run
+    onto the QGIS export + ingest path (which is 7-17x slower).
+
+    That field is **additive**, so a converter predating it parses the job
+    happily, ignores the field, and writes perfectly good building-*free*
+    terrain — which would then be cached under a pool identity claiming it has
+    buildings. To stop that, a pass that requested buildings and saw no
+    ``[Buildings]`` line in the output is treated as a failed fast path: the
+    tiles are flagged for rebuild and we fall back to the ingest path.
+    """
     # Each of the three bail-outs below used to return False without a word,
     # and the caller printed one generic "Rust download unavailable" for all of
     # them — so a missing engine looked exactly like an unsupported layer, and
@@ -990,6 +1032,10 @@ def _try_rust_download(
 
     job_file = os.path.join(tempfile.gettempdir(), f"aether_dl_{os.getpid()}.json")
 
+    # Set by _run_pass; read after the passes to detect an engine that silently
+    # ignored buildings_pbf_dir. A list so the closure can write to it.
+    buildings_seen: List[bool] = []
+
     def _run_pass(specs: List[Dict[str, Any]], conn: int, zoom: int):
         """Write + run one download pass for *specs* at *conn* connections.
 
@@ -1003,9 +1049,15 @@ def _try_rust_download(
             "zoom": zoom,
             "max_connections": conn,
         }
+        # Omitted entirely when unset, so an older converter sees exactly the
+        # job shape it sees today.
+        if pbf_dir:
+            job["buildings_pbf_dir"] = os.path.abspath(pbf_dir)
         with open(job_file, "w") as fh:
             json.dump(job, fh)
         rc, lines = _run_converter_download_once(converter_exe, job_file)
+        if pbf_dir and rc == 0:
+            buildings_seen.append(_buildings_were_applied(lines))
         ok, total = _parse_download_completeness(lines)
         return rc, ok, total
 
@@ -1015,12 +1067,54 @@ def _try_rust_download(
          f"{len(by_zoom)} zoom group(s) {sorted(by_zoom)}, "
          f"encoding={encoding}, connections={base_conn}")
 
+    # Capability gate, decided from the binary itself rather than from what it
+    # prints. `buildings_pbf_dir` is an additive field, so an engine predating
+    # it parses the job, ignores the field and writes building-*free* terrain
+    # that would then be pooled under a buildings-keyed identity.
+    #
+    # This was first gated on the engine's `[Buildings]` output line, which
+    # produced a false negative against an engine that demonstrably has the
+    # feature — and a false negative here is expensive, since it sends the run
+    # down the 7-17x slower export+ingest path. The marker is a literal in the
+    # binary, so its presence is decidable by inspection, before anything runs.
+    if pbf_dir:
+        supported = _binary_has_buildings_support(converter_exe)
+        if supported is False:
+            _log("  this aether_converter predates buildings-on-download — "
+                 "using the slower ingest path instead.")
+            _log(f"    engine: {converter_exe}")
+            # Be specific about which copy is stale. The engine lives in
+            # several places and they are updated by different actions: the
+            # pipeline's "Distribute" step publishes to AETHER_Web/bin and
+            # MPT_SIGMA/aether/, and does NOT touch the directory the plugin
+            # reads. A build can therefore be correctly distributed and still
+            # be old here, which is not obvious from either side.
+            _log("    This is the copy the plugin runs, and it is updated "
+                 "separately from a 'Distribute' build. Refresh it with the "
+                 "pipeline's \"Deploy engine to ~/.aether/bin (local test)\" "
+                 "action, or with Settings → Download binaries.")
+            return False
+        if supported is None:
+            _log(f"  could not read {converter_exe} to check for "
+                 "buildings-on-download; assuming it is supported")
+        _log("  buildings fused during download (buildings_pbf_dir)")
+
     ok_all = True
     for zoom in sorted(by_zoom):
         if not _download_zoom_group(
                 cache_dir, by_zoom[zoom], zoom, base_conn, max_passes,
                 _run_pass, _produced):
             ok_all = False
+
+    # The engine's own report is only a warning here, never the gate — see the
+    # note on the capability check above. A supporting engine that printed
+    # nothing still produced buildings; a *non*-supporting one never got this
+    # far, because the gate refused the fast path before any download ran.
+    if pbf_dir and buildings_seen and not any(buildings_seen):
+        _log("  note: no '[Buildings]' line in the converter output, but the "
+             "engine has the feature — buildings were applied. Report this if "
+             "the result is missing buildings.")
+
     return ok_all
 
 
@@ -1183,6 +1277,37 @@ def list_terrain_files(terrain_dir: str) -> List[str]:
     return found
 
 
+def list_abt_tiles(terrain_dir: str) -> List[str]:
+    """Return the ``.abt`` tiles directly inside *terrain_dir*.
+
+    Deliberately **not** recursive: the engine resolves terrain with a plain
+    `read_dir` over the one directory it is given (`engines/coverage.rs`,
+    `engines/p2p.rs`, `engines/cpu_coverage.rs`), so tiles in sub-directories
+    are invisible to it. Reporting them here would promise coverage the run
+    would not have.
+    """
+    try:
+        return sorted(
+            os.path.join(terrain_dir, f)
+            for f in os.listdir(terrain_dir)
+            if f.lower().endswith(".abt")
+            and os.path.isfile(os.path.join(terrain_dir, f))
+        )
+    except OSError:
+        return []
+
+
+def is_abt_tile_dir(terrain_dir: Optional[str]) -> bool:
+    """True if *terrain_dir* holds pre-built ``.abt`` tiles.
+
+    A directory of `.abt` files is a finished engine input, not a source to
+    convert — the two look alike in a folder picker but must not be conflated:
+    handing `.abt` files to the converter as `base_tif` would fail, and running
+    the conversion at all would waste the work the Map Converter already did.
+    """
+    return bool(terrain_dir) and bool(list_abt_tiles(terrain_dir))
+
+
 def _dataset_wgs84_bbox(ds) -> Optional[Dict[str, float]]:
     """Return a GDAL dataset's WGS84 bounds, or None if GDAL can't report them."""
     info = gdal.Info(ds, format="json")
@@ -1228,9 +1353,134 @@ def bbox_covered_fraction(source: Dict[str, float],
     return min(1.0, (dlat * dlon) / want)
 
 
+#: A pre-built tile set this much coarser than the requested resolution is
+#: worth stopping for. Slack enough to ignore the exact-resolution rounding a
+#: tile carries (29.99757 m for a nominal 30 m tile), tight enough that 30 m
+#: tiles cannot pass for a 5 m request.
+_ABT_RES_TOLERANCE = 1.25
+
+
+def _abt_resolution_warning(headers: List[Any],
+                            resolution_m: Optional[float]) -> Optional[str]:
+    """Warn when pre-built tiles are coarser than the analysis asks for.
+
+    The engine picks the best-fit tile per output cell, so a mixed set is fine
+    and a *finer* set is fine — it just downsamples. Coarser is not: the run
+    upsamples the coarse data and reports it at the requested resolution, which
+    looks like detail that was never measured.
+    """
+    if not resolution_m or not headers:
+        return None
+    # Tile resolution in metres, from degrees-per-pixel.
+    res = sorted(h.pixel_res * 111_111.0 for h in headers)
+    finest = res[0]
+    if finest <= resolution_m * _ABT_RES_TOLERANCE:
+        return None
+    spread = (f"{finest:.0f} m" if len(set(round(r) for r in res)) == 1
+              else f"{finest:.0f}–{res[-1]:.0f} m")
+    return (
+        f"The pre-built tiles are {spread}, but the analysis is set to "
+        f"{resolution_m:g} m.\n\nNo finer terrain exists in that folder, so "
+        f"the result would be computed from {finest:.0f} m data and presented "
+        f"at {resolution_m:g} m — detail that was never measured.\n\n"
+        f"Set the resolution to {finest:.0f} m, or build finer tiles."
+    )
+
+
+def _abt_coverage_warning(terrain_dir: str, paths: List[str],
+                          bbox: Dict[str, float],
+                          resolution_m: Optional[float] = None,
+                          osm_buildings: bool = False,
+                          buildings_file: Optional[str] = None,
+                          ) -> Optional[str]:
+    """Check pre-built ``.abt`` tiles suit this analysis, by their own headers.
+
+    Same contract as the raster check: warn on anything that would silently
+    produce fiction. Three failure modes are specific to `.abt` — a tile whose
+    header cannot be read (the engine will skip it), a set that is coarser than
+    the requested resolution, and buildings that cannot be added because they
+    are already burned into the pixels.
+    """
+    from . import abt
+
+    headers = []
+    unreadable = []
+    for p in paths:
+        h = abt.read_header(p)
+        if h is None:
+            unreadable.append(os.path.basename(p))
+        else:
+            headers.append(h)
+
+    if not headers:
+        return (
+            f"None of the {len(paths)} .abt file(s) in:\n{terrain_dir}\n\n"
+            "could be read as terrain tiles. They may be truncated or not "
+            "actually .abt files."
+        )
+
+    south = min(h.ul_lat - h.size * h.pixel_res for h in headers)
+    north = max(h.ul_lat for h in headers)
+    west = min(h.ul_lon for h in headers)
+    east = max(h.ul_lon + h.size * h.pixel_res for h in headers)
+    src = {"north": north, "south": south, "east": east, "west": west}
+
+    extents = (
+        f"Tiles cover ~ N{north:.3f} S{south:.3f} E{east:.3f} W{west:.3f}\n"
+        f"Analysis needs ~ N{bbox['north']:.3f} S{bbox['south']:.3f} "
+        f"E{bbox['east']:.3f} W{bbox['west']:.3f}"
+    )
+    frac = bbox_covered_fraction(src, bbox)
+    if frac <= 0.0:
+        return (
+            f"The {len(headers)} .abt tile(s) in:\n{terrain_dir}\n\ndo not "
+            f"overlap the analysis area at all.\n\n{extents}"
+        )
+    if frac < _COVERAGE_OK_FRACTION:
+        return (
+            f"The .abt tiles in:\n{terrain_dir}\n\ncover only about "
+            f"{frac * 100:.0f}% of the analysis area. The rest has no terrain "
+            f"and will be computed as flat 0 m sea level.\n\n{extents}"
+        )
+
+    res_msg = _abt_resolution_warning(headers, resolution_m)
+    if res_msg:
+        return res_msg
+
+    if osm_buildings or buildings_file:
+        # Buildings are burned into .abt pixels when the tile is built, so a
+        # pre-built set either already has them or cannot get them. Silently
+        # ignoring the checkbox is the failure this exists to prevent.
+        return (
+            "Buildings were requested, but pre-built .abt tiles are used "
+            f"exactly as they are:\n{terrain_dir}\n\nBuilding heights are "
+            "baked into a tile when it is built, so they cannot be added now. "
+            "The result will include buildings only if these tiles were built "
+            "with them.\n\nUse a downloaded/converted terrain source instead "
+            "if you need buildings applied for this run."
+        )
+
+    if unreadable:
+        return (
+            f"{len(unreadable)} file(s) in:\n{terrain_dir}\n\ncould not be "
+            f"read as .abt tiles and will be ignored by the engine "
+            f"(first: {unreadable[0]}). Coverage there will be missing."
+        )
+    return None
+
+
 def terrain_coverage_warning(terrain_dir: str,
-                             bbox: Dict[str, float]) -> Optional[str]:
-    """Warn when *terrain_dir* cannot cover *bbox*.
+                             bbox: Dict[str, float],
+                             resolution_m: Optional[float] = None,
+                             osm_buildings: bool = False,
+                             buildings_file: Optional[str] = None,
+                             ) -> Optional[str]:
+    """Warn when *terrain_dir* cannot serve this analysis.
+
+    *resolution_m* and the buildings flags are only consulted for pre-built
+    `.abt` directories, where the tiles are finished output and neither can be
+    changed by the run — a raster source is converted at whatever resolution is
+    asked for, and can have buildings burned in on the way.
 
     Fires for the unambiguous mistakes — an empty or unreadable directory, or
     one whose data lies somewhere else entirely — and also when the terrain
@@ -1246,12 +1496,25 @@ def terrain_coverage_warning(terrain_dir: str,
                 f"The terrain directory does not exist:\n{terrain_dir}\n\n"
                 "Check the path in Settings."
             )
+
+        # Pre-built .abt tiles are checked by their own headers, not by GDAL —
+        # GDAL cannot open a .abt at all, so the mosaic path below would report
+        # a directory of perfectly good tiles as unreadable terrain.
+        abts = list_abt_tiles(terrain_dir)
+        if abts:
+            return _abt_coverage_warning(terrain_dir, abts, bbox,
+                                         resolution_m, osm_buildings,
+                                         buildings_file)
+
         tifs = list_terrain_files(terrain_dir)
         if not tifs:
+            # Mention .abt too: a user who points this at Map Converter output
+            # nested one level down gets told what is actually wrong.
             return (
                 f"No terrain files were found in:\n{terrain_dir}\n\n"
-                "Expected GeoTIFF (.tif/.tiff), .dem or .hgt files, searched "
-                "recursively."
+                "Expected GeoTIFF (.tif/.tiff), .dem or .hgt files (searched "
+                "recursively), or pre-built .abt tiles directly in this "
+                "folder (not in sub-folders — the engine does not recurse)."
             )
 
         vrt = gdal.BuildVRT("", tifs)
@@ -1392,7 +1655,7 @@ def _extract_from_local_dir(terrain_dir: str, dest: str, bbox: Dict[str, float],
 
 
 def _extract_reproject(dem_layer: Any, dest: str, bbox: Dict[str, float],
-                       resolution_m: int, binary_manager: Any = None) -> None:
+                       resolution_m: int) -> None:
     source = dem_layer.source()
     if os.path.isfile(source) or source.startswith("/vsi"):
         t = time.perf_counter()
@@ -1459,6 +1722,29 @@ def prepare_terrain(
          + (f", buildings={os.path.basename(buildings_file)}"
             if buildings_file else "")
          + (", buildings=openfreemap" if osm_buildings else ""))
+
+    # A directory of .abt tiles is already an engine input — hand it over
+    # untouched. Everything below this point exists to *produce* .abt tiles, so
+    # running any of it would rebuild what the Map Converter already built (and
+    # the converter would reject a .abt as its `base_tif` anyway).
+    if is_abt_tile_dir(terrain_dir):
+        tiles = list_abt_tiles(terrain_dir)
+        _log(f"  using {len(tiles)} pre-built .abt tile(s) from {terrain_dir} "
+             f"— no download or conversion")
+        # Re-run the same checks the GUI shows as a dialog. A Processing run
+        # never sees that dialog, and this path skips every other safeguard in
+        # this function, so anything wrong with the tiles has to be said here
+        # or the run produces a confident, wrong answer with no trace.
+        problem = _abt_coverage_warning(
+            terrain_dir, tiles,
+            _compute_sector_bbox(tx_lat, tx_lon, max_range_km, az_start, az_end),
+            resolution_m, osm_buildings, buildings_file,
+        )
+        if problem:
+            for line in problem.splitlines():
+                if line.strip():
+                    _log(f"  WARNING: {line.strip()}")
+        return terrain_dir
 
     bbox = _compute_sector_bbox(tx_lat, tx_lon, max_range_km, az_start, az_end)
     subtiles = _compute_subtiles(bbox, resolution_m, tx_lat, tx_lon,
@@ -1553,20 +1839,26 @@ def prepare_terrain(
             buildings_missing = True
 
     # Path 1: Rust downloader (XYZ → .abt directly, no intermediate file).
-    # Skipped when buildings are requested: the downloader writes .abt straight
-    # from the tile stream and has no way to fuse a building overlay, so taking
-    # it here would silently produce terrain with no buildings in it. Path 2/3
-    # is slower but runs the converter's ingest, which does honour them.
-    if (buildings_file or pbf_dir) and not terrain_dir and "type=xyz" in dem_layer.source():
-        _log("  buildings requested — using the converter ingest path "
-             "(the direct XYZ downloader cannot fuse buildings)")
+    #
+    # OpenFreeMap buildings ride along on this path now — the downloader takes a
+    # `buildings_pbf_dir` and fuses them onto the finished tiles. This used to
+    # divert every buildings run onto the QGIS export + ingest path, which
+    # measured 7-17x slower (a 50 km run spent ~1560 s of 1687 s inside
+    # `writeRaster`) and was the single reason buildings were unusable.
+    #
+    # A FlatGeobuf `buildings_file` still has to divert: it is an IngestJob
+    # field only, and the downloader has no equivalent.
+    if buildings_file and not terrain_dir and "type=xyz" in dem_layer.source():
+        _log("  building file requested — using the converter ingest path "
+             "(the downloader fuses OpenFreeMap tiles only, not FlatGeobuf)")
     elif not terrain_dir and "type=xyz" in dem_layer.source():
         if _try_rust_download(dem_layer.source(), pool_dir, bbox,
-                              resolution_m, todo, binary_manager):
-            # A failed buildings download leaves pbf_dir None, which is what
-            # routed us here rather than to the ingest path — so this branch
-            # has to honour the same rule: the pool identity claims buildings
-            # these tiles do not have, so they must not be reused.
+                              resolution_m, todo, binary_manager,
+                              pbf_dir=pbf_dir):
+            # Reached either with buildings fused in (pbf_dir set) or with no
+            # buildings at all. In the second case the pool identity may still
+            # claim buildings — a failed OpenFreeMap download clears pbf_dir
+            # but not the identity — so those tiles must not be reused.
             if buildings_missing:
                 _set_rebuild_flags(pool_dir, [t["filename"] for t in todo],
                                    {t["filename"] for t in todo})
@@ -1596,15 +1888,25 @@ def prepare_terrain(
                 "west": t["ul_lon"] - margin,
                 "east": t["ul_lon"] + t["size_px"] * res_deg + margin,
             }
+            # Disambiguate by pool identity AND process. Tile names are
+            # globally canonical (position + resolution only), so the same
+            # name means different pixels for a different source or building
+            # set — and two runs of the *same* source (Site Analysis and Map
+            # Converter together, or two windows) would otherwise read and
+            # write one shared scratch file, with the `finally` below deleting
+            # it out from under whichever is still using it.
+            # NB: the pid makes this per-run, which is correct only while this
+            # stays scratch. Caching the extract between runs (an open TODO)
+            # means dropping the pid *and* the `finally`, not just the latter.
             tile_tif = os.path.join(
-                tempfile.gettempdir(), f"aether_{t['filename']}.tif"
+                tempfile.gettempdir(),
+                f"aether_{os.path.basename(pool_dir)}_{os.getpid()}_{t['filename']}.tif",
             )
             t1 = time.perf_counter()
             if terrain_dir and os.path.isdir(terrain_dir):
                 _extract_from_local_dir(terrain_dir, tile_tif, sub_bbox, resolution_m)
             else:
-                _extract_reproject(dem_layer, tile_tif, sub_bbox, resolution_m,
-                                   binary_manager)
+                _extract_reproject(dem_layer, tile_tif, sub_bbox, resolution_m)
             temp_tifs.append(tile_tif)
             _log(f"  extract {t['filename']}: {time.perf_counter() - t1:.1f}s, "
                  f"{os.path.getsize(tile_tif) / 1e6:.0f}MB")

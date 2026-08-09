@@ -16,6 +16,7 @@ import unittest
 from waveshed.core.job_builder import (
     CAUTION,
     INVALID,
+    MIN_RX_AGL_M,
     CoverageParams,
     P2PParams,
     format_model_warnings,
@@ -32,9 +33,12 @@ def _severities(param, warnings):
 
 
 class TestAntennaHeights(unittest.TestCase):
-    def test_ground_level_receiver_is_invalid(self):
+    def test_ground_level_receiver_is_reported_but_corrected(self):
+        # The engine floors the receiver at MIN_RX_AGL_M, so this is a notice
+        # that the requested height will not be honoured, not a hard error.
         w = model_warnings(CoverageParams(model="ITM", rx_height=0.0))
-        self.assertIn(INVALID, _severities("RX height", w))
+        self.assertEqual({CAUTION}, _severities("RX height", w))
+        self.assertIn(f"{MIN_RX_AGL_M:.1f} m", _for("RX height", w)[0].message)
 
     def test_below_itm_validated_minimum_is_caution(self):
         w = model_warnings(CoverageParams(model="ITM", rx_height=0.75))
@@ -44,7 +48,9 @@ class TestAntennaHeights(unittest.TestCase):
         w = model_warnings(CoverageParams(model="ITM", rx_height=2.0))
         self.assertEqual([], _for("RX height", w))
 
-    def test_transmitter_is_checked_too(self):
+    def test_ground_level_transmitter_stays_invalid(self):
+        # Only the receiver is floored; a sub-minimum TX is uncorrected, so it
+        # remains a hard error rather than a notice.
         w = model_warnings(CoverageParams(model="ITM", tx_height=0.2))
         self.assertIn(INVALID, _severities("TX height", w))
 
@@ -155,13 +161,13 @@ class TestNonItmModels(unittest.TestCase):
 class TestP2PParams(unittest.TestCase):
     def test_same_checks_apply(self):
         w = model_warnings(P2PParams(model="ITM", tx_height=0.1, rx_height=0.1))
-        self.assertIn(INVALID, _severities("TX height", w))
-        self.assertIn(INVALID, _severities("RX height", w))
+        self.assertIn(INVALID, _severities("TX height", w))   # uncorrected
+        self.assertEqual({CAUTION}, _severities("RX height", w))  # floored
 
 
 class TestFormatting(unittest.TestCase):
     def test_invalid_sorts_before_caution(self):
-        w = model_warnings(CoverageParams(model="ITM", rx_height=0.0, max_range_km=30))
+        w = model_warnings(CoverageParams(model="ITM", tx_height=0.0, max_range_km=30))
         text = format_model_warnings(w)
         self.assertLess(text.index(INVALID), text.index(CAUTION))
 
@@ -170,6 +176,12 @@ class TestFormatting(unittest.TestCase):
         # dialog must not repeat them once per job.
         w = model_warnings(CoverageParams(model="ITM", rx_height=0.0)) * 3
         self.assertEqual(1, format_model_warnings(w).count("hard minimum"))
+
+    def test_floored_receiver_does_not_trigger_the_blocking_dialog(self):
+        # A corrected height must not raise a modal "results are probably
+        # invalid" prompt — the tabs gate that on INVALID.
+        w = model_warnings(CoverageParams(model="ITM", rx_height=0.0))
+        self.assertFalse([x for x in w if x.severity == INVALID])
 
     def test_empty_input_renders_empty(self):
         self.assertEqual("", format_model_warnings([]))

@@ -5,8 +5,10 @@ Produces ``dist/waveshed.<version>.zip`` (version read from
 ``waveshed/metadata.txt``) containing the ``waveshed/`` package as the ZIP
 root directory — the layout the QGIS Plugin Manager expects.
 
-Hygiene excludes (silently skipped): ``__pycache__`` / ``.pytest_cache`` /
-``bin`` directories and ``*.pyc`` / ``*.pyo`` files.
+Hygiene excludes (silently skipped): the directories in ``SKIP_DIRS``
+(``__pycache__``, ``.pytest_cache``, ``bin``, ``.venv``, ``tmp``, ``tests``,
+``dist``, …), the extensions in ``SKIP_EXTS`` (``*.pyc`` / ``*.pyo``) and the
+name patterns in ``SKIP_GLOBS`` (generated ``*_rc.py``, ``deploy.local.ini``).
 
 The build HARD-FAILS (raising :class:`BuildError`, non-zero exit) if:
   * a native/binary artifact (.exe/.dll/.so/.dylib/.pyd/.whl) would be zipped,
@@ -34,10 +36,26 @@ from typing import Iterator, List, Tuple
 PACKAGE_NAME = "waveshed"
 
 #: Directory names pruned from the walk (never included).
-SKIP_DIRS = {"__pycache__", ".pytest_cache", "bin", ".git", ".idea"}
+#:
+#: The walk starts at ``waveshed/``, so the repo-root siblings (``.venv``,
+#: ``tmp``, ``tests``, ``dist``) are already out of reach — they are listed
+#: anyway so the exclusion is a stated rule rather than an accident of where
+#: the walk happens to begin.
+SKIP_DIRS = {
+    "__pycache__", ".pytest_cache", "bin", ".git", ".idea",
+    ".venv", "venv", "tmp", "tests", "dist",
+}
 
 #: File extensions silently skipped.
 SKIP_EXTS = {".pyc", ".pyo"}
+
+#: Filename patterns silently skipped, matched against the basename.
+#:
+#: ``*_rc.py`` are Qt resource modules compiled from ``.qrc``. Unlike the
+#: entries above these really can appear *inside* ``waveshed/`` — nothing in
+#: the plugin imports one today, and shipping a stale generated module is how
+#: a package starts disagreeing with its own sources.
+SKIP_GLOBS = ("*_rc.py", "deploy.local.ini")
 
 #: Native artifacts that must never ship — hard FAIL if present.
 BINARY_EXTS = {".exe", ".dll", ".so", ".dylib", ".pyd", ".whl"}
@@ -63,10 +81,13 @@ def _parts(rel_path: str) -> List[str]:
 
 
 def is_skipped_file(rel_path: str) -> bool:
-    """True if the file lives under a skipped dir or has a skipped extension."""
+    """True if the file is excluded by directory, extension or name pattern."""
     if any(part in SKIP_DIRS for part in _parts(rel_path)):
         return True
-    return os.path.splitext(rel_path)[1].lower() in SKIP_EXTS
+    if os.path.splitext(rel_path)[1].lower() in SKIP_EXTS:
+        return True
+    base = os.path.basename(rel_path)
+    return any(fnmatch.fnmatch(base, glob) for glob in SKIP_GLOBS)
 
 
 def is_binary_artifact(rel_path: str) -> bool:

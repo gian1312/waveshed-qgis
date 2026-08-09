@@ -7,7 +7,7 @@ modes, with per-site parameters and multiple receiver altitudes.
 The parent dialog must provide:
 - ``self.iface``           QgisInterface
 - ``self.get_mode()``      returns "LOS" or "LOSS"
-- ``self.get_loss_model()`` returns "SIMPLE_LOSS" or "ITM"
+- ``self.get_loss_model()`` returns "ITM"
 """
 
 from __future__ import annotations
@@ -130,6 +130,22 @@ _COL_AZ_ROTATION = 4
 _COL_AZ_START = 5
 _COL_AZ_END = 6
 _COL_RANGE = 7
+
+# Widths for the widget-bearing columns. Wide enough for the widget plus its
+# header text — "AZ Rotation (deg)" is the long one, and a column narrower than
+# its own header reads as broken even when the widget inside still works.
+_COL_WIDTHS = {
+    _COL_ASSET: 150,
+    _COL_HEIGHT: 90,
+    _COL_HEIGHT_MODE: 100,
+    _COL_AZ_ROTATION: 130,
+    _COL_AZ_START: 110,
+    _COL_AZ_END: 110,
+    _COL_RANGE: 95,
+}
+
+#: No column may shrink below this, however narrow the dialog gets.
+_COL_MIN_WIDTH = 70
 
 # Altitude table columns.
 _ALT_COLUMNS = ["Altitude (m)", "Reference"]
@@ -501,13 +517,18 @@ class SiteAnalysisTab(QWidget):
         """Configure sites table columns (same for all modes)."""
         self.sites_table.setColumnCount(len(_SITE_COLUMNS))
         self.sites_table.setHorizontalHeaderLabels(_SITE_COLUMNS)
-        # Location column gets extra space; others resize to content.
-        self.sites_table.horizontalHeader().setSectionResizeMode(
-            QHeaderView.ResizeToContents,
-        )
-        self.sites_table.horizontalHeader().setSectionResizeMode(
-            _COL_LOCATION, QHeaderView.Stretch,
-        )
+        header = self.sites_table.horizontalHeader()
+
+        # Every data column holds a *cell widget* (combo/spin), not item data.
+        # `ResizeToContents` measures item data, which those columns do not
+        # have, so it collapses them to near-nothing — which is why Asset and
+        # AZ Rotation were unusable the moment Propagation Loss unhid them.
+        # Size them explicitly and let Location absorb the slack instead.
+        header.setSectionResizeMode(QHeaderView.Interactive)
+        header.setMinimumSectionSize(_COL_MIN_WIDTH)
+        for col, width in _COL_WIDTHS.items():
+            self.sites_table.setColumnWidth(col, width)
+        header.setSectionResizeMode(_COL_LOCATION, QHeaderView.Stretch)
 
     # -- Altitudes section -------------------------------------------------
 
@@ -1065,6 +1086,9 @@ class SiteAnalysisTab(QWidget):
             self._site_coords[row] = (lat, lon)
             self._update_location_spinboxes(row, lat, lon)
             self._update_rubber_band()
+            notify = getattr(self._dialog, "sites_picked_in", None)
+            if callable(notify):
+                notify(self)
 
         # Keep a reference to prevent garbage collection.
         tool = activate_point_capture(self.iface, _callback)
@@ -1074,6 +1098,18 @@ class SiteAnalysisTab(QWidget):
         parent_window = self._dialog
         if hasattr(parent_window, "showMinimized"):
             parent_window.showMinimized()
+
+    def clear_sites(self) -> None:
+        """Zero every site location.
+
+        Counterpart to ``P2PTab.clear_sites`` — see the note there. The rows
+        themselves stay, so the user keeps their heights, ranges and asset
+        choices and only re-places the points.
+        """
+        for row in range(self.sites_table.rowCount()):
+            self._site_coords[row] = (0.0, 0.0)
+            self._update_location_spinboxes(row, 0.0, 0.0)
+        self._update_rubber_band()
 
     def _update_location_spinboxes(
         self, row: int, lat: float, lon: float,
@@ -1499,7 +1535,14 @@ class SiteAnalysisTab(QWidget):
         # area is a mistake worth stopping for: it is the only source once
         # selected, so whatever it misses is computed over 0 m sea level.
         if terrain_dir and union is not None:
-            cov = terrain_coverage_warning(terrain_dir, union)
+            # Resolution and buildings matter for a pre-built .abt folder:
+            # neither can be changed by the run, so a mismatch has to be
+            # raised here or it becomes a silently wrong result.
+            cov = terrain_coverage_warning(
+                terrain_dir, union,
+                resolution_m=jobs[0][0].resolution_m if jobs else None,
+                osm_buildings=self.chk_buildings.isChecked(),
+            )
             if cov and QMessageBox.warning(
                 self, "Incomplete terrain coverage", cov + "\n\nRun anyway?",
                 QMessageBox.Yes | QMessageBox.No, QMessageBox.No,

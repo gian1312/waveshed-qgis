@@ -230,6 +230,7 @@ _qtcore.QThread = _MockQThread
 _qtcore.pyqtSignal = _MockSignalDescriptor
 _qtcore.QTimer = mock.MagicMock()
 _qtcore.QUrl = type("QUrl", (), {"__init__": lambda self, *a, **kw: None})
+_qtcore.QByteArray = type("QByteArray", (), {"__init__": lambda self, *a, **kw: None})
 
 # Qt Widgets — create lightweight stubs for all used widgets
 _widget_names = [
@@ -240,6 +241,8 @@ _widget_names = [
     "QRadioButton", "QSizePolicy", "QSpinBox", "QSplitter",
     "QTableWidget", "QTableWidgetItem", "QTabWidget", "QToolButton",
     "QVBoxLayout", "QWidget", "QInputDialog", "QDialogButtonBox",
+    "QTextEdit", "QProgressDialog", "QApplication", "QListWidget",
+    "QListWidgetItem", "QScrollArea", "QStackedWidget", "QSlider",
 ]
 for name in _widget_names:
     if name in ("QWidget",):

@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from typing import Optional
 
-from qgis.PyQt.QtCore import Qt
+from qgis.PyQt.QtCore import QByteArray, Qt
 from qgis.PyQt.QtWidgets import (
     QButtonGroup,
     QComboBox,
@@ -20,12 +20,29 @@ from qgis.PyQt.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+from qgis.core import QgsSettings
 
 from .site_analysis_tab import SiteAnalysisTab
 from .p2p_tab import P2PTab
 from .asset_manager_tab import AssetManagerTab
 from .map_converter_tab import MapConverterTab
 from .settings_dialog import SettingsDialog
+
+
+#: QgsSettings key holding the saved window geometry.
+_GEOMETRY_KEY = "waveshed/main_dialog_geometry"
+
+#: Opening size on a first run. The minimum is a floor for small screens, not
+#: a sensible working size — five dense tabs at 640x580 make every one of them
+#: scroll — and Qt opens a dialog at its minimum when nothing else is set.
+_DEFAULT_SIZE = (980, 780)
+
+_MIN_ALT_TOOLTIP = (
+    "Minimum-LOS-altitude map: for every location, the lowest altitude "
+    "(AGL) at which it first gains line-of-sight to the transmitter.\n"
+    "One run answers coverage at *any* altitude — explore it live with "
+    "the Altitude Explorer."
+)
 
 
 class AetherMainDialog(QDialog):
@@ -36,7 +53,11 @@ class AetherMainDialog(QDialog):
         self.iface = iface
 
         self.setWindowTitle("Waveshed")
-        self.setMinimumSize(640, 580)
+        # Wide enough for the sites table in Propagation Loss mode, which shows
+        # two more columns than LOS (Asset, AZ Rotation) and totals ~785 px of
+        # fixed columns before Location gets any. At the old 640 the table was
+        # narrower than its own contents in the mode that needs it most.
+        self.setMinimumSize(900, 600)
 
         # Non-modal: clean up on close and float as a proper window
         self.setAttribute(Qt.WA_DeleteOnClose)
@@ -44,6 +65,26 @@ class AetherMainDialog(QDialog):
 
         self._build_ui()
         self._connect_signals()
+        self._restore_geometry()
+
+    # ------------------------------------------------------------------
+    # Window geometry
+    # ------------------------------------------------------------------
+
+    def _restore_geometry(self) -> None:
+        """Reopen at the size and place the user last left the window."""
+        # QgsSettings hands back whatever type it stored, and only a QByteArray
+        # restores; ask for one explicitly rather than trusting the round-trip.
+        try:
+            saved = QgsSettings().value(_GEOMETRY_KEY, None, type=QByteArray)
+        except (TypeError, ValueError):
+            saved = None
+        if saved and self.restoreGeometry(saved):
+            return
+        self.resize(*_DEFAULT_SIZE)
+
+    def _save_geometry(self) -> None:
+        QgsSettings().setValue(_GEOMETRY_KEY, self.saveGeometry())
 
     # ------------------------------------------------------------------
     # Public interface used by child tabs
@@ -56,7 +97,7 @@ class AetherMainDialog(QDialog):
         return "LOS" if self.radio_los.isChecked() else "LOSS"
 
     def get_loss_model(self) -> str:
-        """Return the loss sub-model ('SIMPLE_LOSS' or 'ITM').
+        """Return the loss sub-model ('ITM').
 
         Only meaningful when get_mode() == 'LOSS'.
         """
@@ -76,12 +117,7 @@ class AetherMainDialog(QDialog):
         self.radio_los = QRadioButton("Line of Sight (LOS)")
         self.radio_loss = QRadioButton("Propagation Loss")
         self.radio_min_alt = QRadioButton("Minimum LOS Altitude")
-        self.radio_min_alt.setToolTip(
-            "Minimum-LOS-altitude map: for every location, the lowest altitude "
-            "(AGL) at which it first gains line-of-sight to the transmitter.\n"
-            "One run answers coverage at *any* altitude — explore it live with "
-            "the Altitude Explorer."
-        )
+        self.radio_min_alt.setToolTip(_MIN_ALT_TOOLTIP)
         self.radio_los.setChecked(True)
 
         self._mode_group = QButtonGroup(self)
@@ -99,7 +135,11 @@ class AetherMainDialog(QDialog):
         mode_row.addWidget(self.lbl_loss_model)
 
         self.combo_loss_model = QComboBox()
-        self.combo_loss_model.addItems(["SIMPLE_LOSS", "ITM"])
+        # ITM only. SIMPLE_LOSS (free-space path loss) was withdrawn as a user
+        # choice: it ignores terrain entirely, so on a terrain-analysis tool it
+        # reads as a modelling option when it is really a lower bound. Results
+        # computed with it still load — see core/result_loader.
+        self.combo_loss_model.addItems(["ITM"])
         mode_row.addWidget(self.combo_loss_model)
 
         self.lbl_loss_model.setVisible(False)
@@ -155,6 +195,41 @@ class AetherMainDialog(QDialog):
     def _connect_signals(self) -> None:
         self._mode_group.buttonClicked.connect(self._on_mode_changed)
         self.combo_loss_model.currentIndexChanged.connect(self._on_loss_model_changed)
+        self.tabs.currentChanged.connect(self._on_tab_changed)
+        # Apply the rule to whichever tab opens first, rather than waiting for
+        # the user to switch tabs once.
+        self._on_tab_changed(self.tabs.currentIndex())
+
+    def sites_picked_in(self, tab) -> None:
+        """One tab placed a site — clear the other tab's sites.
+
+        The 360 and P2P tabs are two analyses of the same map, and each keeps
+        its own coordinates. Leaving both populated means a run can quietly use
+        points the user last placed in the tab they are not looking at.
+        """
+        other = self.p2p_tab if tab is self.site_tab else self.site_tab
+        clear = getattr(other, "clear_sites", None)
+        if callable(clear):
+            clear()
+
+    def _on_tab_changed(self, index: int) -> None:
+        """Keep the mode selector consistent with the active tab.
+
+        MIN_ALT is a coverage-only output — there is no per-link minimum
+        altitude — so the radio is disabled while the P2P tab is in front. It
+        was previously possible to select MIN_ALT and then have the P2P tab
+        disabled underneath, which reads as the tab being broken.
+        """
+        on_p2p = index == self.tabs.indexOf(self.p2p_tab)
+        self.radio_min_alt.setEnabled(not on_p2p)
+        self.radio_min_alt.setToolTip(
+            "Not available for point-to-point links — a single link has no "
+            "minimum-altitude surface. Switch to the 360° tab to use it."
+            if on_p2p else _MIN_ALT_TOOLTIP
+        )
+        if on_p2p and self.radio_min_alt.isChecked():
+            self.radio_los.setChecked(True)
+            self._on_mode_changed()
 
     def _on_mode_changed(self) -> None:
         is_loss = self.radio_loss.isChecked()
@@ -188,6 +263,11 @@ class AetherMainDialog(QDialog):
     # ------------------------------------------------------------------
 
     def closeEvent(self, event) -> None:
+        # WA_DeleteOnClose means there is no later chance to read the size, and
+        # Esc closes through reject() without ever reaching here — so both
+        # exits have to save. Geometry first: a throw in the teardown below
+        # must not be what loses it.
+        self._save_geometry()
         # Save settings when closing
         self._settings_widget.save_settings()
         # Cancel any running workers
@@ -197,6 +277,7 @@ class AetherMainDialog(QDialog):
         super().closeEvent(event)
 
     def reject(self) -> None:
+        self._save_geometry()
         self._settings_widget.save_settings()
         self.site_tab.cancel_worker()
         self.p2p_tab.cancel_worker()

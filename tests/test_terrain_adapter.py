@@ -8,6 +8,7 @@ provided by conftest.py.
 import conftest  # noqa: F401 — installs QGIS/PyQt stubs into sys.modules
 
 import hashlib
+import json
 import math
 import os
 import struct
@@ -309,15 +310,19 @@ class TestCacheKey(unittest.TestCase):
         int(k, 16)
 
 
-def _write_pool_abt(path, size=64):
+def _write_pool_abt(path, size=64, res_m=None, ul_lat=47.0, ul_lon=8.0):
     """A minimal complete .abt: 44-byte header plus size*stride body bytes.
 
     Deliberately numpy-free (unlike _write_abt below) so the pool tests run
     everywhere — they care about presence and length, not pixels.
+
+    *res_m* sets the tile's ground resolution (degrees-per-pixel is derived
+    from it); the default keeps the historical 1/size degrees per pixel.
     """
     stride = _abt_row_stride(size)
+    px_deg = (res_m / 111_111.0) if res_m else (1.0 / size)
     hdr = (b"AETH" + struct.pack("<HH", 1, size)
-           + struct.pack("<dddd", 47.0, 8.0, 1.0 / size, 1.0 / size)
+           + struct.pack("<dddd", ul_lat, ul_lon, px_deg, px_deg)
            + struct.pack("<hH", 0, stride))
     with open(path, "wb") as fh:
         fh.write(hdr)
@@ -575,7 +580,7 @@ class TestPoolReuse(unittest.TestCase):
     """The pool exists so a second, smaller run fetches nothing."""
 
     def _run(self, layer, fetched, root, range_km):
-        def fake_download(source, pool, bbox, res, subtiles, bm):
+        def fake_download(source, pool, bbox, res, subtiles, bm, pbf_dir=None):
             fetched.append([t["filename"] for t in subtiles])
             for t in subtiles:
                 _write_pool_abt(os.path.join(pool, t["filename"]))
@@ -676,7 +681,7 @@ class TestBuildingsCacheIdentity(unittest.TestCase):
         layer.source.return_value = _XYZ_SOURCE
         fetched = []
 
-        def fake_download(source, pool, bbox, res, subtiles, bm):
+        def fake_download(source, pool, bbox, res, subtiles, bm, pbf_dir=None):
             fetched.append(len(subtiles))
             for t in subtiles:
                 _write_pool_abt(os.path.join(pool, t["filename"]))
@@ -875,17 +880,33 @@ class TestDownloadGapDetection(unittest.TestCase):
 
 
 @unittest.skipUnless(_HAVE_NUMPY, "numpy not available")
-class TestIncompleteMarker(unittest.TestCase):
-    """An incomplete download must not be reused as a valid cache."""
+class TestRebuildFlag(unittest.TestCase):
+    """A tile flagged for rebuild must not be reused, until the flag clears.
 
-    def test_marker_blocks_cache_hit_until_cleared(self):
+    Supersedes the directory-wide `.incomplete` marker: readiness is a per-tile
+    question, so one bad tile no longer condemns the whole pool.
+    """
+
+    def test_flag_blocks_reuse_until_cleared(self):
         with tempfile.TemporaryDirectory() as d:
             _write_abt(os.path.join(d, "t.abt"))
-            self.assertTrue(ta._cache_hit(d))
-            ta._mark_incomplete(d)
-            self.assertFalse(ta._cache_hit(d))
-            ta._clear_incomplete(d)
-            self.assertTrue(ta._cache_hit(d))
+            self.assertTrue(ta._tile_ready(d, "t.abt"))
+            ta._set_rebuild_flags(d, ["t.abt"], {"t.abt"})
+            self.assertFalse(ta._tile_ready(d, "t.abt"))
+            ta._set_rebuild_flags(d, ["t.abt"])
+            self.assertTrue(ta._tile_ready(d, "t.abt"))
+
+    def test_flag_is_per_tile(self):
+        with tempfile.TemporaryDirectory() as d:
+            _write_abt(os.path.join(d, "good.abt"))
+            _write_abt(os.path.join(d, "bad.abt"))
+            ta._set_rebuild_flags(d, ["good.abt", "bad.abt"], {"bad.abt"})
+            self.assertTrue(ta._tile_ready(d, "good.abt"))
+            self.assertFalse(ta._tile_ready(d, "bad.abt"))
+
+    def test_missing_tile_is_not_ready(self):
+        with tempfile.TemporaryDirectory() as d:
+            self.assertFalse(ta._tile_ready(d, "absent.abt"))
 
 
 class TestCacheKeyBuildings(unittest.TestCase):
@@ -1111,3 +1132,310 @@ class TestEstimateTerrainDiskMb(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestBuildingsOnTheFastPath(unittest.TestCase):
+    """OpenFreeMap buildings are fused during download, not via QGIS export.
+
+    Diverting a buildings run onto the export + ingest path measured 7-17x
+    slower (a 50 km run spent ~1560 s of 1687 s inside ``writeRaster``), which
+    is what made buildings unusable in practice.
+    """
+
+    BBOX = {"north": 47.5, "south": 47.0, "east": 8.5, "west": 8.0}
+    TILE = "tile_N48.00E8.00_30m.abt"
+
+    def _run(self, pool_dir, pbf_dir, out_lines, supported=True):
+        """Run one download and return the job dict the converter was given.
+
+        *supported* stands in for inspecting the engine binary.
+        """
+        subtiles = [{"filename": self.TILE, "ul_lat": 48.0, "ul_lon": 8.0,
+                     "size_px": 3704, "exact_res_m": 30.0}]
+        bm = mock.Mock()
+        bm.find_binary.return_value = "aether_converter"
+        _write_pool_abt(os.path.join(pool_dir, self.TILE))
+        seen = {}
+
+        def fake_run(exe, job_file):
+            with open(job_file) as fh:
+                seen.update(json.load(fh))
+            return 0, out_lines
+
+        with mock.patch.object(ta, "_run_converter_download_once",
+                               side_effect=fake_run), \
+             mock.patch.object(ta, "_binary_has_buildings_support",
+                               return_value=supported), \
+             mock.patch.object(ta, "_abt_has_gaps", return_value=False):
+            ok = ta._try_rust_download(_XYZ_SOURCE, pool_dir, self.BBOX, 30,
+                                       subtiles, bm, pbf_dir=pbf_dir)
+        return ok, seen
+
+    def test_pbf_dir_is_passed_to_the_downloader(self):
+        with tempfile.TemporaryDirectory() as d:
+            ok, job = self._run(
+                d, os.path.join(d, "_buildings"),
+                ["[Stats] Tiles: 100/100 OK", "[Buildings] 12 pbf tile(s)"],
+            )
+        self.assertTrue(ok)
+        self.assertTrue(job["buildings_pbf_dir"].endswith("_buildings"))
+
+    def test_field_is_absent_when_no_buildings_are_requested(self):
+        # An older converter must see exactly the job shape it sees today.
+        with tempfile.TemporaryDirectory() as d:
+            ok, job = self._run(d, None, ["[Stats] Tiles: 100/100 OK"])
+        self.assertTrue(ok)
+        self.assertNotIn("buildings_pbf_dir", job)
+
+    def test_engine_without_buildings_support_is_refused(self):
+        """The field is additive: an old engine ignores it and writes plain
+        terrain, which would then be pooled under a buildings-keyed identity
+        and reused forever. Gate on the binary, before anything downloads."""
+        with tempfile.TemporaryDirectory() as d:
+            ok, job = self._run(d, os.path.join(d, "_buildings"),
+                                ["[Stats] Tiles: 100/100 OK"], supported=False)
+            self.assertFalse(ok, "old engine was allowed onto the fast path")
+            self.assertEqual(job, {}, "download ran despite the refusal")
+
+    def test_unreadable_engine_is_assumed_to_support_it(self):
+        """A false negative costs the 7-17x slow path, so do not guess "no"."""
+        with tempfile.TemporaryDirectory() as d:
+            ok, job = self._run(d, os.path.join(d, "_buildings"),
+                                ["[Stats] Tiles: 100/100 OK"], supported=None)
+            self.assertTrue(ok)
+            self.assertIn("buildings_pbf_dir", job)
+
+    def test_missing_marker_line_does_not_refuse_a_supporting_engine(self):
+        """Regression: the old output-scraping gate produced a false negative
+        against an engine that provably has the feature, sending a real run
+        down the slow path."""
+        with tempfile.TemporaryDirectory() as d:
+            ok, job = self._run(d, os.path.join(d, "_buildings"),
+                                ["[Stats] Tiles: 100/100 OK"])
+            self.assertTrue(ok)
+            self.assertIn("buildings_pbf_dir", job)
+            self.assertTrue(ta._tile_ready(d, self.TILE))
+
+    def test_empty_extent_is_fine(self):
+        # "no buildings in extent" is a real answer from a supporting engine
+        # (ocean, empty countryside) — not a missing feature.
+        with tempfile.TemporaryDirectory() as d:
+            ok, _ = self._run(
+                d, os.path.join(d, "_buildings"),
+                ["[Stats] Tiles: 100/100 OK",
+                 "[Buildings] 8 pbf tile(s), no buildings in extent"],
+            )
+            self.assertTrue(ok)
+            self.assertTrue(ta._tile_ready(d, self.TILE))
+
+
+class TestBuildingsAppliedMarker(unittest.TestCase):
+    def test_detects_the_marker(self):
+        self.assertTrue(ta._buildings_were_applied(["x", "[Buildings] 3 tiles"]))
+
+    def test_absent_marker(self):
+        self.assertFalse(ta._buildings_were_applied(["[Stats] Tiles: 1/1 OK"]))
+
+    def test_empty_output(self):
+        self.assertFalse(ta._buildings_were_applied([]))
+
+
+class TestPrebuiltAbtTiles(unittest.TestCase):
+    """A directory of .abt tiles is an engine input, not a source to convert."""
+
+    BBOX = {"north": 48.4, "south": 48.0, "east": 8.4, "west": 8.0}
+
+    def _tile_dir(self, root, names=("tile_N48.00E8.00_30m.abt",)):
+        d = os.path.join(root, "prebuilt")
+        os.makedirs(d, exist_ok=True)
+        for n in names:
+            _write_pool_abt(os.path.join(d, n))
+        return d
+
+    def test_detects_a_tile_directory(self):
+        with tempfile.TemporaryDirectory() as root:
+            d = self._tile_dir(root)
+            self.assertTrue(ta.is_abt_tile_dir(d))
+            self.assertEqual(len(ta.list_abt_tiles(d)), 1)
+
+    def test_a_geotiff_directory_is_not_one(self):
+        with tempfile.TemporaryDirectory() as root:
+            d = os.path.join(root, "rasters")
+            os.makedirs(d)
+            open(os.path.join(d, "dem.tif"), "wb").close()
+            self.assertFalse(ta.is_abt_tile_dir(d))
+
+    def test_nested_tiles_are_not_found(self):
+        # The engine's read_dir is not recursive, so reporting tiles in a
+        # sub-folder would promise coverage the run would not have.
+        with tempfile.TemporaryDirectory() as root:
+            outer = os.path.join(root, "outer")
+            self._tile_dir(os.path.join(outer, "inner"))
+            os.makedirs(outer, exist_ok=True)
+            self.assertFalse(ta.is_abt_tile_dir(outer))
+
+    def test_empty_and_missing_dirs(self):
+        with tempfile.TemporaryDirectory() as root:
+            self.assertFalse(ta.is_abt_tile_dir(root))
+        self.assertFalse(ta.is_abt_tile_dir(None))
+        self.assertFalse(ta.is_abt_tile_dir("/no/such/dir"))
+
+    def test_prepare_terrain_returns_the_dir_untouched(self):
+        """No download, no conversion — the tiles are already the answer."""
+        layer = mock.Mock()
+        layer.source.return_value = _XYZ_SOURCE
+        with tempfile.TemporaryDirectory() as root:
+            d = self._tile_dir(root)
+            with mock.patch.object(ta, "get_cache_dir", return_value=root), \
+                 mock.patch.object(ta, "_try_rust_download") as dl, \
+                 mock.patch.object(ta, "_run_converter") as conv:
+                out = ta.prepare_terrain(layer, 48.2, 8.2, 20.0, 30,
+                                         mock.Mock(), terrain_dir=d)
+            self.assertEqual(out, d)
+            dl.assert_not_called()
+            conv.assert_not_called()
+
+
+class TestAbtCoverageWarning(unittest.TestCase):
+    """GDAL cannot open a .abt, so these are checked by their own headers."""
+
+    BBOX = {"north": 48.4, "south": 48.0, "east": 8.4, "west": 8.0}
+
+    def _dir_with(self, root, name):
+        d = os.path.join(root, "t")
+        os.makedirs(d, exist_ok=True)
+        _write_pool_abt(os.path.join(d, name))
+        return d
+
+    def test_no_warning_when_tiles_cover_the_area(self):
+        with tempfile.TemporaryDirectory() as root:
+            d = self._dir_with(root, "tile_N48.00E8.00_30m.abt")
+            from waveshed.core import abt as abt_mod
+            hdr = abt_mod.read_header(ta.list_abt_tiles(d)[0])
+            span = hdr.size * hdr.pixel_res
+            bbox = {"north": hdr.ul_lat - span * 0.1,
+                    "south": hdr.ul_lat - span * 0.9,
+                    "west": hdr.ul_lon + span * 0.1,
+                    "east": hdr.ul_lon + span * 0.9}
+            self.assertIsNone(ta.terrain_coverage_warning(d, bbox))
+
+    def test_warns_when_tiles_are_somewhere_else(self):
+        with tempfile.TemporaryDirectory() as root:
+            d = self._dir_with(root, "tile_N48.00E8.00_30m.abt")
+            far = {"north": -10.0, "south": -11.0, "west": 100.0, "east": 101.0}
+            msg = ta.terrain_coverage_warning(d, far)
+            self.assertIsNotNone(msg)
+            self.assertIn("do not overlap", msg)
+
+    def test_unreadable_abt_is_reported(self):
+        with tempfile.TemporaryDirectory() as root:
+            d = os.path.join(root, "t")
+            os.makedirs(d)
+            with open(os.path.join(d, "broken.abt"), "wb") as fh:
+                fh.write(b"nope")
+            msg = ta.terrain_coverage_warning(d, self.BBOX)
+            self.assertIsNotNone(msg)
+            self.assertIn("could be read", msg)
+
+    def test_empty_dir_message_mentions_abt(self):
+        with tempfile.TemporaryDirectory() as root:
+            msg = ta.terrain_coverage_warning(root, self.BBOX)
+            self.assertIsNotNone(msg)
+            self.assertIn(".abt", msg)
+
+
+class TestPrebuiltAbtSuitability(unittest.TestCase):
+    """Pre-built tiles are finished output: the run cannot change their
+    resolution and cannot add buildings to them. Both mismatches have to be
+    raised, or the result is confidently wrong."""
+
+    def _dir(self, root, res_m, n=1):
+        d = os.path.join(root, "prebuilt")
+        os.makedirs(d, exist_ok=True)
+        for i in range(n):
+            _write_pool_abt(os.path.join(d, f"t{i}.abt"), size=64,
+                            res_m=res_m, ul_lat=48.0, ul_lon=8.0)
+        return d
+
+    def _bbox_inside(self, d):
+        from waveshed.core import abt as abt_mod
+        h = abt_mod.read_header(ta.list_abt_tiles(d)[0])
+        span = h.size * h.pixel_res
+        return {"north": h.ul_lat - span * 0.1,
+                "south": h.ul_lat - span * 0.9,
+                "west": h.ul_lon + span * 0.1,
+                "east": h.ul_lon + span * 0.9}
+
+    def test_coarse_tiles_are_refused_for_a_fine_request(self):
+        """30 m tiles must not silently serve a 5 m analysis."""
+        with tempfile.TemporaryDirectory() as root:
+            d = self._dir(root, res_m=30.0)
+            msg = ta.terrain_coverage_warning(d, self._bbox_inside(d),
+                                              resolution_m=5)
+            self.assertIsNotNone(msg, "30 m tiles accepted for a 5 m run")
+            self.assertIn("30 m", msg)
+            self.assertIn("5 m", msg)
+
+    def test_matching_resolution_is_accepted(self):
+        with tempfile.TemporaryDirectory() as root:
+            d = self._dir(root, res_m=5.0)
+            self.assertIsNone(
+                ta.terrain_coverage_warning(d, self._bbox_inside(d),
+                                            resolution_m=5))
+
+    def test_exact_resolution_rounding_does_not_warn(self):
+        """A nominal 30 m tile stores 29.99757 m — that is not a mismatch."""
+        with tempfile.TemporaryDirectory() as root:
+            d = self._dir(root, res_m=29.99757019438445)
+            self.assertIsNone(
+                ta.terrain_coverage_warning(d, self._bbox_inside(d),
+                                            resolution_m=30))
+
+    def test_finer_tiles_are_fine(self):
+        """Downsampling is honest; only upsampling invents detail."""
+        with tempfile.TemporaryDirectory() as root:
+            d = self._dir(root, res_m=5.0)
+            self.assertIsNone(
+                ta.terrain_coverage_warning(d, self._bbox_inside(d),
+                                            resolution_m=30))
+
+    def test_buildings_requested_on_prebuilt_tiles_warns(self):
+        with tempfile.TemporaryDirectory() as root:
+            d = self._dir(root, res_m=5.0)
+            msg = ta.terrain_coverage_warning(d, self._bbox_inside(d),
+                                              resolution_m=5,
+                                              osm_buildings=True)
+            self.assertIsNotNone(msg, "buildings checkbox silently ignored")
+            self.assertIn("Buildings", msg)
+
+    def test_buildings_file_also_warns(self):
+        with tempfile.TemporaryDirectory() as root:
+            d = self._dir(root, res_m=5.0)
+            msg = ta.terrain_coverage_warning(d, self._bbox_inside(d),
+                                              resolution_m=5,
+                                              buildings_file="/x/b.fgb")
+            self.assertIsNotNone(msg)
+
+    def test_no_buildings_no_warning(self):
+        with tempfile.TemporaryDirectory() as root:
+            d = self._dir(root, res_m=5.0)
+            self.assertIsNone(
+                ta.terrain_coverage_warning(d, self._bbox_inside(d),
+                                            resolution_m=5,
+                                            osm_buildings=False))
+
+    def test_prepare_terrain_logs_the_problem(self):
+        """A Processing run never sees the dialog, so the log must carry it."""
+        layer = mock.Mock()
+        layer.source.return_value = _XYZ_SOURCE
+        with tempfile.TemporaryDirectory() as root:
+            d = self._dir(root, res_m=30.0)
+            logged = []
+            with mock.patch.object(ta, "get_cache_dir", return_value=root), \
+                 mock.patch.object(ta, "_log", side_effect=logged.append):
+                out = ta.prepare_terrain(layer, 48.0, 8.0, 1.0, 5,
+                                         mock.Mock(), terrain_dir=d,
+                                         osm_buildings=True)
+            self.assertEqual(out, d)
+            self.assertTrue(any("WARNING" in ln for ln in logged),
+                            f"no warning logged; got {logged}")

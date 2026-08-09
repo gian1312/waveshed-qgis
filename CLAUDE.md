@@ -76,8 +76,10 @@ These are covered by `.gitignore`. The plugin only embeds the **public** verific
 - Use `QgsSettings("waveshed/...")` for persistent plugin settings (the engine env var `AETHER_BIN_DIR` keeps its `AETHER` name)
 - Use `QgsMessageLog` for debug logging, `QgsMessageBar` for user-facing messages
 - Type hints on all public functions
-- No external pip dependencies beyond what QGIS provides (PyQt5, osgeo/GDAL, numpy)
-  - Exception: `pynacl` for Ed25519 API key validation (bundled with plugin)
+- No external pip dependencies beyond what QGIS provides (PyQt5, osgeo/GDAL, numpy).
+  There are no exceptions — `core/api_key.py` verifies Ed25519 signatures with
+  the standard library alone, so nothing imports `nacl`. Keep it that way: a
+  pip dependency is a support burden in a QGIS plugin, which cannot install one.
 
 ## Testing
 

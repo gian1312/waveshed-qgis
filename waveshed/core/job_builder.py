@@ -154,6 +154,13 @@ def _validate_resolution(resolution_m: int) -> None:
 CAUTION = "CAUTION"  # nearly out of range — usable with care (ITM kwx=1)
 INVALID = "INVALID"  # out of range — probably invalid (ITM kwx=3/4)
 
+# Smallest receiver height AGL the terrain data can resolve. Mirrors
+# aether_core::config::MIN_RX_AGL_M — .abt stores elevations in 0.5 m steps, so
+# below this the visibility test's margin drops under the data's own precision
+# and the result is decided by rounding (checkerboard speckle). The engine
+# raises anything lower to this value; the plugin only reports it.
+MIN_RX_AGL_M = 0.5
+
 
 @dataclasses.dataclass(frozen=True)
 class ModelWarning:
@@ -187,14 +194,24 @@ def model_warnings(params: "CoverageParams | P2PParams") -> "list[ModelWarning]"
         out.append(ModelWarning(severity, parameter, message))
 
     # Antenna heights: ITM is validated for 1-1000 m AGL, hard limits 0.5-12000 m.
-    def check_height(label: str, height: float, mode: str) -> None:
+    # ``floored`` marks the receiver, whose height the engine corrects on the way
+    # in. The transmitter has no such floor, so a sub-minimum TX stays a hard error.
+    def check_height(label: str, height: float, mode: str, floored: bool) -> None:
         if (mode or "").upper() != "AGL":
             return  # AMSL: the AGL height is only known once terrain is sampled
-        if height < 0.5:
-            add(INVALID, label,
-                f"{height:.2f} m AGL is below ITM's 0.5 m hard minimum — the model "
-                f"is not defined at ground level (effective height collapses to zero "
-                f"and the ground-reflection term saturates). Use at least 2 m.")
+        if height < MIN_RX_AGL_M:
+            if floored:
+                add(CAUTION, label,
+                    f"{height:.2f} m AGL is below ITM's {MIN_RX_AGL_M:.1f} m hard "
+                    f"minimum, where the model is undefined (effective height collapses "
+                    f"to zero and the ground-reflection term saturates). The engine "
+                    f"raises it to {MIN_RX_AGL_M:.1f} m; use at least 2 m to stay "
+                    f"inside ITM's validated range.")
+            else:
+                add(INVALID, label,
+                    f"{height:.2f} m AGL is below ITM's {MIN_RX_AGL_M:.1f} m hard "
+                    f"minimum — the model is undefined there and nothing corrects it. "
+                    f"Use at least 2 m.")
         elif height < 1.0:
             add(CAUTION, label,
                 f"{height:.2f} m AGL is below ITM's 1 m validated minimum. "
@@ -206,22 +223,24 @@ def model_warnings(params: "CoverageParams | P2PParams") -> "list[ModelWarning]"
                 f"{height:.0f} m AGL is above ITM's 1000 m validated maximum.")
 
     if is_itm:
-        check_height("TX height", params.tx_height, params.tx_mode)
+        check_height("TX height", params.tx_height, params.tx_mode, floored=False)
         if not is_min_alt:
-            check_height("RX height", params.rx_height, params.rx_mode)
+            check_height("RX height", params.rx_height, params.rx_mode, floored=True)
 
     # Terrain-sampling floor (applies to every model, not just ITM). At 0 m AGL
     # the receiver sits exactly on the sampled ground, so the visibility test
     # becomes "is this sample a strict new maximum" and its margin (rx height in
     # metres) falls below the 0.5 m .abt vertical quantum — the LOS decision is
-    # then made by rounding, which renders as checkerboard speckle.
-    if not is_min_alt and (params.rx_mode or "").upper() == "AGL" and params.rx_height < 1.0:
+    # then made by rounding, which renders as checkerboard speckle. The engine
+    # raises the height rather than computing that, so this only reports that the
+    # requested height will not be honoured.
+    if (not is_min_alt and (params.rx_mode or "").upper() == "AGL"
+            and params.rx_height < MIN_RX_AGL_M):
         add(CAUTION, "RX height",
-            f"{params.rx_height:.2f} m AGL is within the terrain quantisation floor: "
-            f"the visibility margin is {params.rx_height:.2f} m while .abt terrain is "
-            f"stored in 0.5 m steps, so the line-of-sight decision is made by rounding "
-            f"rather than geometry (visible as checkerboard speckle). "
-            f"Use at least 1 m, or 2 m for validation work.")
+            f"{params.rx_height:.2f} m AGL is below the {MIN_RX_AGL_M:.1f} m vertical "
+            f"quantum of the terrain data, so the line-of-sight decision would be made "
+            f"by rounding rather than geometry (checkerboard speckle). The engine "
+            f"raises it to {MIN_RX_AGL_M:.1f} m before computing.")
 
     if is_itm:
         # Frequency: ITM works on wn = f/47.7, validated 0.838-210, hard 0.419-420.

@@ -43,6 +43,19 @@ class TestClassifiers:
         assert pkg.is_skipped_file("waveshed/bin/aether_core")
         assert not pkg.is_skipped_file("waveshed/plugin.py")
 
+    def test_is_skipped_file_generated_and_local(self):
+        """Exclusions that must hold *inside* the package, not just beside it."""
+        assert pkg.is_skipped_file("waveshed/resources_rc.py")
+        assert pkg.is_skipped_file("waveshed/gui/dialog_rc.py")
+        assert pkg.is_skipped_file("waveshed/deploy.local.ini")
+        # Hand-written sources that merely end in "rc" are not resource modules.
+        assert not pkg.is_skipped_file("waveshed/core/abt_src.py")
+
+    def test_is_skipped_file_repo_siblings(self):
+        """Stated rules, so they survive the walk root ever moving up."""
+        for d in (".venv", "tmp", "tests", "dist"):
+            assert pkg.is_skipped_file(f"{d}/x.py"), d
+
     def test_enforce_size(self):
         pkg.enforce_size(19 * 1024 * 1024)  # under the limit: no raise
         with pytest.raises(pkg.BuildError):
@@ -62,6 +75,7 @@ class TestIterAndBuild:
         # Hygiene noise that must be excluded:
         _touch(os.path.join(root, "waveshed", "__pycache__", "plugin.pyc"))
         _touch(os.path.join(root, "waveshed", "bin", "aether_core.exe"))
+        _touch(os.path.join(root, "waveshed", "resources_rc.py"))
         return os.path.join(root, "waveshed")
 
     def test_iter_includes_source_excludes_hygiene(self, tmp_path):

@@ -1,11 +1,11 @@
 [general]
 name=Waveshed
 qgisMinimumVersion=3.28
-version=0.1.0
+version=0.2.0
 author=Gian-Andrea Heinrich
 email=info@waveshed.io
 description=RF propagation analysis (coverage, point-to-point) powered by the Aether GPU engine.
-about=Waveshed provides RF propagation analysis for QGIS - area coverage (Site Analysis) and point-to-point link budgets - using LOS, Free-Space Path Loss, and ITM (Longley-Rice) models. All computation is performed by the proprietary Aether engine, a separate closed-source GPU binary that is NOT bundled with this plugin. The engine is downloaded on demand from https://waveshed.io through the plugin's Download dialog (an explicit, user-initiated action) and is licensed under its own EULA, shown for acceptance before download. Running analyses additionally requires an API key obtained from https://waveshed.io. Supported engine platforms: Windows x64, Linux x64, and macOS arm64.
+about=Waveshed provides RF propagation analysis for QGIS - area coverage (Site Analysis) and point-to-point link budgets - using LOS and ITM (Longley-Rice) models. All computation is performed by the proprietary Aether engine, a separate closed-source GPU binary that is NOT bundled with this plugin. The engine is downloaded on demand from https://waveshed.io through the plugin's Download dialog (an explicit, user-initiated action) and is licensed under its own EULA, shown for acceptance before download. Running analyses additionally requires an API key obtained from https://waveshed.io. Supported engine platforms: Windows x64, Linux x64, and macOS arm64.
 tracker=https://github.com/gian1312/waveshed-qgis/issues
 repository=https://github.com/gian1312/waveshed-qgis
 homepage=https://waveshed.io
@@ -13,6 +13,22 @@ license=GPL-2.0-or-later
 tags=rf,propagation,radio,coverage,p2p,gpu,terrain,ITM,LOS,waveshed
 category=Analysis
 icon=resources/icon.png
+changelog=0.2.0
+    - Terrain tiles are pooled and reused across sites, so overlapping runs no
+      longer re-download shared tiles. Existing caches are rebuilt once.
+    - Building tiles (OpenFreeMap) pool alongside terrain and are reused too.
+    - Removed SIMPLE_LOSS as a selectable propagation model; use ITM. Results
+      already computed with it still load. NOTE: the Processing "Propagation
+      Model" dropdown is index-based, so saved Processing models that selected
+      ITM or MIN_ALT must be re-picked.
+    - Data-source attribution for every fetched dataset, shown in Settings.
+    - Settings can clear the terrain cache and reports its size.
+    - Fixed: a failed building download no longer silently caches
+      building-free terrain under a buildings-keyed entry.
+    - Fixed: partial caches from an interrupted run are no longer reused as
+      complete, which produced coverage with silent gaps.
+    0.1.0
+    - Initial experimental release.
 experimental=True
 deprecated=False
 hasProcessingProvider=yes
