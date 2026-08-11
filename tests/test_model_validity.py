@@ -16,10 +16,14 @@ import unittest
 from waveshed.core.job_builder import (
     CAUTION,
     INVALID,
-    MIN_RX_AGL_M,
+    MIN_ANTENNA_AGL_M,
     CoverageParams,
     P2PParams,
+    antenna_height_error,
+    build_coverage_job,
+    build_p2p_job,
     format_model_warnings,
+    height_floor_error,
     model_warnings,
 )
 
@@ -33,24 +37,37 @@ def _severities(param, warnings):
 
 
 class TestAntennaHeights(unittest.TestCase):
-    def test_ground_level_receiver_is_reported_but_corrected(self):
-        # The engine floors the receiver at MIN_RX_AGL_M, so this is a notice
-        # that the requested height will not be honoured, not a hard error.
-        w = model_warnings(CoverageParams(model="ITM", rx_height=0.0))
-        self.assertEqual({CAUTION}, _severities("RX height", w))
-        self.assertIn(f"{MIN_RX_AGL_M:.1f} m", _for("RX height", w)[0].message)
+    def test_the_floor_is_one_metre(self):
+        # The shared floor across the plugin and the engine. If this moves,
+        # every message and every spinbox minimum below moves with it.
+        self.assertEqual(1.0, MIN_ANTENNA_AGL_M)
 
-    def test_below_itm_validated_minimum_is_caution(self):
+    def test_ground_level_receiver_is_invalid(self):
+        # Sub-floor AGL is refused outright now: the plugin rejects the job
+        # rather than letting the engine's backstop silently raise the height.
+        w = model_warnings(CoverageParams(model="ITM", rx_height=0.0))
+        self.assertEqual({INVALID}, _severities("RX height", w))
+        self.assertIn(f"{MIN_ANTENNA_AGL_M:.1f} m", _for("RX height", w)[0].message)
+
+    def test_below_the_floor_is_invalid_not_caution(self):
         w = model_warnings(CoverageParams(model="ITM", rx_height=0.75))
-        self.assertEqual({CAUTION}, _severities("RX height", w))
+        self.assertEqual({INVALID}, _severities("RX height", w))
+
+    def test_exactly_the_floor_is_accepted(self):
+        # Boundary: the floor itself is legal, one ULP below it is not.
+        self.assertEqual(
+            [], _for("RX height", model_warnings(
+                CoverageParams(model="ITM", rx_height=MIN_ANTENNA_AGL_M))))
+        self.assertEqual(
+            {INVALID}, _severities("RX height", model_warnings(
+                CoverageParams(model="ITM", rx_height=MIN_ANTENNA_AGL_M - 0.01))))
 
     def test_two_metres_is_clean(self):
         w = model_warnings(CoverageParams(model="ITM", rx_height=2.0))
         self.assertEqual([], _for("RX height", w))
 
-    def test_ground_level_transmitter_stays_invalid(self):
-        # Only the receiver is floored; a sub-minimum TX is uncorrected, so it
-        # remains a hard error rather than a notice.
+    def test_ground_level_transmitter_is_invalid(self):
+        # The floor covers the transmitter too, not just the receiver.
         w = model_warnings(CoverageParams(model="ITM", tx_height=0.2))
         self.assertIn(INVALID, _severities("TX height", w))
 
@@ -67,13 +84,30 @@ class TestAntennaHeights(unittest.TestCase):
         self.assertEqual([], _for("RX height", w))
         self.assertEqual([], _for("TX height", w))
 
+    def test_negative_amsl_heights_are_not_checked(self):
+        # Below sea level is a real place, not an error: the Dead Sea shore is
+        # -430 m and Schiphol is -4 m. Flooring an AMSL height would lift such
+        # a site hundreds of metres into the air.
+        w = model_warnings(
+            CoverageParams(model="ITM", rx_height=-430.0, rx_mode="AMSL",
+                           tx_height=-4.0, tx_mode="AMSL"))
+        self.assertEqual([], _for("RX height", w))
+        self.assertEqual([], _for("TX height", w))
+
 
 class TestTerrainQuantisationFloor(unittest.TestCase):
-    """Applies to every model — it is a data-resolution limit, not an ITM one."""
+    """The floor is a data-resolution limit too, so it is not ITM-only."""
 
     def test_fires_for_los_at_ground_level(self):
+        # .abt stores elevations in 0.5 m steps, so a sub-metre antenna leaves
+        # the LOS test a margin inside the DEM's own rounding — that is wrong
+        # for a pure geometric run just as much as for ITM.
         w = model_warnings(CoverageParams(model="LOS", rx_height=0.0))
-        self.assertEqual({CAUTION}, _severities("RX height", w))
+        self.assertEqual({INVALID}, _severities("RX height", w))
+
+    def test_fires_for_a_sub_floor_los_transmitter(self):
+        w = model_warnings(CoverageParams(model="LOS", tx_height=0.4))
+        self.assertEqual({INVALID}, _severities("TX height", w))
 
     def test_plugin_default_receiver_height_is_silent(self):
         # 1.5 m is the shipped default; warning here would be crying wolf.
@@ -83,6 +117,12 @@ class TestTerrainQuantisationFloor(unittest.TestCase):
         # MIN_ALT computes the minimum visible altitude; a 0 m receiver is the
         # question being asked, not a mistake.
         self.assertEqual([], model_warnings(CoverageParams(model="MIN_ALT", rx_height=0.0)))
+
+    def test_min_alt_still_checks_the_transmitter(self):
+        # Only the receiver is the unknown being solved for; the MIN_ALT
+        # transmitter is a real antenna and keeps the floor.
+        w = model_warnings(CoverageParams(model="MIN_ALT", tx_height=0.0))
+        self.assertEqual({INVALID}, _severities("TX height", w))
 
 
 class TestFrequency(unittest.TestCase):
@@ -160,9 +200,11 @@ class TestNonItmModels(unittest.TestCase):
 
 class TestP2PParams(unittest.TestCase):
     def test_same_checks_apply(self):
+        # Both ends now carry the same floor — the receiver is no longer the
+        # lenient one.
         w = model_warnings(P2PParams(model="ITM", tx_height=0.1, rx_height=0.1))
-        self.assertIn(INVALID, _severities("TX height", w))   # uncorrected
-        self.assertEqual({CAUTION}, _severities("RX height", w))  # floored
+        self.assertIn(INVALID, _severities("TX height", w))
+        self.assertEqual({INVALID}, _severities("RX height", w))
 
 
 class TestFormatting(unittest.TestCase):
@@ -177,14 +219,99 @@ class TestFormatting(unittest.TestCase):
         w = model_warnings(CoverageParams(model="ITM", rx_height=0.0)) * 3
         self.assertEqual(1, format_model_warnings(w).count("hard minimum"))
 
-    def test_floored_receiver_does_not_trigger_the_blocking_dialog(self):
-        # A corrected height must not raise a modal "results are probably
-        # invalid" prompt — the tabs gate that on INVALID.
+    def test_sub_floor_receiver_reaches_the_blocking_dialog(self):
+        # Inverted deliberately. Both tabs gate their modal on INVALID, so a
+        # sub-metre receiver has to carry that severity to be shown at all —
+        # a CAUTION would let the run through in silence.
         w = model_warnings(CoverageParams(model="ITM", rx_height=0.0))
-        self.assertFalse([x for x in w if x.severity == INVALID])
+        self.assertTrue([x for x in w if x.severity == INVALID])
 
     def test_empty_input_renders_empty(self):
         self.assertEqual("", format_model_warnings([]))
+
+
+class TestHeightFloorError(unittest.TestCase):
+    """The shared message helper the dialogs and CSV parsers all use."""
+
+    def test_names_the_field_and_the_floor(self):
+        msg = height_floor_error("TX height", 0.3, "AGL")
+        self.assertIsNotNone(msg)
+        self.assertIn("TX height", msg)
+        self.assertIn(f"{MIN_ANTENNA_AGL_M:.1f} m", msg)
+
+    def test_at_and_above_the_floor_is_none(self):
+        self.assertIsNone(height_floor_error("RX height", MIN_ANTENNA_AGL_M, "AGL"))
+        self.assertIsNone(height_floor_error("RX height", 1.5, "AGL"))
+
+    def test_amsl_is_never_floored(self):
+        for altitude in (0.0, -4.0, -430.0):
+            self.assertIsNone(height_floor_error("TX height", altitude, "AMSL"))
+
+    def test_mode_matching_is_case_insensitive(self):
+        self.assertIsNone(height_floor_error("TX height", -430.0, "amsl"))
+        self.assertIsNotNone(height_floor_error("TX height", 0.3, "agl"))
+
+
+class TestJobBuilderRejection(unittest.TestCase):
+    """The authoritative refusal: every entry point funnels through these two.
+
+    Qt-level clamping cannot be tested here — conftest stubs QDoubleSpinBox as
+    an inert mock with no range semantics — so the core rejection is the thing
+    under test.
+    """
+
+    def test_coverage_job_rejects_a_sub_floor_receiver(self):
+        with self.assertRaises(ValueError) as ctx:
+            build_coverage_job(
+                CoverageParams(rx_height=0.5), "/abt", "/out")
+        self.assertIn("RX height", str(ctx.exception))
+        self.assertIn(f"{MIN_ANTENNA_AGL_M:.1f} m", str(ctx.exception))
+
+    def test_coverage_job_rejects_a_sub_floor_transmitter(self):
+        with self.assertRaises(ValueError) as ctx:
+            build_coverage_job(
+                CoverageParams(tx_height=0.0), "/abt", "/out")
+        self.assertIn("TX height", str(ctx.exception))
+
+    def test_p2p_job_rejects_a_sub_floor_antenna(self):
+        with self.assertRaises(ValueError):
+            build_p2p_job(P2PParams(rx_height=0.99), "/abt", "/out")
+
+    def test_amsl_below_sea_level_is_built_untouched(self):
+        # The whole point of the AGL/AMSL split: a Dead Sea site must survive.
+        job = build_coverage_job(
+            CoverageParams(tx_height=-430.0, tx_mode="AMSL",
+                           rx_height=-428.5, rx_mode="AMSL"),
+            "/abt", "/out")
+        self.assertEqual(-430.0, job["tx"]["height_m"])
+        self.assertEqual(-428.5, job["rx"]["height_m"])
+
+    def test_the_floor_itself_is_built(self):
+        job = build_coverage_job(
+            CoverageParams(tx_height=MIN_ANTENNA_AGL_M,
+                           rx_height=MIN_ANTENNA_AGL_M),
+            "/abt", "/out")
+        self.assertEqual(MIN_ANTENNA_AGL_M, job["tx"]["height_m"])
+        self.assertEqual(MIN_ANTENNA_AGL_M, job["rx"]["height_m"])
+
+    def test_min_alt_receiver_stays_exempt(self):
+        # MIN_ALT solves for the receiver altitude, so a 0 m RX is the question.
+        job = build_coverage_job(
+            CoverageParams(model="MIN_ALT", rx_height=0.0), "/abt", "/out")
+        self.assertEqual(0.0, job["rx"]["height_m"])
+
+    def test_min_alt_transmitter_is_not_exempt(self):
+        with self.assertRaises(ValueError):
+            build_coverage_job(
+                CoverageParams(model="MIN_ALT", tx_height=0.0), "/abt", "/out")
+
+    def test_antenna_height_error_reports_the_transmitter_first(self):
+        msg = antenna_height_error(CoverageParams(tx_height=0.1, rx_height=0.1))
+        self.assertIn("TX height", msg)
+
+    def test_antenna_height_error_is_none_for_defaults(self):
+        self.assertIsNone(antenna_height_error(CoverageParams()))
+        self.assertIsNone(antenna_height_error(P2PParams()))
 
 
 if __name__ == "__main__":

@@ -21,9 +21,13 @@ from waveshed.core.layer_utils import (
 _BYTE = 0
 _FLOAT32 = 6
 _INT16 = 2
+_ARGB32 = 12
 
 
 class _FakeLayer:
+    """A raster layer with no ``providerType()``, like the QGIS objects that
+    predate it — classification must fall back to the URI's own spelling."""
+
     def __init__(self, source="", bands=1, dtype=_FLOAT32, name="layer"):
         self._source, self._bands, self._dtype, self._name = source, bands, dtype, name
 
@@ -38,6 +42,17 @@ class _FakeLayer:
         prov.bandCount.return_value = self._bands
         prov.dataType.return_value = self._dtype
         return prov
+
+
+class _ProviderLayer(_FakeLayer):
+    """A raster layer that reports its provider, as QGIS layers do."""
+
+    def __init__(self, provider="gdal", **kwargs):
+        super().__init__(**kwargs)
+        self._provider = provider
+
+    def providerType(self):
+        return self._provider
 
 
 class TestClassifyRasterLayer(unittest.TestCase):
@@ -78,6 +93,77 @@ class TestClassifyRasterLayer(unittest.TestCase):
     def test_local_singleband_byte_is_imagery(self):
         lyr = _FakeLayer(source="/data/mask.tif", bands=1, dtype=_BYTE)
         self.assertEqual(classify_raster_layer(lyr), "imagery")
+
+
+class TestRenderedServiceLayers(unittest.TestCase):
+    """WMS/WMTS return a *picture*, so band heuristics cannot classify them.
+
+    A WMS basemap reports a single non-Byte ARGB32 band, so the band checks
+    fell straight through to "dem" and the plugin happily ran propagation over
+    a rendered street map. Only "type=xyz" was URL-aware before this.
+    """
+
+    _WMS_BASEMAP = ("contextualWMSLegend=0&crs=EPSG:3857&dpiMode=7"
+                    "&format=image/png&layers=osm&styles"
+                    "&url=https://tile.openstreetmap.org/wms")
+
+    def test_wms_basemap_is_imagery(self):
+        lyr = _ProviderLayer(provider="wms", source=self._WMS_BASEMAP,
+                             bands=1, dtype=_FLOAT32)
+        self.assertEqual(classify_raster_layer(lyr), "imagery")
+
+    def test_wms_without_any_url_hint_is_still_imagery(self):
+        src = ("crs=EPSG:2056&format=image/png&layers=ch.swisstopo.pixelkarte"
+               "&url=https://wms.geo.admin.ch/")
+        lyr = _ProviderLayer(provider="wms", source=src, bands=1, dtype=_FLOAT32)
+        self.assertEqual(classify_raster_layer(lyr), "imagery")
+
+    def test_wms_elevation_service_is_still_a_dem(self):
+        src = ("crs=EPSG:4326&format=image/tiff&layers=elevation"
+               "&url=https://example.org/dem/wms")
+        lyr = _ProviderLayer(provider="wms", source=src, bands=1, dtype=_FLOAT32)
+        self.assertEqual(classify_raster_layer(lyr), "dem")
+
+    def test_wmts_basemap_is_imagery(self):
+        src = ("crs=EPSG:3857&format=image/jpeg&layers=aerial&type=wmts"
+               "&tileMatrixSet=GoogleMapsCompatible&url=https://example.org/wmts")
+        lyr = _ProviderLayer(provider="wms", source=src, bands=1, dtype=_FLOAT32)
+        self.assertEqual(classify_raster_layer(lyr), "imagery")
+
+    def test_wmts_source_marker_works_without_a_provider_type(self):
+        src = ("crs=EPSG:3857&type=wmts&tileMatrixSet=GoogleMapsCompatible"
+               "&url=https://example.org/wmts")
+        self.assertEqual(classify_raster_layer(_FakeLayer(source=src)), "imagery")
+
+    def test_wcs_coverage_falls_through_to_the_band_heuristics(self):
+        # WCS returns real values (GeoTIFF), not a rendering, so a single
+        # Float32 band genuinely is elevation.
+        src = ("cache=PreferNetwork&crs=EPSG:4326&format=GeoTIFF"
+               "&identifier=height&url=https://example.org/wcs")
+        lyr = _ProviderLayer(provider="wcs", source=src, bands=1, dtype=_FLOAT32)
+        self.assertEqual(classify_raster_layer(lyr), "dem")
+
+    def test_wcs_rgb_coverage_is_still_imagery(self):
+        src = ("crs=EPSG:4326&format=GeoTIFF&identifier=ortho"
+               "&url=https://example.org/wcs")
+        lyr = _ProviderLayer(provider="wcs", source=src, bands=3, dtype=_BYTE)
+        self.assertEqual(classify_raster_layer(lyr), "imagery")
+
+    def test_argb32_band_is_imagery_whatever_the_provider(self):
+        # Backstop for any rendered-image provider not named explicitly.
+        lyr = _ProviderLayer(provider="somethingelse", source="/x",
+                             bands=1, dtype=_ARGB32)
+        self.assertEqual(classify_raster_layer(lyr), "imagery")
+
+    def test_a_local_gdal_dem_is_unaffected(self):
+        lyr = _ProviderLayer(provider="gdal", source="/data/swissalti.tif",
+                             bands=1, dtype=_FLOAT32)
+        self.assertEqual(classify_raster_layer(lyr), "dem")
+
+    def test_xyz_provider_type_is_still_url_classified(self):
+        src = "type=xyz&url=https://s3.amazonaws.com/x/terrarium/{z}/{x}/{y}.png"
+        lyr = _ProviderLayer(provider="wms", source=src, bands=1, dtype=_FLOAT32)
+        self.assertEqual(classify_raster_layer(lyr), "dem")
 
 
 class TestDemLayerWarning(unittest.TestCase):

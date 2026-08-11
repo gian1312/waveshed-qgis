@@ -66,8 +66,10 @@ _SUBPROCESS_FLAGS = (
 )
 from ..core.job_builder import (
     INVALID,
+    MIN_ANTENNA_AGL_M,
     VALID_RESOLUTIONS,
     CoverageParams,
+    antenna_height_error,
     build_coverage_job,
     format_model_warnings,
     model_warnings,
@@ -90,6 +92,7 @@ from ..core.terrain_adapter import (
     terrain_plan,
     terrain_size_warning,
 )
+from .height_inputs import MIN_AMSL_M, bind_height_mode
 from .map_tools import activate_point_capture
 
 TAG = "Waveshed"
@@ -907,7 +910,7 @@ class SiteAnalysisTab(QWidget):
 
         # -- Column 2: Height (m) --
         spin_height = QDoubleSpinBox()
-        spin_height.setRange(0.0, 10000.0)
+        spin_height.setRange(MIN_AMSL_M, 10000.0)
         spin_height.setValue(30.0)
         spin_height.setDecimals(1)
         spin_height.setSuffix(" m")
@@ -917,6 +920,10 @@ class SiteAnalysisTab(QWidget):
         combo_mode = QComboBox()
         combo_mode.addItems(["AGL", "AMSL"])
         self.sites_table.setCellWidget(row, _COL_HEIGHT_MODE, combo_mode)
+
+        # The height's lower bound depends on the mode beside it: a hard 1 m
+        # floor for AGL, below sea level allowed for AMSL. See gui.height_inputs.
+        bind_height_mode(spin_height, combo_mode)
 
         # -- Column 4: AZ Rotation (deg) --
         spin_az_rot = QDoubleSpinBox()
@@ -957,19 +964,22 @@ class SiteAnalysisTab(QWidget):
         if asset is None:
             return
 
-        # Auto-fill height.
-        spin_h = self.sites_table.cellWidget(row, _COL_HEIGHT)
-        if isinstance(spin_h, QDoubleSpinBox):
-            default_h = asset.get("default_height_m", 30.0)
-            spin_h.setValue(default_h)
-
-        # Auto-fill height mode.
+        # Auto-fill height mode *first*: it drives the height spinbox's minimum
+        # (1 m for AGL, below sea level for AMSL), so filling the height before
+        # the mode would clamp an AMSL asset's negative elevation to the AGL
+        # floor and the later mode switch would not bring it back.
         combo_m = self.sites_table.cellWidget(row, _COL_HEIGHT_MODE)
         if isinstance(combo_m, QComboBox):
             mode_text = asset.get("default_height_mode", "AGL")
             idx = combo_m.findText(mode_text)
             if idx >= 0:
                 combo_m.setCurrentIndex(idx)
+
+        # Auto-fill height.
+        spin_h = self.sites_table.cellWidget(row, _COL_HEIGHT)
+        if isinstance(spin_h, QDoubleSpinBox):
+            default_h = asset.get("default_height_m", 30.0)
+            spin_h.setValue(default_h)
 
     def _on_coord_spinbox_changed(self, row: int) -> None:
         """Update internal coords dict when spinboxes are edited manually."""
@@ -1153,7 +1163,7 @@ class SiteAnalysisTab(QWidget):
         self.alt_table.insertRow(row)
 
         spin_alt = QDoubleSpinBox()
-        spin_alt.setRange(0.0, 10000.0)
+        spin_alt.setRange(MIN_AMSL_M, 10000.0)
         spin_alt.setValue(altitude)
         spin_alt.setDecimals(1)
         spin_alt.setSuffix(" m")
@@ -1165,6 +1175,10 @@ class SiteAnalysisTab(QWidget):
         if idx >= 0:
             combo_ref.setCurrentIndex(idx)
         self.alt_table.setCellWidget(row, 1, combo_ref)
+
+        # Bound after the mode is set so the initial minimum matches it: 1 m AGL
+        # floor, or below sea level when the row is AMSL. See gui.height_inputs.
+        bind_height_mode(spin_alt, combo_ref)
 
         return row
 
@@ -1470,6 +1484,24 @@ class SiteAnalysisTab(QWidget):
                 self, "No Jobs",
                 "No valid site/altitude combinations could be built. "
                 "Ensure all sites have a location set.",
+            )
+            return
+
+        # ---- Reject antennas below the AGL floor ----
+        # Not a "run anyway?" prompt: the job builder raises on these, so
+        # offering to continue would only move the failure into the worker
+        # thread. AGL only — an AMSL height is an absolute elevation and may
+        # legitimately be zero or negative.
+        height_errors = [
+            f"{name}: {msg}"
+            for job_params, name in jobs
+            for msg in [antenna_height_error(job_params)]
+            if msg is not None
+        ]
+        if height_errors:
+            QMessageBox.critical(
+                self, f"Antenna below the {MIN_ANTENNA_AGL_M:.1f} m minimum",
+                "\n\n".join(dict.fromkeys(height_errors)),
             )
             return
 

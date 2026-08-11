@@ -143,6 +143,10 @@ class _FakeQgis:
         UInt16 = 1
         Int16 = 2
         Float32 = 6
+        # What every rendered-image provider (WMS/WMTS/XYZ) reports. Values
+        # match QGIS so a test reading them is reading the real thing.
+        ARGB32 = 12
+        ARGB32_Premultiplied = 13
 
 
 class _FakeMessageLog:
@@ -214,6 +218,40 @@ _core.QgsPalettedRasterRenderer = type("QgsPalettedRasterRenderer", (), {
     "__init__": lambda self, *a, **kw: None,
     "Class": type("Class", (), {"__init__": lambda self, *a: None}),
 })
+
+# Processing framework — enough for the algorithms/ modules to import and for
+# their pure-Python helpers (CSV parsing, extent maths) to be unit-tested. The
+# parameter classes are inert: they record nothing and enforce no range, so a
+# test must never assert on ``minValue`` behaviour through them — assert on the
+# core-layer rejection instead.
+_core.QgsProcessing = type("QgsProcessing", (), {
+    "TypeRaster": 3, "TypeVectorAnyGeometry": -1,
+})
+_core.QgsProcessingException = type("QgsProcessingException", (Exception,), {})
+_core.QgsProcessingAlgorithm = type("QgsProcessingAlgorithm", (), {
+    "__init__": lambda self, *a, **kw: None,
+    "addParameter": lambda self, *a, **kw: None,
+})
+_core.QgsProcessingContext = type("QgsProcessingContext", (), {
+    "__init__": lambda self, *a, **kw: None,
+})
+_core.QgsProcessingFeedback = type("QgsProcessingFeedback", (), {
+    "__init__": lambda self, *a, **kw: None,
+})
+_core.QgsProcessingProvider = type("QgsProcessingProvider", (), {
+    "__init__": lambda self, *a, **kw: None,
+})
+for _param_name in (
+    "QgsProcessingParameterEnum",
+    "QgsProcessingParameterFile",
+    "QgsProcessingParameterFolderDestination",
+    "QgsProcessingParameterNumber",
+    "QgsProcessingParameterRasterLayer",
+):
+    setattr(_core, _param_name, type(_param_name, (), {
+        "__init__": lambda self, *a, **kw: None,
+        "Double": 1, "Integer": 0, "File": 0, "Folder": 1,
+    }))
 
 # GUI classes
 _gui.QgsMapLayerComboBox = type("MLCB", (), {"__init__": lambda self, *a, **kw: None})
@@ -290,6 +328,7 @@ for mod_name, mod_obj in [
 _osgeo = ModuleType("osgeo")
 _gdal = ModuleType("osgeo.gdal")
 _gdal.GRA_Bilinear = 1
+_gdal.GRA_Average = 5
 _gdal.Warp = mock.MagicMock(return_value=None)
 _osgeo.gdal = _gdal
 sys.modules.setdefault("osgeo", _osgeo)

@@ -18,6 +18,8 @@ from typing import Optional
 
 from qgis.core import QgsSettings
 
+from .job_builder import MIN_ANTENNA_AGL_M
+
 
 # -- Default values -----------------------------------------------------------
 
@@ -37,6 +39,40 @@ _DEFAULT_ASSET = {
     "fraction_situations": 0.5,
     "fraction_time": 0.5,
 }
+
+
+# -- Default height validation -----------------------------------------------
+
+
+def default_height_error(height_m: float, mode: str) -> Optional[str]:
+    """Return a message if an asset's default height is below the AGL floor.
+
+    Args:
+        height_m: The asset's ``default_height_m``.
+        mode: The asset's ``default_height_mode`` (``"AGL"`` or ``"AMSL"``).
+
+    Returns:
+        An error string naming the field and the floor, or None when the height
+        is acceptable. AMSL heights always return None — they are absolute
+        elevations and are legitimately zero or negative.
+    """
+    if (mode or "").upper() != "AGL":
+        return None
+    try:
+        height = float(height_m)
+    except (TypeError, ValueError):
+        return (
+            f"default_height_m is not a number ({height_m!r}). It must be at "
+            f"least {MIN_ANTENNA_AGL_M:.1f} m AGL."
+        )
+    if height < MIN_ANTENNA_AGL_M:
+        return (
+            f"default_height_m is {height:.2f} m AGL, below the "
+            f"{MIN_ANTENNA_AGL_M:.1f} m minimum antenna height above ground "
+            f"level. Raise it to at least {MIN_ANTENNA_AGL_M:.1f} m, or set "
+            f"default_height_mode to AMSL if this is an absolute elevation."
+        )
+    return None
 
 
 # -- ERP computation ---------------------------------------------------------
@@ -152,6 +188,28 @@ def load_asset(path: str) -> dict:
     for key, default_val in _DEFAULT_ASSET.items():
         if key not in asset:
             asset[key] = default_val
+
+    # A hand-edited file can carry a sub-minimum AGL default height, which would
+    # then pre-fill every new site row with a height the job builder rejects.
+    # Raise it here and say so, rather than raising: ``list_assets`` catches only
+    # JSON/OS errors, so an exception would make the asset vanish from the picker
+    # with no explanation. The authoritative rejection still stands at job build
+    # time (``job_builder._validate_antenna_heights``) — this only stops a bad
+    # file from seeding bad rows.
+    height_error = default_height_error(
+        asset["default_height_m"], asset["default_height_mode"],
+    )
+    if height_error is not None:
+        asset["default_height_m"] = MIN_ANTENNA_AGL_M
+        try:
+            from qgis.core import Qgis, QgsMessageLog
+            QgsMessageLog.logMessage(
+                f"asset {os.path.basename(path)}: {height_error} "
+                f"Using {MIN_ANTENNA_AGL_M:.1f} m instead.",
+                "Waveshed", Qgis.MessageLevel.Warning,
+            )
+        except Exception:  # noqa: BLE001 — no QGIS available (unit tests)
+            pass
 
     # Recompute ERP for consistency.
     asset["erp_watts"] = compute_erp(

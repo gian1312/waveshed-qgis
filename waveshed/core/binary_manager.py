@@ -559,12 +559,24 @@ def download_engine(
     url = asset.get("url")
     if not url:
         raise RuntimeError("Selected manifest asset has no download URL.")
-    filename = asset.get("filename") or "aether-engine.zip"
     version = manifest.get("version", "?")
-    zip_path = os.path.join(tempfile.gettempdir(), filename)
+
+    # The manifest is not signed — only TLS to waveshed.io stands between it
+    # and an attacker — so nothing in it is allowed to choose a filesystem
+    # path. Joining asset["filename"] onto the temp dir let a value like
+    # "../../home/<user>/.bashrc" resolve outside it, and the response body is
+    # written there BEFORE verify_sha256 runs, with the `finally` below then
+    # deleting it: an arbitrary file clobber-and-delete driven by a network
+    # response. Sanitise it to a basename for the log, and download to a name
+    # we generate. mkstemp also creates the file exclusively, so the temp path
+    # cannot be pre-created as a symlink to somewhere else.
+    asset_name = os.path.basename(str(asset.get("filename") or "")).strip()
+    handle, zip_path = tempfile.mkstemp(prefix="aether-engine-", suffix=".zip")
+    os.close(handle)
 
     QgsMessageLog.logMessage(
-        f"Downloading Aether engine {version} from {url}",
+        f"Downloading Aether engine {version} "
+        f"({asset_name or 'engine archive'}) from {url}",
         TAG, Qgis.MessageLevel.Info,
     )
 

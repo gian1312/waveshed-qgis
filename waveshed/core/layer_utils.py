@@ -147,6 +147,55 @@ _IMAGERY_URL_HINTS = (
     "bing", "esri", "carto", "stamen",
 )
 
+# Providers that hand back a *rendered picture* instead of pixel values. What
+# arrives is whatever the server drew — typically a single ARGB32 band — so
+# band count and data type say nothing at all about whether the layer carries
+# elevation, and the band heuristics below classify every one of them as a DEM.
+# Only the URL can decide, exactly as for XYZ.
+_RENDERED_PROVIDERS = ("wms", "wmts", "xyz", "arcgismapserver")
+# WCS is a coverage service: it returns real band types (Float32 GeoTIFF and
+# friends), so the URL decides only when it says something, and the band
+# heuristics remain trustworthy otherwise.
+_COVERAGE_PROVIDERS = ("wcs",)
+
+# Markers in a layer URI that identify a remote service when ``providerType()``
+# is unavailable (a non-QGIS object, or a stubbed one under test).
+_WMS_SOURCE_MARKERS = ("type=xyz", "type=wmts", "type=wms", "tilematrixset=")
+
+
+def _service_kind(layer, source: str) -> str:
+    """``'rendered'``, ``'coverage'`` or ``''`` for *layer*'s data provider."""
+    provider = ""
+    try:
+        provider = (layer.providerType() or "").lower()
+    except Exception:
+        provider = ""
+    if provider in _RENDERED_PROVIDERS:
+        return "rendered"
+    if provider in _COVERAGE_PROVIDERS:
+        return "coverage"
+    if provider:
+        return ""
+    # No provider type to go on — fall back to the URI's own spelling.
+    if any(marker in source for marker in _WMS_SOURCE_MARKERS):
+        return "rendered"
+    if "identifier=" in source and "url=" in source:
+        return "coverage"
+    if "url=" in source and "layers=" in source:
+        return "rendered"
+    return ""
+
+
+def _classify_by_url(source: str) -> Optional[str]:
+    """``'dem'``/``'imagery'`` if *source*'s URL says which, else None."""
+    if any(h in source for h in _TERRAIN_URL_HINTS):
+        return "dem"
+    if any(h in source for h in _IMAGERY_URL_HINTS):
+        return "imagery"
+    if "terrain" in source:  # e.g. interpretation=terrainrgb
+        return "dem"
+    return None
+
 
 def classify_raster_layer(layer) -> str:
     """Classify *layer* as ``'dem'``, ``'imagery'``, or ``'unknown'``.
@@ -164,16 +213,19 @@ def classify_raster_layer(layer) -> str:
     except Exception:
         source = ""
 
-    # XYZ tile layers are RGB-encoded regardless of purpose, so band/type
-    # heuristics can't tell terrain from imagery — decide by the URL/params.
-    if "type=xyz" in source:
-        if any(h in source for h in _TERRAIN_URL_HINTS):
-            return "dem"
-        if any(h in source for h in _IMAGERY_URL_HINTS):
+    # XYZ / WMS / WMTS layers are a rendered picture regardless of purpose, so
+    # band/type heuristics can't tell terrain from imagery — decide by the
+    # URL/params. Restricting this to "type=xyz" left every WMS basemap to the
+    # band heuristics, which see one non-Byte ARGB32 band and call it a DEM.
+    kind = _service_kind(layer, source)
+    if kind:
+        by_url = _classify_by_url(source)
+        if by_url is not None:
+            return by_url
+        if kind == "rendered":
+            # Unknown basemap service — safer to flag than to trust.
             return "imagery"
-        if "terrain" in source:  # e.g. interpretation=terrainrgb
-            return "dem"
-        return "imagery"  # unknown XYZ basemap — safer to flag than to trust
+        # A coverage service (WCS) returns real values, so fall through.
 
     provider = None
     try:
@@ -191,7 +243,15 @@ def classify_raster_layer(layer) -> str:
 
     try:
         from qgis.core import Qgis
-        if provider.dataType(1) == Qgis.DataType.Byte:
+        # ARGB32 is what every rendered-image provider reports, so it catches
+        # any service the guard above does not name. Members are looked up by
+        # name because the older QGIS builds do not all define them.
+        image_types = {
+            getattr(Qgis.DataType, n) for n in
+            ("Byte", "ARGB32", "ARGB32_Premultiplied")
+            if hasattr(Qgis.DataType, n)
+        }
+        if provider.dataType(1) in image_types:
             return "imagery"
     except Exception:
         pass

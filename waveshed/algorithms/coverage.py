@@ -32,6 +32,7 @@ from qgis.core import (
 
 from ..core.binary_manager import find_binary
 from ..core.job_builder import (
+    MIN_ANTENNA_AGL_M,
     VALID_RESOLUTIONS,
     CoverageParams,
     build_coverage_job,
@@ -126,12 +127,17 @@ class CoverageAlgorithm(QgsProcessingAlgorithm):
             )
         )
 
+        # minValue is the AGL floor (job_builder.MIN_ANTENNA_AGL_M). Safe as a
+        # parameter bound only because this algorithm exposes no height mode and
+        # so is always AGL — if an AMSL option is ever added here, minValue must
+        # be dropped (an AMSL height is legitimately negative) and the check
+        # moved into processAlgorithm, conditional on the selected mode.
         self.addParameter(
             QgsProcessingParameterNumber(
                 self.TX_HEIGHT,
-                "TX Height (m)",
+                "TX Height (m AGL)",
                 type=QgsProcessingParameterNumber.Double,
-                minValue=0.0,
+                minValue=MIN_ANTENNA_AGL_M,
                 maxValue=10000.0,
                 defaultValue=30.0,
             )

@@ -53,6 +53,7 @@ from ..core.asset_manager import (
     load_asset,
     save_asset,
 )
+from .height_inputs import MIN_AMSL_M, bind_height_mode
 
 
 # ---------------------------------------------------------------------------
@@ -881,7 +882,7 @@ class AssetManagerTab(QWidget):
         defaults_form = QFormLayout(defaults_group)
 
         self.spin_height = QDoubleSpinBox()
-        self.spin_height.setRange(0.0, 10000.0)
+        self.spin_height.setRange(MIN_AMSL_M, 10000.0)
         self.spin_height.setDecimals(1)
         self.spin_height.setValue(30.0)
         self.spin_height.setSuffix(" m")
@@ -890,6 +891,11 @@ class AssetManagerTab(QWidget):
         self.combo_height_mode = QComboBox()
         self.combo_height_mode.addItems(["AGL", "AMSL"])
         defaults_form.addRow("Height Mode:", self.combo_height_mode)
+
+        # The default height seeds every site row built from this asset, so it
+        # gets the same mode-dependent bound as the site table: a 1 m floor
+        # while the mode is AGL, below sea level once it is AMSL.
+        bind_height_mode(self.spin_height, self.combo_height_mode)
 
         layout.addWidget(defaults_group)
 
@@ -1321,10 +1327,13 @@ class AssetManagerTab(QWidget):
         pol = asset.get("polarization", 0)
         self.combo_polarization.setCurrentIndex(min(max(pol, 0), 1))
 
-        self.spin_height.setValue(asset.get("default_height_m", 30.0))
+        # Mode before height: the mode sets the height spinbox's minimum (1 m
+        # AGL floor vs. below sea level for AMSL), so filling the height first
+        # would clamp an AMSL asset's negative elevation to the AGL floor.
         mode = asset.get("default_height_mode", "AGL")
         idx = self.combo_height_mode.findText(mode)
         self.combo_height_mode.setCurrentIndex(max(idx, 0))
+        self.spin_height.setValue(asset.get("default_height_m", 30.0))
 
         # Antenna patterns.
         az_data = asset.get("azimuth_pattern", {}).get("data", [])

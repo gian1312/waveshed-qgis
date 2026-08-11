@@ -438,5 +438,63 @@ class TestMissingBinaryWarning(unittest.TestCase):
                              ["aether_core"])
 
 
+class TestManifestCannotChooseAPath(unittest.TestCase):
+    """The release manifest is unsigned — only TLS protects it.
+
+    ``asset["filename"]`` used to be joined straight onto the temp dir, so a
+    value like "../../home/<user>/.bashrc" resolved outside it. The response
+    body is written there BEFORE the SHA-256 check runs and the ``finally``
+    then deletes it: an arbitrary file clobber-and-delete driven by a network
+    response.
+    """
+
+    def _download_to(self, filename):
+        captured = {}
+
+        def fake_download(url, dest_path, progress_cb=None):
+            captured["dest"] = dest_path
+            captured["existed"] = os.path.exists(dest_path)
+            raise RuntimeError("stop before the checksum")
+
+        with tempfile.TemporaryDirectory() as target:
+            with mock.patch.object(bm, "_download_to_file",
+                                   side_effect=fake_download):
+                with self.assertRaises(RuntimeError):
+                    bm.download_engine(
+                        {"version": "0.4.2"},
+                        {"url": "https://waveshed.io/a.zip",
+                         "filename": filename},
+                        target_dir=target,
+                    )
+        return captured
+
+    def test_traversing_filename_never_reaches_the_filesystem(self):
+        evil = os.path.join("..", "..", "home", "victim", ".bashrc")
+        captured = self._download_to(evil)
+        dest = captured["dest"]
+        self.assertEqual(os.path.dirname(dest), tempfile.gettempdir())
+        self.assertNotIn(".bashrc", os.path.basename(dest))
+        self.assertNotIn("..", dest)
+        self.assertFalse(os.path.exists(dest), "temp file was not cleaned up")
+
+    def test_absolute_filename_never_reaches_the_filesystem(self):
+        captured = self._download_to("/etc/cron.d/pwn")
+        self.assertEqual(os.path.dirname(captured["dest"]),
+                         tempfile.gettempdir())
+        self.assertNotIn("pwn", os.path.basename(captured["dest"]))
+
+    def test_download_target_is_created_by_us_not_opened_blind(self):
+        # mkstemp creates it exclusively, so the path cannot have been
+        # pre-planted as a symlink pointing somewhere else.
+        captured = self._download_to("aether-0.4.2-linux-x64.zip")
+        self.assertTrue(captured["existed"])
+        self.assertTrue(os.path.basename(captured["dest"]).endswith(".zip"))
+
+    def test_a_missing_filename_is_still_fine(self):
+        captured = self._download_to("")
+        self.assertEqual(os.path.dirname(captured["dest"]),
+                         tempfile.gettempdir())
+
+
 if __name__ == "__main__":
     unittest.main()

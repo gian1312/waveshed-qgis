@@ -168,14 +168,15 @@ def get_source_resolution_info(dem_layer: Any) -> str:
     try:
         source = dem_layer.source()
 
-        # XYZ tiles: compute from zmax.
+        # XYZ tiles: compute from zmax. Use the *effective* zmax — the label
+        # drives the user's resolution choice, and advertising a zoom the
+        # service does not publish is how a run ends up asking for tiles that
+        # all 404 (see resolve_zmax).
         if "type=xyz" in source:
-            params = dict(urllib.parse.parse_qsl(source))
-            z_max = int(params.get("zmax", "15"))
+            z_max, _warning = resolve_zmax(source)
             # At equator: res = 40075000 / (2^z * 256)
             res_equator = 40_075_000 / (2 ** z_max * 256)
-            encoding = params.get("interpretation", "")
-            label = encoding if encoding else "XYZ"
+            label = xyz_encoding(source) or "XYZ"
             return f"{label} z{z_max} (~{res_equator:.0f}m at equator, less at higher latitudes)"
 
         # Local files: read from provider.
@@ -299,13 +300,187 @@ def source_fingerprint(buildings: str) -> str:
         return path
 
 
+# ---------------------------------------------------------------------------
+# XYZ elevation encoding and zoom limits
+# ---------------------------------------------------------------------------
+
+#: The two RGB elevation encodings ``aether_converter download`` can decode.
+ENCODING_TERRARIUM = "terrarium"
+ENCODING_MAPBOX = "mapbox"
+
+# Substrings that pin a tile URL template to one encoding.  Terrarium and
+# Mapbox Terrain-RGB are both plain 8-bit RGB PNGs, so nothing in the *pixels*
+# tells them apart: decode a Terrain-RGB tile as Terrarium and every elevation
+# lands near -32000 m, which the engine happily treats as terrain.  QGIS's own
+# ``interpretation=`` parameter is authoritative when the layer carries one —
+# but a hand-added XYZ layer usually carries none, and defaulting those to
+# Terrarium was a silent wrong answer for every Terrain-RGB service.
+_MAPBOX_URL_HINTS = (
+    "terrain-rgb", "terrain_rgb", "terrainrgb",
+    "terrain-dem", "terrain_dem", "mapbox", "maptiler",
+)
+_TERRARIUM_URL_HINTS = (
+    "terrarium", "mapzen", "nextzen", "elevation-tiles-prod", "aws-terrain",
+)
+
+
+def _xyz_url(source: str) -> str:
+    """The decoded ``url=`` tile template of an XYZ layer URI (``""`` if none)."""
+    params = dict(urllib.parse.parse_qsl(source))
+    return urllib.parse.unquote(params.get("url", ""))
+
+
+def _xyz_encoding_hints(url_template: str) -> Tuple[bool, bool]:
+    """``(mapbox_hint, terrarium_hint)`` present in *url_template*."""
+    low = url_template.lower()
+    return (any(h in low for h in _MAPBOX_URL_HINTS),
+            any(h in low for h in _TERRARIUM_URL_HINTS))
+
+
+def xyz_encoding(source: str) -> Optional[str]:
+    """Elevation encoding an XYZ URI pins itself to, or None if it pins none.
+
+    ``interpretation=`` wins when QGIS wrote one (``terrarium`` /
+    ``mapboxterrain``); otherwise the URL template decides.  None means the URI
+    is undecided — either it names no known service at all, or it names both
+    families at once.  :func:`resolve_xyz_encoding` turns that into a default
+    or an error; :func:`source_identity` turns it into the historical default
+    so a URI that is later disambiguated lands on the same pool.
+    """
+    params = dict(urllib.parse.parse_qsl(source))
+    interpretation = params.get("interpretation", "").lower()
+    if "mapbox" in interpretation:
+        return ENCODING_MAPBOX
+    if "terrarium" in interpretation:
+        return ENCODING_TERRARIUM
+
+    mapbox, terrarium = _xyz_encoding_hints(_xyz_url(source))
+    if mapbox != terrarium:
+        return ENCODING_MAPBOX if mapbox else ENCODING_TERRARIUM
+    return None
+
+
+def resolve_xyz_encoding(source: str) -> str:
+    """The encoding to decode *source* with, for the paths that fetch tiles.
+
+    Raises :class:`RuntimeError` when the URL names both encoding families —
+    that is genuinely ambiguous and guessing it has a 50 % chance of producing
+    terrain 32 km below sea level, so the user has to say which it is.  A URL
+    naming *neither* keeps the historical Terrarium default (that is what every
+    working self-hosted mirror relies on today) but says so in the log.
+    """
+    encoding = xyz_encoding(source)
+    if encoding is not None:
+        return encoding
+
+    mapbox, terrarium = _xyz_encoding_hints(_xyz_url(source))
+    if mapbox and terrarium:
+        raise RuntimeError(
+            "This elevation layer's URL mentions both Mapbox Terrain-RGB and "
+            "Terrarium encoding, so the plugin cannot tell how its tiles "
+            "decode to metres. Decoding with the wrong one puts the terrain "
+            "around -32000 m.\n\n"
+            "Set the layer's interpretation explicitly — in the XYZ "
+            "connection dialog, or by adding 'interpretation=terrarium' or "
+            "'interpretation=mapboxterrain' to the layer URI. Already-cached "
+            "terrain for this layer is kept."
+        )
+    _log("  NOTE: this XYZ layer names no known elevation service and carries "
+         "no 'interpretation=' parameter — assuming Terrarium encoding. If the "
+         "terrain comes out near -32000 m it is Mapbox Terrain-RGB; set "
+         "interpretation=mapboxterrain on the layer.")
+    return ENCODING_TERRARIUM
+
+
+#: Deepest zoom each known elevation-tile service actually publishes.  QGIS
+#: defaults a hand-added XYZ layer to ``zmax=18``, but no public terrain
+#: service goes that deep: every tile past the real maximum 404s, the converter
+#: writes those as 0 m, and the run completes — confidently — over a flat
+#: sea-level plane.  Clamping here is what stops that.
+_SERVICE_MAX_ZOOM = (
+    ("elevation-tiles-prod", 15),   # AWS Terrain Tiles (Mapzen Terrarium)
+    ("nextzen.org", 15),            # Nextzen terrarium / normal tiles
+    ("mapzen.com", 15),
+    ("api.mapbox.com", 15),         # Terrain-RGB v4 / Terrain-DEM v1
+)
+
+#: Absolute ceiling for a slippy-map zoom; past this it is a typo, not a level.
+_XYZ_ZOOM_CEILING = 24
+#: Historical default when the URI carries no ``zmax``.
+_XYZ_DEFAULT_ZMAX = 15
+
+
+def service_max_zoom(url_template: str) -> Optional[int]:
+    """Deepest zoom *url_template*'s service is known to publish, else None."""
+    low = url_template.lower()
+    for needle, zoom in _SERVICE_MAX_ZOOM:
+        if needle in low:
+            return zoom
+    return None
+
+
+def resolve_zmax(source: str) -> Tuple[int, Optional[str]]:
+    """``(effective_zmax, warning)`` for an XYZ source.
+
+    ``int(params["zmax"])`` used to be taken at face value, unvalidated: a
+    non-numeric value crashed the run, and QGIS's own default of 18 on a
+    service that stops at 15 made every tile 404 at fine resolutions — which
+    the converter writes as 0 m, so the analysis ran to completion over a flat
+    sea.  Clamp to what the service really publishes and say so.
+
+    The *raw* zmax stays in :func:`source_identity`, deliberately: clamping the
+    identity too would move every existing ``zmax=18`` pool, discarding the
+    coarse-resolution tiles in it that were always correct (a 30 m run never
+    asks for a zoom past 15 in the first place).
+    """
+    params = dict(urllib.parse.parse_qsl(source))
+    raw = params.get("zmax")
+    warning: Optional[str] = None
+
+    if raw is None or raw == "":
+        z_max = _XYZ_DEFAULT_ZMAX
+    else:
+        try:
+            z_max = int(raw)
+        except (TypeError, ValueError):
+            return _XYZ_DEFAULT_ZMAX, (
+                f"the layer's zmax ({raw!r}) is not a number — using "
+                f"z{_XYZ_DEFAULT_ZMAX}."
+            )
+
+    if z_max < 0:
+        return 0, f"the layer's zmax ({z_max}) is negative — using z0."
+    if z_max > _XYZ_ZOOM_CEILING:
+        warning = (f"the layer's zmax ({z_max}) is past any real slippy-map "
+                   f"zoom — capped at z{_XYZ_ZOOM_CEILING}.")
+        z_max = _XYZ_ZOOM_CEILING
+
+    known = service_max_zoom(_xyz_url(source))
+    if known is not None and z_max > known:
+        warning = (
+            f"this service publishes tiles only to z{known}, but the layer "
+            f"says zmax={z_max}. Every request past z{known} returns 404 and "
+            f"the converter writes those tiles as 0 m, so the analysis would "
+            f"run over a flat sea-level plane. Capping at z{known} — fix the "
+            f"layer's Max. Zoom Level to silence this."
+        )
+        z_max = known
+
+    return z_max, warning
+
+
 # Bumped whenever tile geometry, provenance or cache layout changes, so tiles
 # built by an older plugin can never be mistaken for current ones.
 #   v2: tile extent is resolution-keyed (ABT_EXTENT_DEG) instead of a flat 1
 #       degree, and the key is the tile set rather than the request bbox.
 #   v3: tiles are pooled per tile; source identity is normalised; the XYZ zoom
 #       is computed per tile instead of from the request's bbox centre.
-_CACHE_SCHEMA = "v3"
+#   v4: the converter area-averages each output pixel's footprint instead of
+#       taking one source sample from it, and the GDAL warps feeding it use
+#       GRA_Average rather than GRA_Bilinear. Every stored elevation changes,
+#       for the same tile geometry — nothing in the key would otherwise differ,
+#       so a v3 pool would keep serving the aliased tiles forever.
+_CACHE_SCHEMA = "v4"
 
 
 def source_identity(source: str) -> str:
@@ -324,13 +499,23 @@ def source_identity(source: str) -> str:
 
     Anything else in the URI is presentation.  Non-XYZ sources (a file, a VRT,
     a local terrain directory) are already identified by their path.
+
+    The encoding comes from :func:`xyz_encoding`, the same detector the
+    download path uses, so the key can never disagree with the bytes that were
+    written under it.  An undecided URI falls back to Terrarium — the value it
+    has always had — so adding an explicit ``interpretation=terrarium`` later
+    keeps the existing pool instead of re-downloading it.
+
+    ``zmax`` is the *raw* URI value, not the clamped one from
+    :func:`resolve_zmax`: clamping it here would move every pool whose layer
+    says ``zmax=18``, including the coarse-resolution tiles in it that were
+    never affected by the 404s (see :func:`resolve_zmax`).
     """
     if "type=xyz" not in source:
         return source
     params = dict(urllib.parse.parse_qsl(source))
-    url = urllib.parse.unquote(params.get("url", ""))
-    encoding = ("mapbox" if "mapbox" in params.get("interpretation", "").lower()
-                else "terrarium")
+    url = _xyz_url(source)
+    encoding = xyz_encoding(source) or ENCODING_TERRARIUM
     return f"xyz|{url}|{encoding}|zmax={params.get('zmax', '15')}"
 
 
@@ -983,9 +1168,10 @@ def _try_rust_download(
 
     url_template = urllib.parse.unquote(url_raw)
 
-    encoding = "terrarium"
-    if "mapbox" in params.get("interpretation", "").lower():
-        encoding = "mapbox"
+    # Shared with source_identity() so the cache key can never claim an
+    # encoding the tiles were not built with. Raises when the URL genuinely
+    # cannot be told apart (see resolve_xyz_encoding).
+    encoding = resolve_xyz_encoding(source)
 
     # TODO(waveshed): the live XYZ download path has only been exercised against
     # Mapzen Global Terrain (Terrarium encoding). Test it end-to-end with other
@@ -997,7 +1183,13 @@ def _try_rust_download(
     #   res = 40075000 * cos(θ) / (2^z * 256)
     # So z = log2(40075000 * cos(θ) / (res * 256))
     # We need res <= resolution_m, so: z = ceil(log2(...))
-    z_max = int(params.get("zmax", "15"))
+    #
+    # zmax is whatever the layer's URI says, which for a hand-added XYZ layer
+    # is QGIS's default of 18 — deeper than any real terrain service. Validate
+    # and clamp it here rather than trusting int() on it.
+    z_max, zmax_warning = resolve_zmax(source)
+    if zmax_warning:
+        _log(f"  WARNING: {zmax_warning}")
 
     try:
         converter_exe = binary_manager.find_binary("aether_converter")
@@ -1159,6 +1351,24 @@ def _download_zoom_group(
                 _set_rebuild_flags(cache_dir, all_names)
                 return True
 
+            if ok == 0:
+                # TOTAL failure, which is a different animal from the partial
+                # one warned about further down: not one source tile arrived,
+                # so every output tile in this group is 0 m end to end and the
+                # analysis would run over a flat sea-level plane and report
+                # success. Retrying at half the connections cannot fix a
+                # service that answers 404 to everything, so say what it is,
+                # make sure none of it is cached, and let the caller fall back.
+                _log(f"  ERROR: Rust download z={zoom}: 0 of {total} source "
+                     f"tile(s) fetched — nothing was downloaded, so these "
+                     f"tiles would be flat 0 m terrain.")
+                _log(f"    Usual cause: z{zoom} is deeper than this service "
+                     f"publishes (check the layer's Max. Zoom Level), or the "
+                     f"tile URL/API key is wrong. Over open ocean this is also "
+                     f"what an area with genuinely no tiles looks like.")
+                _set_rebuild_flags(cache_dir, all_names, set(all_names))
+                return False
+
             missing = total - ok
             # Which sub-tiles need re-fetching? Ones with a hole in them, and
             # ones never written at all — _abt_has_gaps cannot see the latter,
@@ -1224,7 +1434,13 @@ def _try_gdal_warp(src: str, dest: str, bbox: Dict[str, float],
         opts = dict(
             dstSRS="EPSG:4326",
             outputBounds=[bbox["west"], bbox["south"], bbox["east"], bbox["north"]],
-            format="GTiff", outputType=gdal.GDT_Float32, resampleAlg=gdal.GRA_Bilinear,
+            # Average, not bilinear: this warp usually *decimates* (a 0.5-2 m
+            # national DEM onto a 10-30 m analysis grid), and an interpolator
+            # reads four source pixels around the target centre and drops the
+            # rest of the footprint, so sub-pixel relief survives as speckle
+            # instead of being filtered out. Averaging is the same rule
+            # aether_converter's own resampler and raster_tools:603 use.
+            format="GTiff", outputType=gdal.GDT_Float32, resampleAlg=gdal.GRA_Average,
             # Fill everything outside the source footprint (and source-nodata
             # pixels) with 0 m rather than leaving it nodata, so an analysis
             # radius that reaches past the DEM still produces a full-extent
@@ -1821,7 +2037,20 @@ def prepare_terrain(
         pbf_dir = os.path.join(view_dir, "_buildings")
         try:
             from . import openfreemap
-            openfreemap.download_building_tiles(bbox, pbf_pool, log=_log)
+            # The (ok, missing) result used to be dropped on the floor, so a
+            # run that fetched NOTHING carried on with buildings_missing=False
+            # and pooled building-free terrain under a buildings-keyed
+            # identity — a cache HIT for every later run, forever. Per-tile
+            # failures are the silent case: the over-MAX_TILES guard raises,
+            # but a dead network or a moved endpoint just returns (0, N).
+            ok, missing = openfreemap.download_building_tiles(
+                bbox, pbf_pool, log=_log)
+            if ok == 0:
+                raise RuntimeError(
+                    f"no building tiles could be fetched ({missing} tile(s) "
+                    f"empty or unavailable) — the terrain would carry no "
+                    f"buildings at all"
+                )
             _link_pbf_view(pbf_pool, pbf_dir, [
                 openfreemap.tile_filename(*t)
                 for t in openfreemap.tiles_for_bbox(bbox)

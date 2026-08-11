@@ -34,9 +34,11 @@ from qgis.core import (
 
 from ..core.binary_manager import find_binary
 from ..core.job_builder import (
+    MIN_ANTENNA_AGL_M,
     VALID_RESOLUTIONS,
     P2PParams,
     build_p2p_job,
+    height_floor_error,
     write_job_file,
 )
 from ..core.terrain_adapter import prepare_terrain
@@ -145,13 +147,20 @@ class P2PAlgorithm(QgsProcessingAlgorithm):
                 optional=True,
             )
         )
+        # minValue is the AGL floor (job_builder.MIN_ANTENNA_AGL_M). It is safe
+        # as a parameter bound only because this algorithm hardcodes AGL mode
+        # (see processAlgorithm's P2PParams) and exposes no mode option. If an
+        # AMSL mode is ever exposed here, minValue MUST be removed — an AMSL
+        # height is an absolute elevation and is legitimately zero or negative —
+        # and the floor check moved into processAlgorithm, conditional on the
+        # selected mode, the way _parse_csv already does it per CSV row.
         self.addParameter(
             QgsProcessingParameterNumber(
                 self.TX_HEIGHT,
-                "TX Height (m)",
+                "TX Height (m AGL)",
                 type=QgsProcessingParameterNumber.Double,
                 defaultValue=30.0,
-                minValue=0.0,
+                minValue=MIN_ANTENNA_AGL_M,
                 maxValue=10000.0,
                 optional=True,
             )
@@ -180,13 +189,14 @@ class P2PAlgorithm(QgsProcessingAlgorithm):
                 optional=True,
             )
         )
+        # See TX_HEIGHT: minValue is only sound while the mode is hardcoded AGL.
         self.addParameter(
             QgsProcessingParameterNumber(
                 self.RX_HEIGHT,
-                "RX Height (m)",
+                "RX Height (m AGL)",
                 type=QgsProcessingParameterNumber.Double,
                 defaultValue=1.5,
-                minValue=0.0,
+                minValue=MIN_ANTENNA_AGL_M,
                 maxValue=10000.0,
                 optional=True,
             )
@@ -243,7 +253,7 @@ class P2PAlgorithm(QgsProcessingAlgorithm):
             4. Prepare terrain via terrain_adapter
             5. Build P2P job via job_builder
             6. Run aether_core
-            7. Export results via aether_export
+            7. Verify aether_core wrote its result CSV
             8. Return output path
         """
 
@@ -317,6 +327,16 @@ class P2PAlgorithm(QgsProcessingAlgorithm):
 
         output_name = f"p2p_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
 
+        # NOTE: in batch mode (is_batch) the CSV drives every link and these
+        # tx/rx heights are inert fallbacks that aether_core does not use, so
+        # the model-validity pass build_p2p_job runs on them (log_model_warnings)
+        # describes a link that is not being computed. The per-row limits that
+        # actually matter — the AGL floor and the AGL/AMSL mode — are enforced in
+        # _parse_csv above, which is the batch path's real gate. Deliberately not
+        # re-running the ITM envelope check per CSV row: it would repeat the
+        # frequency/range/refractivity warnings once per site in the log for no
+        # extra information. If per-row ITM height warnings are ever wanted, add
+        # them in _parse_csv where the row values live, not here.
         params = P2PParams(
             tx_lat=tx_lat,
             tx_lon=tx_lon,
@@ -388,28 +408,18 @@ class P2PAlgorithm(QgsProcessingAlgorithm):
         if feedback.isCanceled():
             return {}
 
-        # ---- 7. Export results ----
-        feedback.setProgressText("Exporting results...")
+        # ---- 7. Verify output files ----
+        # P2P produces output directly -- no aether_export step. aether_core
+        # writes <output_name>.csv itself and never writes a .bit/.tiles pair,
+        # so running the exporter here only ever failed on a missing input.
+        feedback.setProgressText("Verifying output files...")
         feedback.setProgress(80)
 
-        export_exe = find_binary("aether_export")
-
-        bit_file = os.path.join(output_dir, output_name + ".bit")
-        tiles_file = os.path.join(output_dir, output_name + ".tiles")
-        input_file = bit_file if os.path.isfile(bit_file) else tiles_file
-
-        json_sidecar = os.path.join(output_dir, output_name + ".json")
         output_path = os.path.join(output_dir, output_name + ".csv")
-
-        result = subprocess.run(
-            [export_exe, "-i", input_file, "-j", json_sidecar, "-o", output_path],
-            capture_output=True,
-            text=True,
-            creationflags=_SUBPROCESS_FLAGS,
-        )
-        if result.returncode != 0:
+        if not os.path.isfile(output_path):
             raise QgsProcessingException(
-                f"aether_export failed (exit {result.returncode}):\n{result.stderr}"
+                f"Expected P2P result CSV not found: {output_path}\n"
+                "aether_core may have failed to produce output."
             )
 
         feedback.setProgress(100)
@@ -454,6 +464,16 @@ class P2PAlgorithm(QgsProcessingAlgorithm):
         """Parse an AETHER batch CSV.
 
         Returns a list of (type, id, lat, lon, alt_m, mode) tuples.
+
+        This is the *only* validation a batch run gets: when BATCH_FILE is
+        supplied the TX/RX parameters are ignored entirely and the CSV drives
+        every link, so the parameter bounds in ``initAlgorithm`` never see these
+        values. Altitude and mode are therefore checked here, matching
+        ``gui.p2p_tab._parse_batch_csv``.
+
+        Raises:
+            QgsProcessingException: On a malformed row, an unknown mode, or an
+                AGL altitude below ``MIN_ANTENNA_AGL_M``.
         """
         entries: List[Tuple[str, str, float, float, float, str]] = []
         with open(path, "r", newline="", encoding="utf-8-sig") as fh:
@@ -471,13 +491,33 @@ class P2PAlgorithm(QgsProcessingAlgorithm):
                         f"Batch CSV line {line_no}: type must be 'S' or 'R', "
                         f"got '{row[0].strip()}'"
                     )
+                mode = row[5].strip().upper()
+                if mode not in ("AGL", "AMSL"):
+                    raise QgsProcessingException(
+                        f"Batch CSV line {line_no}: mode must be AGL or AMSL, "
+                        f"got '{row[5].strip()}'"
+                    )
+                try:
+                    altitude = float(row[4].strip())
+                except ValueError as exc:
+                    raise QgsProcessingException(
+                        f"Batch CSV line {line_no}: altitude is not a number, "
+                        f"got '{row[4].strip()}'"
+                    ) from exc
+                # AGL rows only. An AMSL row is an absolute elevation and is
+                # legitimately zero or negative (Dead Sea shore -430 m).
+                floor_error = height_floor_error(
+                    f"Batch CSV line {line_no}: altitude", altitude, mode,
+                )
+                if floor_error is not None:
+                    raise QgsProcessingException(floor_error)
                 entries.append((
                     row_type,
                     row[1].strip(),
                     float(row[2].strip()),
                     float(row[3].strip()),
-                    float(row[4].strip()),
-                    row[5].strip().upper(),
+                    altitude,
+                    mode,
                 ))
         return entries
 

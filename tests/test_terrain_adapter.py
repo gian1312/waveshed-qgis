@@ -14,6 +14,7 @@ import os
 import struct
 import tempfile
 import unittest
+import urllib.parse
 from unittest import mock
 
 try:
@@ -448,7 +449,9 @@ class TestMissingEngineFailsFast(unittest.TestCase):
                                   30, [], bm)
         self.assertIn("not an XYZ tile service", logged[0])
         self.assertIn("no 'url'", logged[1])
-        self.assertIn("not found", logged[2])
+        # The third bail-out (missing engine) is now preceded by the encoding
+        # note for a URL that names no known service, so match on the tail.
+        self.assertTrue(any("not found" in line for line in logged[2:]), logged)
 
 
 class TestSourceIdentity(unittest.TestCase):
@@ -1439,3 +1442,261 @@ class TestPrebuiltAbtSuitability(unittest.TestCase):
             self.assertEqual(out, d)
             self.assertTrue(any("WARNING" in ln for ln in logged),
                             f"no warning logged; got {logged}")
+
+
+# ---------------------------------------------------------------------------
+# XYZ encoding detection (B2)
+# ---------------------------------------------------------------------------
+
+_MAPZEN_URL = ("https%3A//s3.amazonaws.com/elevation-tiles-prod/terrarium/"
+               "%7Bz%7D/%7Bx%7D/%7By%7D.png")
+_MAPBOX_URL = ("https%3A//api.mapbox.com/v4/mapbox.terrain-rgb/"
+               "%7Bz%7D/%7Bx%7D/%7By%7D.pngraw")
+_ANON_URL = "https%3A//tiles.example.com/%7Bz%7D/%7Bx%7D/%7By%7D.png"
+
+
+class TestXyzEncoding(unittest.TestCase):
+    """Terrarium and Terrain-RGB are both 8-bit RGB PNGs.
+
+    Nothing in the pixels tells them apart, so decoding a Terrain-RGB tile as
+    Terrarium yields terrain around -32000 m — a confident, silent wrong
+    answer. The URI used to be read for ``interpretation=mapbox…`` only, so a
+    Terrain-RGB layer added by hand (QGIS writes no interpretation) was always
+    decoded as Terrarium.
+    """
+
+    def test_mapbox_url_without_interpretation_is_mapbox(self):
+        src = f"type=xyz&url={_MAPBOX_URL}&zmax=15"
+        self.assertEqual(ta.xyz_encoding(src), ta.ENCODING_MAPBOX)
+
+    def test_terrarium_url_without_interpretation_is_terrarium(self):
+        src = f"type=xyz&url={_MAPZEN_URL}&zmax=15"
+        self.assertEqual(ta.xyz_encoding(src), ta.ENCODING_TERRARIUM)
+
+    def test_explicit_interpretation_beats_the_url(self):
+        # QGIS wrote it: it is authoritative, whatever the host name suggests.
+        src = f"type=xyz&interpretation=mapboxterrain&url={_MAPZEN_URL}"
+        self.assertEqual(ta.xyz_encoding(src), ta.ENCODING_MAPBOX)
+        src = f"type=xyz&interpretation=terrarium&url={_MAPBOX_URL}"
+        self.assertEqual(ta.xyz_encoding(src), ta.ENCODING_TERRARIUM)
+
+    def test_url_naming_neither_family_is_undecided(self):
+        self.assertIsNone(ta.xyz_encoding(f"type=xyz&url={_ANON_URL}"))
+
+    def test_url_naming_both_families_is_undecided(self):
+        both = "https%3A//tiles.example.com/mapbox/terrarium/%7Bz%7D.png"
+        self.assertIsNone(ta.xyz_encoding(f"type=xyz&url={both}"))
+
+
+class TestResolveXyzEncoding(unittest.TestCase):
+
+    def test_conflicting_url_requires_an_explicit_choice(self):
+        both = "https%3A//tiles.example.com/mapbox/terrarium/%7Bz%7D.png"
+        with self.assertRaises(RuntimeError) as caught:
+            ta.resolve_xyz_encoding(f"type=xyz&url={both}")
+        msg = str(caught.exception)
+        self.assertIn("interpretation=terrarium", msg)
+        self.assertIn("interpretation=mapboxterrain", msg)
+
+    def test_unknown_url_keeps_the_terrarium_default_and_says_so(self):
+        # Every self-hosted Terrarium mirror in the wild relies on this
+        # default, so it stays — but it is no longer silent.
+        logged = []
+        with mock.patch.object(ta, "_log", side_effect=logged.append):
+            enc = ta.resolve_xyz_encoding(f"type=xyz&url={_ANON_URL}")
+        self.assertEqual(enc, ta.ENCODING_TERRARIUM)
+        self.assertTrue(any("Terrarium" in ln for ln in logged), logged)
+
+    def test_decided_urls_log_nothing(self):
+        logged = []
+        with mock.patch.object(ta, "_log", side_effect=logged.append):
+            ta.resolve_xyz_encoding(f"type=xyz&url={_MAPZEN_URL}")
+            ta.resolve_xyz_encoding(f"type=xyz&url={_MAPBOX_URL}")
+        self.assertEqual(logged, [])
+
+
+class TestEncodingAndIdentityCannotDrift(unittest.TestCase):
+    """One detector feeds both the cache key and the downloader."""
+
+    def test_identity_carries_the_detected_encoding(self):
+        for url in (_MAPZEN_URL, _MAPBOX_URL, _ANON_URL):
+            src = f"type=xyz&url={url}&zmax=15"
+            self.assertIn(f"|{ta.resolve_xyz_encoding(src)}|",
+                          ta.source_identity(src))
+
+    def test_terrarium_pools_keep_their_existing_identity(self):
+        # The whole point of the constraint: a source that decodes correctly
+        # today must not be re-downloaded because of this fix.
+        src = f"type=xyz&url={_MAPZEN_URL}&zmax=15"
+        self.assertEqual(
+            ta.source_identity(src),
+            f"xyz|{urllib.parse.unquote(_MAPZEN_URL)}|terrarium|zmax=15")
+
+    def test_undecided_uri_keeps_the_historical_identity(self):
+        # So adding interpretation=terrarium later lands on the same pool
+        # rather than re-downloading it.
+        anon = f"type=xyz&url={_ANON_URL}&zmax=15"
+        explicit = f"type=xyz&url={_ANON_URL}&zmax=15&interpretation=terrarium"
+        self.assertEqual(ta.source_identity(anon), ta.source_identity(explicit))
+
+    def test_mapbox_pool_identity_moves_off_the_wrong_data(self):
+        # Its current tiles decode to about -32000 m, so they must not be
+        # reused — a new identity is the point, not a regression.
+        src = f"type=xyz&url={_MAPBOX_URL}&zmax=15"
+        legacy = f"xyz|{urllib.parse.unquote(_MAPBOX_URL)}|terrarium|zmax=15"
+        self.assertNotEqual(ta.source_identity(src), legacy)
+        self.assertIn("|mapbox|", ta.source_identity(src))
+
+
+# ---------------------------------------------------------------------------
+# zmax validation (B1)
+# ---------------------------------------------------------------------------
+
+class TestResolveZmax(unittest.TestCase):
+    """QGIS defaults a hand-added XYZ layer to zmax=18.
+
+    Mapzen/AWS stops at 15, so at 2 m every tile 404s, the converter writes
+    those as 0 m, and the run completes over a flat sea-level plane.
+    """
+
+    def test_known_service_is_capped_at_its_real_maximum(self):
+        z, warning = ta.resolve_zmax(f"type=xyz&url={_MAPZEN_URL}&zmax=18")
+        self.assertEqual(z, 15)
+        self.assertIsNotNone(warning)
+        self.assertIn("z15", warning)
+
+    def test_a_correct_zmax_passes_without_a_warning(self):
+        self.assertEqual(ta.resolve_zmax(f"type=xyz&url={_MAPZEN_URL}&zmax=15"),
+                         (15, None))
+
+    def test_unknown_service_is_left_alone(self):
+        # We have no idea what it publishes; guessing would silently coarsen
+        # a service that really does go deeper.
+        self.assertEqual(ta.resolve_zmax(f"type=xyz&url={_ANON_URL}&zmax=18"),
+                         (18, None))
+
+    def test_absent_zmax_keeps_the_historical_default(self):
+        self.assertEqual(ta.resolve_zmax(f"type=xyz&url={_ANON_URL}"), (15, None))
+
+    def test_non_numeric_zmax_does_not_crash_the_run(self):
+        # int(params["zmax"]) used to raise straight out of prepare_terrain.
+        z, warning = ta.resolve_zmax(f"type=xyz&url={_ANON_URL}&zmax=abc")
+        self.assertEqual(z, 15)
+        self.assertIn("not a number", warning)
+
+    def test_absurd_zmax_is_capped(self):
+        z, warning = ta.resolve_zmax(f"type=xyz&url={_ANON_URL}&zmax=99")
+        self.assertEqual(z, ta._XYZ_ZOOM_CEILING)
+        self.assertIsNotNone(warning)
+
+    def test_negative_zmax_is_floored(self):
+        z, warning = ta.resolve_zmax(f"type=xyz&url={_ANON_URL}&zmax=-3")
+        self.assertEqual(z, 0)
+        self.assertIsNotNone(warning)
+
+    def test_clamping_does_not_move_the_cache_identity(self):
+        # A zmax=18 pool also holds the coarse tiles that were always correct
+        # (a 30 m run never asks past z12), so the raw value stays in the key.
+        src = f"type=xyz&url={_MAPZEN_URL}&zmax=18"
+        self.assertIn("zmax=18", ta.source_identity(src))
+        self.assertEqual(ta.resolve_zmax(src)[0], 15)
+
+    def test_capped_zoom_is_what_tiles_are_built_from(self):
+        # 2 m at lat 47 wants z16; the cap is what keeps it fetchable.
+        z_max, _warning = ta.resolve_zmax(f"type=xyz&url={_MAPZEN_URL}&zmax=18")
+        self.assertEqual(ta.tile_zoom(47.0, 2.0, z_max), 15)
+        self.assertEqual(ta.tile_zoom(47.0, 2.0, 18), 16)   # the old behaviour
+
+
+class TestTotalDownloadFailureIsDistinct(unittest.TestCase):
+    """"Nothing arrived" must not read like "a few tiles are gapped"."""
+
+    _SPECS = [{"filename": "tile_a.abt"}, {"filename": "tile_b.abt"}]
+
+    def _run_group(self, ok, total, pool):
+        logged = []
+        calls = []
+
+        def run_pass(specs, conn, zoom):
+            calls.append((len(specs), conn, zoom))
+            return 0, ok, total
+
+        with mock.patch.object(ta, "_log", side_effect=logged.append):
+            result = ta._download_zoom_group(
+                pool, self._SPECS, 16, 256, 4, run_pass, lambda: True)
+        return result, logged, calls
+
+    def test_zero_tiles_fetched_is_reported_as_a_total_failure(self):
+        with tempfile.TemporaryDirectory() as pool:
+            result, logged, calls = self._run_group(0, 100, pool)
+            flags = sorted(os.listdir(pool))
+        self.assertFalse(result)
+        text = "\n".join(logged)
+        self.assertIn("0 of 100", text)
+        self.assertIn("flat 0 m terrain", text)
+        # Retrying at half the connections cannot fix a 404 for everything.
+        self.assertEqual(len(calls), 1)
+        # And none of it may be left cached as a valid tile.
+        self.assertEqual(flags, ["tile_a.abt.rebuild", "tile_b.abt.rebuild"])
+
+    def test_a_partial_failure_still_reads_as_partial(self):
+        with tempfile.TemporaryDirectory() as pool:
+            _result, logged, _calls = self._run_group(97, 100, pool)
+        text = "\n".join(logged)
+        self.assertNotIn("flat 0 m terrain", text)
+        self.assertIn("partial terrain", text)
+
+    def test_a_complete_download_says_nothing_about_failure(self):
+        with tempfile.TemporaryDirectory() as pool:
+            _result, logged, _calls = self._run_group(100, 100, pool)
+        self.assertNotIn("flat 0 m terrain", "\n".join(logged))
+
+
+# ---------------------------------------------------------------------------
+# Buildings download result (B6)
+# ---------------------------------------------------------------------------
+
+class TestBuildingDownloadResultIsChecked(unittest.TestCase):
+    """A zero-tile buildings fetch used to pass for a successful one.
+
+    The (ok, missing) return was discarded, so buildings_missing stayed False,
+    the tiles were pooled under a buildings-keyed identity — and every later
+    run hit that cache and quietly produced building-free terrain.
+    """
+
+    def _prepare(self, download_result):
+        from waveshed.core import openfreemap as ofm
+
+        layer = mock.Mock()
+        layer.source.return_value = _XYZ_SOURCE
+
+        logged = []
+        with tempfile.TemporaryDirectory() as root:
+            with mock.patch.object(ta, "get_cache_dir", return_value=root), \
+                 mock.patch.object(ta, "_log", side_effect=logged.append), \
+                 mock.patch.object(ta, "_try_rust_download", return_value=True), \
+                 mock.patch.object(ofm, "download_building_tiles",
+                                   return_value=download_result), \
+                 mock.patch.object(ofm, "tiles_for_bbox",
+                                   return_value=[(14, 8000, 5000)]):
+                buildings = ta.buildings_identity(osm_buildings=True)
+                pool = ta._pool_dir(_XYZ_SOURCE, buildings)
+                ta.prepare_terrain(layer, 47.4, 8.5, 5.0, 30, mock.Mock(),
+                                   osm_buildings=True)
+                flags = sorted(n for n in os.listdir(pool)
+                               if n.endswith(".rebuild"))
+        return logged, flags
+
+    def test_zero_tiles_fetched_is_a_failed_buildings_run(self):
+        logged, flags = self._prepare((0, 42))
+        text = "\n".join(logged)
+        self.assertIn("no building tiles could be fetched", text)
+        self.assertIn("buildings were requested but unavailable", text)
+        # Nothing may stay pooled under an identity that claims buildings.
+        self.assertTrue(flags, "no tile was flagged for rebuild")
+
+    def test_a_successful_fetch_leaves_the_tiles_pooled(self):
+        logged, flags = self._prepare((17, 3))
+        text = "\n".join(logged)
+        self.assertNotIn("no building tiles could be fetched", text)
+        self.assertEqual(flags, [])

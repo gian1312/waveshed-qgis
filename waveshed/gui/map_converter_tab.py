@@ -62,7 +62,12 @@ from qgis.gui import QgsMapLayerComboBox, QgsRubberBand
 
 from ..core.binary_manager import find_binary
 from ..core.layer_utils import classify_raster_layer
-from ..core.terrain_adapter import ABT_EXTENT_DEG, source_fingerprint
+from ..core.terrain_adapter import (
+    ABT_EXTENT_DEG,
+    _estimate_abt_disk_mb,
+    _tile_params,
+    source_fingerprint,
+)
 
 TAG = "Waveshed"
 
@@ -117,33 +122,81 @@ def _set_layer_filters(combo) -> None:
     )
 
 
-def _abt_size_px(res_m: int, extent_deg: float) -> int:
-    """Compute .abt tile pixel width for a given resolution and extent."""
-    target_deg = res_m / 111_111.0
-    sz = int(round(extent_deg / target_deg))
-    return ((sz + 3) // 4) * 4  # BC6H block alignment
+def _abt_tile_name(res_m: int, ul_lat: float, ul_lon: float) -> str:
+    """Output file name for one Map Converter tile.
+
+    Distinct from ``terrain_adapter._tile_params``' name: the analysis path
+    pools its tiles by source and this tab writes a user-chosen folder, so the
+    two naming schemes are deliberately not interchangeable.
+    """
+    return f"Tile_N{ul_lat:.2f}E{ul_lon:.2f}_{res_m}m_r16sint.abt"
 
 
-def _estimate_tile_count_and_mb(
+def _snap_bbox(bbox: Dict[str, float], resolutions: List[int]) -> Dict[str, float]:
+    """Snap *bbox* outward onto the finest tile grid the run will use."""
+    finest = min(_ABT_EXTENT_DEG.get(r, 1.0) for r in resolutions)
+    return {
+        "south": math.floor(bbox["south"] / finest) * finest,
+        "north": math.ceil(bbox["north"] / finest) * finest,
+        "west": math.floor(bbox["west"] / finest) * finest,
+        "east": math.ceil(bbox["east"] / finest) * finest,
+    }
+
+
+def _enumerate_tiles(
     bbox: Dict[str, float], resolutions: List[int],
-) -> Tuple[int, int]:
-    """Return (tile_count, total_mb) for the given bbox and resolutions."""
-    total_tiles = 0
-    total_bytes = 0
-    for res in resolutions:
+) -> List[Tuple[int, Dict[str, Any]]]:
+    """Every ``(resolution, tile_params)`` a conversion of *bbox* produces.
+
+    One definition for the pre-run estimate and for the worker that builds the
+    jobs.  They used to walk the grid separately, over *different* extents (the
+    worker snaps outward first), so the estimate could name a different number
+    of tiles than the run then built.
+
+    Tile geometry comes from ``terrain_adapter._tile_params`` — the same
+    formula the analysis path uses, including the ``_ABT_MAX_SIZE_PX`` u16
+    row-stride guard that the copy here used to omit.
+    """
+    tiles: List[Tuple[int, Dict[str, Any]]] = []
+    for res in sorted(resolutions):
         ext = _ABT_EXTENT_DEG.get(res, 1.0)
         lat = math.floor(bbox["south"] / ext) * ext
         while lat < bbox["north"]:
             lon = math.floor(bbox["west"] / ext) * ext
             while lon < bbox["east"]:
-                sz = _abt_size_px(res, ext)
-                bpr = sz * 2
-                stride = (bpr + 255) & ~255
-                total_bytes += 44 + stride * sz
-                total_tiles += 1
+                tiles.append((res, _tile_params(ext, lat, lon, res)))
                 lon = round(lon + ext, 6)
             lat = round(lat + ext, 6)
-    return total_tiles, total_bytes // (1024 * 1024)
+    return tiles
+
+
+def _estimate_tile_count_and_mb(
+    bbox: Dict[str, float],
+    resolutions: List[int],
+    output_dir: str = "",
+    overwrite: bool = True,
+) -> Tuple[int, int]:
+    """Return ``(tile_count, total_mb)`` for the tiles a run would build.
+
+    Prices exactly what the worker will do: the same outward-snapped extent,
+    and — unless *overwrite* — without the tiles already sitting in
+    *output_dir*, which the worker skips.
+    """
+    if not resolutions:
+        return 0, 0
+    tiles = _enumerate_tiles(_snap_bbox(bbox, resolutions), resolutions)
+    if output_dir and not overwrite:
+        # One listing rather than a stat per tile: this runs on every checkbox
+        # toggle and a big area is tens of thousands of tiles.
+        try:
+            existing = set(os.listdir(output_dir))
+        except OSError:
+            existing = set()
+        tiles = [
+            (res, t) for res, t in tiles
+            if _abt_tile_name(res, t["ul_lat"], t["ul_lon"]) not in existing
+        ]
+    return len(tiles), _estimate_abt_disk_mb([t for _res, t in tiles])
 
 
 def _list_terrain_files(folder: str) -> List[str]:
@@ -325,7 +378,29 @@ def _fgb_translate_options(src_crs: str = "") -> List[str]:
     return options
 
 
-def _fgb_cache_name(src_path: str, src_crs: str = "") -> str:
+def _split_sublayer(uri: str) -> Tuple[str, str]:
+    """Split a QGIS OGR URI into ``(file path, sublayer name)``.
+
+    QGIS hands a GeoPackage/GDB/KML sublayer over as
+    ``…/x.gpkg|layername=buildings``. Neither ``os.path.isfile`` nor
+    ``os.path.splitext`` understands that suffix, so the extension test in
+    ``_resolve_buildings`` never matched — no conversion happened and the raw
+    URI went to the converter, which cannot open it and only warns. Anything
+    other than ``layername=`` (``layerid=``, ``geometrytype=``, …) yields an
+    empty name, which converts every layer rather than the wrong one.
+    """
+    head, sep, tail = uri.partition("|")
+    if not sep:
+        return uri, ""
+    for part in tail.split("|"):
+        key, _, value = part.partition("=")
+        if key.strip().lower() == "layername":
+            return head, value
+    return head, ""
+
+
+def _fgb_cache_name(src_path: str, src_crs: str = "",
+                    layer_name: str = "") -> str:
     """File name for a cached conversion of *src_path* declared as *src_crs*.
 
     The conversion cache lives in a shared temp directory that survives across
@@ -341,21 +416,30 @@ def _fgb_cache_name(src_path: str, src_crs: str = "") -> str:
     Including the source fingerprint and the CRS makes each of those a
     different file, and leaves pre-existing entries unreachable rather than
     wrong.
+
+    *layer_name* rides along too: two sublayers of one GeoPackage are two
+    different conversions of the same file.
     """
     basename = os.path.splitext(os.path.basename(src_path))[0]
-    ident = f"{source_fingerprint(src_path)}|{src_crs}"
+    ident = f"{source_fingerprint(src_path)}|{src_crs}|{layer_name}"
     digest = hashlib.md5(ident.encode("utf-8")).hexdigest()[:12]
     return f"{basename}_{digest}.fgb"
 
 
-def _convert_to_fgb(src_path: str, out_dir: str, src_crs: str = "") -> Optional[str]:
+def _convert_to_fgb(src_path: str, out_dir: str, src_crs: str = "",
+                    layer_name: str = "") -> Optional[str]:
     """Convert a vector file (GDB/SHP/GPKG/GeoJSON) to FlatGeobuf via GDAL.
+
+    *src_path* must be a plain filesystem path — GDAL does not understand
+    QGIS's ``|layername=`` suffix, so a container's sublayer is selected with
+    *layer_name* instead (see :func:`_split_sublayer`).
 
     Returns path to the output .fgb file, or None on failure.
     """
     try:
         from osgeo import gdal, ogr
-        out_path = os.path.join(out_dir, _fgb_cache_name(src_path, src_crs))
+        out_path = os.path.join(
+            out_dir, _fgb_cache_name(src_path, src_crs, layer_name))
         if os.path.exists(out_path):
             return out_path
 
@@ -367,7 +451,13 @@ def _convert_to_fgb(src_path: str, out_dir: str, src_crs: str = "") -> Optional[
             os.remove(tmp_path)
 
         options = _fgb_translate_options(src_crs)
-        result = gdal.VectorTranslate(tmp_path, src_path, options=options)
+        # `layers` is only passed when there is one, so the far commoner
+        # whole-file conversion issues exactly the call it always has.
+        if layer_name:
+            result = gdal.VectorTranslate(tmp_path, src_path, options=options,
+                                          layers=[layer_name])
+        else:
+            result = gdal.VectorTranslate(tmp_path, src_path, options=options)
         if result is None:
             if os.path.exists(tmp_path):
                 os.remove(tmp_path)
@@ -738,44 +828,28 @@ class _MapConverterWorker(QThread):
                 self.finished_err.emit("No layer has an extent set.")
                 return
 
-            # Snap to grid.
-            finest = min(_ABT_EXTENT_DEG.get(r, 1.0) for r in self._out_res)
-            bbox = {
-                "south": math.floor(combined["south"] / finest) * finest,
-                "north": math.ceil(combined["north"] / finest) * finest,
-                "west": math.floor(combined["west"] / finest) * finest,
-                "east": math.ceil(combined["east"] / finest) * finest,
-            }
+            # Snap to grid, then enumerate — the same two calls the pre-run
+            # estimate makes, so the tile count it showed is the one built.
+            bbox = _snap_bbox(combined, self._out_res)
 
             os.makedirs(self._output_dir, exist_ok=True)
             jobs = []
-            for res in sorted(self._out_res):
-                ext_deg = _ABT_EXTENT_DEG.get(res, 1.0)
-                lat = math.floor(bbox["south"] / ext_deg) * ext_deg
-                while lat < bbox["north"]:
-                    lon = math.floor(bbox["west"] / ext_deg) * ext_deg
-                    while lon < bbox["east"]:
-                        ul_lat = round(lat + ext_deg, 6)
-                        ul_lon = round(lon, 6)
-                        sz = _abt_size_px(res, ext_deg)
-                        exact_res = ext_deg / sz * 111_111.0
-                        fn = f"Tile_N{ul_lat:.2f}E{ul_lon:.2f}_{res}m_r16sint.abt"
-                        out = os.path.join(self._output_dir, fn)
-                        if self._overwrite or not os.path.exists(out):
-                            job = {
-                                "output_path": os.path.abspath(out),
-                                "format": "r16sint",
-                                "ul_lat": ul_lat, "ul_lon": ul_lon,
-                                "resolution_m": float(exact_res),
-                                "size_px": sz,
-                                "base_tif": base,
-                                "swiss_tifs": overlays,
-                            }
-                            if buildings_path:
-                                job["buildings_file"] = buildings_path
-                            jobs.append(job)
-                        lon = round(lon + ext_deg, 6)
-                    lat = round(lat + ext_deg, 6)
+            for res, tile in _enumerate_tiles(bbox, self._out_res):
+                fn = _abt_tile_name(res, tile["ul_lat"], tile["ul_lon"])
+                out = os.path.join(self._output_dir, fn)
+                if self._overwrite or not os.path.exists(out):
+                    job = {
+                        "output_path": os.path.abspath(out),
+                        "format": "r16sint",
+                        "ul_lat": tile["ul_lat"], "ul_lon": tile["ul_lon"],
+                        "resolution_m": float(tile["exact_res_m"]),
+                        "size_px": tile["size_px"],
+                        "base_tif": base,
+                        "swiss_tifs": overlays,
+                    }
+                    if buildings_path:
+                        job["buildings_file"] = buildings_path
+                    jobs.append(job)
 
             if not jobs:
                 self.status.emit("All tiles already exist.")
@@ -931,14 +1005,21 @@ class _MapConverterWorker(QThread):
         if path.startswith("[OSM Download"):
             return self._download_osm_buildings(entry)
 
+        # A container sublayer arrives as "<file>|layername=<x>". Split it off
+        # before every isfile/splitext test below — on the joined URI isfile()
+        # is always False and splitext() yields ".gpkg|layername=x", so the
+        # conversion was skipped twice over and the raw URI reached the
+        # converter, which cannot open it.
+        file_path, sublayer = _split_sublayer(path)
+
         # GDB → FGB conversion.
         is_gdb = False
-        if path.lower().endswith(".gdb") and os.path.isdir(path):
+        if file_path.lower().endswith(".gdb") and os.path.isdir(file_path):
             is_gdb = True
-        elif os.path.isdir(path):
+        elif os.path.isdir(file_path):
             try:
                 is_gdb = any(f.lower().endswith(".gdbtable")
-                             for f in os.listdir(path))
+                             for f in os.listdir(file_path))
             except OSError:
                 pass
 
@@ -946,18 +1027,19 @@ class _MapConverterWorker(QThread):
             self._log(f"  Converting GDB → FlatGeobuf: {path}")
             out_dir = os.path.join(tempfile.gettempdir(), "aether_fgb")
             os.makedirs(out_dir, exist_ok=True)
-            fgb = _convert_to_fgb(path, out_dir, src_crs)
+            fgb = _convert_to_fgb(file_path, out_dir, src_crs, sublayer)
             if fgb:
                 return os.path.abspath(fgb)
             self._log("  GDB conversion failed.")
 
         # SHP/GPKG/GeoJSON → FGB.
-        ext = os.path.splitext(path)[1].lower() if os.path.isfile(path) else ""
+        ext = (os.path.splitext(file_path)[1].lower()
+               if os.path.isfile(file_path) else "")
         if ext in (".shp", ".gpkg", ".geojson"):
             self._log(f"  Converting {ext} → FlatGeobuf...")
             out_dir = os.path.join(tempfile.gettempdir(), "aether_fgb")
             os.makedirs(out_dir, exist_ok=True)
-            fgb = _convert_to_fgb(path, out_dir, src_crs)
+            fgb = _convert_to_fgb(file_path, out_dir, src_crs, sublayer)
             if fgb:
                 return os.path.abspath(fgb)
 
@@ -967,7 +1049,7 @@ class _MapConverterWorker(QThread):
             self._log(f"  Reprojecting buildings {src_crs} → EPSG:4326...")
             out_dir = os.path.join(tempfile.gettempdir(), "aether_fgb")
             os.makedirs(out_dir, exist_ok=True)
-            fgb = _convert_to_fgb(path, out_dir, src_crs)
+            fgb = _convert_to_fgb(file_path, out_dir, src_crs, sublayer)
             if fgb:
                 return os.path.abspath(fgb)
             self._log(
@@ -975,7 +1057,11 @@ class _MapConverterWorker(QThread):
                 "they may be placed incorrectly."
             )
 
-        return os.path.abspath(path)
+        # Absolutise the file part only: abspath() on the whole URI prefixes
+        # the cwd to it, and the suffix has to survive for anything downstream
+        # that still understands it.
+        resolved = os.path.abspath(file_path)
+        return f"{resolved}|layername={sublayer}" if sublayer else resolved
 
     def _download_osm_buildings(self, entry: dict) -> Optional[str]:
         """Download buildings from OSM Overpass API."""
@@ -1044,7 +1130,12 @@ class _MapConverterWorker(QThread):
                 return out
             self._log(f"  Reprojecting {os.path.basename(path)} → WGS84")
             r = gdal.Warp(out, path, dstSRS="EPSG:4326", format="GTiff",
-                          resampleAlg=gdal.GRA_Bilinear)
+                          # Average, not bilinear: the reprojected raster is
+                          # resampled again onto the .abt grid, and an
+                          # interpolator throws away everything outside the four
+                          # pixels around each target centre — the discarded
+                          # relief is what shows up later as speckle.
+                          resampleAlg=gdal.GRA_Average)
             if r:
                 r.FlushCache()
                 r = None
@@ -1292,7 +1383,7 @@ class MapConverterTab(QWidget):
         self._res_checks: Dict[int, QCheckBox] = {}
         for res in sorted(_ABT_EXTENT_DEG):
             ext = _ABT_EXTENT_DEG.get(res, 1.0)
-            sz = _abt_size_px(res, ext)
+            sz = _tile_params(ext, 0.0, 0.0, res)["size_px"]
             cb = QCheckBox(f"{res}m")
             cb.setToolTip(
                 f"{res}m resolution, {ext}\u00b0 geographic extent per tile, "
@@ -1300,7 +1391,6 @@ class MapConverterTab(QWidget):
             )
             if res == 30:
                 cb.setChecked(True)
-            cb.stateChanged.connect(self._update_estimate)
             self._res_checks[res] = cb
             res_lay.addWidget(cb)
         res_lay.addStretch()
@@ -1327,6 +1417,12 @@ class MapConverterTab(QWidget):
         self._btn_browse = QPushButton("Browse...")
         out_row.addWidget(self._btn_browse)
         root.addLayout(out_row)
+
+        # Wired only now: the estimate reads the output directory and the
+        # rebuild flag, both of which are built above but *after* the
+        # resolution checkboxes.
+        for cb in self._res_checks.values():
+            cb.stateChanged.connect(self._update_estimate)
 
         # ---- Estimate ----
         self._lbl_estimate = QLabel("")
@@ -1907,7 +2003,13 @@ class MapConverterTab(QWidget):
             )
             return
 
-        total_tiles, total_mb = _estimate_tile_count_and_mb(combined, out_res)
+        # Price what the run will actually build: the worker skips tiles that
+        # already exist unless "Rebuild existing tiles" is on.
+        total_tiles, total_mb = _estimate_tile_count_and_mb(
+            combined, out_res,
+            output_dir=self._get_output_dir(),
+            overwrite=self._chk_overwrite.isChecked(),
+        )
 
         colour = "red" if total_mb > 200_000 else (
             "darkorange" if total_mb > 50_000 else "black")

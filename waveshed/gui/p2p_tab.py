@@ -67,14 +67,16 @@ from ..core.job_builder import (
     P2PParams,
     build_p2p_job,
     format_model_warnings,
+    height_floor_error,
     model_warnings,
     write_job_file,
 )
 from ..core.layer_utils import dem_layer_warning, hide_from_dem_picker
 from ..core.terrain_adapter import (
-    estimate_terrain_disk_mb,
+    terrain_plan,
     terrain_size_warning,
 )
+from .height_inputs import MIN_AMSL_M, bind_height_mode
 from .map_tools import activate_point_capture
 
 TAG = "Waveshed"
@@ -191,12 +193,27 @@ def _parse_batch_csv(path: str) -> List[Tuple[str, str, float, float, float, str
                 raise ValueError(
                     f"Line {line_no}: mode must be AGL or AMSL, got '{row[5].strip()}'"
                 )
+            try:
+                altitude = float(row[4].strip())
+            except ValueError as exc:
+                raise ValueError(
+                    f"Line {line_no}: altitude is not a number, "
+                    f"got '{row[4].strip()}'"
+                ) from exc
+            # A batch CSV bypasses every spinbox, so the floor has to be
+            # enforced here too. AGL rows only — an AMSL row is an absolute
+            # elevation and may legitimately be zero or negative.
+            floor_error = height_floor_error(
+                f"Line {line_no}: altitude", altitude, mode,
+            )
+            if floor_error is not None:
+                raise ValueError(floor_error)
             entries.append((
                 row_type,
                 row[1].strip(),
                 float(row[2].strip()),
                 float(row[3].strip()),
-                float(row[4].strip()),
+                altitude,
                 mode,
             ))
     return entries
@@ -907,7 +924,11 @@ class P2PTab(QWidget):
         # Height row
         a_height_layout = QHBoxLayout()
         self.spin_a_height = QDoubleSpinBox()
-        self.spin_a_height.setRange(0.0, 10000.0)
+        self.spin_a_height.setRange(MIN_AMSL_M, 10000.0)
+        # One decimal, because that is all the batch CSV carries: the row is
+        # written with "%.1f", so a second decimal typed here would be silently
+        # dropped on the way to the engine.
+        self.spin_a_height.setDecimals(1)
         self.spin_a_height.setValue(30.0)
         self.spin_a_height.setSuffix(" m")
         a_height_layout.addWidget(self.spin_a_height)
@@ -918,6 +939,9 @@ class P2PTab(QWidget):
         a_height_layout.addWidget(self.combo_a_mode)
         a_height_layout.addStretch()
         site_a_form.addRow("Height:", a_height_layout)
+
+        # 1 m floor while the mode is AGL, below sea level once it is AMSL.
+        bind_height_mode(self.spin_a_height, self.combo_a_mode)
 
         main_layout.addLayout(site_a_form)
 
@@ -951,7 +975,9 @@ class P2PTab(QWidget):
         # Height row
         b_height_layout = QHBoxLayout()
         self.spin_b_height = QDoubleSpinBox()
-        self.spin_b_height.setRange(0.0, 10000.0)
+        self.spin_b_height.setRange(MIN_AMSL_M, 10000.0)
+        # See spin_a_height: the batch CSV is written with "%.1f".
+        self.spin_b_height.setDecimals(1)
         self.spin_b_height.setValue(1.5)
         self.spin_b_height.setSuffix(" m")
         b_height_layout.addWidget(self.spin_b_height)
@@ -962,6 +988,9 @@ class P2PTab(QWidget):
         b_height_layout.addWidget(self.combo_b_mode)
         b_height_layout.addStretch()
         site_b_form.addRow("Height:", b_height_layout)
+
+        # 1 m floor while the mode is AGL, below sea level once it is AMSL.
+        bind_height_mode(self.spin_b_height, self.combo_b_mode)
 
         main_layout.addLayout(site_b_form)
 
@@ -1357,6 +1386,21 @@ class P2PTab(QWidget):
         if b_lat == 0.0 and b_lon == 0.0:
             return "Please set the Site B / Receiver location."
 
+        # Antenna heights. The spinbox minimums already stop this while typing,
+        # but a saved/restored state or a programmatic setValue can still get a
+        # sub-floor AGL height in, and build_p2p_job raises on it — reporting it
+        # here turns a worker-thread traceback into a plain message. AMSL rows
+        # are absolute elevations and are deliberately left alone.
+        for label, spin, combo in (
+            ("Site A / Transmitter height", self.spin_a_height, self.combo_a_mode),
+            ("Site B / Receiver height", self.spin_b_height, self.combo_b_mode),
+        ):
+            height_error = height_floor_error(
+                label, spin.value(), combo.currentText(),
+            )
+            if height_error is not None:
+                return height_error
+
         return None
 
     # ------------------------------------------------------------------
@@ -1425,14 +1469,24 @@ class P2PTab(QWidget):
                 return
 
         # ---- Confirm an unreasonably large terrain download ----
+        # Price the tile POOL, not the whole tile set: estimate_terrain_disk_mb
+        # counted every tile the link needs whether or not it was already on
+        # disk, so a fully-cached link still announced tens of gigabytes of
+        # "download" — which trained users to click straight through it.
+        disk_mb = 0
+        cached_mb = 0
         try:
             c_lat, c_lon, range_km = _terrain_extent_for_batch(batch_file)
-            disk_mb = estimate_terrain_disk_mb(
+            plan = terrain_plan(
+                dem_layer.source() if dem_layer else "",
                 c_lat, c_lon, range_km, params.resolution_m,
             )
+            disk_mb = plan["download_mb"]
+            cached_mb = plan["total_mb"] - plan["download_mb"]
         except Exception:  # noqa: BLE001 — an estimate must never block a run.
             disk_mb = 0
-        warn = terrain_size_warning(disk_mb)
+            cached_mb = 0
+        warn = terrain_size_warning(disk_mb, cached_mb)
         if warn is not None:
             msg, strong = warn
             default = QMessageBox.No if strong else QMessageBox.Yes

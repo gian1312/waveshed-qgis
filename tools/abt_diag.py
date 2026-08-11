@@ -53,6 +53,15 @@ except ImportError:
     print("[Error] numpy required. Run with QGIS's Python.", file=sys.stderr)
     raise SystemExit(1)
 
+# The plugin's own .abt reader, so this diagnostic and the plugin can never
+# disagree about a tile's geometry. It used to recompute the row stride from
+# the width instead of reading the header field, and skipped the legacy
+# scale_x correction — which put every reported gap coordinate off by a factor
+# of `size` on tiles written by older converter builds. That is exactly the
+# kind of bug you reach for this script to chase.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from waveshed.core import abt as abt_reader  # noqa: E402
+
 DEFAULT_URL = "https://s3.amazonaws.com/elevation-tiles-prod/terrarium/{z}/{x}/{y}.png"
 _COLOR = {0: "grayscale", 2: "rgb", 3: "palette", 4: "grayscale+a", 6: "rgba"}
 
@@ -60,25 +69,25 @@ _COLOR = {0: "grayscale", 2: "rgb", 3: "palette", 4: "grayscale+a", 6: "rgba"}
 # --------------------------------------------------------------------------- #
 # .abt
 # --------------------------------------------------------------------------- #
-def _aligned_stride(width: int) -> int:
-    return (width * 2 + 255) & ~255
-
-
 def load_abt(path: str):
+    """``(elev, ul_lat, ul_lon, deg_per_px_y, deg_per_px_x)`` or None.
+
+    Geometry comes from :func:`waveshed.core.abt.read_header`; only the pixel
+    body is read here (``read_tile`` copies row by row, which is needlessly slow
+    for a whole-cache sweep). Tiles are square, so one pixel resolution serves
+    both axes.
+    """
+    header = abt_reader.read_header(path)
+    if header is None:
+        return None
+    size, stride = header.size, header.stride
+    need = abt_reader.HEADER_SIZE + size * stride
     data = np.fromfile(path, dtype=np.uint8)
-    if data.size < 44 or bytes(data[:4]) != b"AETH":
+    if stride < size * 2 or data.size < need:
         return None
-    w = struct.unpack_from("<H", data, 6)[0]
-    ul_lat = struct.unpack_from("<d", data, 8)[0]
-    ul_lon = struct.unpack_from("<d", data, 16)[0]
-    scale_y = struct.unpack_from("<d", data, 24)[0]
-    scale_x = struct.unpack_from("<d", data, 32)[0]
-    stride = _aligned_stride(w)
-    if w == 0 or data.size < 44 + w * stride:
-        return None
-    body = data[44:44 + w * stride].reshape(w, stride)
-    elev = np.ascontiguousarray(body[:, : w * 2]).view(np.int16)
-    return elev, ul_lat, ul_lon, scale_y, scale_x
+    body = data[abt_reader.HEADER_SIZE:need].reshape(size, stride)
+    elev = np.ascontiguousarray(body[:, : size * 2]).view(np.int16)
+    return elev, header.ul_lat, header.ul_lon, header.pixel_res, header.pixel_res
 
 
 # A pixel at/under this i16 value renders as NaN/transparent in the map-

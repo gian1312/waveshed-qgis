@@ -14,8 +14,11 @@ import unittest
 from unittest import mock
 
 from waveshed.gui.map_converter_tab import (
+    _abt_tile_name,
     _estimate_tile_count_and_mb,
-    _abt_size_px,
+    _enumerate_tiles,
+    _snap_bbox,
+    _split_sublayer,
     _ABT_EXTENT_DEG,
     _LayerEntry,
     _MapConverterWorker,
@@ -24,6 +27,13 @@ from waveshed.gui.map_converter_tab import (
     _list_terrain_files,
     _detect_xyz_resolution,
 )
+from waveshed.core.terrain_adapter import _tile_params
+import waveshed.gui.map_converter_tab as mct
+
+
+def _abt_size_px(res_m: int, extent_deg: float) -> int:
+    """Tile pixel width, via the one sizing function the plugin now has."""
+    return _tile_params(extent_deg, 0.0, 0.0, res_m)["size_px"]
 
 
 class TestFgbCacheName(unittest.TestCase):
@@ -173,6 +183,158 @@ class TestAbtExtentMapping(unittest.TestCase):
         self.assertLessEqual(_ABT_EXTENT_DEG[5], _ABT_EXTENT_DEG[30])
         self.assertLessEqual(_ABT_EXTENT_DEG[30], _ABT_EXTENT_DEG[90])
         self.assertLessEqual(_ABT_EXTENT_DEG[90], _ABT_EXTENT_DEG[250])
+
+
+class TestSharedTileEnumeration(unittest.TestCase):
+    """The estimate and the worker must walk the same grid (A13/A14).
+
+    The estimate walked the raw extent and counted every tile; the worker
+    walked the outward-snapped extent and skipped tiles already on disk. So
+    the number shown before the run was wrong in both directions, and the
+    tab's tile sizing was a second copy of ``_tile_params`` that had already
+    lost the ``_ABT_MAX_SIZE_PX`` u16 row-stride guard.
+    """
+
+    BBOX = {"north": 47.83, "south": 47.11, "east": 8.77, "west": 8.13}
+
+    def test_sizing_comes_from_the_shared_tile_params(self):
+        for res, ext in _ABT_EXTENT_DEG.items():
+            for _r, tile in _enumerate_tiles(
+                    {"north": 47.0 + ext / 2, "south": 47.0,
+                     "east": 8.0 + ext / 2, "west": 8.0}, [res]):
+                self.assertEqual(tile["size_px"],
+                                 _tile_params(ext, 0.0, 0.0, res)["size_px"])
+
+    def test_estimate_matches_the_worker_enumeration(self):
+        for resolutions in ([30], [10, 30], [2, 250], [2, 5, 10, 30, 90, 250]):
+            count, _mb = _estimate_tile_count_and_mb(self.BBOX, resolutions)
+            worker = _enumerate_tiles(_snap_bbox(self.BBOX, resolutions),
+                                      resolutions)
+            self.assertEqual(count, len(worker), resolutions)
+
+    def test_estimate_snaps_outward_exactly_as_the_worker_does(self):
+        snapped = _snap_bbox(self.BBOX, [10, 30])
+        self.assertLessEqual(snapped["south"], self.BBOX["south"])
+        self.assertGreaterEqual(snapped["north"], self.BBOX["north"])
+        self.assertLessEqual(snapped["west"], self.BBOX["west"])
+        self.assertGreaterEqual(snapped["east"], self.BBOX["east"])
+
+    def test_existing_tiles_are_not_priced_again(self):
+        # The run skips them unless "Rebuild existing tiles" is on, so the
+        # estimate must not bill for them either.
+        with tempfile.TemporaryDirectory() as out_dir:
+            total, total_mb = _estimate_tile_count_and_mb(self.BBOX, [30])
+            self.assertGreater(total, 1)
+
+            res, tile = _enumerate_tiles(_snap_bbox(self.BBOX, [30]), [30])[0]
+            open(os.path.join(out_dir, _abt_tile_name(
+                res, tile["ul_lat"], tile["ul_lon"])), "w").close()
+
+            left, left_mb = _estimate_tile_count_and_mb(
+                self.BBOX, [30], output_dir=out_dir, overwrite=False)
+            self.assertEqual(left, total - 1)
+            self.assertLess(left_mb, total_mb)
+
+            # …but a rebuild really does redo them.
+            again, _mb = _estimate_tile_count_and_mb(
+                self.BBOX, [30], output_dir=out_dir, overwrite=True)
+            self.assertEqual(again, total)
+
+    def test_worker_uses_the_shared_enumerator(self):
+        # Pins the sharing itself: a second grid walk in the worker is exactly
+        # how the two drifted apart before.
+        entry = _LayerEntry(layer_type="raster", source_path="/a.tif",
+                            extent=dict(self.BBOX), target_resolutions=[30])
+        with tempfile.TemporaryDirectory() as out_dir:
+            worker = _MapConverterWorker([entry], out_dir, [30], ["/a.tif"])
+            with mock.patch.object(_MapConverterWorker, "_resolve_raster",
+                                   return_value=["/a.tif"]), \
+                 mock.patch.object(_MapConverterWorker, "_resolve_buildings",
+                                   return_value=None), \
+                 mock.patch.object(mct, "find_binary",
+                                   side_effect=RuntimeError("no engine")), \
+                 mock.patch.object(mct, "_enumerate_tiles",
+                                   wraps=mct._enumerate_tiles) as spy:
+                worker.run()
+        spy.assert_called_once()
+        self.assertEqual(spy.call_args[0][0], _snap_bbox(self.BBOX, [30]))
+
+
+class TestSublayerUris(unittest.TestCase):
+    """A GeoPackage sublayer arrives as "<file>|layername=<x>" (B13).
+
+    ``os.path.isfile`` is False on the joined URI and ``os.path.splitext``
+    yields ".gpkg|layername=x", so the ->FGB conversion was skipped twice over
+    and the raw URI reached the converter, which cannot open it and only warns.
+    """
+
+    def test_plain_path_is_unchanged(self):
+        self.assertEqual(_split_sublayer("/data/b.fgb"), ("/data/b.fgb", ""))
+
+    def test_layername_is_split_off(self):
+        self.assertEqual(_split_sublayer("/data/x.gpkg|layername=buildings"),
+                         ("/data/x.gpkg", "buildings"))
+
+    def test_layername_is_found_past_other_options(self):
+        self.assertEqual(
+            _split_sublayer("/d/x.gpkg|geometrytype=Polygon|layername=b"),
+            ("/d/x.gpkg", "b"))
+
+    def test_unnamed_sublayer_yields_the_file_alone(self):
+        # layerid= is an index, not a name: convert the whole container rather
+        # than the wrong layer.
+        self.assertEqual(_split_sublayer("/d/x.gpkg|layerid=0"),
+                         ("/d/x.gpkg", ""))
+
+    def test_two_sublayers_of_one_file_are_two_conversions(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "x.gpkg")
+            open(p, "w").close()
+            self.assertNotEqual(_fgb_cache_name(p, "", "buildings"),
+                                _fgb_cache_name(p, "", "roads"))
+            self.assertNotEqual(_fgb_cache_name(p, ""),
+                                _fgb_cache_name(p, "", "buildings"))
+
+    def _resolve(self, uri, converted="/tmp/out.fgb"):
+        calls = []
+
+        def fake_convert(src, out_dir, src_crs="", layer_name=""):
+            calls.append((src, src_crs, layer_name))
+            return converted
+
+        with tempfile.TemporaryDirectory() as out_dir:
+            worker = _MapConverterWorker([], out_dir, [30], [])
+            with mock.patch.object(mct, "_convert_to_fgb",
+                                   side_effect=fake_convert):
+                result = worker._resolve_buildings(
+                    {"resolved_source": uri, "crs_authid": "EPSG:4326"})
+        return result, calls
+
+    def test_gpkg_sublayer_is_converted_to_fgb(self):
+        with tempfile.TemporaryDirectory() as d:
+            gpkg = os.path.join(d, "x.gpkg")
+            open(gpkg, "w").close()
+            result, calls = self._resolve(f"{gpkg}|layername=buildings")
+        self.assertEqual(calls, [(gpkg, "EPSG:4326", "buildings")])
+        self.assertEqual(result, os.path.abspath("/tmp/out.fgb"))
+
+    def test_plain_gpkg_extension_is_matched(self):
+        # Second latent bug in the same expression: even for a real file,
+        # splitext of the joined URI never matched the extension tuple.
+        with tempfile.TemporaryDirectory() as d:
+            gpkg = os.path.join(d, "x.gpkg")
+            open(gpkg, "w").close()
+            _result, calls = self._resolve(gpkg)
+        self.assertEqual(calls, [(gpkg, "EPSG:4326", "")])
+
+    def test_unconvertible_sublayer_keeps_its_suffix_and_absolute_path(self):
+        # abspath() on the whole URI used to prefix the cwd to it.
+        with tempfile.TemporaryDirectory() as d:
+            fgb = os.path.join(d, "x.fgb")
+            open(fgb, "w").close()
+            result, calls = self._resolve(f"{fgb}|layername=b", converted=None)
+        self.assertEqual(result, f"{fgb}|layername=b")
+        self.assertTrue(os.path.isabs(result))
 
 
 class TestLayerEntry(unittest.TestCase):

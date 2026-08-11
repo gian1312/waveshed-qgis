@@ -154,12 +154,28 @@ def _validate_resolution(resolution_m: int) -> None:
 CAUTION = "CAUTION"  # nearly out of range — usable with care (ITM kwx=1)
 INVALID = "INVALID"  # out of range — probably invalid (ITM kwx=3/4)
 
-# Smallest receiver height AGL the terrain data can resolve. Mirrors
-# aether_core::config::MIN_RX_AGL_M — .abt stores elevations in 0.5 m steps, so
-# below this the visibility test's margin drops under the data's own precision
-# and the result is decided by rounding (checkerboard speckle). The engine
-# raises anything lower to this value; the plugin only reports it.
-MIN_RX_AGL_M = 0.5
+# Vertical quantum of the terrain data: .abt stores elevations in 0.5 m steps.
+# Not a limit on its own — it is the reason MIN_ANTENNA_AGL_M sits where it does.
+TERRAIN_QUANTUM_M = 0.5
+
+# Smallest antenna height above ground level the plugin accepts, for the
+# transmitter and the receiver alike. Mirrors aether_core::config's floor.
+#
+# Two reasons converge on 1 m. ITM is undefined below it (the effective antenna
+# height collapses to zero and the ground-reflection term saturates), and the
+# terrain data is quantised to TERRAIN_QUANTUM_M, so a sub-metre antenna leaves
+# the line-of-sight test a margin no bigger than the DEM's own rounding error —
+# the visibility decision is then made by rounding rather than geometry, which
+# renders as checkerboard speckle.
+#
+# The engine floors both TX and RX as a backstop so that old job JSON still
+# runs. The plugin does not rely on that: it rejects the value outright at job
+# build time (see _validate_antenna_heights) so the user is told, rather than
+# being handed a result computed at a height they did not ask for.
+#
+# AGL only. An AMSL height is an absolute elevation and is legitimately zero or
+# negative (Dead Sea shore -430 m, Schiphol -4 m) — it is never floored.
+MIN_ANTENNA_AGL_M = 1.0
 
 
 @dataclasses.dataclass(frozen=True)
@@ -193,54 +209,37 @@ def model_warnings(params: "CoverageParams | P2PParams") -> "list[ModelWarning]"
     def add(severity: str, parameter: str, message: str) -> None:
         out.append(ModelWarning(severity, parameter, message))
 
-    # Antenna heights: ITM is validated for 1-1000 m AGL, hard limits 0.5-12000 m.
-    # ``floored`` marks the receiver, whose height the engine corrects on the way
-    # in. The transmitter has no such floor, so a sub-minimum TX stays a hard error.
-    def check_height(label: str, height: float, mode: str, floored: bool) -> None:
+    # Antenna heights. The lower bound applies to every propagation model, not
+    # just ITM: it is a terrain-data limit (TERRAIN_QUANTUM_M) as much as a model
+    # one, so a LOS run at 0.4 m AGL is decided by DEM rounding just the same.
+    # The upper bounds are ITM's alone — validated to 1000 m AGL, hard max 12000.
+    def check_height(label: str, height: float, mode: str) -> None:
         if (mode or "").upper() != "AGL":
-            return  # AMSL: the AGL height is only known once terrain is sampled
-        if height < MIN_RX_AGL_M:
-            if floored:
-                add(CAUTION, label,
-                    f"{height:.2f} m AGL is below ITM's {MIN_RX_AGL_M:.1f} m hard "
-                    f"minimum, where the model is undefined (effective height collapses "
-                    f"to zero and the ground-reflection term saturates). The engine "
-                    f"raises it to {MIN_RX_AGL_M:.1f} m; use at least 2 m to stay "
-                    f"inside ITM's validated range.")
-            else:
-                add(INVALID, label,
-                    f"{height:.2f} m AGL is below ITM's {MIN_RX_AGL_M:.1f} m hard "
-                    f"minimum — the model is undefined there and nothing corrects it. "
-                    f"Use at least 2 m.")
-        elif height < 1.0:
-            add(CAUTION, label,
-                f"{height:.2f} m AGL is below ITM's 1 m validated minimum. "
-                f"Use at least 2 m.")
-        elif height > 12000.0:
+            # AMSL is an absolute elevation, legitimately zero or negative; the
+            # AGL height it implies is only known once terrain is sampled.
+            return
+        if height < MIN_ANTENNA_AGL_M:
+            add(INVALID, label,
+                f"{height:.2f} m AGL is below the {MIN_ANTENNA_AGL_M:.1f} m hard "
+                f"minimum antenna height. ITM is undefined there (effective height "
+                f"collapses to zero and the ground-reflection term saturates), and "
+                f"the line-of-sight margin falls under the "
+                f"{TERRAIN_QUANTUM_M:.1f} m vertical quantum of the terrain data, "
+                f"so the visibility decision would be made by rounding rather than "
+                f"geometry (checkerboard speckle). Use at least "
+                f"{MIN_ANTENNA_AGL_M:.1f} m — 2 m to stay inside ITM's validated "
+                f"range.")
+        elif is_itm and height > 12000.0:
             add(INVALID, label, f"{height:.0f} m AGL exceeds ITM's 12000 m maximum.")
-        elif height > 1000.0:
+        elif is_itm and height > 1000.0:
             add(CAUTION, label,
                 f"{height:.0f} m AGL is above ITM's 1000 m validated maximum.")
 
-    if is_itm:
-        check_height("TX height", params.tx_height, params.tx_mode, floored=False)
-        if not is_min_alt:
-            check_height("RX height", params.rx_height, params.rx_mode, floored=True)
-
-    # Terrain-sampling floor (applies to every model, not just ITM). At 0 m AGL
-    # the receiver sits exactly on the sampled ground, so the visibility test
-    # becomes "is this sample a strict new maximum" and its margin (rx height in
-    # metres) falls below the 0.5 m .abt vertical quantum — the LOS decision is
-    # then made by rounding, which renders as checkerboard speckle. The engine
-    # raises the height rather than computing that, so this only reports that the
-    # requested height will not be honoured.
-    if (not is_min_alt and (params.rx_mode or "").upper() == "AGL"
-            and params.rx_height < MIN_RX_AGL_M):
-        add(CAUTION, "RX height",
-            f"{params.rx_height:.2f} m AGL is below the {MIN_RX_AGL_M:.1f} m vertical "
-            f"quantum of the terrain data, so the line-of-sight decision would be made "
-            f"by rounding rather than geometry (checkerboard speckle). The engine "
-            f"raises it to {MIN_RX_AGL_M:.1f} m before computing.")
+    check_height("TX height", params.tx_height, params.tx_mode)
+    if not is_min_alt:
+        # MIN_ALT solves for the receiver altitude; a 0 m receiver is the
+        # question being asked there, not a mistake.
+        check_height("RX height", params.rx_height, params.rx_mode)
 
     if is_itm:
         # Frequency: ITM works on wn = f/47.7, validated 0.838-210, hard 0.419-420.
@@ -336,6 +335,83 @@ def log_model_warnings(params: "CoverageParams | P2PParams") -> "list[ModelWarni
     return warnings
 
 
+def height_floor_error(
+    label: str, height: float, mode: str,
+) -> Optional[str]:
+    """Return a rejection message if one AGL antenna height is below the floor.
+
+    The one place the wording lives, so the dialogs, the Processing algorithms
+    and the batch-CSV parsers all name the same field and the same limit.
+
+    Args:
+        label: What to call the field in the message, e.g. ``"TX height"``.
+        height: The height in metres.
+        mode: ``"AGL"`` or ``"AMSL"``.
+
+    Returns:
+        The message, or None when the height is acceptable. AMSL always returns
+        None: it is an absolute elevation and is legitimately zero or negative
+        (Dead Sea shore -430 m, Schiphol -4 m), so flooring it would lift such a
+        site hundreds of metres into the air.
+    """
+    if (mode or "").upper() != "AGL":
+        return None
+    if height >= MIN_ANTENNA_AGL_M:
+        return None
+    return (
+        f"{label} is {height:.2f} m AGL, below the {MIN_ANTENNA_AGL_M:.1f} m "
+        f"minimum antenna height above ground level. Below it the propagation "
+        f"model is undefined and the line-of-sight decision is made by the "
+        f"terrain data's {TERRAIN_QUANTUM_M:.1f} m rounding rather than by "
+        f"geometry. Raise it to at least {MIN_ANTENNA_AGL_M:.1f} m, or switch "
+        f"its height mode to AMSL if this is an absolute elevation."
+    )
+
+
+def antenna_height_error(params: "CoverageParams | P2PParams") -> Optional[str]:
+    """Return a rejection message if either antenna is below the AGL floor.
+
+    Args:
+        params: The coverage or P2P parameters to check.
+
+    Returns:
+        The message for the first offending height, or None when both are fine.
+    """
+    is_min_alt = "MIN_ALT" in (params.model or "").upper()
+
+    checks = [("TX height", params.tx_height, params.tx_mode)]
+    if not is_min_alt:
+        # MIN_ALT solves for the receiver altitude rather than being given one,
+        # so its RX height is not an antenna and is exempt from the floor.
+        checks.append(("RX height", params.rx_height, params.rx_mode))
+
+    for label, height, mode in checks:
+        message = height_floor_error(label, height, mode)
+        if message is not None:
+            return message
+    return None
+
+
+def _validate_antenna_heights(params: "CoverageParams | P2PParams") -> None:
+    """Raise ValueError if a TX/RX antenna sits below :data:`MIN_ANTENNA_AGL_M`.
+
+    The single convergence point for every entry point — both GUI tabs and both
+    Processing algorithms reach the engine through ``build_coverage_job`` /
+    ``build_p2p_job``, so putting the rejection here means no caller can bypass
+    it by constructing params directly. Callers that want to report the problem
+    before starting work call :func:`antenna_height_error` instead.
+
+    Args:
+        params: The coverage or P2P parameters about to be serialized.
+
+    Raises:
+        ValueError: If an AGL antenna height is below the floor.
+    """
+    message = antenna_height_error(params)
+    if message is not None:
+        raise ValueError(message)
+
+
 def _build_tx(params: "CoverageParams | P2PParams") -> dict:
     """Build the tx section of the job config."""
     tx = {
@@ -385,9 +461,11 @@ def build_coverage_job(
         Job config dict matching aether_core's JobConfig schema.
 
     Raises:
-        ValueError: If resolution_m is not in VALID_RESOLUTIONS.
+        ValueError: If resolution_m is not in VALID_RESOLUTIONS, or if an AGL
+            antenna height is below MIN_ANTENNA_AGL_M.
     """
     _validate_resolution(params.resolution_m)
+    _validate_antenna_heights(params)
     log_model_warnings(params)
 
     return {
@@ -437,9 +515,14 @@ def build_p2p_job(
         Job config dict matching aether_core's JobConfig schema.
 
     Raises:
-        ValueError: If resolution_m is not in VALID_RESOLUTIONS.
+        ValueError: If resolution_m is not in VALID_RESOLUTIONS, or if an AGL
+            antenna height is below MIN_ANTENNA_AGL_M. In batch mode the two
+            heights here are the fallbacks; the per-link heights in the CSV are
+            validated by whoever parses it (``gui.p2p_tab._parse_batch_csv`` /
+            ``algorithms.p2p.P2PAlgorithm._parse_csv``).
     """
     _validate_resolution(params.resolution_m)
+    _validate_antenna_heights(params)
     log_model_warnings(params)
 
     task_type = "BATCH_P2P" if batch_file else "P2P"
