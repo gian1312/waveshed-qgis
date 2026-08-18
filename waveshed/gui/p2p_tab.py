@@ -60,6 +60,7 @@ from qgis.gui import QgsRubberBand
 
 from ..core.binary_manager import binaries_warning, find_binary
 from ..core import api_key
+from ..core import terrain_adapter
 from ..core.asset_manager import compute_erp, list_assets
 from ..core.job_builder import (
     INVALID,
@@ -611,42 +612,40 @@ class _P2PWorker(QThread):
             # (raises ApiKeyError -> surfaced by the worker on failure).
             api_key.apply_license_env(env)
 
-            # `with` closes the stdout pipe (and waits) on exit so we don't
-            # leak a file handle (the ResourceWarning).
-            with subprocess.Popen(
-                [core_exe, "--config", job_file],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                env=env,
-                creationflags=_SUBPROCESS_FLAGS,
-            ) as proc:
+            # Streams through the one shared subprocess runner
+            # (terrain_adapter.run_converter_streaming).
+            output_lines: list[str] = []
+
+            def on_start(proc) -> None:
                 self._proc = proc
 
-                output_lines: list[str] = []
-                for line in iter(proc.stdout.readline, ""):
-                    if self._canceled:
-                        _kill_proc(proc)
-                        return
-                    output_lines.append(line)
-                    # Surface aether_core's own stdout log in the QGIS Log
-                    # Messages panel under the AETHER tag.
-                    s = line.rstrip()
-                    if s:
-                        QgsMessageLog.logMessage(s, TAG, Qgis.MessageLevel.Info)
-                    pct = self._parse_p2p_progress(line)
-                    if pct is not None:
-                        self.progress.emit(25 + int(pct * 0.70))
+            def on_line(line: str) -> None:
+                if self._canceled:
+                    raise terrain_adapter.ConverterCancelled()
+                output_lines.append(line)
+                # Surface aether_core's own stdout log in the QGIS Log
+                # Messages panel under the AETHER tag.
+                QgsMessageLog.logMessage(line, TAG, Qgis.MessageLevel.Info)
+                pct = self._parse_p2p_progress(line)
+                if pct is not None:
+                    self.progress.emit(25 + int(pct * 0.70))
 
-                proc.wait()
-
-            self._proc = None
-            if proc.returncode != 0:
-                tail = "".join(output_lines[-20:])
+            try:
+                rc = terrain_adapter.run_converter_streaming(
+                    core_exe, ["--config", job_file], on_line,
+                    on_start=on_start, env=env)
+            except terrain_adapter.ConverterCancelled:
+                return
+            finally:
+                self._proc = None
+            if self._canceled:
+                # cancel() killed the process directly — rc is the kill
+                # signal, not an engine failure. End quietly.
+                return
+            if rc != 0:
+                tail = "\n".join(output_lines[-20:])
                 raise RuntimeError(
-                    f"aether_core exited with code {proc.returncode}:\n{tail}"
+                    f"aether_core exited with code {rc}:\n{tail}"
                 )
 
             if self._canceled:
@@ -746,6 +745,17 @@ class P2PTab(QWidget):
             QgsMessageLog.logMessage(
                 f"Could not list assets: {exc}", TAG, Qgis.MessageLevel.Warning)
         return sorted(names)
+
+    def refresh_settings(self) -> None:
+        """Re-read what this tab derives from QgsSettings (cheap, idempotent).
+
+        Called by the main dialog when the Settings tab saves. The only
+        settings-derived content here is the asset dropdown
+        (``waveshed/assets_dir``); ``_refresh_assets`` preserves the current
+        choice, so user-entered link parameters survive untouched. Binary
+        discovery and the cache dir are read per run, never cached.
+        """
+        self._refresh_assets()
 
     def _refresh_assets(self) -> None:
         """Re-read the asset list, keeping the current selection if it lives."""

@@ -53,10 +53,22 @@ data/swissaltiregio_tiles/
 data/swissaltiregio_tif/
 *.vrt
 
+# Torture test set — fixtures + the QGIS project built by
+# tools/make_torture_project.py (GBs of DEMs, buildings, tiles). Regenerate
+# with: python3 tools/make_torture_project.py
+data/torture/
+# QGIS projects and their autosave/backup twins are generated, never committed
+*.qgs
+*.qgz
+*.qgs~
+*.qgd
+
 # Local scratch (logs, screenshots)
 tmp/
 
-# Local deploy config (machine-specific paths)
+# Local machine-specific config (paths, API keys) — *.local.template.ini is
+# the committed template and is deliberately NOT matched by this pattern.
+*.local.ini
 deploy.local.ini
 
 # Claude

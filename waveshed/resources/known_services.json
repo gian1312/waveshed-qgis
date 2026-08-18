@@ -1,0 +1,29 @@
+{
+  "_comment": [
+    "Known public elevation-tile services: URL substrings that pin an XYZ",
+    "layer to an elevation encoding and/or to the deepest zoom the service",
+    "actually publishes. Read by waveshed/core/terrain_adapter.py",
+    "(_known_services); the matching logic lives there, only the data lives",
+    "here. Every entry needs a non-empty 'match' (substring, compared",
+    "lower-case against the decoded tile URL template); 'encoding' must be",
+    "'terrarium' or 'mapbox' when present; 'max_zoom' an integer when",
+    "present. Order matters for max_zoom: the first matching entry wins."
+  ],
+  "services": [
+    {"match": "elevation-tiles-prod", "max_zoom": 15, "encoding": "terrarium"},
+    {"match": "nextzen.org", "max_zoom": 15},
+    {"match": "nextzen", "encoding": "terrarium"},
+    {"match": "mapzen.com", "max_zoom": 15},
+    {"match": "mapzen", "encoding": "terrarium"},
+    {"match": "api.mapbox.com", "max_zoom": 15},
+    {"match": "terrarium", "encoding": "terrarium"},
+    {"match": "aws-terrain", "encoding": "terrarium"},
+    {"match": "terrain-rgb", "encoding": "mapbox"},
+    {"match": "terrain_rgb", "encoding": "mapbox"},
+    {"match": "terrainrgb", "encoding": "mapbox"},
+    {"match": "terrain-dem", "encoding": "mapbox"},
+    {"match": "terrain_dem", "encoding": "mapbox"},
+    {"match": "mapbox", "encoding": "mapbox"},
+    {"match": "maptiler", "encoding": "mapbox"}
+  ]
+}

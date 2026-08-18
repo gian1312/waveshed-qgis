@@ -1285,6 +1285,29 @@ class AssetManagerTab(QWidget):
     # Public API
     # ------------------------------------------------------------------
 
+    def refresh_settings(self) -> None:
+        """Re-read what this tab derives from QgsSettings (cheap, idempotent).
+
+        Called by the main dialog when the Settings tab saves — the asset
+        store location (``waveshed/assets_dir``) is a setting, so the list
+        must follow it. A half-edited asset survives: with unsaved edits the
+        reload is SKIPPED entirely (rebuilding the list would reset the
+        selection and clobber the form); the Reload button remains the
+        explicit way to discard edits. Without edits, the reload preserves
+        the current selection by name.
+        """
+        if self._dirty:
+            return
+        current = None
+        if 0 <= self._current_index < len(self._assets):
+            current = self._assets[self._current_index].get("name")
+        self.refresh()
+        if current:
+            for i, asset in enumerate(self._assets):
+                if asset.get("name") == current:
+                    self.asset_list.setCurrentRow(i)
+                    break
+
     def refresh(self) -> None:
         """Reload the asset list from disk and repopulate the QListWidget."""
         self._assets = list_assets()

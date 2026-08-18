@@ -30,6 +30,7 @@ from qgis.core import (
     QgsProcessingParameterRasterLayer,
 )
 
+from ..core import terrain_adapter
 from ..core.binary_manager import find_binary
 from ..core.job_builder import (
     MIN_ANTENNA_AGL_M,
@@ -248,6 +249,8 @@ class CoverageAlgorithm(QgsProcessingAlgorithm):
                 resolution_m=resolution_m,
                 binary_manager=bm,
                 feedback=feedback,
+                # Terrain occupies the 5-15 % stretch of this algorithm's bar.
+                progress_span=(5.0, 15.0),
             )
         except Exception as exc:
             raise QgsProcessingException(
@@ -300,44 +303,35 @@ class CoverageAlgorithm(QgsProcessingAlgorithm):
         except api_key.ApiKeyError as exc:
             raise QgsProcessingException(str(exc)) from exc
 
-        # `with` closes the stdout pipe (and waits) on exit so we don't leak a
-        # file handle (the ResourceWarning).
-        with subprocess.Popen(
-            [core_exe, "--config", job_file],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,  # aether_core logs everything to stdout
-            text=True,
-            env=core_env,
-            creationflags=_SUBPROCESS_FLAGS,
-        ) as proc:
-            # aether_core writes all its diagnostics ([Core] tile-grid / bounds,
-            # [P:NN] progress) to stdout — surface every line in the Processing
-            # log and keep a tail for the error message. (Previously only stderr
-            # was read, so none of this was visible and stdout could deadlock.)
-            output_lines: list[str] = []
-            for line in iter(proc.stdout.readline, ""):
-                if feedback.isCanceled():
-                    proc.terminate()
-                    return {}
-                line = line.rstrip()
-                if not line:
-                    continue
-                output_lines.append(line)
-                feedback.pushInfo(line)
-                m = re.search(r"Wedge\s+(\d+)/(\d+)", line)
-                if m:
-                    current, total = int(m.group(1)), int(m.group(2))
-                    if total > 0:
-                        # Map wedge progress into 20-80% range
-                        pct = 20 + int(current * 60 / total)
-                        feedback.setProgress(pct)
+        # aether_core writes all its diagnostics ([Core] tile-grid / bounds,
+        # [P:NN] progress) to stdout — surface every line in the Processing
+        # log and keep a tail for the error message. Streams through the one
+        # shared subprocess runner (terrain_adapter.run_converter_streaming).
+        output_lines: list[str] = []
 
-            proc.wait()
+        def on_line(line: str) -> None:
+            if feedback.isCanceled():
+                raise terrain_adapter.ConverterCancelled()
+            output_lines.append(line)
+            feedback.pushInfo(line)
+            m = re.search(r"Wedge\s+(\d+)/(\d+)", line)
+            if m:
+                current, total = int(m.group(1)), int(m.group(2))
+                if total > 0:
+                    # Map wedge progress into 20-80% range
+                    pct = 20 + int(current * 60 / total)
+                    feedback.setProgress(pct)
 
-        if proc.returncode != 0:
+        try:
+            rc = terrain_adapter.run_converter_streaming(
+                core_exe, ["--config", job_file], on_line, env=core_env)
+        except terrain_adapter.ConverterCancelled:
+            return {}
+
+        if rc != 0:
             tail = "\n".join(output_lines[-20:])
             raise QgsProcessingException(
-                f"aether_core failed (exit {proc.returncode}):\n{tail}"
+                f"aether_core failed (exit {rc}):\n{tail}"
             )
 
         if feedback.isCanceled():

@@ -59,6 +59,7 @@ from ..core.asset_manager import compute_erp, list_assets, load_asset
 from ..core.attribution import source_credit
 from ..core.binary_manager import find_binary
 from ..core import api_key
+from ..core import terrain_adapter
 
 # Hide console windows on Windows.
 _SUBPROCESS_FLAGS = (
@@ -286,41 +287,41 @@ class _SiteAnalysisWorker(QThread):
                 # (raises ApiKeyError -> surfaced by the worker on failure).
                 api_key.apply_license_env(env)
 
-                # `with` closes the stdout pipe (and waits) on exit so we don't
-                # leak a file handle (the ResourceWarning).
-                with subprocess.Popen(
-                    [core_exe, "--config", job_file],
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.STDOUT,  # merge stderr into stdout
-                    text=True,
-                    encoding="utf-8",
-                    errors="replace",
-                    env=env,
-                    creationflags=_SUBPROCESS_FLAGS,
-                ) as proc:
+                # Streams through the one shared subprocess runner
+                # (terrain_adapter.run_converter_streaming).
+                stderr_lines: list[str] = []
+
+                def on_start(proc) -> None:
                     self._proc = proc  # expose for kill
 
-                    stderr_lines: list[str] = []
-                    for line in iter(proc.stdout.readline, ""):
-                        if self._canceled:
-                            _kill_proc(proc)
-                            return
-                        stderr_lines.append(line)
-                        # Surface aether_core's own log (it writes its [Core]
-                        # tile-grid / bounds diagnostics to stdout) in the QGIS
-                        # Log Messages panel under the AETHER tag.
-                        s = line.rstrip()
-                        if s:
-                            QgsMessageLog.logMessage(s, TAG, Qgis.MessageLevel.Info)
-                        pct = self._parse_wedge_progress(line)
-                        if pct is not None:
-                            self.progress.emit(_job_progress(20 + int(pct * 0.6)))
+                def on_line(line: str) -> None:
+                    if self._canceled:
+                        raise terrain_adapter.ConverterCancelled()
+                    stderr_lines.append(line)
+                    # Surface aether_core's own log (it writes its [Core]
+                    # tile-grid / bounds diagnostics to stdout) in the QGIS
+                    # Log Messages panel under the AETHER tag.
+                    QgsMessageLog.logMessage(line, TAG, Qgis.MessageLevel.Info)
+                    pct = self._parse_wedge_progress(line)
+                    if pct is not None:
+                        self.progress.emit(_job_progress(20 + int(pct * 0.6)))
 
-                self._proc = None
-                if proc.returncode != 0:
-                    tail = "".join(stderr_lines[-20:])
+                try:
+                    rc = terrain_adapter.run_converter_streaming(
+                        core_exe, ["--config", job_file], on_line,
+                        on_start=on_start, env=env)
+                except terrain_adapter.ConverterCancelled:
+                    return
+                finally:
+                    self._proc = None
+                if self._canceled:
+                    # cancel() killed the process directly — rc is the kill
+                    # signal, not an engine failure. End quietly.
+                    return
+                if rc != 0:
+                    tail = "\n".join(stderr_lines[-20:])
                     raise RuntimeError(
-                        f"aether_core exited with code {proc.returncode}"
+                        f"aether_core exited with code {rc}"
                         f" for {display_name}:\n{tail}"
                     )
 
@@ -429,6 +430,25 @@ class SiteAnalysisTab(QWidget):
         self._on_dem_changed()
 
     # ==================================================================
+    # Settings refresh
+    # ==================================================================
+
+    def refresh_settings(self) -> None:
+        """Re-read what this tab derives from QgsSettings (cheap, idempotent).
+
+        Called by the main dialog when the Settings tab saves. Covers:
+        * the "Local directory: …" DEM entry (``waveshed/terrain_dir``) —
+          ``_populate_raster_layers`` re-reads it and preserves the current
+          selection;
+        * the asset dropdowns in the sites table (``waveshed/assets_dir``
+          contents) — repopulated per row, each row's choice preserved.
+        User-entered state (coordinates, heights, chosen rows) is untouched.
+        """
+        self._populate_raster_layers()
+        self._refresh_asset_cache()
+        self._refresh_asset_combos()
+
+    # ==================================================================
     # Asset helpers
     # ==================================================================
 
@@ -439,6 +459,27 @@ class SiteAnalysisTab(QWidget):
             name = asset.get("name", "")
             if name:
                 self._asset_cache[name] = asset
+
+    def _refresh_asset_combos(self) -> None:
+        """Repopulate every site row's asset dropdown from the cache.
+
+        Preserves each row's current choice (an asset that vanished from the
+        store falls back to the blank entry — visibly, not silently).
+        """
+        names = self._asset_names()
+        for row in range(self.sites_table.rowCount()):
+            combo = self.sites_table.cellWidget(row, _COL_ASSET)
+            if not isinstance(combo, QComboBox):
+                continue
+            current = combo.currentText()
+            blocked = combo.blockSignals(True)
+            combo.clear()
+            combo.addItem("")  # blank default
+            combo.addItems(names)
+            idx = combo.findText(current)
+            if idx >= 0:
+                combo.setCurrentIndex(idx)
+            combo.blockSignals(blocked)
 
     def _asset_names(self) -> List[str]:
         """Return sorted list of cached asset names."""

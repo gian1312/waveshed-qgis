@@ -60,12 +60,17 @@ from qgis.core import (
 )
 from qgis.gui import QgsMapLayerComboBox, QgsRubberBand
 
+from ..core import terrain_adapter
 from ..core.binary_manager import find_binary
 from ..core.layer_utils import classify_raster_layer
 from ..core.terrain_adapter import (
     ABT_EXTENT_DEG,
     _estimate_abt_disk_mb,
+    _expand_bbox,
+    _subtile_degrees,
     _tile_params,
+    bboxes_intersect,
+    build_tile_sources,
     source_fingerprint,
 )
 
@@ -125,16 +130,22 @@ def _set_layer_filters(combo) -> None:
 def _abt_tile_name(res_m: int, ul_lat: float, ul_lon: float) -> str:
     """Output file name for one Map Converter tile.
 
-    Distinct from ``terrain_adapter._tile_params``' name: the analysis path
-    pools its tiles by source and this tab writes a user-chosen folder, so the
-    two naming schemes are deliberately not interchangeable.
+    Thin wrapper over the ONE naming scheme both terrain paths share —
+    ``terrain_adapter._tile_params``' ``tile_N{lat:.2f}E{lon:.2f}_{res}m.abt``.
+    The tab used to have its own ``Tile_…_r16sint.abt`` spelling, which made
+    Map-Converter output invisible to anything expecting the canonical name.
     """
-    return f"Tile_N{ul_lat:.2f}E{ul_lon:.2f}_{res_m}m_r16sint.abt"
+    return f"tile_N{ul_lat:.2f}E{ul_lon:.2f}_{res_m}m.abt"
 
 
 def _snap_bbox(bbox: Dict[str, float], resolutions: List[int]) -> Dict[str, float]:
-    """Snap *bbox* outward onto the finest tile grid the run will use."""
-    finest = min(_ABT_EXTENT_DEG.get(r, 1.0) for r in resolutions)
+    """Snap *bbox* outward onto the finest tile grid the run will use.
+
+    Grid size comes from ``terrain_adapter._subtile_degrees`` — the extent
+    ladder plus the u16 row-stride guard — the same authority the analysis
+    path and the engine's ``plan`` subcommand reproduce.
+    """
+    finest = min(_subtile_degrees(r) for r in resolutions)
     return {
         "south": math.floor(bbox["south"] / finest) * finest,
         "north": math.ceil(bbox["north"] / finest) * finest,
@@ -153,13 +164,14 @@ def _enumerate_tiles(
     worker snaps outward first), so the estimate could name a different number
     of tiles than the run then built.
 
-    Tile geometry comes from ``terrain_adapter._tile_params`` — the same
-    formula the analysis path uses, including the ``_ABT_MAX_SIZE_PX`` u16
-    row-stride guard that the copy here used to omit.
+    Tile geometry comes from ``terrain_adapter`` — ``_subtile_degrees`` for
+    the extent (ladder + ``_ABT_MAX_SIZE_PX`` u16 row-stride guard) and
+    ``_tile_params`` for the sizing — the same formulas the analysis path
+    uses and the engine's ``plan`` subcommand cross-checks.
     """
     tiles: List[Tuple[int, Dict[str, Any]]] = []
     for res in sorted(resolutions):
-        ext = _ABT_EXTENT_DEG.get(res, 1.0)
+        ext = _subtile_degrees(res)
         lat = math.floor(bbox["south"] / ext) * ext
         while lat < bbox["north"]:
             lon = math.floor(bbox["west"] / ext) * ext
@@ -192,20 +204,17 @@ def _estimate_tile_count_and_mb(
             existing = set(os.listdir(output_dir))
         except OSError:
             existing = set()
-        tiles = [
-            (res, t) for res, t in tiles
-            if _abt_tile_name(res, t["ul_lat"], t["ul_lon"]) not in existing
-        ]
+        # `filename` from _tile_params is the canonical name the worker
+        # writes (and skips on) — the estimate must consult the same one.
+        tiles = [(res, t) for res, t in tiles
+                 if t["filename"] not in existing]
     return len(tiles), _estimate_abt_disk_mb([t for _res, t in tiles])
 
 
-def _list_terrain_files(folder: str) -> List[str]:
-    """Return sorted absolute paths of terrain files in *folder*."""
-    exts = (".tif", ".tiff", ".dem", ".hgt")
-    return sorted(
-        os.path.join(folder, f) for f in os.listdir(folder)
-        if f.lower().endswith(exts)
-    )
+# Folder scanning: terrain_adapter.list_terrain_files is the ONE folder
+# scanner (recursive, sorted ascending — earlier-sorted filename wins for
+# overlapping files). Behaviour change vs the tab's old flat os.listdir scan:
+# files in SUBFOLDERS are now included, same as Site Analysis.
 
 
 def _detect_resolution(layer) -> Optional[float]:
@@ -231,16 +240,9 @@ def _detect_resolution(layer) -> Optional[float]:
         return None
 
 
-def _detect_xyz_resolution(source: str) -> Optional[float]:
-    """Detect resolution of an XYZ tile layer from its zmax parameter."""
-    try:
-        import urllib.parse
-        params = dict(urllib.parse.parse_qsl(source))
-        z_max = int(params.get("zmax", "15"))
-        # At equator: res = 40075000 / (2^z * 256)
-        return round(40_075_000 / (2 ** z_max * 256), 1)
-    except Exception:
-        return None
+# XYZ native resolution: terrain_adapter.xyz_native_resolution_m is the ONE
+# helper (resolve_zmax-based — validated, clamped to what the service really
+# publishes). The tab's old copy trusted the raw zmax parameter.
 
 
 def _detect_layer_type(layer) -> str:
@@ -255,108 +257,55 @@ def _detect_layer_type(layer) -> str:
     return "terrain" if kind == "dem" else kind
 
 
+def _first_folder_geotiff(folder: str) -> Optional[str]:
+    """First GeoTIFF the run would use — via the ONE shared folder scanner."""
+    for path in terrain_adapter.list_terrain_files(folder):
+        if path.lower().endswith((".tif", ".tiff")):
+            return path
+    return None
+
+
 def _detect_folder_crs(folder: str) -> Optional[str]:
-    """Detect CRS from the first GeoTIFF in a folder."""
+    """Detect CRS from the first GeoTIFF in a folder (recursive, sorted)."""
     try:
         from osgeo import gdal
-        for fn in os.listdir(folder):
-            if fn.lower().endswith((".tif", ".tiff")):
-                ds = gdal.Open(os.path.join(folder, fn))
-                if ds and ds.GetProjection():
-                    crs = QgsCoordinateReferenceSystem(ds.GetProjection())
-                    if crs.isValid():
-                        return crs.authid()
-                    ds = None
-                break
+        path = _first_folder_geotiff(folder)
+        if path:
+            ds = gdal.Open(path)
+            if ds and ds.GetProjection():
+                crs = QgsCoordinateReferenceSystem(ds.GetProjection())
+                if crs.isValid():
+                    return crs.authid()
     except Exception:
         pass
     return None
 
 
 def _detect_folder_resolution(folder: str) -> Optional[float]:
-    """Detect ground resolution from the first GeoTIFF in a folder."""
+    """Detect ground resolution from the first GeoTIFF (recursive, sorted)."""
     try:
         from osgeo import gdal
-        for fn in os.listdir(folder):
-            if fn.lower().endswith((".tif", ".tiff")):
-                ds = gdal.Open(os.path.join(folder, fn))
-                if ds:
-                    gt = ds.GetGeoTransform()
-                    proj = ds.GetProjection()
-                    crs = QgsCoordinateReferenceSystem(proj) if proj else None
-                    res = min(abs(gt[1]), abs(gt[5]))
-                    if crs and crs.isGeographic():
-                        clat = gt[3] - (ds.RasterYSize / 2) * abs(gt[5])
-                        res *= 111_111 * max(math.cos(math.radians(clat)), 0.01)
-                    return round(res, 1)
-                break
+        path = _first_folder_geotiff(folder)
+        if path:
+            ds = gdal.Open(path)
+            if ds:
+                gt = ds.GetGeoTransform()
+                proj = ds.GetProjection()
+                crs = QgsCoordinateReferenceSystem(proj) if proj else None
+                res = min(abs(gt[1]), abs(gt[5]))
+                if crs and crs.isGeographic():
+                    clat = gt[3] - (ds.RasterYSize / 2) * abs(gt[5])
+                    res *= 111_111 * max(math.cos(math.radians(clat)), 0.01)
+                return round(res, 1)
     except Exception:
         pass
     return None
 
 
-def _filter_files_by_extent(
-    files: List[str],
-    extent: Dict[str, float],
-    crs_authid: str,
-) -> List[str]:
-    """Keep only files whose geographic bounds overlap *extent* (WGS84).
-
-    Reads only the GeoTransform from each file (fast, no pixel data).
-    For LV95 files, converts bounds to WGS84 for comparison.
-    """
-    from osgeo import gdal
-    result = []
-    s, n, w, e = extent["south"], extent["north"], extent["west"], extent["east"]
-    is_lv95 = crs_authid == "EPSG:2056"
-
-    for path in files:
-        try:
-            ds = gdal.Open(path, gdal.GA_ReadOnly)
-            if ds is None:
-                continue
-            gt = ds.GetGeoTransform()
-            xsize, ysize = ds.RasterXSize, ds.RasterYSize
-            ds = None
-
-            f_west = gt[0]
-            f_north = gt[3]
-            f_east = gt[0] + gt[1] * xsize
-            f_south = gt[3] + gt[5] * ysize
-            if f_south > f_north:
-                f_south, f_north = f_north, f_south
-
-            if is_lv95:
-                # Quick LV95 → WGS84 approximation (inverse of the fast formula).
-                # Accurate enough for bounding-box overlap testing.
-                f_south, f_west = _lv95_to_wgs84_approx(f_west, f_south)
-                f_north, f_east = _lv95_to_wgs84_approx(f_east, f_north)
-
-            # Overlap test.
-            if f_east > w and f_west < e and f_north > s and f_south < n:
-                result.append(path)
-        except Exception:
-            result.append(path)  # Keep on error (safe fallback).
-    return result
-
-
-def _lv95_to_wgs84_approx(easting: float, northing: float) -> Tuple[float, float]:
-    """Approximate LV95 → WGS84 conversion (inverse of Swisstopo formula).
-
-    Returns (latitude, longitude).  Accuracy ~1m in Switzerland.
-    """
-    y_aux = (easting - 2_600_000) / 1_000_000
-    x_aux = (northing - 1_200_000) / 1_000_000
-    lat = (16.9023892 + 3.238272 * x_aux
-           - 0.270978 * y_aux * y_aux
-           - 0.002528 * x_aux * x_aux
-           - 0.0447 * y_aux * y_aux * x_aux
-           - 0.0140 * x_aux * x_aux * x_aux) * 100 / 36
-    lon = (2.6779094 + 4.728982 * y_aux
-           + 0.791484 * y_aux * x_aux
-           + 0.1306 * y_aux * x_aux * x_aux
-           - 0.0436 * y_aux * y_aux * y_aux) * 100 / 36
-    return lat, lon
+# NB: file-vs-extent filtering is generic now — per-file WGS84 bounds come
+# from terrain_adapter.source_file_info (GDAL geotransform + a QGIS coordinate
+# transform for ANY CRS). The historical LV95-only approximation and the
+# CRS special-casing that surrounded it are gone.
 
 
 def _fgb_translate_options(src_crs: str = "") -> List[str]:
@@ -474,6 +423,234 @@ def _convert_to_fgb(src_path: str, out_dir: str, src_crs: str = "",
 
 
 # ---------------------------------------------------------------------------
+# Pre-run plan cross-check (engine `plan` subcommand)
+# ---------------------------------------------------------------------------
+
+_PLAN_SCHEMA = "aether-plan/1"
+
+#: Exact user-facing message when the installed engine has no `plan`
+#: subcommand — contract text, matched by tests.
+_ENGINE_PREDATES_MSG = ("engine binaries predate this plugin version — "
+                        "update them")
+
+# clap error spellings across versions for an unknown subcommand.
+_UNKNOWN_SUBCOMMAND_HINTS = (
+    "unrecognized subcommand", "unknown subcommand", "invalid subcommand",
+    "wasn't expected", "wasn't recognized",
+)
+
+
+def _run_plan(converter_exe: str, bbox: Dict[str, float],
+              resolutions: List[int]) -> Dict[str, Any]:
+    """Run ``aether_converter plan`` for *bbox*/*resolutions*; parsed JSON.
+
+    *bbox* must be the RAW (unsnapped) bbox — the engine snaps it once
+    itself, and snapping is not idempotent on this float grid (see the
+    caller in ``_MapConverterWorker.run``).
+
+    Hard errors only: a binary without the subcommand aborts with
+    ``_ENGINE_PREDATES_MSG``; any other failure or unparseable output aborts
+    with the engine's own words. There is no fallback — running without the
+    cross-check is exactly the silent-drift failure it exists to prevent.
+    """
+    cmd = [
+        converter_exe, "plan",
+        "--south", repr(float(bbox["south"])),
+        "--north", repr(float(bbox["north"])),
+        "--west", repr(float(bbox["west"])),
+        "--east", repr(float(bbox["east"])),
+        "--resolutions", ",".join(str(r) for r in sorted(resolutions)),
+    ]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True,
+                              encoding="utf-8", errors="replace",
+                              creationflags=_SUBPROCESS_FLAGS)
+    except OSError as exc:
+        raise RuntimeError(
+            f"Could not run the engine's plan check ({converter_exe}): {exc}"
+        ) from exc
+
+    if proc.returncode != 0:
+        err = ((proc.stderr or "") + "\n" + (proc.stdout or "")).strip()
+        if any(h in err.lower() for h in _UNKNOWN_SUBCOMMAND_HINTS):
+            raise RuntimeError(
+                f"{_ENGINE_PREDATES_MSG}.\n\nThe installed aether_converter "
+                f"({converter_exe}) has no 'plan' subcommand, so the plugin "
+                "cannot verify that it will produce the same tile grid. "
+                "Update the engine binaries (Settings → Download binaries)."
+            )
+        raise RuntimeError(
+            f"aether_converter plan failed (exit {proc.returncode}):\n"
+            f"{err[-2000:]}"
+        )
+
+    try:
+        doc = json.loads(proc.stdout)
+    except ValueError as exc:
+        raise RuntimeError(
+            f"aether_converter plan produced unparseable output ({exc}). "
+            f"Engine: {converter_exe}"
+        ) from exc
+    if not isinstance(doc, dict) or doc.get("schema") != _PLAN_SCHEMA:
+        raise RuntimeError(
+            f"aether_converter plan returned schema "
+            f"{doc.get('schema') if isinstance(doc, dict) else type(doc)!r}, "
+            f"expected {_PLAN_SCHEMA!r}. Engine: {converter_exe}"
+        )
+    return doc
+
+
+def _plan_cross_check(converter_exe: str, bbox: Dict[str, float],
+                      resolutions: List[int],
+                      expected: List[Tuple[int, Dict[str, Any]]]) -> None:
+    """Abort (RuntimeError) unless the engine's plan matches *expected*.
+
+    *bbox* is the RAW combined bbox (both sides snap it exactly once, from
+    bit-identical input); *expected* is the Python enumeration
+    (``_enumerate_tiles`` over the Python-snapped bbox — the equality of the
+    two enumerations is precisely what the check guarantees).
+    Tile count and filenames must agree exactly — a mismatch
+    means plugin and engine disagree about tile geometry, and every tile the
+    run wrote would land on the wrong grid.
+    """
+    doc = _run_plan(converter_exe, bbox, resolutions)
+    ours = sorted(t["filename"] for _res, t in expected)
+    theirs = sorted(t.get("filename", "?") for t in doc.get("tiles", []))
+    count_theirs = doc.get("tile_count")
+    if count_theirs == len(ours) and theirs == ours:
+        return
+    only_ours = [n for n in ours if n not in set(theirs)]
+    only_theirs = [n for n in theirs if n not in set(ours)]
+    detail = ""
+    if only_ours:
+        detail += f"\nFirst tile only the plugin has: {only_ours[0]}"
+    if only_theirs:
+        detail += f"\nFirst tile only the engine has: {only_theirs[0]}"
+    raise RuntimeError(
+        "Tile-grid mismatch between plugin and engine: the plugin "
+        f"enumerates {len(ours)} tile(s), the engine's plan reports "
+        f"{count_theirs} ({len(theirs)} filenames).{detail}\n\n"
+        "The run was aborted — converting would write tiles on a grid the "
+        "engine disagrees with. Update the engine binaries and the plugin "
+        "to matching versions."
+    )
+
+
+def _build_tile_jobs(
+    expected: List[Tuple[int, Dict[str, Any]]],
+    output_dir: str,
+    overwrite: bool,
+    resolved_entries: List[Dict[str, Any]],
+    buildings_path: Optional[str],
+    tmp_dir: str,
+) -> Tuple[List[Dict[str, Any]], List[str]]:
+    """Ingest jobs for one Map Converter run; ``(jobs, temp files)``.
+
+    One job per enumerated tile (minus the already-existing ones unless
+    *overwrite*). ``sources[]`` holds, in UI stack order (entry 0 = highest
+    priority), each resolved entry's per-tile contribution:
+
+    * ``{"kind": "files", "infos": […]}`` — bounds+halo-filtered files via
+      the shared ``build_tile_sources`` (same rule as Site Analysis);
+    * ``{"kind": "xyz", "pool": {res: {filename: path}}}`` — the downloaded
+      pool ``.abt`` for this very tile. NO ``crs``/``nodata`` on the entry:
+      .abt sources are self-describing and the converter hard-errors on
+      either field (contract A1);
+    * ``{"kind": "rendered", "tiles": {filename: path}}`` — the per-tile
+      QGIS render (always WGS84).
+
+    Deliberately NO ``void_fill_m``: Map Converter tiles keep VOID for
+    no-data.
+    """
+    jobs: List[Dict[str, Any]] = []
+    temp_tifs: List[str] = []
+    for res, tile in expected:
+        fn = tile["filename"]
+        out = os.path.join(output_dir, fn)
+        if not overwrite and os.path.exists(out):
+            continue
+        sub = _subtile_degrees(res)
+        tile_bbox = {
+            "north": tile["ul_lat"], "south": tile["ul_lat"] - sub,
+            "west": tile["ul_lon"], "east": tile["ul_lon"] + sub,
+        }
+        sources: List[Dict[str, Any]] = []
+        for idx, ent in enumerate(resolved_entries):
+            kind = ent.get("kind")
+            if kind == "files":
+                s, temps = build_tile_sources(
+                    ent["infos"], tile_bbox, tmp_dir,
+                    tag=f"mc_{os.getpid()}_{idx}_{fn}",
+                    output_res_m=tile["exact_res_m"])
+                sources.extend(s)
+                temp_tifs.extend(temps)
+            elif kind == "xyz":
+                pool_path = ent.get("pool", {}).get(res, {}).get(fn)
+                if pool_path:
+                    # Self-describing .abt — adding "crs" here would be a
+                    # converter hard error by contract.
+                    sources.append({"path": os.path.abspath(pool_path)})
+            elif kind == "rendered":
+                tif = ent.get("tiles", {}).get(fn)
+                if tif:
+                    sources.append({"path": os.path.abspath(tif),
+                                    "crs": "EPSG:4326"})
+        job = {
+            "output_path": os.path.abspath(out),
+            "format": "r16sint",
+            "ul_lat": tile["ul_lat"], "ul_lon": tile["ul_lon"],
+            "resolution_m": float(tile["exact_res_m"]),
+            "size_px": tile["size_px"],
+            "sources": sources,
+        }
+        if buildings_path:
+            job["buildings_file"] = buildings_path
+        jobs.append(job)
+    return jobs, temp_tifs
+
+
+def _download_xyz_entries(
+    entries: List[Dict[str, Any]],
+    expected: List[Tuple[int, Dict[str, Any]]],
+    progress_cb: Any = None,
+    should_cancel: Any = None,
+    on_start: Any = None,
+) -> None:
+    """Fill each XYZ entry's ``["pool"]`` via the shared pool downloader.
+
+    Per entry, per resolution: the enumerated tiles overlapping the entry's
+    extent go through ``terrain_adapter.ensure_pool_tiles`` (same pool cache
+    and gap-repair retries as Site Analysis). *progress_cb(frac, label)*
+    receives the aggregate download fraction across ALL entries and
+    resolutions. Failures propagate (RuntimeError) — no render fallback.
+    """
+    plan: List[Tuple[Dict[str, Any], int, List[Dict[str, Any]]]] = []
+    for ent in entries:
+        for res in sorted({r for r, _t in expected}):
+            jobs = _jobs_overlapping_extent(
+                [(r, t) for r, t in expected if r == res], ent.get("extent"))
+            specs = [t for _r, t in jobs]
+            if specs:
+                plan.append((ent, res, specs))
+        ent["pool"] = {}
+
+    total = sum(len(specs) for _e, _r, specs in plan) or 1
+    done = 0
+    for ent, res, specs in plan:
+        def cb(frac: float, label: str, _done=done, _n=len(specs)) -> None:
+            if progress_cb is not None:
+                progress_cb((_done + frac * _n) / total, label)
+
+        ent["pool"][res] = terrain_adapter.ensure_pool_tiles(
+            ent["uri"], specs, res, progress_cb=cb,
+            should_cancel=should_cancel, on_start=on_start)
+        done += len(specs)
+        if progress_cb is not None:
+            progress_cb(done / total,
+                        f"Terrain download: {done}/{total} tiles ready")
+
+
+# ---------------------------------------------------------------------------
 # Layer data model
 # ---------------------------------------------------------------------------
 
@@ -509,105 +686,206 @@ class _LayerEntry:
 # Worker thread
 # ---------------------------------------------------------------------------
 
-def _resolve_source_on_main_thread(entry: _LayerEntry,
-                                   target_res_m: Optional[float] = None) -> str:
-    """Extract a file/folder path from a layer entry (must be called on
-    the main thread because QgsMapLayer objects are not thread-safe).
+# ---------------------------------------------------------------------------
+# Acquisition router + main-thread resolve/render phase
+# ---------------------------------------------------------------------------
 
-    For local files/folders, returns the path directly.
-    For remote layers (WMS/XYZ), exports to a temp GeoTIFF.
+#: Phase spans of the single run progress bar (percent).
+_PHASE_SPANS = {"resolve": (0, 20), "download": (20, 70), "convert": (70, 100)}
 
-    *target_res_m* is the finest .abt resolution this run will produce. The
-    export MUST be pinned to it: ``ingest.rs`` point-samples the GeoTIFF onto
-    the .abt grid (one source pixel per output cell, no averaging either way),
-    so any mismatch between the export pitch and the .abt pitch is resampled at
-    an arbitrary ratio — coarser gives plateaus of repeated cells, finer gives
-    1-in-N aliasing. Both are lattice-locked terrain error and the LOS sweep
-    renders them as a checkerboard. This mirrors what the analysis path already
-    does with `terrain_adapter._try_gdal_warp`, which pins xRes/yRes to the
-    analysis resolution. Sizing the export from the *layer* instead (the old
-    behaviour) is what made Map-Converter tiles speckle at every resolution
-    while the direct XYZ download — whose zoom is chosen from the target via
-    `terrain_adapter.tile_zoom` — stayed clean.
+
+def phase_progress(phase: str, frac: float) -> int:
+    """Map a 0..1 within-phase fraction onto the run's ONE progress bar.
+
+    Phase weights: resolve/render 0-20 %, download 20-70 %, convert 70-100 %.
     """
-    if entry.qgis_layer is not None:
-        src = entry.qgis_layer.source()
-        if os.path.isfile(src) or src.startswith("/vsi"):
+    lo, hi = _PHASE_SPANS[phase]
+    frac = min(max(frac, 0.0), 1.0)
+    return round(lo + (hi - lo) * frac)
+
+
+def _classify_acquisition(source: str) -> str:
+    """Route a raster source string: ``'xyz' | 'file' | 'rendered'``.
+
+    * ``xyz`` — elevation tile service; fetched by the toolkit downloader
+      into the shared pool (NO QGIS render — rendering XYZ through QGIS is
+      the aliasing/UI-freeze path this router removes).
+    * ``file`` — local file, folder or GDAL ``/vsi*`` path; ingested
+      directly.
+    * ``rendered`` — a server QGIS must render (WMS/WMTS/ArcGIS/…);
+      exported per TILE via ``terrain_adapter._export_via_qgis``.
+    """
+    if "type=xyz" in source:
+        return "xyz"
+    if (os.path.isfile(source) or os.path.isdir(source)
+            or source.startswith("/vsi")):
+        return "file"
+    return "rendered"
+
+
+def _entry_kind(entry: _LayerEntry) -> str:
+    """Acquisition kind for a stack entry (``'buildings'`` for vectors)."""
+    if entry.layer_type == "buildings":
+        return "buildings"
+    if os.path.isdir(entry.source_path):
+        return "file"
+    src = (entry.qgis_layer.source() if entry.qgis_layer is not None
+           else entry.source_path)
+    return _classify_acquisition(src)
+
+
+def _jobs_overlapping_extent(
+    render_jobs: List[Tuple[int, Dict[str, Any]]],
+    extent: Optional[Dict[str, float]],
+) -> List[Tuple[int, Dict[str, Any]]]:
+    """The ``(res, tile)`` jobs whose tile bbox intersects *extent*."""
+    if not extent:
+        return list(render_jobs)
+    out = []
+    for res, tile in render_jobs:
+        sub = _subtile_degrees(res)
+        tile_bbox = {"north": tile["ul_lat"], "south": tile["ul_lat"] - sub,
+                     "west": tile["ul_lon"], "east": tile["ul_lon"] + sub}
+        if bboxes_intersect(tile_bbox, extent):
+            out.append((res, tile))
+    return out
+
+
+def _render_resolution_m(entry: _LayerEntry,
+                         render_jobs: List[Tuple[int, Dict[str, Any]]]) -> float:
+    """Resolution a rendered server is exported at, in metres.
+
+    The FINER of (detected native resolution, finest requested output
+    resolution), so the export never undersamples the output grid and
+    ingest's area-averaging engages on the way down — this is what removes
+    the WMS aliasing the old whole-extent nearest-neighbour export had.
+    """
+    finest_out = float(min((r for r, _t in render_jobs), default=30))
+    native = entry.native_res_m
+    return min(float(native), finest_out) if native else finest_out
+
+
+class _ResolveCancelled(Exception):
+    """Internal: the user cancelled the resolve/render progress dialog."""
+
+
+def _render_tiles_via_qgis(
+    entry: _LayerEntry,
+    render_jobs: List[Tuple[int, Dict[str, Any]]],
+    on_tile: Any = None,
+) -> Dict[str, str]:
+    """Render a WMS/WMTS/ArcGIS layer per TILE; ``{tile filename: tif path}``.
+
+    ``terrain_adapter._export_via_qgis`` is the ONLY renderer (main-thread —
+    QGIS map layers are not thread-safe, which is why this runs during the
+    resolve phase). Each enumerated tile overlapping the entry's extent is
+    rendered to its own WGS84 GeoTIFF (tile bbox + ~4 output-px halo) at
+    :func:`_render_resolution_m`. *on_tile(filename)* ticks the progress
+    dialog after each tile.
+
+    Any failure is a HARD error naming the layer — the old code swallowed
+    every exception and silently passed the raw source string onward, which
+    the converter could not open.
+    """
+    layer = entry.qgis_layer
+    name = (layer.name() if layer is not None and hasattr(layer, "name")
+            else entry.source_path)
+    if layer is None:
+        raise RuntimeError(
+            f"Layer '{entry.source_path}' is a rendered map service but is "
+            "not loaded in QGIS, so it cannot be rendered. Add it to the "
+            "project and re-add it to the converter stack."
+        )
+    jobs = _jobs_overlapping_extent(render_jobs, entry.extent)
+    render_res = _render_resolution_m(entry, render_jobs)
+    out: Dict[str, str] = {}
+    for res, tile in jobs:
+        fn = tile["filename"]
+        sub = _subtile_degrees(res)
+        tile_bbox = {"north": tile["ul_lat"], "south": tile["ul_lat"] - sub,
+                     "west": tile["ul_lon"], "east": tile["ul_lon"] + sub}
+        res_deg = tile["exact_res_m"] / 111_111.0
+        sub_bbox = _expand_bbox(tile_bbox, res_deg * 4.0)
+        dest = os.path.join(
+            tempfile.gettempdir(),
+            f"aether_render_{os.getpid()}_{id(entry)}_{fn}.tif",
+        )
+        try:
+            terrain_adapter._export_via_qgis(layer, dest, sub_bbox,
+                                             render_res)
+        except _ResolveCancelled:
+            raise
+        except Exception as exc:
+            raise RuntimeError(
+                f"Rendering layer '{name}' failed for tile {fn}: {exc}\n\n"
+                "The run was aborted — a silently skipped layer would "
+                "convert the wrong terrain. Check the service (login, "
+                "network, extent) and run again."
+            ) from exc
+        out[fn] = dest
+        if on_tile is not None:
+            on_tile(fn)
+    return out
+
+
+def _resolve_source_on_main_thread(
+    entry: _LayerEntry,
+    render_jobs: Optional[List[Tuple[int, Dict[str, Any]]]] = None,
+    on_tile: Any = None,
+) -> Any:
+    """Resolve one stack entry on the main thread (QGIS layers live here).
+
+    Buildings entries keep the plain-path contract (vector pipeline).
+    Raster entries return an acquisition dict routed by
+    :func:`_classify_acquisition`:
+
+    * ``{"kind": "file", "path": …}`` — local file/folder//vsi, untouched.
+    * ``{"kind": "xyz", "uri": …, "extent": …}`` — NO render; the worker
+      downloads through the shared toolkit pool.
+    * ``{"kind": "rendered", "tiles": {filename: tif}}`` — per-tile QGIS
+      render (:func:`_render_tiles_via_qgis`), done HERE because map layers
+      are main-thread-only.
+
+    Failures are hard errors — the old catch-all that silently passed the
+    raw source path onward is gone.
+    """
+    layer = entry.qgis_layer
+    src = layer.source() if layer is not None else entry.source_path
+
+    if entry.layer_type == "buildings":
+        # Vector sources: plain path, conversion happens in the worker.
+        if layer is not None and (os.path.isfile(src)
+                                  or src.startswith("/vsi")):
             return src
-        if os.path.isdir(entry.source_path):
-            return entry.source_path
-        # Remote layer: the actual export happens in the worker thread
-        # using the source path.  We can't export here (would block).
-        # For remote layers, pass the source string and let the worker
-        # handle export — but QGIS writeRaster needs a QgsRasterLayer
-        # which is main-thread-only.  So export NOW on main thread.
-        if isinstance(entry.qgis_layer, QgsRasterLayer) and entry.extent:
-            try:
-                from qgis.core import (
-                    QgsRasterFileWriter, QgsRasterPipe,
-                    QgsRasterProjector, QgsRectangle,
-                )
-                wgs84 = QgsCoordinateReferenceSystem("EPSG:4326")
-                bbox = entry.extent
-                extent = QgsRectangle(
-                    bbox["west"], bbox["south"], bbox["east"], bbox["north"]
-                )
-                provider = entry.qgis_layer.dataProvider()
-                if provider:
-                    pipe = QgsRasterPipe()
-                    if pipe.set(provider.clone()):
-                        if entry.qgis_layer.crs() != wgs84:
-                            proj = QgsRasterProjector()
-                            proj.setCrs(
-                                entry.qgis_layer.crs(), wgs84,
-                                QgsProject.instance().transformContext(),
-                            )
-                            pipe.insert(pipe.size(), proj)
-                        # Target pitch first; the layer's own resolution is only
-                        # a fallback for callers that pass nothing.
-                        res = (target_res_m
-                               or (min(entry.target_resolutions)
-                                   if entry.target_resolutions else None)
-                               or _detect_resolution(entry.qgis_layer)
-                               or 30.0)
-                        deg = res / 111_111.0
-                        nc = max(1, int(round(extent.width() / deg)))
-                        nr = max(1, int(round(extent.height() / deg)))
-                        cap = 16384
-                        if max(nc, nr) > cap:
-                            ratio = max(nc, nr) / cap
-                            nc, nr = int(nc / ratio), int(nr / ratio)
-                            # The cap silently coarsens the export below the
-                            # target, which puts the arbitrary-ratio resample
-                            # back — the whole defect this parameter exists to
-                            # avoid. One export spans the entire AOI here,
-                            # unlike terrain_adapter, which clips one base
-                            # GeoTIFF per tile and never hits this. Say so
-                            # rather than shipping quietly degraded terrain.
-                            got = extent.width() / max(nc, 1) * 111_111.0
-                            QgsMessageLog.logMessage(
-                                f"Export capped at {cap} px: requested "
-                                f"{res:.2f} m, got {got:.2f} m. Tiles finer "
-                                f"than {got:.2f} m will be interpolated from "
-                                f"this. Convert a smaller extent to avoid it.",
-                                TAG, Qgis.MessageLevel.Warning,
-                            )
-                        out = os.path.join(
-                            tempfile.gettempdir(),
-                            f"aether_exp_{id(entry)}_{os.getpid()}.tif",
-                        )
-                        w = QgsRasterFileWriter(out)
-                        w.setOutputFormat("GTiff")
-                        err = w.writeRaster(
-                            pipe, nc, nr, extent, wgs84,
-                            QgsProject.instance().transformContext(),
-                        )
-                        if err == 0:  # NoError
-                            return out
-            except Exception:
-                pass
         return entry.source_path
-    return entry.source_path
+
+    if os.path.isdir(entry.source_path):
+        return {"kind": "file", "path": entry.source_path}
+
+    kind = _classify_acquisition(src)
+    if kind == "file":
+        return {"kind": "file", "path": src}
+    if kind == "xyz":
+        # Fail loudly BEFORE routing an RGB basemap into the elevation
+        # downloader: Terrarium-decoding a picture yields garbage terrain.
+        # The add-time "Possible Imagery — Add anyway?" prompt lets a user
+        # keep such a layer in the stack for inspection; converting it is
+        # where the line is drawn.
+        if (layer is not None
+                and classify_raster_layer(layer) == "imagery"):
+            lname = layer.name() if hasattr(layer, "name") else src
+            raise RuntimeError(
+                f"Layer '{lname}' classifies as imagery, not elevation — "
+                "it cannot be converted to terrain. Its XYZ tiles are an "
+                "RGB picture; decoding them as elevation would produce "
+                "garbage. Use an elevation-encoded service (Terrarium / "
+                "Mapbox Terrain-RGB) or remove the layer from the stack."
+            )
+        return {"kind": "xyz", "uri": src,
+                "extent": dict(entry.extent) if entry.extent else None}
+    return {"kind": "rendered",
+            "tiles": _render_tiles_via_qgis(entry, render_jobs or [],
+                                            on_tile)}
 
 
 def _kill_proc(proc: subprocess.Popen) -> None:
@@ -621,26 +899,35 @@ def _kill_proc(proc: subprocess.Popen) -> None:
         pass
 
 
-def resolve_sources_with_progress(layers, parent=None, target_res_m=None):
-    """Resolve every layer to a path, on the main thread, but visibly.
+def resolve_sources_with_progress(layers, parent=None, render_jobs=None,
+                                  on_progress=None):
+    """Resolve every layer on the main thread, visibly, per-tile for renders.
 
-    *target_res_m* is forwarded to :func:`_resolve_source_on_main_thread` and
-    must be the finest resolution this run will write. It used to be absent,
-    which is precisely why the export could not see it: the caller reads the
-    resolution checkboxes before this call and only hands them to the worker,
-    which is constructed *after* the export has already run.
+    *render_jobs* is the run's enumerated ``(res, tile)`` list (minus tiles
+    that will be skipped as existing); rendered servers are exported per
+    tile here, and the dialog ticks per TILE — the old per-layer tick froze
+    at 0 for the whole multi-minute export. *on_progress(frac)* additionally
+    drives the tab's main bar (resolve phase, 0-20 %).
 
-    This work cannot move to the worker: it calls ``writeRaster`` through a
-    ``QgsRasterLayer``, and QGIS map layers are main-thread-only. What it can
-    stop doing is happening *invisibly* — it used to run inside
-    ``_MapConverterWorker.__init__``, which is constructed on the GUI thread
-    before ``start()``, so a multi-minute WMS/XYZ export looked like the plugin
-    had hung with no progress, no log and no way out.
+    This work cannot move to the worker: rendering goes through a
+    ``QgsRasterLayer``, and QGIS map layers are main-thread-only.
 
-    Returns the list of resolved sources, or ``None`` if the user cancelled.
+    Returns the resolved list, or ``None`` if the user cancelled. Hard
+    errors (render failures, unloaded layers) propagate as RuntimeError.
     The dialog is window-modal so pumping events here cannot re-enter Run.
     """
-    dlg = QProgressDialog("Preparing layers…", "Cancel", 0, len(layers), parent)
+    render_jobs = render_jobs or []
+    weights = []
+    for entry in layers:
+        if _entry_kind(entry) == "rendered":
+            weights.append(
+                max(1, len(_jobs_overlapping_extent(render_jobs,
+                                                    entry.extent))))
+        else:
+            weights.append(1)
+    total = sum(weights) or 1
+
+    dlg = QProgressDialog("Preparing layers…", "Cancel", 0, total, parent)
     dlg.setWindowTitle("Map Converter")
     dlg.setWindowModality(Qt.WindowModal)
     # Show at once: the first layer is often the slowest, and a dialog that
@@ -648,6 +935,20 @@ def resolve_sources_with_progress(layers, parent=None, target_res_m=None):
     dlg.setMinimumDuration(0)
     dlg.setValue(0)
     QApplication.processEvents()
+
+    done = 0
+
+    def tick(label: Optional[str] = None) -> None:
+        nonlocal done
+        done += 1
+        dlg.setValue(min(done, total))
+        if label:
+            dlg.setLabelText(label)
+        if on_progress is not None:
+            on_progress(done / total)
+        QApplication.processEvents()
+        if dlg.wasCanceled():
+            raise _ResolveCancelled()
 
     resolved = []
     try:
@@ -657,29 +958,35 @@ def resolve_sources_with_progress(layers, parent=None, target_res_m=None):
             QApplication.processEvents()
             if dlg.wasCanceled():
                 return None
-            # A single export is one blocking call inside QGIS; the UI can only
-            # come back between layers, not during one.
-            resolved.append(_resolve_source_on_main_thread(entry, target_res_m))
-            dlg.setValue(i + 1)
-            QApplication.processEvents()
-            if dlg.wasCanceled():
-                return None
+            if _entry_kind(entry) == "rendered":
+                resolved.append(_resolve_source_on_main_thread(
+                    entry, render_jobs,
+                    on_tile=lambda fn, _n=name: tick(f"Rendering {_n}: {fn}")))
+            else:
+                resolved.append(
+                    _resolve_source_on_main_thread(entry, render_jobs))
+                tick()
+    except _ResolveCancelled:
+        return None
     finally:
         dlg.close()
     return resolved
 
 
 class _MapConverterWorker(QThread):
-    """Background worker — does ALL heavy I/O + runs the converter.
+    """Background worker — heavy I/O, terrain download, converter run.
 
-    The main thread only passes lightweight config; this worker handles:
-    - Resolving layer paths (file discovery, CRS detection)
-    - GDAL reprojection of non-WGS84 layers
-    - Exporting remote WMS/XYZ layers to temp GeoTIFF
+    The main thread passes lightweight config plus the pre-resolved
+    acquisition dicts (rendered servers were already exported per tile on
+    the main thread); this worker handles:
+    - Per-file source infos for local files/folders (CRS detection — never
+      reprojection: the converter samples each source in its own CRS)
+    - XYZ terrain download via the shared pool
+      (terrain_adapter.ensure_pool_tiles — same cache as Site Analysis)
     - Downloading OSM buildings via Overpass API
     - Converting GDB/SHP/GPKG → FGB
-    - Building the ingest job JSON
-    - Running the converter subprocess
+    - Building the ingest job JSON (sources[] per tile, stack order)
+    - Running the converter through the shared streaming runner
     """
 
     progress = pyqtSignal(int)
@@ -715,6 +1022,7 @@ class _MapConverterWorker(QThread):
         self._overwrite = overwrite
         self._canceled = False
         self._proc = None
+        self._temp_tifs: List[str] = []
 
     def cancel(self):
         self._canceled = True
@@ -743,7 +1051,6 @@ class _MapConverterWorker(QThread):
 
             from concurrent.futures import ThreadPoolExecutor, as_completed
 
-            all_raster_paths = []
             buildings_path = None
             total_tasks = len(raster_entries) + len(building_entries)
             done_tasks = 0
@@ -768,11 +1075,15 @@ class _MapConverterWorker(QThread):
                     try:
                         raster_results[idx] = fut.result()
                     except Exception as exc:
+                        # Hard error, not warn-and-continue: silently dropping
+                        # a stack entry converts the wrong terrain.
                         self._log(f"  ERROR resolving raster layer {idx}: {exc}")
-                        raster_results[idx] = []
+                        self.finished_err.emit(
+                            f"Layer {idx + 1} could not be prepared: {exc}")
+                        return
                     done_tasks += 1
-                    pct = int(done_tasks * 25 / max(total_tasks, 1))
-                    self.progress.emit(pct)
+                    self.progress.emit(phase_progress(
+                        "resolve", done_tasks / max(total_tasks, 1)))
                     self.status.emit(
                         f"Resolved layer {done_tasks}/{total_tasks}")
 
@@ -785,30 +1096,43 @@ class _MapConverterWorker(QThread):
                         if bp:
                             buildings_path = bp
                     except Exception as exc:
+                        # Hard error, same rule as rasters: running on
+                        # WITHOUT the requested buildings and reporting
+                        # success is a silently wrong result.
                         self._log(f"  ERROR resolving buildings: {exc}")
+                        self.finished_err.emit(
+                            f"Buildings could not be prepared: {exc}")
+                        return
                     done_tasks += 1
-                    pct = int(done_tasks * 25 / max(total_tasks, 1))
-                    self.progress.emit(pct)
+                    self.progress.emit(phase_progress(
+                        "resolve", done_tasks / max(total_tasks, 1)))
 
-            # Reassemble raster paths in priority order.
+            # Reassemble resolved entries in UI stack order: entry 0 sits on
+            # top of the stack and is therefore the HIGHEST priority —
+            # sources[] array order is priority order (first valid sample
+            # wins), so this ordered list goes straight into every tile job.
+            all_entries: List[Dict[str, Any]] = []
             for i in sorted(raster_results.keys()):
-                all_raster_paths.extend(raster_results[i])
+                all_entries.append(raster_results[i])
 
-            if not all_raster_paths:
+            if not all_entries:
                 self.finished_err.emit("No raster layers resolved to files.")
                 return
 
-            base = all_raster_paths[-1]
-            overlays = all_raster_paths[:-1]
-            self._log(f"  Base: {os.path.basename(base)}")
-            self._log(f"  Overlays: {len(overlays)} file(s)")
+            # Rendered temp tifs belong to this run — clean them up with the
+            # materialized scratch files when the run ends.
+            for ent in all_entries:
+                if ent.get("kind") == "rendered":
+                    self._temp_tifs.extend(ent.get("tiles", {}).values())
+
+            self._log(f"  Stack: {len(all_entries)} raster entr(ies)")
             if buildings_path:
                 self._log(f"  Buildings: {buildings_path}")
 
             # ---- Phase 2: Build tile job list ----
             if self._canceled:
                 return
-            self.progress.emit(30)
+            self.progress.emit(phase_progress("resolve", 1.0))
             self.status.emit("Building tile list...")
             self._log("Phase 2: Building .abt tile jobs...")
 
@@ -831,37 +1155,7 @@ class _MapConverterWorker(QThread):
             # Snap to grid, then enumerate — the same two calls the pre-run
             # estimate makes, so the tile count it showed is the one built.
             bbox = _snap_bbox(combined, self._out_res)
-
-            os.makedirs(self._output_dir, exist_ok=True)
-            jobs = []
-            for res, tile in _enumerate_tiles(bbox, self._out_res):
-                fn = _abt_tile_name(res, tile["ul_lat"], tile["ul_lon"])
-                out = os.path.join(self._output_dir, fn)
-                if self._overwrite or not os.path.exists(out):
-                    job = {
-                        "output_path": os.path.abspath(out),
-                        "format": "r16sint",
-                        "ul_lat": tile["ul_lat"], "ul_lon": tile["ul_lon"],
-                        "resolution_m": float(tile["exact_res_m"]),
-                        "size_px": tile["size_px"],
-                        "base_tif": base,
-                        "swiss_tifs": overlays,
-                    }
-                    if buildings_path:
-                        job["buildings_file"] = buildings_path
-                    jobs.append(job)
-
-            if not jobs:
-                self.status.emit("All tiles already exist.")
-                self.finished_ok.emit(self._output_dir)
-                return
-
-            self._log(f"Generated {len(jobs)} tile jobs.")
-            self.progress.emit(40)
-
-            # ---- Phase 3: Run converter ----
-            if self._canceled:
-                return
+            expected = _enumerate_tiles(bbox, self._out_res)
 
             try:
                 converter_exe = find_binary("aether_converter")
@@ -869,6 +1163,103 @@ class _MapConverterWorker(QThread):
                 self.finished_err.emit(str(exc))
                 return
 
+            # Pre-run cross-check: the engine must enumerate the SAME grid.
+            # Fails loudly — a mismatch (or an engine without `plan`) aborts
+            # before anything is written.
+            #
+            # Pass the RAW combined bbox, never the snapped one: the engine
+            # snaps once itself, and floor/ceil on this float grid is NOT
+            # idempotent (e.g. ceil(47.400000000000006/0.1) = 475 — 516 of
+            # 3601 0.1-grid values move a step when re-snapped), so handing
+            # it an already-snapped bbox double-snaps on its side and the
+            # check falsely aborts. Both sides snapping exactly once from
+            # bit-identical input is what makes the equality meaningful.
+            self.status.emit("Cross-checking tile grid with the engine...")
+            try:
+                _plan_cross_check(converter_exe, combined, self._out_res,
+                                  expected)
+            except RuntimeError as exc:
+                self.finished_err.emit(str(exc))
+                return
+
+            # ---- Download phase (20-70 %): XYZ entries via the shared
+            # toolkit pool downloader. Hard errors abort the run — there is
+            # no QGIS-render fallback for XYZ any more.
+            xyz_entries = [e for e in all_entries if e.get("kind") == "xyz"]
+            if xyz_entries:
+                self.status.emit("Downloading terrain tiles...")
+                self._log(f"Downloading terrain for {len(xyz_entries)} XYZ "
+                          f"entr(ies) via the shared pool...")
+
+                def dl_progress(frac: float, label: str) -> None:
+                    if self._canceled:
+                        return
+                    self.progress.emit(phase_progress("download", frac))
+                    self.status.emit(label)
+
+                # Only the tiles this run will actually build: render and
+                # job building both skip existing outputs, so downloading
+                # terrain for skipped tiles would be pure waste.
+                pending = [
+                    (r, t) for r, t in expected
+                    if self._overwrite or not os.path.exists(
+                        os.path.join(self._output_dir, t["filename"]))
+                ]
+                try:
+                    _download_xyz_entries(
+                        xyz_entries, pending,
+                        progress_cb=dl_progress,
+                        # Cancel must reach the running download: polled per
+                        # output line (raises ConverterCancelled), and the
+                        # subprocess handle is exposed so cancel() can kill
+                        # it outright.
+                        should_cancel=lambda: self._canceled,
+                        on_start=self._register_proc)
+                except terrain_adapter.ConverterCancelled:
+                    self._log("Cancelled by user.")
+                    self.status.emit("Cancelled.")
+                    return
+                except RuntimeError as exc:
+                    if self._canceled:
+                        # cancel() killed the download subprocess; the
+                        # resulting "download failed" is not an error.
+                        self._log("Cancelled by user.")
+                        self.status.emit("Cancelled.")
+                        return
+                    self.finished_err.emit(str(exc))
+                    return
+                finally:
+                    self._proc = None
+            self.progress.emit(phase_progress("download", 1.0))
+
+            if self._canceled:
+                return
+
+            os.makedirs(self._output_dir, exist_ok=True)
+            try:
+                jobs, mat_temps = _build_tile_jobs(
+                    expected, self._output_dir, self._overwrite, all_entries,
+                    buildings_path, tempfile.gettempdir())
+            except RuntimeError as exc:
+                self.finished_err.emit(str(exc))
+                return
+            # Materialized windows join the rendered tifs (already
+            # registered above) in the end-of-run cleanup list.
+            self._temp_tifs.extend(mat_temps)
+
+            if not jobs:
+                self.status.emit("All tiles already exist.")
+                self.finished_ok.emit(self._output_dir)
+                return
+
+            self._log(f"Generated {len(jobs)} tile jobs.")
+
+            # ---- Phase 3 (70-100 %): Run converter ----
+            if self._canceled:
+                return
+
+            # converter_exe was resolved in Phase 2 (the plan cross-check
+            # needed it before any job was built).
             total = len(jobs)
             self.status.emit(f"Converting {total} .abt tiles...")
             self._log(f"Phase 3: Running converter ({total} tiles)...")
@@ -881,49 +1272,41 @@ class _MapConverterWorker(QThread):
 
             self._log(f"Launching: {converter_exe} ingest")
 
-            env = os.environ.copy()
-            env["PYTHONUNBUFFERED"] = "1"
+            def on_line(line: str) -> None:
+                if self._canceled:
+                    raise terrain_adapter.ConverterCancelled()
+                self._log(line)
+                prog = self._parse_progress(line)
+                if prog:
+                    curr, tot = prog
+                    self.progress.emit(
+                        phase_progress("convert", curr / max(tot, 1)))
+                    self.status.emit(f"Converting tile {curr}/{tot}")
 
-            # `with` closes the stdout pipe (and waits) on exit so we don't
-            # leak a file handle (the ResourceWarning).
-            with subprocess.Popen(
-                [converter_exe, "ingest", "--job-file", job_file],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                bufsize=1,
-                text=True, encoding="utf-8", errors="replace",
-                creationflags=_SUBPROCESS_FLAGS,
-                env=env,
-            ) as proc:
-                self._proc = proc
-
-                for line in iter(proc.stdout.readline, ""):
-                    if self._canceled:
-                        _kill_proc(proc)
-                        self._log("Cancelled by user.")
-                        return
-                    line = line.strip()
-                    if not line:
-                        continue
-                    self._log(line)
-
-                    prog = self._parse_progress(line)
-                    if prog:
-                        curr, tot = prog
-                        # Map converter progress to 40-100% range.
-                        pct = 40 + int(curr * 60 / max(tot, 1))
-                        self.progress.emit(pct)
-                        self.status.emit(f"Tile {curr}/{tot}")
-
-                proc.wait()
-                rc = proc.returncode
-
-            self._proc = None
+            try:
+                # The one shared subprocess runner (terrain_adapter).
+                rc = terrain_adapter.run_converter_streaming(
+                    converter_exe, ["ingest", "--job-file", job_file],
+                    on_line, on_start=self._register_proc)
+            except terrain_adapter.ConverterCancelled:
+                self._log("Cancelled by user.")
+                self.status.emit("Cancelled.")
+                return
+            finally:
+                self._proc = None
 
             try:
                 os.remove(job_file)
             except OSError:
                 pass
+
+            if self._canceled:
+                # cancel() killed the process directly — the kill won the
+                # race against the per-line check, so rc is the kill signal
+                # (-15), not a converter failure. End cleanly, no error.
+                self._log("Cancelled by user.")
+                self.status.emit("Cancelled.")
+                return
 
             if rc != 0:
                 msg = f"Converter failed (exit code {rc}). See log."
@@ -939,64 +1322,97 @@ class _MapConverterWorker(QThread):
         except Exception as exc:
             self._log(f"ERROR: {exc}")
             self.finished_err.emit(f"Unexpected error: {exc}")
+        finally:
+            self._cleanup_temp_tifs()
+
+    def _register_proc(self, proc) -> None:
+        """on_start hook: expose the running engine process for cancel()."""
+        self._proc = proc
+
+    def _cleanup_temp_tifs(self):
+        """Remove the per-tile materialized GeoTIFF scratch files."""
+        for tf in self._temp_tifs:
+            try:
+                if os.path.exists(tf):
+                    os.remove(tf)
+            except OSError:
+                pass
+        self._temp_tifs = []
 
     # -- Heavy I/O methods (run on worker thread) -------------------------
 
-    # CRS that the converter handles natively (no reprojection needed).
-    _NATIVE_CRS = {"EPSG:4326", "EPSG:2056"}
+    def _resolve_raster(self, entry: dict) -> Dict[str, Any]:
+        """Resolve one raster stack entry to an acquisition dict.
 
-    def _needs_reproject(self, crs: str) -> bool:
-        """Return True if CRS is not natively handled by the converter."""
-        return bool(crs) and crs not in self._NATIVE_CRS
+        ``{"kind": "files", "infos": […]}`` for local files/folders (per-file
+        source infos, generic CRS, entry-extent-filtered);
+        ``{"kind": "xyz", …}`` and ``{"kind": "rendered", …}`` pass through
+        from the main-thread router — the download happens later in
+        ``run()`` (needs the enumerated tile grid), the render already
+        happened on the main thread.
 
-    def _resolve_raster(self, entry: dict) -> List[str]:
-        """Resolve a raster layer entry to file paths for the converter.
-
-        - WGS84 (EPSG:4326) and LV95 (EPSG:2056) are passed as-is —
-          the converter handles both natively.
-        - Other CRS are reprojected to WGS84 via GDAL Warp.
-        - Folders are filtered by extent to avoid loading irrelevant files.
+        No reprojection of any kind: the converter samples every source in
+        its own CRS, and a CRS it rejects is a hard error surfaced verbatim.
         """
-        source = entry["resolved_source"]
-        crs = entry["crs_authid"]
-        extent = entry.get("extent")
-        is_folder = os.path.isdir(source)
+        resolved = entry["resolved_source"]
+        # Back-compat: a plain string is a local path (older callers/tests).
+        if isinstance(resolved, str):
+            resolved = {"kind": "file", "path": resolved}
 
-        if is_folder:
-            files = _list_terrain_files(source)
+        kind = resolved.get("kind")
+        if kind == "xyz":
+            self._log(f"  XYZ service (shared toolkit download): "
+                      f"{resolved['uri'][:80]}")
+            return {"kind": "xyz", "uri": resolved["uri"],
+                    "extent": resolved.get("extent") or entry.get("extent")}
+        if kind == "rendered":
+            tiles = resolved.get("tiles", {})
+            self._log(f"  Rendered service: {len(tiles)} pre-rendered "
+                      f"tile(s) from the main thread")
+            return {"kind": "rendered", "tiles": tiles}
+
+        source = resolved["path"]
+        crs = entry["crs_authid"] or ""
+        extent = entry.get("extent")
+
+        if os.path.isdir(source):
+            files = terrain_adapter.list_terrain_files(source)
             if not files:
                 raise RuntimeError(f"No terrain files in {source}")
-
-            # Filter by extent — only keep files that overlap.
-            if extent:
-                before = len(files)
-                files = _filter_files_by_extent(files, extent, crs)
-                self._log(f"  Folder: {source} — {len(files)}/{before} "
-                          f"files overlap extent")
-            else:
-                self._log(f"  Folder: {source} ({len(files)} files, no filter)")
-
-            if self._needs_reproject(crs):
-                self._log(f"  Reprojecting {len(files)} files to WGS84...")
-                files = [self._ensure_wgs84(f, crs) for f in files]
-
-            return [os.path.abspath(f) for f in files]
-
-        if os.path.isfile(source) or source.startswith("/vsi"):
+            self._log(f"  Folder: {source} ({len(files)} files, recursive)")
+            # The entry CRS is a FOLDER-level answer (detected from the first
+            # file, or asked from the user) — each file's own embedded CRS
+            # must win, the folder answer only fills in files without one.
+            infos = [terrain_adapter.source_file_info(
+                         f, crs_authid=crs or None, declared_is_fallback=True)
+                     for f in files]
+        else:
+            files = [source]
             self._log(f"  File: {os.path.basename(source)}")
-            if self._needs_reproject(crs):
-                source = self._ensure_wgs84(source, crs)
-            return [os.path.abspath(source)]
+            # A single-file entry carries the LAYER's authid — authoritative,
+            # since a user can deliberately override a layer's CRS in QGIS.
+            infos = [terrain_adapter.source_file_info(
+                         f, crs_authid=crs or None)
+                     for f in files]
 
-        self._log(f"  Resolved: {source}")
-        return [os.path.abspath(source)]
+        if extent:
+            before = len(infos)
+            infos = [
+                i for i in infos
+                if bboxes_intersect(i["wgs84_bounds"],
+                                    _expand_bbox(extent, i["halo_deg"]))
+            ]
+            self._log(f"  {len(infos)}/{before} file(s) overlap the extent")
+        return {"kind": "files", "infos": infos}
 
     def _resolve_buildings(self, entry: dict) -> Optional[str]:
         """Resolve a buildings entry to an FGB path.
 
-        The converter only understands WGS84 and LV95 geometry, so anything in
-        another CRS is reprojected here.  ``.fgb`` inputs used to be handed over
-        untouched, which silently placed buildings at the wrong coordinates.
+        The converter reads building geometry in WGS84, so anything declared
+        in another CRS is reprojected here (vector reprojection is the
+        plugin's job — the generic-CRS ingest applies to rasters only).
+        ``.fgb`` inputs used to be handed over untouched, which silently
+        placed buildings at the wrong coordinates.
         """
         path = entry["resolved_source"]
         src_crs = entry.get("crs_authid", "") or ""
@@ -1044,8 +1460,8 @@ class _MapConverterWorker(QThread):
                 return os.path.abspath(fgb)
 
         # Already FlatGeobuf (or an unrecognised container): only safe to pass
-        # straight through when it is in a CRS the converter reads natively.
-        if self._needs_reproject(src_crs):
+        # straight through when it is already WGS84.
+        if src_crs and src_crs != "EPSG:4326":
             self._log(f"  Reprojecting buildings {src_crs} → EPSG:4326...")
             out_dir = os.path.join(tempfile.gettempdir(), "aether_fgb")
             os.makedirs(out_dir, exist_ok=True)
@@ -1114,36 +1530,6 @@ class _MapConverterWorker(QThread):
         except Exception as exc:
             self._log(f"  OSM building download failed: {exc}")
             return None
-
-    def _ensure_wgs84(self, path: str, crs: str) -> str:
-        if not crs or crs == "EPSG:4326":
-            return path
-        try:
-            from osgeo import gdal
-            out = os.path.join(
-                tempfile.gettempdir(),
-                f"aether_wgs84_{os.path.basename(path)}"
-            )
-            # Keyed on basename only, so a different source with the same file
-            # name reuses this. "Rebuild existing tiles" discards it too.
-            if os.path.exists(out) and not self._overwrite:
-                return out
-            self._log(f"  Reprojecting {os.path.basename(path)} → WGS84")
-            r = gdal.Warp(out, path, dstSRS="EPSG:4326", format="GTiff",
-                          # Average, not bilinear: the reprojected raster is
-                          # resampled again onto the .abt grid, and an
-                          # interpolator throws away everything outside the four
-                          # pixels around each target centre — the discarded
-                          # relief is what shows up later as speckle.
-                          resampleAlg=gdal.GRA_Average)
-            if r:
-                r.FlushCache()
-                r = None
-                return out
-        except Exception as exc:
-            self._log(f"  Reproject failed: {exc}")
-        return path
-
 
 # ---------------------------------------------------------------------------
 # Rectangle-draw map tool
@@ -1411,7 +1797,7 @@ class MapConverterTab(QWidget):
         out_row = QHBoxLayout()
         out_row.addWidget(QLabel("Output:"))
         self._edit_output = QLineEdit()
-        self._edit_output.setPlaceholderText("~/.aether/cache")
+        self._edit_output.setPlaceholderText(terrain_adapter.get_cache_dir())
         self._edit_output.setToolTip("Directory for .abt output files.")
         out_row.addWidget(self._edit_output, 1)
         self._btn_browse = QPushButton("Browse...")
@@ -1504,7 +1890,7 @@ class MapConverterTab(QWidget):
         if not is_buildings:
             source = layer.source()
             if "type=xyz" in source:
-                native_res = _detect_xyz_resolution(source)
+                native_res = terrain_adapter.xyz_native_resolution_m(source)
             else:
                 native_res = _detect_resolution(layer)
 
@@ -1530,10 +1916,13 @@ class MapConverterTab(QWidget):
         )
         if not folder:
             return
-        tifs = _list_terrain_files(folder)
+        # Recursive, sorted — the same scanner the worker (and Site
+        # Analysis) uses, so what is counted here is what converts.
+        tifs = terrain_adapter.list_terrain_files(folder)
         if not tifs:
             QMessageBox.warning(self, "No Terrain Files",
-                                f"No GeoTIFF/DEM/HGT files in:\n{folder}")
+                                f"No GeoTIFF/DEM/HGT files in:\n{folder}\n"
+                                f"(searched recursively)")
             return
 
         crs_id = _detect_folder_crs(folder)
@@ -1690,8 +2079,10 @@ class MapConverterTab(QWidget):
         return None
 
     def _ask_crs(self, context: str) -> Optional[str]:
-        common = ["EPSG:4326", "EPSG:2056", "EPSG:32632", "EPSG:32633",
-                   "EPSG:3857", "EPSG:25832", "EPSG:25833"]
+        # Generic starter suggestions only — the combo is editable, and ANY
+        # EPSG authid works: the converter reprojects every CRS itself.
+        common = ["EPSG:4326", "EPSG:32632", "EPSG:32633",
+                  "EPSG:3857", "EPSG:25832", "EPSG:25833"]
         from qgis.PyQt.QtWidgets import QInputDialog
         crs, ok = QInputDialog.getItem(
             self, "Select CRS", f"{context}\n\nSelect CRS:", common, 0, True
@@ -2027,16 +2418,32 @@ class MapConverterTab(QWidget):
     def _on_browse_output(self):
         folder = QFileDialog.getExistingDirectory(
             self, "Output Directory",
-            self._edit_output.text() or os.path.expanduser("~/.aether/cache"),
+            self._edit_output.text() or self._get_output_dir(),
         )
         if folder:
             self._edit_output.setText(folder)
 
     def _get_output_dir(self) -> str:
         text = self._edit_output.text().strip()
-        return os.path.expanduser(text) if text else os.path.expanduser(
-            "~/.aether/cache"
-        )
+        # The DEFAULT follows the terrain-cache setting (waveshed/cache_dir);
+        # it used to hardcode ~/.aether/cache and ignore a relocated cache.
+        # A path the user typed always wins.
+        return (os.path.expanduser(text) if text
+                else terrain_adapter.get_cache_dir())
+
+    def refresh_settings(self) -> None:
+        """Re-read what this tab derives from QgsSettings (cheap, idempotent).
+
+        Called by the main dialog when the Settings tab saves. The output
+        directory DEFAULT (placeholder + empty-field fallback) follows
+        ``waveshed/cache_dir``; a user-typed output path is user state and
+        stays untouched. The estimate is recomputed because its
+        skip-existing scan prices against the (possibly relocated) default.
+        Download connections/passes and binary discovery are read per run,
+        never cached here.
+        """
+        self._edit_output.setPlaceholderText(terrain_adapter.get_cache_dir())
+        self._update_estimate()
 
     # ------------------------------------------------------------------
     # Run
@@ -2110,15 +2517,43 @@ class MapConverterTab(QWidget):
         self._log.clear()
         self._log_msg("Starting conversion...")
 
-        # Remote layers must be exported through QGIS on this thread before the
-        # worker can touch them. Shown with progress and a Cancel rather than a
-        # silent freeze — see resolve_sources_with_progress.
-        self._log_msg("Preparing layers (this can take a while for WMS/XYZ)...")
-        # Export at the FINEST requested resolution: one export feeds every
-        # requested .abt resolution, and ingest.rs can only decimate from it.
-        resolved = resolve_sources_with_progress(
-            self._layers, self, target_res_m=float(min(out_res))
-        )
+        # Rendered servers must be exported through QGIS on this thread
+        # before the worker can touch them — per TILE, so enumerate the
+        # run's grid now (the same _snap_bbox/_enumerate_tiles the worker
+        # repeats). Tiles that will be skipped as existing are not rendered.
+        combined = None
+        for entry in self._layers:
+            if entry.layer_type == "buildings" or not entry.extent:
+                continue
+            if combined is None:
+                combined = dict(entry.extent)
+            else:
+                combined["south"] = min(combined["south"], entry.extent["south"])
+                combined["north"] = max(combined["north"], entry.extent["north"])
+                combined["west"] = min(combined["west"], entry.extent["west"])
+                combined["east"] = max(combined["east"], entry.extent["east"])
+        render_jobs = _enumerate_tiles(_snap_bbox(combined, out_res), out_res)
+        if not self._chk_overwrite.isChecked():
+            render_jobs = [
+                (r, t) for r, t in render_jobs
+                if not os.path.exists(os.path.join(output_dir, t["filename"]))
+            ]
+
+        self._log_msg("Preparing layers (rendered servers render per tile)...")
+        self._progress.setValue(phase_progress("resolve", 0.0))
+        try:
+            resolved = resolve_sources_with_progress(
+                self._layers, self, render_jobs=render_jobs,
+                on_progress=lambda frac: self._progress.setValue(
+                    phase_progress("resolve", frac)),
+            )
+        except RuntimeError as exc:
+            # Hard error (render failure, unloaded layer): blocking dialog,
+            # nothing runs.
+            self._log_msg(f"ERROR: {exc}")
+            QMessageBox.critical(self, "Layer preparation failed", str(exc))
+            self._lbl_status.setText("Failed.")
+            return
         if resolved is None:
             self._log_msg("Cancelled while preparing layers.")
             self._lbl_status.setText("Cancelled.")

@@ -2,10 +2,16 @@
 
 Three extraction paths (fastest first):
   1. Rust downloader: XYZ tiles → .abt directly (parallel HTTP, no intermediate)
-  2. GDAL Warp: local GeoTIFF/VRT/COG → temp GeoTIFF → converter → .abt
-  3. QGIS writeRaster: any provider (WMS, WCS, etc.) → temp GeoTIFF → converter → .abt
+  2. Direct sources: local GeoTIFF/DEM files are handed to
+     ``aether_converter ingest`` as ``sources[]`` entries in their OWN CRS —
+     the converter reprojects while sampling, so the plugin never warps.
+     Formats its tiff reader cannot open (.hgt/.dem, VRT, /vsi*, oversized
+     files) are window-copied to plain GeoTIFF at native resolution first
+     (see :func:`materialize_for_converter`).
+  3. QGIS writeRaster: non-file providers (WMS, WMTS, ArcGIS, …) → temp
+     WGS84 GeoTIFF (server-rendered; unavoidable) → converter → .abt
 
-Also supports a local terrain directory of GeoTIFF/DEM files (GDAL path).
+Also supports a local terrain directory of GeoTIFF/DEM files (path 2).
 """
 
 from __future__ import annotations
@@ -308,20 +314,72 @@ def source_fingerprint(buildings: str) -> str:
 ENCODING_TERRARIUM = "terrarium"
 ENCODING_MAPBOX = "mapbox"
 
-# Substrings that pin a tile URL template to one encoding.  Terrarium and
-# Mapbox Terrain-RGB are both plain 8-bit RGB PNGs, so nothing in the *pixels*
-# tells them apart: decode a Terrain-RGB tile as Terrarium and every elevation
-# lands near -32000 m, which the engine happily treats as terrain.  QGIS's own
-# ``interpretation=`` parameter is authoritative when the layer carries one —
-# but a hand-added XYZ layer usually carries none, and defaulting those to
-# Terrarium was a silent wrong answer for every Terrain-RGB service.
-_MAPBOX_URL_HINTS = (
-    "terrain-rgb", "terrain_rgb", "terrainrgb",
-    "terrain-dem", "terrain_dem", "mapbox", "maptiler",
-)
-_TERRARIUM_URL_HINTS = (
-    "terrarium", "mapzen", "nextzen", "elevation-tiles-prod", "aws-terrain",
-)
+# Provider knowledge lives in DATA, not code: waveshed/resources/
+# known_services.json holds the URL substrings that pin a tile service to an
+# elevation encoding and/or to the deepest zoom it actually publishes. The
+# matching logic below stays here; only the facts moved.
+#
+# Why the encoding matters: Terrarium and Mapbox Terrain-RGB are both plain
+# 8-bit RGB PNGs, so nothing in the *pixels* tells them apart — decode a
+# Terrain-RGB tile as Terrarium and every elevation lands near -32000 m,
+# which the engine happily treats as terrain.  QGIS's own ``interpretation=``
+# parameter is authoritative when the layer carries one, but a hand-added XYZ
+# layer usually carries none.
+_KNOWN_SERVICES_PATH = os.path.normpath(os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "..", "resources",
+    "known_services.json"))
+
+# Lazy cache for the parsed known-services list (loaded at most once).
+_known_services_cache: Optional[List[Dict[str, Any]]] = None
+
+
+def _known_services() -> List[Dict[str, Any]]:
+    """The known-elevation-services table, loaded lazily from resources.
+
+    A missing or invalid file is a packaging bug, not a runtime condition the
+    plugin can paper over — every XYZ encoding/zoom decision depends on this
+    data, so guessing without it risks silently wrong terrain. Fail loudly.
+    """
+    global _known_services_cache
+    if _known_services_cache is not None:
+        return _known_services_cache
+
+    path = _KNOWN_SERVICES_PATH
+    try:
+        with open(path, encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError) as exc:
+        raise RuntimeError(
+            f"The plugin's known-services table could not be read:\n{path}\n"
+            f"({exc})\n\nThis file ships with the plugin — its absence or "
+            "corruption is a packaging bug. Reinstall the Waveshed plugin."
+        ) from exc
+
+    services = data.get("services") if isinstance(data, dict) else None
+    if not isinstance(services, list):
+        raise RuntimeError(
+            f"The plugin's known-services table is invalid:\n{path}\n"
+            "(expected a top-level object with a \"services\" list). "
+            "Reinstall the Waveshed plugin."
+        )
+    for i, svc in enumerate(services):
+        match = svc.get("match") if isinstance(svc, dict) else None
+        bad = (
+            not isinstance(match, str) or not match
+            or ("max_zoom" in svc and not isinstance(svc["max_zoom"], int))
+            or ("encoding" in svc and svc["encoding"] not in
+                (ENCODING_TERRARIUM, ENCODING_MAPBOX))
+        )
+        if bad:
+            raise RuntimeError(
+                f"The plugin's known-services table is invalid:\n{path}\n"
+                f"(services[{i}] = {svc!r} — every entry needs a non-empty "
+                f"\"match\" string; \"max_zoom\" must be an integer; "
+                f"\"encoding\" must be \"{ENCODING_TERRARIUM}\" or "
+                f"\"{ENCODING_MAPBOX}\"). Reinstall the Waveshed plugin."
+            )
+    _known_services_cache = services
+    return services
 
 
 def _xyz_url(source: str) -> str:
@@ -333,8 +391,14 @@ def _xyz_url(source: str) -> str:
 def _xyz_encoding_hints(url_template: str) -> Tuple[bool, bool]:
     """``(mapbox_hint, terrarium_hint)`` present in *url_template*."""
     low = url_template.lower()
-    return (any(h in low for h in _MAPBOX_URL_HINTS),
-            any(h in low for h in _TERRARIUM_URL_HINTS))
+    mapbox = terrarium = False
+    for svc in _known_services():
+        if svc["match"] in low:
+            if svc.get("encoding") == ENCODING_MAPBOX:
+                mapbox = True
+            elif svc.get("encoding") == ENCODING_TERRARIUM:
+                terrarium = True
+    return mapbox, terrarium
 
 
 def xyz_encoding(source: str) -> Optional[str]:
@@ -392,17 +456,12 @@ def resolve_xyz_encoding(source: str) -> str:
     return ENCODING_TERRARIUM
 
 
-#: Deepest zoom each known elevation-tile service actually publishes.  QGIS
-#: defaults a hand-added XYZ layer to ``zmax=18``, but no public terrain
-#: service goes that deep: every tile past the real maximum 404s, the converter
-#: writes those as 0 m, and the run completes — confidently — over a flat
-#: sea-level plane.  Clamping here is what stops that.
-_SERVICE_MAX_ZOOM = (
-    ("elevation-tiles-prod", 15),   # AWS Terrain Tiles (Mapzen Terrarium)
-    ("nextzen.org", 15),            # Nextzen terrarium / normal tiles
-    ("mapzen.com", 15),
-    ("api.mapbox.com", 15),         # Terrain-RGB v4 / Terrain-DEM v1
-)
+# Deepest zoom each known elevation-tile service actually publishes lives in
+# known_services.json (per-entry "max_zoom").  QGIS defaults a hand-added XYZ
+# layer to ``zmax=18``, but no public terrain service goes that deep: every
+# tile past the real maximum 404s, the converter writes those as 0 m, and the
+# run completes — confidently — over a flat sea-level plane.  Clamping via
+# ``resolve_zmax`` is what stops that.
 
 #: Absolute ceiling for a slippy-map zoom; past this it is a typo, not a level.
 _XYZ_ZOOM_CEILING = 24
@@ -413,10 +472,27 @@ _XYZ_DEFAULT_ZMAX = 15
 def service_max_zoom(url_template: str) -> Optional[int]:
     """Deepest zoom *url_template*'s service is known to publish, else None."""
     low = url_template.lower()
-    for needle, zoom in _SERVICE_MAX_ZOOM:
-        if needle in low:
+    for svc in _known_services():
+        zoom = svc.get("max_zoom")
+        if zoom is not None and svc["match"] in low:
             return zoom
     return None
+
+
+def xyz_native_resolution_m(source: str) -> Optional[float]:
+    """Approximate native ground resolution (m at the equator) of an XYZ URI.
+
+    Computed from the EFFECTIVE max zoom (:func:`resolve_zmax` — validated
+    and clamped to what the service really publishes), so a hand-added layer
+    carrying QGIS's default ``zmax=18`` on a z15 service reports the real
+    ~4.8 m instead of a fictitious 0.6 m. Returns None for non-XYZ sources.
+    The one XYZ-resolution helper for every tab.
+    """
+    if "type=xyz" not in source:
+        return None
+    z_max, _warning = resolve_zmax(source)
+    # At the equator: res = 40075000 / (2^z * 256); less at higher latitudes.
+    return round(40_075_000 / (2 ** z_max * 256), 1)
 
 
 def resolve_zmax(source: str) -> Tuple[int, Optional[str]]:
@@ -476,10 +552,15 @@ def resolve_zmax(source: str) -> Tuple[int, Optional[str]]:
 #   v3: tiles are pooled per tile; source identity is normalised; the XYZ zoom
 #       is computed per tile instead of from the request's bbox centre.
 #   v4: the converter area-averages each output pixel's footprint instead of
-#       taking one source sample from it, and the GDAL warps feeding it use
-#       GRA_Average rather than GRA_Bilinear. Every stored elevation changes,
+#       taking one source sample from it, and every stored elevation changes,
 #       for the same tile geometry — nothing in the key would otherwise differ,
-#       so a v3 pool would keep serving the aliased tiles forever.
+#       so a v3 pool would keep serving the aliased tiles forever. Within v4
+#       the ingest source format also changed: jobs now pass ``sources[]``
+#       (each file in its OWN CRS, reprojected by the converter while
+#       sampling) instead of a plugin-side GDAL warp to a WGS84 ``base_tif``.
+#       Pixels may move by up to one source sample where a projected CRS used
+#       to go through the warp — accepted within the same schema, alongside
+#       the area-averaging change it ships with.
 _CACHE_SCHEMA = "v4"
 
 
@@ -1027,40 +1108,127 @@ def terrain_size_warning(disk_mb: int,
 # Path 1: Rust downloader (XYZ → .abt directly)
 # ---------------------------------------------------------------------------
 
-def _run_converter_download_once(
-    converter_exe: str, job_file: str
-) -> Tuple[int, List[str]]:
-    """Run one ``aether_converter download`` pass, streaming stderr to the log.
+class ConverterCancelled(Exception):
+    """Raised by an ``on_line`` callback to abort a streaming engine run.
 
-    Returns ``(returncode, stderr_lines)``. Raises RuntimeError on a
-    non-recoverable disk-space error (no point retrying or falling back).
+    ``run_converter_streaming`` kills the process and re-raises, so the
+    caller keeps its own cancel control flow.
     """
-    stderr_lines: List[str] = []
-    # `with` closes the stderr pipe (and waits) so we don't leak a file handle
-    # (the ResourceWarning). stdout goes to DEVNULL — Rust logs to stderr, so we
-    # never read stdout and don't want its pipe filling up either.
+
+
+def run_converter_streaming(exe: str, args: List[str], on_line: Any,
+                            on_start: Any = None,
+                            env: Optional[Dict[str, str]] = None) -> int:
+    """THE engine subprocess runner — the single ``Popen`` site in the plugin.
+
+    Runs ``exe *args`` with stdout+stderr merged and streams every non-empty
+    (rstripped) line into *on_line*. *on_start(proc)* exposes the process so
+    a worker can kill it on cancel; *on_line* may raise
+    :class:`ConverterCancelled` to abort (the process is terminated, then the
+    exception propagates). *env* replaces the environment when given (e.g.
+    aether_core's license injection). Returns the process exit code.
+
+    Every engine invocation (aether_converter download/ingest, aether_core)
+    goes through here so pipe handling, encoding and cancellation exist
+    exactly once.
+    """
     with subprocess.Popen(
-        [converter_exe, "download", "--job-file", job_file],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.PIPE,
+        [exe, *args],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        bufsize=1,
         text=True, encoding="utf-8", errors="replace",
+        env=env,
         creationflags=_SUBPROCESS_FLAGS,
     ) as proc:
-        # Stream stderr for progress (Rust prints to stderr).
-        for line in iter(proc.stderr.readline, ""):
-            line = line.strip()
-            if line:
-                _log(f"    {line}")
-                stderr_lines.append(line)
+        if on_start is not None:
+            on_start(proc)
+        try:
+            for line in iter(proc.stdout.readline, ""):
+                line = line.rstrip()
+                if line:
+                    on_line(line)
+        except ConverterCancelled:
+            try:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+            except Exception:  # noqa: BLE001 — best-effort kill on cancel
+                pass
+            raise
+    return proc.returncode
 
-    if proc.returncode != 0:
-        stderr_text = " ".join(stderr_lines).lower()
-        if "insufficient disk" in stderr_text or "not enough space" in stderr_text:
-            detail = stderr_lines[-1] if stderr_lines else "unknown"
+
+# The converter's download progress line is a PARSED INTERFACE (see
+# aether-tools docs/CONTRACT.md). Exact format, download.rs ~:747:
+#   [Download] {pct}% ({done}/{total}) — {mb:.1} MB/s, {n} errors, {m} in-flight
+_DL_PROGRESS_RE = re.compile(r"\[Download\]\s+(\d+)%\s+\((\d+)/(\d+)\)")
+
+
+def _parse_download_progress(line: str) -> Optional[Tuple[int, int, int]]:
+    """``(pct, done, total)`` from a ``[Download] X% (a/b) — …`` line, or None."""
+    m = _DL_PROGRESS_RE.search(line)
+    return (int(m.group(1)), int(m.group(2)), int(m.group(3))) if m else None
+
+
+class DownloadProgressAggregator:
+    """Pure math: per-zoom-group download fractions → one monotonic 0..1.
+
+    A download runs one pass per zoom group (plus gap-repair retry passes
+    over subsets). Each group is weighted by its output-tile count; a group's
+    fraction only ever rises (a retry pass over a subset reports small
+    ``done/total`` values again, which must not walk the bar backwards).
+    """
+
+    def __init__(self, group_weights: List[int]) -> None:
+        self._w = [max(0, int(w)) for w in group_weights]
+        self._total = sum(self._w) or 1
+        self._fracs = [0.0] * len(self._w)
+
+    def group_update(self, group_idx: int, frac: float) -> float:
+        """Set group *group_idx* progress to *frac*; return overall 0..1."""
+        frac = min(max(frac, 0.0), 1.0)
+        self._fracs[group_idx] = max(self._fracs[group_idx], frac)
+        return sum(w * f for w, f in zip(self._w, self._fracs)) / self._total
+
+
+def _run_converter_download_once(
+    converter_exe: str, job_file: str, on_line: Any = None,
+    should_cancel: Any = None, on_start: Any = None,
+) -> Tuple[int, List[str]]:
+    """Run one ``aether_converter download`` pass, streaming output to the log.
+
+    Returns ``(returncode, lines)``. *on_line*, when given, sees every line
+    too (progress parsing). *should_cancel()* is polled per output line and
+    raises :class:`ConverterCancelled` (the shared runner then kills the
+    process); *on_start(proc)* exposes the process so a worker can kill it
+    directly. Raises RuntimeError on a non-recoverable disk-space error (no
+    point retrying or falling back).
+    """
+    lines: List[str] = []
+
+    def handle(line: str) -> None:
+        if should_cancel is not None and should_cancel():
+            raise ConverterCancelled()
+        _log(f"    {line}")
+        lines.append(line)
+        if on_line is not None:
+            on_line(line)
+
+    rc = run_converter_streaming(
+        converter_exe, ["download", "--job-file", job_file], handle,
+        on_start=on_start)
+
+    if rc != 0:
+        text = " ".join(lines).lower()
+        if "insufficient disk" in text or "not enough space" in text:
+            detail = lines[-1] if lines else "unknown"
             raise RuntimeError(
                 f"Insufficient disk space for terrain download. {detail}"
             )
-    return proc.returncode, stderr_lines
+    return rc, lines
 
 
 # Concurrency floor for the halving retry — below this, extra parallelism buys
@@ -1135,6 +1303,9 @@ def _try_rust_download(
     subtiles: List[Dict[str, Any]],
     binary_manager: Any,
     pbf_dir: Optional[str] = None,
+    progress_cb: Any = None,
+    should_cancel: Any = None,
+    on_start: Any = None,
 ) -> bool:
     """Download XYZ tiles via Rust and produce .abt files directly.
 
@@ -1222,11 +1393,21 @@ def _try_rust_download(
     def _produced() -> bool:
         return any(_tile_is_whole(os.path.join(cache_dir, n)) for n in all_names)
 
-    job_file = os.path.join(tempfile.gettempdir(), f"aether_dl_{os.getpid()}.json")
+    # Per-run scratch job file: the Map Converter worker and Site Analysis
+    # can download in the same QGIS process now, so a pid-derived shared name
+    # would race. mkstemp is unique per call; removed in the finally below.
+    job_fd, job_file = tempfile.mkstemp(prefix="aether_dl_", suffix=".json")
+    os.close(job_fd)
 
     # Set by _run_pass; read after the passes to detect an engine that silently
     # ignored buildings_pbf_dir. A list so the closure can write to it.
     buildings_seen: List[bool] = []
+
+    # Aggregated download progress across zoom groups and retry passes, for
+    # callers that want a live bar (progress_cb(frac_0_to_1, label)).
+    zoom_order = sorted(by_zoom)
+    aggregator = (DownloadProgressAggregator(
+        [len(by_zoom[z]) for z in zoom_order]) if progress_cb else None)
 
     def _run_pass(specs: List[Dict[str, Any]], conn: int, zoom: int):
         """Write + run one download pass for *specs* at *conn* connections.
@@ -1247,7 +1428,25 @@ def _try_rust_download(
             job["buildings_pbf_dir"] = os.path.abspath(pbf_dir)
         with open(job_file, "w") as fh:
             json.dump(job, fh)
-        rc, lines = _run_converter_download_once(converter_exe, job_file)
+
+        on_line = None
+        if progress_cb is not None:
+            group_idx = zoom_order.index(zoom)
+
+            def on_line(line: str) -> None:
+                parsed = _parse_download_progress(line)
+                if parsed:
+                    _pct, done, total = parsed
+                    overall = aggregator.group_update(
+                        group_idx, done / max(total, 1))
+                    progress_cb(overall,
+                                f"Downloading terrain (z{zoom}): "
+                                f"{done}/{total} source tiles")
+
+        rc, lines = _run_converter_download_once(converter_exe, job_file,
+                                                 on_line=on_line,
+                                                 should_cancel=should_cancel,
+                                                 on_start=on_start)
         if pbf_dir and rc == 0:
             buildings_seen.append(_buildings_were_applied(lines))
         ok, total = _parse_download_completeness(lines)
@@ -1291,23 +1490,30 @@ def _try_rust_download(
                  "buildings-on-download; assuming it is supported")
         _log("  buildings fused during download (buildings_pbf_dir)")
 
-    ok_all = True
-    for zoom in sorted(by_zoom):
-        if not _download_zoom_group(
-                cache_dir, by_zoom[zoom], zoom, base_conn, max_passes,
-                _run_pass, _produced):
-            ok_all = False
+    try:
+        ok_all = True
+        for zoom in sorted(by_zoom):
+            if not _download_zoom_group(
+                    cache_dir, by_zoom[zoom], zoom, base_conn, max_passes,
+                    _run_pass, _produced):
+                ok_all = False
 
-    # The engine's own report is only a warning here, never the gate — see the
-    # note on the capability check above. A supporting engine that printed
-    # nothing still produced buildings; a *non*-supporting one never got this
-    # far, because the gate refused the fast path before any download ran.
-    if pbf_dir and buildings_seen and not any(buildings_seen):
-        _log("  note: no '[Buildings]' line in the converter output, but the "
-             "engine has the feature — buildings were applied. Report this if "
-             "the result is missing buildings.")
+        # The engine's own report is only a warning here, never the gate —
+        # see the note on the capability check above. A supporting engine
+        # that printed nothing still produced buildings; a *non*-supporting
+        # one never got this far, because the gate refused the fast path
+        # before any download ran.
+        if pbf_dir and buildings_seen and not any(buildings_seen):
+            _log("  note: no '[Buildings]' line in the converter output, but "
+                 "the engine has the feature — buildings were applied. Report "
+                 "this if the result is missing buildings.")
 
-    return ok_all
+        return ok_all
+    finally:
+        try:
+            os.remove(job_file)
+        except OSError:
+            pass
 
 
 def _download_zoom_group(
@@ -1417,6 +1623,8 @@ def _download_zoom_group(
         _set_rebuild_flags(cache_dir, all_names,
                            {s["filename"] for s in specs})
         return _produced()
+    except ConverterCancelled:
+        raise                      # cancellation must reach the caller
     except RuntimeError:
         raise
     except Exception as exc:
@@ -1424,73 +1632,412 @@ def _download_zoom_group(
         return False
 
 
-# ---------------------------------------------------------------------------
-# Path 2/3: GeoTIFF extraction (GDAL or QGIS) + converter
-# ---------------------------------------------------------------------------
+class _DefaultBinaryManager:
+    """binary_manager stand-in for callers that hold no manager object.
 
-def _try_gdal_warp(src: str, dest: str, bbox: Dict[str, float],
-                   resolution_m: Optional[int] = None) -> bool:
-    try:
-        opts = dict(
-            dstSRS="EPSG:4326",
-            outputBounds=[bbox["west"], bbox["south"], bbox["east"], bbox["north"]],
-            # Average, not bilinear: this warp usually *decimates* (a 0.5-2 m
-            # national DEM onto a 10-30 m analysis grid), and an interpolator
-            # reads four source pixels around the target centre and drops the
-            # rest of the footprint, so sub-pixel relief survives as speckle
-            # instead of being filtered out. Averaging is the same rule
-            # aether_converter's own resampler and raster_tools:603 use.
-            format="GTiff", outputType=gdal.GDT_Float32, resampleAlg=gdal.GRA_Average,
-            # Fill everything outside the source footprint (and source-nodata
-            # pixels) with 0 m rather than leaving it nodata, so an analysis
-            # radius that reaches past the DEM still produces a full-extent
-            # raster — sea-level assumption where we have no elevation. We do
-            # NOT set dstNodata, so aether_converter reads the 0-fill as valid
-            # ground instead of skipping it (which produced empty coverage).
-            warpOptions=["INIT_DEST=0"],
+    ``_try_rust_download`` speaks to a ``.find_binary(name)`` interface; the
+    Map Converter only has the module-level ``binary_manager.find_binary``.
+    """
+
+    @staticmethod
+    def find_binary(name: str) -> str:
+        from .binary_manager import find_binary
+        return find_binary(name)
+
+
+def ensure_pool_tiles(
+    source_uri: str,
+    subtiles: List[Dict[str, Any]],
+    resolution_m: int,
+    binary_manager: Any = None,
+    progress_cb: Any = None,
+    should_cancel: Any = None,
+    on_start: Any = None,
+) -> Dict[str, str]:
+    """Shared acquisition entry: make the pool hold every tile in *subtiles*.
+
+    THE one XYZ downloader for both terrain paths. Uses the same pool cache
+    Site Analysis uses (v4 identity from ``source_identity`` — pure terrain,
+    deliberately NO buildings term: buildings are applied at ingest by the
+    Map Converter, which keeps this pool shareable between the tabs) and the
+    same download machinery (zoom groups, gap-repair retry passes).
+
+    Returns ``{filename: absolute pool path}`` for every requested tile.
+    Fails loudly: a download that cannot provide the tiles is a RuntimeError
+    — there is no render fallback (rendering XYZ through QGIS is exactly the
+    aliasing/UI-freeze failure this replaces).
+
+    *progress_cb(frac_0_to_1, label)* is optional; *binary_manager* defaults
+    to the module-level binary discovery.
+    """
+    if binary_manager is None:
+        binary_manager = _DefaultBinaryManager()
+    pool_dir = _pool_dir(source_uri)
+    os.makedirs(pool_dir, exist_ok=True)
+    _log(f"  shared pool: {pool_dir}")
+
+    todo = [t for t in subtiles if not _tile_ready(pool_dir, t["filename"])]
+    if todo:
+        ok = _try_rust_download(source_uri, pool_dir, {}, resolution_m, todo,
+                                binary_manager, pbf_dir=None,
+                                progress_cb=progress_cb,
+                                should_cancel=should_cancel,
+                                on_start=on_start)
+        if not ok:
+            raise RuntimeError(
+                f"Terrain download failed: {len(todo)} tile(s) could not be "
+                f"fetched from the elevation service. See the "
+                f"Waveshed-Terrain log for the cause (encoding/zoom/URL "
+                f"problems are reported there), fix the layer, and run again."
+            )
+    else:
+        _log(f"  pool HIT — all {len(subtiles)} tile(s) already downloaded")
+
+    mapping: Dict[str, str] = {}
+    missing: List[str] = []
+    for t in subtiles:
+        path = os.path.join(pool_dir, t["filename"])
+        # A tile flagged for rebuild (gap-repair exhausted) still holds
+        # usable partial terrain for THIS run — the same policy Site
+        # Analysis applies when it links such tiles into its view. Only a
+        # missing/short file is a hard failure.
+        if _tile_is_whole(path):
+            mapping[t["filename"]] = os.path.abspath(path)
+        else:
+            missing.append(t["filename"])
+    if missing:
+        raise RuntimeError(
+            f"{len(missing)} of {len(subtiles)} terrain tile(s) are missing "
+            f"from the pool after download (first: {missing[0]}). The "
+            f"elevation service did not provide them — check the layer's "
+            f"zoom limit and URL, then run again."
         )
-        if resolution_m:
-            deg_px = resolution_m / 111_111.0
-            # Pin the base raster to the analysis grid, and cap its size so a
-            # radius far larger than the DEM can't allocate a giant raster
-            # (the previous auto-resolution warp blew up / failed here).
-            nc = (bbox["east"] - bbox["west"]) / deg_px
-            nr = (bbox["north"] - bbox["south"]) / deg_px
-            cap = 20000
-            if max(nc, nr) > cap:
-                deg_px *= max(nc, nr) / cap
-            opts["xRes"] = deg_px
-            opts["yRes"] = deg_px
-        r = gdal.Warp(dest, src, options=gdal.WarpOptions(**opts))
-        if r:
-            # Strip any nodata flag so the 0-fill beyond the DEM edge (and any
-            # source-nodata pixels, now 0) is read as valid sea-level ground by
-            # aether_converter instead of being skipped — otherwise coverage
-            # past the DEM border comes out empty even with INIT_DEST=0.
-            for b in range(1, r.RasterCount + 1):
-                try:
-                    r.GetRasterBand(b).DeleteNoDataValue()
-                except Exception:
-                    pass
-            r.FlushCache()
-            r = None
-            return True
-    except Exception as exc:
-        _log(f"  GDAL warp error: {exc}")
-    return False
+    return mapping
+
+
+# ---------------------------------------------------------------------------
+# Path 2/3: direct sources[] (converter reprojects) + converter
+# ---------------------------------------------------------------------------
+#
+# There is deliberately NO GDAL-warp path here any more. The converter samples
+# every source in its own CRS (``sources[]`` + GeoKeys); a CRS it cannot
+# handle is *its* hard error, surfaced verbatim — silently warping around it
+# would hide exactly the failures the toolkit is designed to report.
+
+def _bounds_from_geotransform(gt: Tuple[float, ...], xsize: int,
+                              ysize: int) -> Dict[str, float]:
+    """Axis-aligned bounds of a raster in its own CRS, from its geotransform.
+
+    Evaluates all four corners so rotated/sheared geotransforms and negative
+    pixel heights come out right.
+    """
+    xs = []
+    ys = []
+    for px, py in ((0, 0), (xsize, 0), (0, ysize), (xsize, ysize)):
+        xs.append(gt[0] + gt[1] * px + gt[2] * py)
+        ys.append(gt[3] + gt[4] * px + gt[5] * py)
+    return {"west": min(xs), "east": max(xs),
+            "south": min(ys), "north": max(ys)}
+
+
+def _expand_bbox(bbox: Dict[str, float], margin: float) -> Dict[str, float]:
+    """*bbox* grown by *margin* on every side (same units as the bbox)."""
+    return {"west": bbox["west"] - margin, "east": bbox["east"] + margin,
+            "south": bbox["south"] - margin, "north": bbox["north"] + margin}
+
+
+def _clamp_bbox(a: Dict[str, float],
+                b: Dict[str, float]) -> Optional[Dict[str, float]]:
+    """Intersection of two bboxes, or None when they do not overlap."""
+    out = {"west": max(a["west"], b["west"]),
+           "east": min(a["east"], b["east"]),
+           "south": max(a["south"], b["south"]),
+           "north": min(a["north"], b["north"])}
+    if out["west"] >= out["east"] or out["south"] >= out["north"]:
+        return None
+    return out
+
+
+def _union_bbox(bboxes: List[Dict[str, float]]) -> Optional[Dict[str, float]]:
+    """Axis-aligned union of *bboxes* (None for an empty list)."""
+    if not bboxes:
+        return None
+    return {"west": min(b["west"] for b in bboxes),
+            "east": max(b["east"] for b in bboxes),
+            "south": min(b["south"] for b in bboxes),
+            "north": max(b["north"] for b in bboxes)}
+
+
+def _bbox_transform(bbox: Dict[str, float], src_crs: Any,
+                    dst_crs: Any) -> Dict[str, float]:
+    """*bbox* transformed between CRSs via QGIS (densified bounding box).
+
+    The one place coordinates are transformed: QgsCoordinateTransform's own
+    ``transformBoundingBox`` — generic for any CRS pair, no hand-rolled
+    formulas. Kept minimal so every caller's *logic* (intersection, halo
+    arithmetic) stays pure-Python testable with injected results.
+    """
+    from qgis.core import QgsCoordinateTransform, QgsProject, QgsRectangle
+    xform = QgsCoordinateTransform(src_crs, dst_crs, QgsProject.instance())
+    rect = xform.transformBoundingBox(
+        QgsRectangle(bbox["west"], bbox["south"], bbox["east"], bbox["north"]))
+    return {"west": rect.xMinimum(), "east": rect.xMaximum(),
+            "south": rect.yMinimum(), "north": rect.yMaximum()}
+
+
+#: Halo, in source pixels, added around a tile when deciding which files can
+#: contribute to it (and when window-copying them): the converter's
+#: area-averaging edge sampling needs neighbours past the tile border.
+_SOURCE_HALO_PX = 4
+
+#: A plain GeoTIFF above this size is window-copied per tile instead of being
+#: handed over whole, to bound the converter's decode RAM.
+_MATERIALIZE_MAX_TIFF_BYTES = 512 * 1024 * 1024
+
+
+def source_file_info(path: str, crs_authid: Optional[str] = None,
+                     declared_is_fallback: bool = False) -> Dict[str, Any]:
+    """Everything the per-tile source filter needs to know about one raster.
+
+    Returns ``{"path", "crs", "crs_authid", "native_bounds", "wgs84_bounds",
+    "halo_deg"}`` where ``crs`` is the QgsCoordinateReferenceSystem object,
+    ``native_bounds`` the file's bounds in its own CRS, ``wgs84_bounds`` the
+    same transformed to WGS84 and ``halo_deg`` the 4-source-pixel halo in
+    degrees of latitude (``build_tile_sources`` widens it per tile for the
+    longitude direction and the output resolution).
+
+    CRS precedence: with ``declared_is_fallback=False`` (single-file QGIS
+    layer) the declared *crs_authid* is authoritative — a user can
+    deliberately override a layer's CRS in QGIS. With
+    ``declared_is_fallback=True`` (a FOLDER-level answer, detected from one
+    file or asked from the user) each file's own embedded CRS wins and the
+    declared one applies only to files with no usable embedded CRS —
+    otherwise a folder mixing e.g. a projected national DEM with a WGS84
+    filler would silently georeference every file as the first file's CRS.
+
+    Hard errors, never guesses: a file that cannot be opened, has no
+    geotransform, or has no resolvable CRS stops the run with a message naming
+    the file — the converter would reject it anyway, only later and after the
+    other tiles were built.
+    """
+    from qgis.core import QgsCoordinateReferenceSystem
+
+    ds = gdal.Open(path, gdal.GA_ReadOnly)
+    if ds is None:
+        raise RuntimeError(
+            f"Terrain source could not be opened as a raster:\n{path}\n\n"
+            "Remove it from the terrain folder, or fix the file."
+        )
+    try:
+        gt = ds.GetGeoTransform(can_return_null=True)
+    except TypeError:              # older GDAL bindings lack the kwarg
+        gt = ds.GetGeoTransform()
+        if gt == (0.0, 1.0, 0.0, 0.0, 0.0, 1.0):
+            gt = None
+    if gt is None:
+        raise RuntimeError(
+            f"Terrain source has no georeferencing (no geotransform):\n"
+            f"{path}\n\nAssign one (e.g. gdal_edit.py -a_ullr …) or remove "
+            "the file. Filename-derived georeferencing is not supported."
+        )
+    xsize, ysize = ds.RasterXSize, ds.RasterYSize
+    wkt = ds.GetProjection()
+    ds = None
+
+    embedded = QgsCoordinateReferenceSystem(wkt) if wkt else None
+    if embedded is not None and not embedded.isValid():
+        embedded = None
+    declared = (QgsCoordinateReferenceSystem(crs_authid)
+                if crs_authid else None)
+    if declared is not None and not declared.isValid():
+        declared = None
+
+    if declared_is_fallback:
+        crs = embedded or declared      # the file knows itself best
+    else:
+        crs = declared or embedded      # the caller's declaration wins
+    if crs is None:
+        raise RuntimeError(
+            f"Terrain source has no usable coordinate system:\n{path}\n\n"
+            "Assign one (e.g. gdal_edit.py -a_srs EPSG:…), or add the layer "
+            "to QGIS with its CRS set and use it as the DEM layer."
+        )
+
+    native_bounds = _bounds_from_geotransform(gt, xsize, ysize)
+    # Pixel size in degrees, for the halo: geographic CRSs are already in
+    # degrees; projected units are treated as metres and divided by 111 111
+    # m/deg. Only a filter margin — a slightly generous halo merely admits a
+    # file the converter then finds contributes nothing.
+    px = max(abs(gt[1]), abs(gt[5]))
+    px_deg = px if crs.isGeographic() else px / 111_111.0
+    authid = crs.authid() or ""
+
+    if authid == "EPSG:4326":
+        wgs84_bounds = dict(native_bounds)
+    else:
+        wgs84 = QgsCoordinateReferenceSystem("EPSG:4326")
+        wgs84_bounds = _bbox_transform(native_bounds, crs, wgs84)
+
+    return {
+        "path": path,
+        "crs": crs,
+        "crs_authid": authid,
+        "native_bounds": native_bounds,
+        "wgs84_bounds": wgs84_bounds,
+        "halo_deg": _SOURCE_HALO_PX * px_deg,
+    }
+
+
+def _needs_materialization(path: str) -> bool:
+    """True when the converter's tiff reader cannot take *path* directly.
+
+    Routing only — the copy itself happens in
+    :func:`materialize_for_converter`. Non-TIFF formats (.hgt/.dem), VRTs and
+    ``/vsi*`` virtual paths always need it; a plain GeoTIFF needs it only
+    past ``_MATERIALIZE_MAX_TIFF_BYTES``. A file whose size cannot be read is
+    handed over unchanged: if it is genuinely unreadable the converter fails
+    loudly on it, which beats failing here on a stat quirk.
+    """
+    if path.startswith("/vsi"):
+        return True
+    ext = os.path.splitext(path)[1].lower()
+    if ext not in (".tif", ".tiff"):
+        return True
+    try:
+        return os.path.getsize(path) > _MATERIALIZE_MAX_TIFF_BYTES
+    except OSError:
+        return False
+
+
+def materialize_for_converter(
+    path: str,
+    dest: str,
+    window: Optional[Dict[str, float]] = None,
+) -> str:
+    """Window-copy *path* to a plain GeoTIFF the converter can read.
+
+    **Never resampled**: no target resolution, no warp — ``gdal.Translate``
+    copies the source pixels at native resolution, optionally windowed to
+    *window* (a bbox in the SOURCE CRS, already clamped to the file's own
+    extent by the caller so GDAL never zero-fills a partially-outside
+    window with fake 0 m ground).
+
+    Shared by both terrain paths (Site Analysis and the Map Converter tab).
+    Returns *dest*. Failure is a hard error naming the file.
+    """
+    opts: Dict[str, Any] = {"format": "GTiff"}
+    if window:
+        opts["projWin"] = [window["west"], window["north"],
+                           window["east"], window["south"]]
+    out = gdal.Translate(dest, path, **opts)
+    if out is None:
+        raise RuntimeError(
+            f"Terrain source could not be converted to GeoTIFF for the "
+            f"engine:\n{path}\n\nGDAL could not read it — check the file, or "
+            "convert it to a plain GeoTIFF yourself and use that instead."
+        )
+    out.FlushCache()
+    out = None
+    return dest
+
+
+def build_tile_sources(
+    infos: List[Dict[str, Any]],
+    tile_bbox: Dict[str, float],
+    tmp_dir: str,
+    tag: str,
+    output_res_m: float,
+) -> Tuple[List[Dict[str, Any]], List[str]]:
+    """``sources[]`` entries for one tile, from per-file *infos*.
+
+    *infos* is in priority order (first = highest; the converter takes the
+    first valid sample per pixel). A file contributes when its WGS84 bounds
+    intersect the tile bbox grown by a per-file halo (below). Files the
+    converter cannot read directly are window-copied (tile window + halo,
+    clamped to the file) into *tmp_dir*; the created temp paths are returned
+    for cleanup.
+
+    Halo sizing: ``max(4 source px, 0.6 output cells)`` in degrees of
+    latitude. The 4-source-px term gives the converter's edge sampling its
+    neighbours; the 0.6-output-cell term matters when heavily decimating —
+    an edge output cell's area-average footprint reaches half an output cell
+    past the tile border (30 m output over a 2 m source needs 7.5 source px,
+    far more than 4). The longitude component is divided by
+    ``max(cos(center_lat), 0.2)`` because a degree of longitude shrinks with
+    latitude — a metre-derived halo would otherwise be undersized 2x at
+    60°N (the 0.2 floor caps the blow-up near the poles; over-inclusive is
+    safe, it merely admits a file that contributes nothing).
+
+    ``crs`` is set on an entry when the plugin knows an EPSG authid; non-EPSG
+    authids (e.g. ``USER:100000``) are omitted because the toolkit accepts
+    only ``EPSG:nnnn`` or a proj string — it then reads the file's own
+    GeoKeys, and its error surfaces verbatim if they are unusable.
+    """
+    from qgis.core import QgsCoordinateReferenceSystem
+
+    center_lat = (tile_bbox["north"] + tile_bbox["south"]) / 2.0
+    cos_lat = max(math.cos(math.radians(center_lat)), 0.2)
+
+    sources: List[Dict[str, Any]] = []
+    temps: List[str] = []
+    for idx, info in enumerate(infos):
+        halo_lat = max(info["halo_deg"], 0.6 * output_res_m / 111_111.0)
+        halo_lon = halo_lat / cos_lat
+        halo_bbox = {
+            "west": tile_bbox["west"] - halo_lon,
+            "east": tile_bbox["east"] + halo_lon,
+            "south": tile_bbox["south"] - halo_lat,
+            "north": tile_bbox["north"] + halo_lat,
+        }
+        if not bboxes_intersect(info["wgs84_bounds"], halo_bbox):
+            continue
+        path = info["path"]
+        if _needs_materialization(path):
+            if info["crs_authid"] == "EPSG:4326":
+                window_native = halo_bbox
+            else:
+                wgs84 = QgsCoordinateReferenceSystem("EPSG:4326")
+                window_native = _bbox_transform(halo_bbox, wgs84, info["crs"])
+            window = _clamp_bbox(window_native, info["native_bounds"])
+            if window is None:
+                # The transformed tile+halo window misses the file's native
+                # extent (the WGS84 filter and the native clamp can disagree
+                # near a CRS's edge of validity). The file cannot contribute
+                # to this tile — skip it. Falling back to a whole-file copy
+                # here would defeat the very RAM bound windowing exists for
+                # (a > 512 MB source would be copied in full).
+                continue
+            dest = os.path.join(tmp_dir, f"aether_src_{tag}_{idx}.tif")
+            materialize_for_converter(path, dest, window)
+            temps.append(dest)
+            path = dest
+        entry: Dict[str, Any] = {"path": os.path.abspath(path)}
+        if info["crs_authid"].startswith("EPSG:"):
+            entry["crs"] = info["crs_authid"]
+        sources.append(entry)
+    return sources, temps
 
 
 _TERRAIN_EXTS = (".tif", ".tiff", ".dem", ".hgt")
 
 
 def list_terrain_files(terrain_dir: str) -> List[str]:
-    """Return every terrain raster under *terrain_dir* (recursive)."""
+    """Return every terrain raster under *terrain_dir* (recursive), sorted.
+
+    Sorted ascending by full path, deliberately: this list becomes the
+    ``sources[]`` priority order (first valid sample wins per pixel), so for
+    overlapping files the earlier-sorted filename wins. os.walk order is
+    filesystem-dependent — unsorted, two machines with the same folder would
+    build different pixels under the identical pool cache key. This is THE
+    folder scanner: the Map Converter uses it too (its own flat copy is
+    gone).
+    """
     found: List[str] = []
     for root, _, files in os.walk(terrain_dir):
         for f in files:
             if f.lower().endswith(_TERRAIN_EXTS):
                 found.append(os.path.join(root, f))
-    return found
+    return sorted(found)
 
 
 def list_abt_tiles(terrain_dir: str) -> List[str]:
@@ -1518,7 +2065,7 @@ def is_abt_tile_dir(terrain_dir: Optional[str]) -> bool:
 
     A directory of `.abt` files is a finished engine input, not a source to
     convert — the two look alike in a folder picker but must not be conflated:
-    handing `.abt` files to the converter as `base_tif` would fail, and running
+    handing `.abt` files to the converter as `sources` would fail, and running
     the conversion at all would waste the work the Map Converter already did.
     """
     return bool(terrain_dir) and bool(list_abt_tiles(terrain_dir))
@@ -1702,7 +2249,7 @@ def terrain_coverage_warning(terrain_dir: str,
     one whose data lies somewhere else entirely — and also when the terrain
     covers only part of the analysis area.  Partial coverage is not benign:
     once a terrain directory is selected it is the *only* source
-    (``_extract_from_local_dir``), with no fall back to the base DEM, so
+    (``_gather_source_infos``), with no fall back to the base DEM, so
     everything past its edge is built as 0 m and the coverage computed there
     is fiction.  A small tolerance keeps a one-pixel overhang quiet.
     """
@@ -1777,37 +2324,50 @@ def terrain_coverage_warning(terrain_dir: str,
         return None
 
 
+def _warn_if_bbox_exceeds_bounds(src: Dict[str, float],
+                                 bbox: Dict[str, float],
+                                 source_key: str = "") -> None:
+    """Warn (once per run) when *bbox* reaches beyond WGS84 bounds *src*.
+
+    Non-fatal, bounds-only: with ``void_fill_m: 0.0`` the converter fills the
+    gap with 0 m ground, but the user should know part of the result is
+    flat-filled rather than real terrain. *source_key* dedups the warning so
+    a multi-site/height run shows it once, not per terrain build (see
+    :func:`reset_terrain_warnings`).
+    """
+    src_w, src_e = src["west"], src["east"]
+    src_s, src_n = src["south"], src["north"]
+    m = 1e-6
+    if (bbox["west"] < src_w - m or bbox["east"] > src_e + m
+            or bbox["south"] < src_s - m or bbox["north"] > src_n + m):
+        if source_key and source_key in _warned_extent_sources:
+            return
+        if source_key:
+            _warned_extent_sources.add(source_key)
+        _log(
+            "  WARNING: requested area extends beyond the DEM coverage "
+            f"(DEM bounds ~ N{src_n:.3f} S{src_s:.3f} E{src_e:.3f} W{src_w:.3f}). "
+            "Missing areas are assumed 0 m (sea level); coverage there is "
+            "not reliable — use a DEM that covers the full range."
+        )
+
+
 def _warn_if_bbox_exceeds_source(ds, bbox: Dict[str, float],
                                  source_key: str = "") -> None:
-    """Warn (once per run) when *bbox* reaches beyond the source dataset *ds*.
+    """Bounds-check *bbox* against GDAL dataset *ds* (any CRS), then warn.
 
-    Non-fatal and best-effort: the warp fills the gap with 0 m, but the user
-    should know part of the result is flat-filled rather than real terrain.
-    Uses GDAL's WGS84 extent so it works regardless of the source CRS.
-    *source_key* dedups the warning so a multi-site/height run shows it once,
-    not per terrain build (see :func:`reset_terrain_warnings`).
+    Thin wrapper over :func:`_warn_if_bbox_exceeds_bounds` for callers that
+    hold a dataset rather than bounds. Best-effort: a dataset whose extent
+    GDAL cannot report is skipped with a log line.
     """
     try:
         src = _dataset_wgs84_bbox(ds)
         if src is None:
             return
-        src_w, src_e = src["west"], src["east"]
-        src_s, src_n = src["south"], src["north"]
-        m = 1e-6
-        if (bbox["west"] < src_w - m or bbox["east"] > src_e + m
-                or bbox["south"] < src_s - m or bbox["north"] > src_n + m):
-            if source_key and source_key in _warned_extent_sources:
-                return
-            if source_key:
-                _warned_extent_sources.add(source_key)
-            _log(
-                "  WARNING: requested area extends beyond the DEM coverage "
-                f"(DEM bounds ~ N{src_n:.3f} S{src_s:.3f} E{src_e:.3f} W{src_w:.3f}). "
-                "Missing areas are assumed 0 m (sea level); coverage there is "
-                "not reliable — use a DEM that covers the full range."
-            )
     except Exception as exc:
         _log(f"  (DEM-extent check skipped: {exc})")
+        return
+    _warn_if_bbox_exceeds_bounds(src, bbox, source_key)
 
 
 def _export_via_qgis(dem_layer: Any, dest: str, bbox: Dict[str, float], resolution_m: int) -> None:
@@ -1849,61 +2409,52 @@ def _export_via_qgis(dem_layer: Any, dest: str, bbox: Dict[str, float], resoluti
         raise RuntimeError(f"writeRaster failed (code {err})")
 
 
-def _extract_from_local_dir(terrain_dir: str, dest: str, bbox: Dict[str, float],
-                            resolution_m: Optional[int] = None) -> None:
-    tifs = list_terrain_files(terrain_dir)
-    if not tifs:
-        raise RuntimeError(f"No terrain files in {terrain_dir}")
+def _gather_source_infos(dem_layer: Any, terrain_dir: Optional[str]
+                         ) -> Tuple[List[Dict[str, Any]], bool]:
+    """``(source file infos, use_qgis_export)`` for one prepare_terrain run.
 
-    _log(f"  local dir: {len(tifs)} files")
-    vrt = dest + ".vrt"
-    ds = gdal.BuildVRT(vrt, tifs)
-    if ds is None:
-        raise RuntimeError("BuildVRT failed")
-    ds.FlushCache()
-    # Tell the user (once per run) if the range spills past the available data.
-    _warn_if_bbox_exceeds_source(ds, bbox, terrain_dir)
-    ds = None
-    if not _try_gdal_warp(vrt, dest, bbox, resolution_m):
-        raise RuntimeError("GDAL Warp on VRT failed")
-    if os.path.exists(vrt):
-        os.remove(vrt)
+    A terrain directory yields one info per raster file (CRS read from each
+    file). A file-backed layer yields one info, carrying the layer's own
+    authid when QGIS knows it. A non-file provider (WMS/WMTS/ArcGIS/…)
+    yields no infos and ``use_qgis_export=True`` — those are server-rendered
+    per tile via :func:`_export_via_qgis`, which is unavoidable.
+    """
+    if terrain_dir and os.path.isdir(terrain_dir):
+        files = list_terrain_files(terrain_dir)
+        if not files:
+            raise RuntimeError(f"No terrain files in {terrain_dir}")
+        _log(f"  local dir: {len(files)} files")
+        return [source_file_info(f) for f in files], False
 
+    src = dem_layer.source()
+    if os.path.isfile(src) or src.startswith("/vsi"):
+        authid = ""
+        try:
+            crs = dem_layer.crs()
+            if crs is not None and crs.isValid():
+                authid = crs.authid() or ""
+        except Exception:  # noqa: BLE001 — fall back to the file's own CRS
+            authid = ""
+        return [source_file_info(src, crs_authid=authid or None)], False
 
-def _extract_reproject(dem_layer: Any, dest: str, bbox: Dict[str, float],
-                       resolution_m: int) -> None:
-    source = dem_layer.source()
-    if os.path.isfile(source) or source.startswith("/vsi"):
-        t = time.perf_counter()
-        ds = gdal.Open(source)
-        if ds is not None:
-            _warn_if_bbox_exceeds_source(ds, bbox, source)
-            ds = None
-        if _try_gdal_warp(source, dest, bbox, resolution_m):
-            _log(f"  GDAL warp: {time.perf_counter() - t:.1f}s")
-            return
-    _export_via_qgis(dem_layer, dest, bbox, resolution_m)
+    return [], True
 
 
 def _run_converter(exe: str, job_file: str) -> None:
     # Stream the converter's output into the log so the .abt creation step is
-    # visible (merge stdout+stderr; the converter logs to both). Keep a tail
-    # for the error message.
+    # visible. Keep a tail for the error message. Uses the one shared
+    # subprocess runner (run_converter_streaming).
     lines: List[str] = []
-    with subprocess.Popen(
-        [exe, "ingest", "--job-file", job_file],
-        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-        text=True, encoding="utf-8", errors="replace",
-        creationflags=_SUBPROCESS_FLAGS,
-    ) as proc:
-        for line in iter(proc.stdout.readline, ""):
-            line = line.rstrip()
-            if line:
-                _log(f"    {line}")
-                lines.append(line)
-    if proc.returncode != 0:
+
+    def handle(line: str) -> None:
+        _log(f"    {line}")
+        lines.append(line)
+
+    rc = run_converter_streaming(exe, ["ingest", "--job-file", job_file],
+                                 handle)
+    if rc != 0:
         tail = "\n".join(lines[-20:])
-        raise RuntimeError(f"converter failed ({proc.returncode}):\n{tail}")
+        raise RuntimeError(f"converter failed ({rc}):\n{tail}")
 
 
 # ---------------------------------------------------------------------------
@@ -1923,8 +2474,14 @@ def prepare_terrain(
     az_end: float = 360.0,
     buildings_file: Optional[str] = None,
     osm_buildings: bool = False,
+    progress_span: Optional[Tuple[float, float]] = None,
 ) -> str:
     """Produce .abt terrain tiles for aether_core. Returns cache directory.
+
+    *progress_span* ``(lo, hi)``, when given together with a *feedback* that
+    has ``setProgress``, maps the terrain-download fraction into that
+    sub-range of the caller's progress bar (the caller knows its own phase
+    layout; the adapter must not claim 0-100).
 
     Buildings can come from *buildings_file* (FlatGeobuf, absolute roof
     elevations) and/or *osm_buildings* (OpenFreeMap vector tiles, heights above
@@ -1942,7 +2499,7 @@ def prepare_terrain(
     # A directory of .abt tiles is already an engine input — hand it over
     # untouched. Everything below this point exists to *produce* .abt tiles, so
     # running any of it would rebuild what the Map Converter already built (and
-    # the converter would reject a .abt as its `base_tif` anyway).
+    # the converter would reject a .abt as an ingest source anyway).
     if is_abt_tile_dir(terrain_dir):
         tiles = list_abt_tiles(terrain_dir)
         _log(f"  using {len(tiles)} pre-built .abt tile(s) from {terrain_dir} "
@@ -2081,9 +2638,24 @@ def prepare_terrain(
         _log("  building file requested — using the converter ingest path "
              "(the downloader fuses OpenFreeMap tiles only, not FlatGeobuf)")
     elif not terrain_dir and "type=xyz" in dem_layer.source():
+        # Trivial progress wiring only (A3): map the download fraction onto
+        # the SUB-SPAN of the processing feedback the caller reserved for
+        # terrain (progress_span). Mapping onto 0-100 here made the bar hit
+        # 100 % mid-download and snap back when the caller resumed.
+        progress_cb = None
+        if (progress_span is not None and feedback is not None
+                and hasattr(feedback, "setProgress")):
+            span_lo, span_hi = progress_span
+
+            def progress_cb(frac: float, _label: str) -> None:
+                try:
+                    feedback.setProgress(
+                        int(span_lo + frac * (span_hi - span_lo)))
+                except Exception:  # noqa: BLE001 — progress must never abort
+                    pass
         if _try_rust_download(dem_layer.source(), pool_dir, bbox,
                               resolution_m, todo, binary_manager,
-                              pbf_dir=pbf_dir):
+                              pbf_dir=pbf_dir, progress_cb=progress_cb):
             # Reached either with buildings fused in (pbf_dir set) or with no
             # buildings at all. In the second case the pool identity may still
             # claim buildings — a failed OpenFreeMap download clears pbf_dir
@@ -2097,49 +2669,30 @@ def prepare_terrain(
             return view_dir
         _log("  Rust download unavailable, falling back")
 
-    # Path 2/3: Extract a GeoTIFF PER sub-tile, then convert. Each .abt tile
-    # gets its own base GeoTIFF clipped to just that tile's extent, instead of
-    # one raster spanning the whole analysis area. The converter loads each
-    # base whole-image (via the tiff crate, which caps the decode buffer), so a
-    # single sector-wide raster blew past that limit and the converter silently
-    # wrote terrain-less tiles -> empty coverage. Splitting per tile bounds
-    # every decode to one tile, independent of the total range or resolution.
+    # Path 2/3: hand the converter the source rasters themselves, per tile.
+    # Each job carries `sources[]` — the files (in their OWN CRS) whose WGS84
+    # bounds intersect that tile plus a per-file halo — and the converter
+    # reprojects while sampling. `void_fill_m: 0.0` keeps the engine-visible
+    # behaviour of the old INIT_DEST=0 warp: 0 m ground outside the DEM.
+    # Per-tile filtering (not one whole-extent raster) bounds every decode to
+    # one tile, independent of the total range or resolution.
     temp_tifs: List[str] = []
     try:
+        infos, use_qgis_export = _gather_source_infos(dem_layer, terrain_dir)
+        if infos:
+            union = _union_bbox([i["wgs84_bounds"] for i in infos])
+            # Tell the user (once per run) if the range spills past the data.
+            _warn_if_bbox_exceeds_bounds(union, bbox, source)
+
         jobs = []
         for t in todo:
             res_deg = t["exact_res_m"] / 111_111.0
-            # ~4 px halo so the converter's edge sampling has neighbours.
-            margin = res_deg * 4.0
-            sub_bbox = {
-                "north": t["ul_lat"] + margin,
-                "south": t["ul_lat"] - t["size_px"] * res_deg - margin,
-                "west": t["ul_lon"] - margin,
-                "east": t["ul_lon"] + t["size_px"] * res_deg + margin,
+            tile_bbox = {
+                "north": t["ul_lat"],
+                "south": t["ul_lat"] - t["size_px"] * res_deg,
+                "west": t["ul_lon"],
+                "east": t["ul_lon"] + t["size_px"] * res_deg,
             }
-            # Disambiguate by pool identity AND process. Tile names are
-            # globally canonical (position + resolution only), so the same
-            # name means different pixels for a different source or building
-            # set — and two runs of the *same* source (Site Analysis and Map
-            # Converter together, or two windows) would otherwise read and
-            # write one shared scratch file, with the `finally` below deleting
-            # it out from under whichever is still using it.
-            # NB: the pid makes this per-run, which is correct only while this
-            # stays scratch. Caching the extract between runs (an open TODO)
-            # means dropping the pid *and* the `finally`, not just the latter.
-            tile_tif = os.path.join(
-                tempfile.gettempdir(),
-                f"aether_{os.path.basename(pool_dir)}_{os.getpid()}_{t['filename']}.tif",
-            )
-            t1 = time.perf_counter()
-            if terrain_dir and os.path.isdir(terrain_dir):
-                _extract_from_local_dir(terrain_dir, tile_tif, sub_bbox, resolution_m)
-            else:
-                _extract_reproject(dem_layer, tile_tif, sub_bbox, resolution_m)
-            temp_tifs.append(tile_tif)
-            _log(f"  extract {t['filename']}: {time.perf_counter() - t1:.1f}s, "
-                 f"{os.path.getsize(tile_tif) / 1e6:.0f}MB")
-
             job = {
                 "output_path": os.path.abspath(os.path.join(pool_dir, t["filename"])),
                 "format": "r16sint",
@@ -2147,9 +2700,38 @@ def prepare_terrain(
                 "ul_lon": t["ul_lon"],
                 "resolution_m": t["exact_res_m"],
                 "size_px": t["size_px"],
-                "base_tif": os.path.abspath(tile_tif),
-                "swiss_tifs": [],
+                "void_fill_m": 0.0,
             }
+            if use_qgis_export:
+                # Non-file provider: server-rendered per tile into a WGS84
+                # GeoTIFF (~4 output-px halo so edge sampling has
+                # neighbours). The export IS WGS84, whatever the layer's own
+                # CRS is, so the source entry says so explicitly.
+                sub_bbox = _expand_bbox(tile_bbox, res_deg * 4.0)
+                # Disambiguate by pool identity AND process: tile names are
+                # globally canonical, so the same name means different pixels
+                # for a different source, and two concurrent runs must not
+                # share a scratch file the `finally` below deletes.
+                tile_tif = os.path.join(
+                    tempfile.gettempdir(),
+                    f"aether_{os.path.basename(pool_dir)}_{os.getpid()}_"
+                    f"{t['filename']}.tif",
+                )
+                t1 = time.perf_counter()
+                _export_via_qgis(dem_layer, tile_tif, sub_bbox, resolution_m)
+                temp_tifs.append(tile_tif)
+                _log(f"  export {t['filename']}: "
+                     f"{time.perf_counter() - t1:.1f}s, "
+                     f"{os.path.getsize(tile_tif) / 1e6:.0f}MB")
+                job["sources"] = [{"path": os.path.abspath(tile_tif),
+                                   "crs": "EPSG:4326"}]
+            else:
+                job["sources"], temps = build_tile_sources(
+                    infos, tile_bbox, tempfile.gettempdir(),
+                    tag=f"{os.path.basename(pool_dir)}_{os.getpid()}_"
+                        f"{t['filename']}",
+                    output_res_m=t["exact_res_m"])
+                temp_tifs.extend(temps)
             # Omitted entirely when unset — MPT_SIGMA and older converters must
             # keep seeing exactly the job shape they do today.
             if buildings_file:

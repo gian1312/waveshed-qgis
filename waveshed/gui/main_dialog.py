@@ -196,6 +196,11 @@ class AetherMainDialog(QDialog):
         self._mode_group.buttonClicked.connect(self._on_mode_changed)
         self.combo_loss_model.currentIndexChanged.connect(self._on_loss_model_changed)
         self.tabs.currentChanged.connect(self._on_tab_changed)
+        # Saved settings must reach the OPEN tabs — they read QgsSettings at
+        # construction, and without this fan-out every settings-derived
+        # dropdown/path/status stayed stale until the dialog was reopened.
+        self._settings_widget.settings_changed.connect(
+            self._on_settings_changed)
         # Apply the rule to whichever tab opens first, rather than waiting for
         # the user to switch tabs once.
         self._on_tab_changed(self.tabs.currentIndex())
@@ -253,6 +258,19 @@ class AetherMainDialog(QDialog):
         self._settings_widget.save_settings()
         from qgis.PyQt.QtWidgets import QMessageBox
         QMessageBox.information(self, "Settings", "Settings saved.")
+
+    def _on_settings_changed(self) -> None:
+        """Fan saved settings out to every open tab.
+
+        Each tab's ``refresh_settings()`` is cheap and idempotent: it
+        re-reads only what that tab derives from QgsSettings and never
+        touches user-entered form state.
+        """
+        for tab in (self.site_tab, self.p2p_tab, self.asset_tab,
+                    self.converter_tab):
+            refresh = getattr(tab, "refresh_settings", None)
+            if callable(refresh):
+                refresh()
 
     def _on_loss_model_changed(self) -> None:
         # Propagate to tabs that care (site analysis ITM section)

@@ -10,13 +10,8 @@ from __future__ import annotations
 import csv
 import math
 import os
-import platform
-import subprocess
 import tempfile
 
-_SUBPROCESS_FLAGS = (
-    subprocess.CREATE_NO_WINDOW if platform.system() == "Windows" else 0
-)
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -41,6 +36,7 @@ from ..core.job_builder import (
     height_floor_error,
     write_job_file,
 )
+from ..core import terrain_adapter
 from ..core.terrain_adapter import prepare_terrain
 from ..core import api_key
 from ..core import binary_manager as bm
@@ -316,6 +312,8 @@ class P2PAlgorithm(QgsProcessingAlgorithm):
             resolution_m=resolution_m,
             binary_manager=bm,
             feedback=feedback,
+            # Terrain occupies the 10-20 % stretch of this algorithm's bar.
+            progress_span=(10.0, 20.0),
         )
 
         if feedback.isCanceled():
@@ -373,36 +371,26 @@ class P2PAlgorithm(QgsProcessingAlgorithm):
         except api_key.ApiKeyError as exc:
             raise QgsProcessingException(str(exc)) from exc
 
-        # `with` closes the stdout pipe (and waits) on exit so we don't leak a
-        # file handle (the ResourceWarning).
-        with subprocess.Popen(
-            [core_exe, "--config", job_file],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,  # aether_core logs everything to stdout
-            text=True,
-            env=core_env,
-            creationflags=_SUBPROCESS_FLAGS,
-        ) as proc:
-            # aether_core writes all its diagnostics to stdout — surface every
-            # line and keep a tail for the error message. (Previously only
-            # stderr was read, so none of it was visible and stdout could
-            # deadlock.)
-            output_lines: list[str] = []
-            for line in iter(proc.stdout.readline, ""):
-                if feedback.isCanceled():
-                    proc.terminate()
-                    return {}
-                line = line.rstrip()
-                if not line:
-                    continue
-                output_lines.append(line)
-                feedback.pushInfo(line)
+        # aether_core writes all its diagnostics to stdout — surface every
+        # line and keep a tail for the error message. Streams through the one
+        # shared subprocess runner (terrain_adapter.run_converter_streaming).
+        output_lines: list[str] = []
 
-            proc.wait()
-        if proc.returncode != 0:
+        def on_line(line: str) -> None:
+            if feedback.isCanceled():
+                raise terrain_adapter.ConverterCancelled()
+            output_lines.append(line)
+            feedback.pushInfo(line)
+
+        try:
+            rc = terrain_adapter.run_converter_streaming(
+                core_exe, ["--config", job_file], on_line, env=core_env)
+        except terrain_adapter.ConverterCancelled:
+            return {}
+        if rc != 0:
             tail = "\n".join(output_lines[-20:])
             raise QgsProcessingException(
-                f"aether_core exited with code {proc.returncode}:\n{tail}"
+                f"aether_core exited with code {rc}:\n{tail}"
             )
 
         if feedback.isCanceled():

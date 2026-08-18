@@ -409,7 +409,7 @@ class TestMissingEngineFailsFast(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as root:
             with mock.patch.object(ta, "get_cache_dir", return_value=root), \
-                 mock.patch.object(ta, "_extract_reproject") as extract:
+                 mock.patch.object(ta, "_export_via_qgis") as extract:
                 with self.assertRaises(RuntimeError) as caught:
                     ta.prepare_terrain(layer, 47.4, 8.5, 30.0, 30, bm)
         self.assertIn("aether_converter", str(caught.exception))
@@ -583,7 +583,8 @@ class TestPoolReuse(unittest.TestCase):
     """The pool exists so a second, smaller run fetches nothing."""
 
     def _run(self, layer, fetched, root, range_km):
-        def fake_download(source, pool, bbox, res, subtiles, bm, pbf_dir=None):
+        def fake_download(source, pool, bbox, res, subtiles, bm,
+                          pbf_dir=None, progress_cb=None, **_kw):
             fetched.append([t["filename"] for t in subtiles])
             for t in subtiles:
                 _write_pool_abt(os.path.join(pool, t["filename"]))
@@ -684,7 +685,8 @@ class TestBuildingsCacheIdentity(unittest.TestCase):
         layer.source.return_value = _XYZ_SOURCE
         fetched = []
 
-        def fake_download(source, pool, bbox, res, subtiles, bm, pbf_dir=None):
+        def fake_download(source, pool, bbox, res, subtiles, bm,
+                          pbf_dir=None, progress_cb=None, **_kw):
             fetched.append(len(subtiles))
             for t in subtiles:
                 _write_pool_abt(os.path.join(pool, t["filename"]))
@@ -1160,7 +1162,7 @@ class TestBuildingsOnTheFastPath(unittest.TestCase):
         _write_pool_abt(os.path.join(pool_dir, self.TILE))
         seen = {}
 
-        def fake_run(exe, job_file):
+        def fake_run(exe, job_file, on_line=None, **_kw):
             with open(job_file) as fh:
                 seen.update(json.load(fh))
             return 0, out_lines
@@ -1700,3 +1702,826 @@ class TestBuildingDownloadResultIsChecked(unittest.TestCase):
         text = "\n".join(logged)
         self.assertNotIn("no building tiles could be fetched", text)
         self.assertEqual(flags, [])
+
+
+# ---------------------------------------------------------------------------
+# known_services.json — provider knowledge as data
+# ---------------------------------------------------------------------------
+
+class TestKnownServicesLoading(unittest.TestCase):
+    """Provider facts live in waveshed/resources/known_services.json.
+
+    The logic (service_max_zoom, xyz_encoding, resolve_zmax) stays in code and
+    reads the data; a missing or invalid file is a packaging bug and must be a
+    RuntimeError, never a silent guess.
+    """
+
+    def setUp(self):
+        ta._known_services_cache = None
+
+    def tearDown(self):
+        ta._known_services_cache = None
+
+    def test_the_shipped_file_loads_and_drives_the_logic(self):
+        self.assertTrue(os.path.isfile(ta._KNOWN_SERVICES_PATH))
+        services = ta._known_services()
+        self.assertTrue(services)
+        # Zoom caps come from the data.
+        self.assertEqual(ta.service_max_zoom(
+            "https://s3.amazonaws.com/elevation-tiles-prod/terrarium/"), 15)
+        self.assertEqual(ta.service_max_zoom("https://api.mapbox.com/v4/"), 15)
+        self.assertIsNone(ta.service_max_zoom("https://tiles.example.com/"))
+        # Encodings come from the data.
+        self.assertEqual(ta.xyz_encoding(f"type=xyz&url={_MAPZEN_URL}"),
+                         ta.ENCODING_TERRARIUM)
+        self.assertEqual(ta.xyz_encoding(f"type=xyz&url={_MAPBOX_URL}"),
+                         ta.ENCODING_MAPBOX)
+        # resolve_zmax clamps from the same table.
+        z, warning = ta.resolve_zmax(f"type=xyz&url={_MAPZEN_URL}&zmax=18")
+        self.assertEqual(z, 15)
+        self.assertIsNotNone(warning)
+
+    def test_missing_file_is_a_packaging_error(self):
+        with mock.patch.object(ta, "_KNOWN_SERVICES_PATH",
+                               "/no/such/known_services.json"):
+            with self.assertRaises(RuntimeError) as caught:
+                ta.service_max_zoom("https://example.com/")
+        self.assertIn("known_services.json", str(caught.exception))
+        self.assertIn("Reinstall", str(caught.exception))
+
+    def test_corrupt_json_is_a_packaging_error(self):
+        with tempfile.TemporaryDirectory() as d:
+            bad = os.path.join(d, "known_services.json")
+            with open(bad, "w") as fh:
+                fh.write("{not json")
+            with mock.patch.object(ta, "_KNOWN_SERVICES_PATH", bad):
+                with self.assertRaises(RuntimeError) as caught:
+                    ta._known_services()
+        self.assertIn(bad, str(caught.exception))
+
+    def test_wrong_shape_is_a_packaging_error(self):
+        cases = (
+            '{"no_services": []}',
+            '{"services": [{"match": ""}]}',
+            '{"services": [{"match": "x", "max_zoom": "15"}]}',
+            '{"services": [{"match": "x", "encoding": "elevator"}]}',
+        )
+        for body in cases:
+            with self.subTest(body=body), \
+                    tempfile.TemporaryDirectory() as d:
+                bad = os.path.join(d, "known_services.json")
+                with open(bad, "w") as fh:
+                    fh.write(body)
+                ta._known_services_cache = None
+                with mock.patch.object(ta, "_KNOWN_SERVICES_PATH", bad):
+                    with self.assertRaises(RuntimeError):
+                        ta._known_services()
+
+    def test_loaded_once_then_cached(self):
+        ta._known_services()
+        with mock.patch.object(ta, "_KNOWN_SERVICES_PATH", "/no/such/file"):
+            # Cached — no reload, no error.
+            self.assertEqual(ta.service_max_zoom("mapzen.com"), 15)
+
+
+# ---------------------------------------------------------------------------
+# Generic bounds helpers (pure — the transform itself is injected)
+# ---------------------------------------------------------------------------
+
+class TestBoundsHelpers(unittest.TestCase):
+
+    def test_bounds_from_geotransform_north_up(self):
+        gt = (8.0, 0.001, 0.0, 47.5, 0.0, -0.001)
+        b = ta._bounds_from_geotransform(gt, 100, 200)
+        self.assertEqual(b, {"west": 8.0, "east": 8.1,
+                             "south": 47.3, "north": 47.5})
+
+    def test_bounds_from_geotransform_projected_metres(self):
+        gt = (2_600_000.0, 2.0, 0.0, 1_200_000.0, 0.0, -2.0)
+        b = ta._bounds_from_geotransform(gt, 1000, 500)
+        self.assertEqual(b["west"], 2_600_000.0)
+        self.assertEqual(b["east"], 2_602_000.0)
+        self.assertEqual(b["north"], 1_200_000.0)
+        self.assertEqual(b["south"], 1_199_000.0)
+
+    def test_expand_bbox(self):
+        b = {"west": 8.0, "east": 9.0, "south": 47.0, "north": 48.0}
+        e = ta._expand_bbox(b, 0.25)
+        self.assertEqual(e, {"west": 7.75, "east": 9.25,
+                             "south": 46.75, "north": 48.25})
+
+    def test_clamp_bbox_intersection(self):
+        a = {"west": 8.0, "east": 9.0, "south": 47.0, "north": 48.0}
+        b = {"west": 8.5, "east": 9.5, "south": 47.5, "north": 48.5}
+        self.assertEqual(ta._clamp_bbox(a, b),
+                         {"west": 8.5, "east": 9.0,
+                          "south": 47.5, "north": 48.0})
+
+    def test_clamp_bbox_disjoint_is_none(self):
+        a = {"west": 8.0, "east": 9.0, "south": 47.0, "north": 48.0}
+        b = {"west": 10.0, "east": 11.0, "south": 47.0, "north": 48.0}
+        self.assertIsNone(ta._clamp_bbox(a, b))
+
+    def test_union_bbox(self):
+        a = {"west": 8.0, "east": 9.0, "south": 47.0, "north": 48.0}
+        b = {"west": 7.0, "east": 8.5, "south": 47.5, "north": 49.0}
+        self.assertEqual(ta._union_bbox([a, b]),
+                         {"west": 7.0, "east": 9.0,
+                          "south": 47.0, "north": 49.0})
+        self.assertIsNone(ta._union_bbox([]))
+
+
+# ---------------------------------------------------------------------------
+# Materialize helper — routing decisions
+# ---------------------------------------------------------------------------
+
+class TestNeedsMaterialization(unittest.TestCase):
+    """Only what the converter's tiff reader cannot take gets converted."""
+
+    def test_plain_small_geotiff_passes_through(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "a.tif")
+            open(p, "wb").close()
+            self.assertFalse(ta._needs_materialization(p))
+
+    def test_non_tiff_formats_are_materialized(self):
+        with tempfile.TemporaryDirectory() as d:
+            for name in ("n47e008.hgt", "dem.dem", "mosaic.vrt"):
+                p = os.path.join(d, name)
+                open(p, "wb").close()
+                self.assertTrue(ta._needs_materialization(p), name)
+
+    def test_vsi_paths_are_materialized(self):
+        self.assertTrue(ta._needs_materialization(
+            "/vsicurl/https://host/dem.tif"))
+        self.assertTrue(ta._needs_materialization(
+            "/vsizip//data/x.zip/dem.tif"))
+
+    def test_oversized_geotiff_is_materialized(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "big.tif")
+            with open(p, "wb") as fh:
+                fh.write(b"\0" * 32)
+            with mock.patch.object(ta, "_MATERIALIZE_MAX_TIFF_BYTES", 16):
+                self.assertTrue(ta._needs_materialization(p))
+            self.assertFalse(ta._needs_materialization(p))
+
+    def test_unstattable_tif_is_handed_over_unchanged(self):
+        # If it is genuinely unreadable the converter fails loudly on it,
+        # which beats failing here on a stat quirk.
+        self.assertFalse(ta._needs_materialization("/no/such/file.tif"))
+
+
+class TestMaterializeForConverter(unittest.TestCase):
+
+    def test_window_copy_never_resamples(self):
+        seen = {}
+
+        def fake_translate(dest, src, **opts):
+            seen.update({"dest": dest, "src": src, "opts": opts})
+            return mock.Mock()
+
+        with mock.patch.object(ta.gdal, "Translate", create=True,
+                               side_effect=fake_translate):
+            out = ta.materialize_for_converter(
+                "/x/a.hgt", "/tmp/out.tif",
+                {"west": 8.0, "east": 8.5, "south": 47.0, "north": 47.5})
+        self.assertEqual(out, "/tmp/out.tif")
+        self.assertEqual(seen["opts"]["format"], "GTiff")
+        self.assertEqual(seen["opts"]["projWin"], [8.0, 47.5, 8.5, 47.0])
+        # No resolution, size or resampling options — a pure window copy.
+        for banned in ("xRes", "yRes", "width", "height", "resampleAlg"):
+            self.assertNotIn(banned, seen["opts"])
+
+    def test_failure_is_a_hard_error_naming_the_file(self):
+        with mock.patch.object(ta.gdal, "Translate", create=True,
+                               return_value=None):
+            with self.assertRaises(RuntimeError) as caught:
+                ta.materialize_for_converter("/x/broken.hgt", "/tmp/out.tif")
+        self.assertIn("/x/broken.hgt", str(caught.exception))
+
+
+# ---------------------------------------------------------------------------
+# Per-tile sources[] building (bounds + halo filter, priority order)
+# ---------------------------------------------------------------------------
+
+def _info(path, bounds, crs="EPSG:4326", halo=0.001):
+    return {"path": path, "crs": None, "crs_authid": crs,
+            "native_bounds": dict(bounds), "wgs84_bounds": dict(bounds),
+            "halo_deg": halo}
+
+
+class TestBuildTileSources(unittest.TestCase):
+
+    TILE = {"west": 8.0, "east": 8.5, "south": 47.0, "north": 47.5}
+    #: cos-correction the halo applies in longitude at this tile's centre.
+    COS = max(math.cos(math.radians(47.25)), 0.2)
+
+    def test_filters_by_bounds_and_keeps_priority_order(self):
+        infos = [
+            _info("/a/high.tif", {"west": 8.1, "east": 8.2,
+                                  "south": 47.1, "north": 47.2}),
+            _info("/b/base.tif", {"west": 0.0, "east": 20.0,
+                                  "south": 40.0, "north": 50.0}),
+            _info("/c/far.tif", {"west": 10.0, "east": 11.0,
+                                 "south": 10.0, "north": 11.0}),
+        ]
+        sources, temps = ta.build_tile_sources(infos, self.TILE, "/tmp", "t",
+                                               output_res_m=2.0)
+        self.assertEqual([s["path"] for s in sources],
+                         [os.path.abspath("/a/high.tif"),
+                          os.path.abspath("/b/base.tif")])
+        self.assertEqual(temps, [])
+
+    def test_halo_admits_a_file_just_outside_the_tile(self):
+        # The file ends 0.002 deg west of the tile; a 4-source-pixel halo of
+        # 0.004 deg must still include it, a 0.001 halo must not (the output
+        # floor is negligible at 2 m: 0.6*2/111111 ~ 1e-5 deg).
+        near = {"west": 7.9, "east": 7.998, "south": 47.0, "north": 47.5}
+        inside = ta.build_tile_sources(
+            [_info("/n.tif", near, halo=0.004)], self.TILE, "/tmp", "t",
+            output_res_m=2.0)[0]
+        outside = ta.build_tile_sources(
+            [_info("/n.tif", near, halo=0.001)], self.TILE, "/tmp", "t",
+            output_res_m=2.0)[0]
+        self.assertEqual(len(inside), 1)
+        self.assertEqual(outside, [])
+
+    def test_output_resolution_floors_the_halo(self):
+        # Heavily decimating (fine source, coarse output): the area-average
+        # footprint of an edge output cell reaches ~0.5 output cells past the
+        # tile, so a 4-source-px halo alone is too small. 0.6 output cells at
+        # 250 m is ~0.00135 deg — a file 0.001 deg outside the tile must be
+        # admitted even with a tiny source-pixel halo.
+        near = {"west": 7.9, "east": 7.999, "south": 47.0, "north": 47.5}
+        info = _info("/fine.tif", near, halo=1e-5)   # ~0.3 m source pixels
+        with_floor = ta.build_tile_sources(
+            [info], self.TILE, "/tmp", "t", output_res_m=250.0)[0]
+        without_floor = ta.build_tile_sources(
+            [info], self.TILE, "/tmp", "t", output_res_m=0.0)[0]
+        self.assertEqual(len(with_floor), 1)
+        self.assertEqual(without_floor, [])
+
+    def test_longitude_halo_is_cos_corrected(self):
+        # At 60N a degree of longitude is half a degree of ground: a
+        # metre-derived halo must be divided by cos(lat) in longitude or a
+        # neighbouring file is missed exactly when decimation needs it.
+        tile = {"west": 8.0, "east": 8.5, "south": 59.75, "north": 60.25}
+        halo = 0.001
+        # 1.7x the raw halo west of the tile: outside the uncorrected halo,
+        # inside the cos-corrected one (1/cos(60) = 2).
+        near = {"west": 7.9, "east": 8.0 - halo * 1.7,
+                "south": 59.75, "north": 60.25}
+        sources = ta.build_tile_sources(
+            [_info("/n.tif", near, halo=halo)], tile, "/tmp", "t",
+            output_res_m=0.0)[0]
+        self.assertEqual(len(sources), 1)
+        # Latitude is NOT cos-corrected: the same margin below the tile
+        # stays outside.
+        below = {"west": 8.0, "east": 8.5,
+                 "south": 59.0, "north": 59.75 - halo * 1.7}
+        sources = ta.build_tile_sources(
+            [_info("/b.tif", below, halo=halo)], tile, "/tmp", "t",
+            output_res_m=0.0)[0]
+        self.assertEqual(sources, [])
+
+    def test_epsg_crs_is_declared_non_epsg_is_omitted(self):
+        b = {"west": 8.0, "east": 9.0, "south": 47.0, "north": 48.0}
+        infos = [_info("/a.tif", b, crs="EPSG:32632"),
+                 _info("/b.tif", b, crs="USER:100001")]
+        sources, _ = ta.build_tile_sources(infos, self.TILE, "/tmp", "t",
+                                           output_res_m=30.0)
+        self.assertEqual(sources[0]["crs"], "EPSG:32632")
+        # The toolkit only parses EPSG:nnnn / proj strings; it reads the
+        # file's own GeoKeys when we cannot name the CRS.
+        self.assertNotIn("crs", sources[1])
+
+    def test_materialized_source_gets_a_clamped_native_window(self):
+        seen = {}
+
+        def fake_materialize(path, dest, window=None):
+            seen.update({"path": path, "dest": dest, "window": window})
+            return dest
+
+        bounds = {"west": 8.2, "east": 9.0, "south": 46.0, "north": 47.2}
+        halo = 0.01
+        info = _info("/x/n47e008.hgt", bounds, halo=halo)
+        with mock.patch.object(ta, "materialize_for_converter",
+                               side_effect=fake_materialize):
+            sources, temps = ta.build_tile_sources(
+                [info], self.TILE, "/scratch", "tag", output_res_m=2.0)
+        # Window = tile + halo (longitude cos-corrected), clamped to the
+        # file's own extent so GDAL never zero-fills a partially-outside
+        # window with fake ground.
+        halo_lat = max(halo, 0.6 * 2.0 / 111_111.0)
+        halo_lon = halo_lat / self.COS
+        self.assertEqual(seen["window"],
+                         {"west": 8.2,
+                          "east": min(8.5 + halo_lon, 9.0),
+                          "south": 47.0 - halo_lat,
+                          "north": 47.2})
+        self.assertEqual(seen["path"], "/x/n47e008.hgt")
+        self.assertEqual(sources[0]["path"], os.path.abspath(seen["dest"]))
+        self.assertEqual(temps, [seen["dest"]])
+
+    def test_clamp_miss_skips_the_file_instead_of_whole_copying(self):
+        # The WGS84 filter admits the file but its native bounds miss the
+        # transformed window (edge-of-validity disagreement). A whole-file
+        # copy here would defeat the RAM bound windowing exists for — the
+        # file must be skipped, and materialize never called.
+        info = _info("/x/huge.hgt",
+                     {"west": 8.0, "east": 9.0, "south": 47.0, "north": 48.0},
+                     halo=0.01)
+        info["native_bounds"] = {"west": 100.0, "east": 101.0,
+                                 "south": 10.0, "north": 11.0}
+        with mock.patch.object(ta, "materialize_for_converter") as mat:
+            sources, temps = ta.build_tile_sources(
+                [info], self.TILE, "/scratch", "tag", output_res_m=30.0)
+        mat.assert_not_called()
+        self.assertEqual(sources, [])
+        self.assertEqual(temps, [])
+
+
+# ---------------------------------------------------------------------------
+# prepare_terrain — sources[] job content
+# ---------------------------------------------------------------------------
+
+class TestPrepareTerrainSourcesJobs(unittest.TestCase):
+    """The ingest jobs carry sources[] + void_fill_m, never base_tif."""
+
+    COVERING = {"west": 0.0, "east": 20.0, "south": 40.0, "north": 50.0}
+    ELSEWHERE = {"west": 100.0, "east": 101.0, "south": 10.0, "north": 11.0}
+
+    def _run_prepare(self, root, terrain_dir):
+        layer = mock.Mock()
+        layer.source.return_value = terrain_dir
+        bm = mock.Mock()
+        bm.find_binary.return_value = "aether_converter"
+        captured = []
+
+        def fake_run_converter(exe, job_file):
+            with open(job_file) as fh:
+                captured.extend(json.load(fh))
+
+        infos = {
+            "covering.tif": self.COVERING,
+            "elsewhere.tif": self.ELSEWHERE,
+        }
+
+        def fake_info(path, crs_authid=None):
+            return _info(path, infos[os.path.basename(path)])
+
+        with mock.patch.object(ta, "get_cache_dir", return_value=root), \
+             mock.patch.object(ta, "source_file_info",
+                               side_effect=fake_info), \
+             mock.patch.object(ta, "_run_converter",
+                               side_effect=fake_run_converter):
+            ta.prepare_terrain(layer, 47.4, 8.5, 5.0, 30, bm,
+                               terrain_dir=terrain_dir)
+        return captured
+
+    def test_jobs_carry_sources_and_void_fill(self):
+        with tempfile.TemporaryDirectory() as root:
+            d = os.path.join(root, "dem")
+            os.makedirs(d)
+            open(os.path.join(d, "covering.tif"), "wb").close()
+            open(os.path.join(d, "elsewhere.tif"), "wb").close()
+            jobs = self._run_prepare(root, d)
+
+        self.assertTrue(jobs)
+        for job in jobs:
+            # The legacy shim fields must never be emitted alongside sources.
+            self.assertNotIn("base_tif", job)
+            self.assertNotIn("swiss_tifs", job)
+            # 0 m ground outside the DEM — the old INIT_DEST=0 behaviour.
+            self.assertEqual(job["void_fill_m"], 0.0)
+            paths = [os.path.basename(s["path"]) for s in job["sources"]]
+            self.assertEqual(paths, ["covering.tif"],
+                             "per-tile bounds filter failed")
+            self.assertEqual(job["sources"][0]["crs"], "EPSG:4326")
+
+    def test_qgis_export_path_declares_wgs84(self):
+        layer = mock.Mock()
+        layer.source.return_value = (
+            "contextualWMSLegend=0&crs=EPSG:4326&url=https://wms.example/x")
+        layer.crs.return_value = conftest._FakeCRS("EPSG:4326")
+        bm = mock.Mock()
+        bm.find_binary.return_value = "aether_converter"
+        captured = []
+
+        def fake_run_converter(exe, job_file):
+            with open(job_file) as fh:
+                captured.extend(json.load(fh))
+
+        def fake_export(dem_layer, dest, bbox, resolution_m):
+            with open(dest, "wb") as fh:
+                fh.write(b"\0" * 8)
+
+        with tempfile.TemporaryDirectory() as root:
+            with mock.patch.object(ta, "get_cache_dir", return_value=root), \
+                 mock.patch.object(ta, "_export_via_qgis",
+                                   side_effect=fake_export), \
+                 mock.patch.object(ta, "_run_converter",
+                                   side_effect=fake_run_converter):
+                ta.prepare_terrain(layer, 47.4, 8.5, 5.0, 30, bm)
+
+        self.assertTrue(captured)
+        for job in captured:
+            self.assertEqual(job["void_fill_m"], 0.0)
+            self.assertNotIn("base_tif", job)
+            self.assertEqual(len(job["sources"]), 1)
+            # The export IS WGS84 whatever the layer's own CRS was.
+            self.assertEqual(job["sources"][0]["crs"], "EPSG:4326")
+
+
+class TestSourceFileInfoCrsPrecedence(unittest.TestCase):
+    """Folder-level CRS answers must not override a file's own embedded CRS.
+
+    A folder mixing EPSG:2056-style national tiles with a WGS84 filler DEM
+    used to be silently georeferenced entirely as the first file's CRS.
+    Single-file QGIS layers keep the opposite rule: the layer's authid is
+    authoritative, because a user can deliberately override a layer's CRS.
+    (The stubbed QgsCoordinateReferenceSystem treats the projection string as
+    the authid, so plain "EPSG:nnnn" strings stand in for embedded WKT.)
+    """
+
+    GT = (8.0, 0.001, 0.0, 47.5, 0.0, -0.001)
+
+    def _ds(self, wkt):
+        ds = mock.Mock()
+        ds.GetGeoTransform.return_value = self.GT
+        ds.RasterXSize = 100
+        ds.RasterYSize = 100
+        ds.GetProjection.return_value = wkt
+        return ds
+
+    def _info(self, wkt, declared, fallback):
+        with mock.patch.object(ta.gdal, "Open", create=True,
+                               return_value=self._ds(wkt)), \
+             mock.patch.object(ta.gdal, "GA_ReadOnly", create=True, new=0):
+            return ta.source_file_info("/x/a.tif", crs_authid=declared,
+                                       declared_is_fallback=fallback)
+
+    def test_folder_answer_is_only_a_fallback(self):
+        # File carries its own CRS -> the folder-level declaration loses.
+        info = self._info("EPSG:32632", "EPSG:4326", fallback=True)
+        self.assertEqual(info["crs_authid"], "EPSG:32632")
+
+    def test_folder_answer_fills_in_files_without_a_crs(self):
+        info = self._info("", "EPSG:4326", fallback=True)
+        self.assertEqual(info["crs_authid"], "EPSG:4326")
+
+    def test_layer_authid_stays_authoritative_for_single_files(self):
+        # declared_is_fallback=False (default): the declaration wins even
+        # against an embedded CRS — deliberate QGIS-side overrides work.
+        info = self._info("EPSG:32632", "EPSG:4326", fallback=False)
+        self.assertEqual(info["crs_authid"], "EPSG:4326")
+
+    def test_embedded_crs_used_when_nothing_is_declared(self):
+        info = self._info("EPSG:4326", None, fallback=False)
+        self.assertEqual(info["crs_authid"], "EPSG:4326")
+
+    def test_no_crs_anywhere_is_a_hard_error(self):
+        for fallback in (False, True):
+            with self.assertRaises(RuntimeError) as caught:
+                self._info("", None, fallback=fallback)
+            self.assertIn("/x/a.tif", str(caught.exception))
+
+
+class TestListTerrainFilesIsSorted(unittest.TestCase):
+    """sources[] priority for a folder is the SORTED path order.
+
+    os.walk order is filesystem-dependent; unsorted, two machines with the
+    same folder build different pixels under the identical pool cache key.
+    For overlapping files the earlier-sorted filename wins per pixel — the
+    same rule the Map Converter's _list_terrain_files applies.
+    """
+
+    def test_recursive_listing_is_sorted(self):
+        with tempfile.TemporaryDirectory() as d:
+            os.makedirs(os.path.join(d, "sub"))
+            for name in ("z.tif", "a.tif", os.path.join("sub", "m.tif"),
+                         "b.hgt"):
+                open(os.path.join(d, name), "wb").close()
+            files = ta.list_terrain_files(d)
+        self.assertEqual(files, sorted(files))
+        self.assertEqual([os.path.relpath(f, d) for f in files],
+                         sorted(["z.tif", "a.tif", "b.hgt",
+                                 os.path.join("sub", "m.tif")]))
+
+
+# ---------------------------------------------------------------------------
+# Shared subprocess runner + download progress (Addendum A)
+# ---------------------------------------------------------------------------
+
+class _FakeStreamProc:
+    """Popen stand-in: canned stdout lines, records terminate()."""
+
+    lines = "line one\n\n[Download] 50% (5/10) — 1.0 MB/s, 0 errors, 2 in-flight\n"
+    rc = 3
+
+    def __init__(self, cmd, **kwargs):
+        import io
+        _FakeStreamProc.last = self
+        self.cmd = cmd
+        self.kwargs = kwargs
+        self.returncode = self.rc
+        self.stdout = io.StringIO(self.lines)
+        self.terminated = False
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def terminate(self):
+        self.terminated = True
+
+    def wait(self, timeout=None):
+        return self.returncode
+
+    def kill(self):
+        pass
+
+
+class TestRunConverterStreaming(unittest.TestCase):
+    """The ONE subprocess runner: streaming, exit code, cancel."""
+
+    def test_streams_nonempty_lines_and_returns_exit_code(self):
+        seen = []
+        started = []
+        with mock.patch.object(ta.subprocess, "Popen", _FakeStreamProc):
+            rc = ta.run_converter_streaming(
+                "/bin/conv", ["ingest", "--job-file", "j.json"],
+                seen.append, on_start=started.append)
+        self.assertEqual(rc, 3)
+        self.assertEqual(seen, [
+            "line one",
+            "[Download] 50% (5/10) — 1.0 MB/s, 0 errors, 2 in-flight",
+        ])
+        self.assertEqual(_FakeStreamProc.last.cmd,
+                         ["/bin/conv", "ingest", "--job-file", "j.json"])
+        self.assertEqual(started, [_FakeStreamProc.last])
+
+    def test_cancel_kills_the_process_and_propagates(self):
+        def on_line(_line):
+            raise ta.ConverterCancelled()
+
+        with mock.patch.object(ta.subprocess, "Popen", _FakeStreamProc):
+            with self.assertRaises(ta.ConverterCancelled):
+                ta.run_converter_streaming("/bin/conv", ["ingest"], on_line)
+        self.assertTrue(_FakeStreamProc.last.terminated)
+
+    def test_env_is_forwarded(self):
+        with mock.patch.object(ta.subprocess, "Popen", _FakeStreamProc):
+            ta.run_converter_streaming("/bin/core", ["--config", "c"],
+                                       lambda _l: None, env={"A": "1"})
+        self.assertEqual(_FakeStreamProc.last.kwargs.get("env"), {"A": "1"})
+
+
+class TestDownloadProgressParsing(unittest.TestCase):
+    """The [Download] progress line is a parsed interface (download.rs ~:747)."""
+
+    def test_parses_the_exact_line_format(self):
+        line = "[Download] 40% (123/300) — 12.3 MB/s, 4 errors, 5 in-flight"
+        self.assertEqual(ta._parse_download_progress(line), (40, 123, 300))
+
+    def test_other_download_lines_do_not_match(self):
+        for line in (
+            "[Download] first timeout: z=15/x=1/y=2",
+            "[Download] SLOW tile z=15/x=1/y=2: 6.1s",
+            "[Stats] Tiles: 500/500 OK (100.0% success)",
+            "[Rust] Progress: 3/10",
+        ):
+            self.assertIsNone(ta._parse_download_progress(line), line)
+
+
+class TestDownloadProgressAggregator(unittest.TestCase):
+
+    def test_groups_are_weighted(self):
+        agg = ta.DownloadProgressAggregator([3, 1])
+        self.assertAlmostEqual(agg.group_update(0, 0.5), 0.375)
+        self.assertAlmostEqual(agg.group_update(0, 1.0), 0.75)
+        self.assertAlmostEqual(agg.group_update(1, 1.0), 1.0)
+
+    def test_monotonic_across_retry_passes(self):
+        # A gap-repair retry reports small done/total again; the bar must
+        # never walk backwards.
+        agg = ta.DownloadProgressAggregator([2])
+        self.assertAlmostEqual(agg.group_update(0, 1.0), 1.0)
+        self.assertAlmostEqual(agg.group_update(0, 0.1), 1.0)
+
+    def test_empty_weights_do_not_divide_by_zero(self):
+        agg = ta.DownloadProgressAggregator([])
+        # No groups: nothing to update, but construction must be safe.
+        self.assertEqual(agg._total, 1)
+
+
+class TestTryRustDownloadReportsProgress(unittest.TestCase):
+    """progress_cb sees aggregated download fractions from the [Download] lines."""
+
+    BBOX = {"north": 47.5, "south": 47.0, "east": 8.5, "west": 8.0}
+    TILE = "tile_N48.00E8.00_30m.abt"
+
+    def test_progress_lines_reach_the_callback(self):
+        subtiles = [{"filename": self.TILE, "ul_lat": 48.0, "ul_lon": 8.0,
+                     "size_px": 3704, "exact_res_m": 30.0}]
+        bm = mock.Mock()
+        bm.find_binary.return_value = "aether_converter"
+        fracs = []
+
+        def fake_once(exe, job_file, on_line=None, **_kw):
+            if on_line:
+                on_line("[Download] 50% (5/10) — 1.0 MB/s, 0 errors, 1 in-flight")
+                on_line("[Download] 100% (10/10) — 1.0 MB/s, 0 errors, 0 in-flight")
+            return 0, ["[Stats] Tiles: 10/10 OK (100.0% success)"]
+
+        with tempfile.TemporaryDirectory() as pool:
+            _write_pool_abt(os.path.join(pool, self.TILE))
+            with mock.patch.object(ta, "_run_converter_download_once",
+                                   side_effect=fake_once), \
+                 mock.patch.object(ta, "_abt_has_gaps", return_value=False):
+                ok = ta._try_rust_download(
+                    _XYZ_SOURCE, pool, self.BBOX, 30, subtiles, bm,
+                    progress_cb=lambda frac, label: fracs.append(frac))
+        self.assertTrue(ok)
+        self.assertEqual(fracs, [0.5, 1.0])
+
+
+# ---------------------------------------------------------------------------
+# ensure_pool_tiles — the shared acquisition entry point
+# ---------------------------------------------------------------------------
+
+class TestEnsurePoolTiles(unittest.TestCase):
+
+    SPEC = [{"filename": "tile_N48.00E8.00_30m.abt", "ul_lat": 48.0,
+             "ul_lon": 8.0, "size_px": 64, "exact_res_m": 30.0}]
+
+    def test_pool_hit_downloads_nothing(self):
+        with tempfile.TemporaryDirectory() as root:
+            with mock.patch.object(ta, "get_cache_dir", return_value=root), \
+                 mock.patch.object(ta, "_try_rust_download") as dl:
+                pool = ta._pool_dir(_XYZ_SOURCE)
+                os.makedirs(pool, exist_ok=True)
+                _write_pool_abt(os.path.join(pool, self.SPEC[0]["filename"]))
+                mapping = ta.ensure_pool_tiles(_XYZ_SOURCE, self.SPEC, 30)
+        dl.assert_not_called()
+        self.assertEqual(list(mapping), [self.SPEC[0]["filename"]])
+        self.assertTrue(mapping[self.SPEC[0]["filename"]].startswith(pool))
+
+    def test_missing_tiles_are_downloaded_into_the_shared_pool(self):
+        def fake_download(source, pool, bbox, res, subtiles, bm,
+                          pbf_dir=None, progress_cb=None, **_kw):
+            self.assertIsNone(pbf_dir, "pool must stay pure terrain")
+            for t in subtiles:
+                _write_pool_abt(os.path.join(pool, t["filename"]))
+            return True
+
+        with tempfile.TemporaryDirectory() as root:
+            with mock.patch.object(ta, "get_cache_dir", return_value=root), \
+                 mock.patch.object(ta, "_try_rust_download",
+                                   side_effect=fake_download):
+                mapping = ta.ensure_pool_tiles(_XYZ_SOURCE, self.SPEC, 30)
+                # Same pool identity Site Analysis uses (no buildings term).
+                self.assertEqual(
+                    os.path.dirname(mapping[self.SPEC[0]["filename"]]),
+                    ta._pool_dir(_XYZ_SOURCE))
+
+    def test_failed_download_is_a_hard_error(self):
+        with tempfile.TemporaryDirectory() as root:
+            with mock.patch.object(ta, "get_cache_dir", return_value=root), \
+                 mock.patch.object(ta, "_try_rust_download",
+                                   return_value=False):
+                with self.assertRaises(RuntimeError) as caught:
+                    ta.ensure_pool_tiles(_XYZ_SOURCE, self.SPEC, 30)
+        self.assertIn("download failed", str(caught.exception).lower())
+
+    def test_tiles_missing_after_download_are_a_hard_error(self):
+        # Download "succeeds" but writes nothing (e.g. permanent 404s over
+        # the whole extent): no silent all-void tiles.
+        with tempfile.TemporaryDirectory() as root:
+            with mock.patch.object(ta, "get_cache_dir", return_value=root), \
+                 mock.patch.object(ta, "_try_rust_download",
+                                   return_value=True):
+                with self.assertRaises(RuntimeError) as caught:
+                    ta.ensure_pool_tiles(_XYZ_SOURCE, self.SPEC, 30)
+        self.assertIn(self.SPEC[0]["filename"], str(caught.exception))
+
+
+class TestXyzNativeResolutionHelper(unittest.TestCase):
+    """resolve_zmax-based — clamps to what the service really publishes."""
+
+    def test_known_service_clamps_a_lying_zmax(self):
+        src = f"type=xyz&url={_MAPZEN_URL}&zmax=18"
+        self.assertAlmostEqual(ta.xyz_native_resolution_m(src), 4.8, delta=0.5)
+
+    def test_unknown_service_uses_its_own_zmax(self):
+        src = f"type=xyz&url={_ANON_URL}&zmax=10"
+        self.assertAlmostEqual(ta.xyz_native_resolution_m(src), 152.9, delta=5)
+
+    def test_non_xyz_returns_none(self):
+        self.assertIsNone(ta.xyz_native_resolution_m("/data/dem.tif"))
+
+
+class TestDownloadCancellation(unittest.TestCase):
+    """Cancel must reach a RUNNING download promptly (review fix 1)."""
+
+    def test_should_cancel_kills_the_download_subprocess(self):
+        with mock.patch.object(ta.subprocess, "Popen", _FakeStreamProc):
+            with self.assertRaises(ta.ConverterCancelled):
+                ta._run_converter_download_once(
+                    "/bin/conv", "job.json", should_cancel=lambda: True)
+        self.assertTrue(_FakeStreamProc.last.terminated,
+                        "subprocess kept running after cancel")
+
+    def test_on_start_exposes_the_download_process(self):
+        started = []
+        with mock.patch.object(ta.subprocess, "Popen", _FakeStreamProc):
+            ta._run_converter_download_once(
+                "/bin/conv", "job.json", on_start=started.append)
+        self.assertEqual(started, [_FakeStreamProc.last])
+
+    def test_cancellation_is_not_swallowed_by_the_retry_machinery(self):
+        # _download_zoom_group logs-and-returns-False on generic errors; a
+        # cancellation must pass straight through instead.
+        subtiles = [{"filename": "tile_N48.00E8.00_30m.abt", "ul_lat": 48.0,
+                     "ul_lon": 8.0, "size_px": 3704, "exact_res_m": 30.0}]
+        bm = mock.Mock()
+        bm.find_binary.return_value = "aether_converter"
+        with mock.patch.object(ta, "_run_converter_download_once",
+                               side_effect=ta.ConverterCancelled):
+            with tempfile.TemporaryDirectory() as pool:
+                with self.assertRaises(ta.ConverterCancelled):
+                    ta._try_rust_download(_XYZ_SOURCE, pool, {}, 30,
+                                          subtiles, bm)
+
+    def test_ensure_pool_tiles_forwards_the_cancel_hooks(self):
+        seen = {}
+
+        def fake_download(source, pool, bbox, res, subtiles, bm,
+                          pbf_dir=None, progress_cb=None,
+                          should_cancel=None, on_start=None):
+            seen["should_cancel"] = should_cancel
+            seen["on_start"] = on_start
+            for t in subtiles:
+                _write_pool_abt(os.path.join(pool, t["filename"]))
+            return True
+
+        spec = [{"filename": "tile_N48.00E8.00_30m.abt", "ul_lat": 48.0,
+                 "ul_lon": 8.0, "size_px": 64, "exact_res_m": 30.0}]
+        cancel = lambda: False   # noqa: E731
+        start = lambda proc: None  # noqa: E731
+        with tempfile.TemporaryDirectory() as root:
+            with mock.patch.object(ta, "get_cache_dir", return_value=root), \
+                 mock.patch.object(ta, "_try_rust_download",
+                                   side_effect=fake_download):
+                ta.ensure_pool_tiles(_XYZ_SOURCE, spec, 30,
+                                     should_cancel=cancel, on_start=start)
+        self.assertIs(seen["should_cancel"], cancel)
+        self.assertIs(seen["on_start"], start)
+
+
+class TestFeedbackProgressSubSpan(unittest.TestCase):
+    """Download progress maps into the CALLER's sub-span, never 0-100 (fix 2)."""
+
+    def _prepare(self, progress_span, feedback):
+        layer = mock.Mock()
+        layer.source.return_value = _XYZ_SOURCE
+        captured = {}
+
+        def fake_download(source, pool, bbox, res, subtiles, bm,
+                          pbf_dir=None, progress_cb=None, **_kw):
+            captured["progress_cb"] = progress_cb
+            if progress_cb is not None:
+                progress_cb(0.0, "start")
+                progress_cb(0.5, "half")
+                progress_cb(1.0, "done")
+            for t in subtiles:
+                _write_pool_abt(os.path.join(pool, t["filename"]))
+            return True
+
+        with tempfile.TemporaryDirectory() as root:
+            with mock.patch.object(ta, "get_cache_dir", return_value=root), \
+                 mock.patch.object(ta, "_try_rust_download",
+                                   side_effect=fake_download):
+                ta.prepare_terrain(layer, 47.4, 8.5, 5.0, 30, mock.Mock(),
+                                   feedback=feedback,
+                                   progress_span=progress_span)
+        return captured
+
+    def test_span_is_respected(self):
+        seen = []
+        feedback = mock.Mock(spec=["setProgress"])
+        feedback.setProgress.side_effect = seen.append
+        self._prepare((5.0, 15.0), feedback)
+        # 5 + frac*10 — never anywhere near 100 mid-download.
+        self.assertEqual(seen, [5, 10, 15])
+
+    def test_no_span_means_no_feedback_progress(self):
+        # Without a declared span the adapter must not guess a range (the
+        # old full 0-100 mapping made the caller's bar hit 100 % early).
+        feedback = mock.Mock(spec=["setProgress"])
+        captured = self._prepare(None, feedback)
+        self.assertIsNone(captured["progress_cb"])
+        feedback.setProgress.assert_not_called()

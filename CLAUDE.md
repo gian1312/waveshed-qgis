@@ -46,7 +46,7 @@ Defined in `rust/aether_core/src/config.rs`. Sections: tx, rx, analysis, output,
 
 ## Converter Ingest Job JSON Structure
 
-Defined in `rust/aether_converter/src/ingest.rs:18-29`:
+Defined in `aether_converter/src/ingest.rs` (contract v2.0):
 ```json
 {
   "output_path": "path/to/output.abt",
@@ -54,10 +54,40 @@ Defined in `rust/aether_converter/src/ingest.rs:18-29`:
   "ul_lat": 47.5, "ul_lon": 8.0,
   "resolution_m": 10,
   "size_px": 4096,
-  "base_tif": "path/to/wgs84.tif",
-  "swiss_tifs": []
+  "sources": [
+    {"path": "overlay.tif", "crs": "EPSG:32632"},
+    {"path": "base.tif", "crs": "EPSG:4326"}
+  ],
+  "void_fill_m": 0.0
 }
 ```
+
+- `sources[]`: priority = array order (first valid sample wins per pixel).
+  `crs` is optional (`"EPSG:nnnn"` or a proj string); when absent the
+  converter reads the GeoTIFF's GeoKeys and hard-errors if they are
+  user-defined/absent. `nodata` is optional per source (else `GDAL_NODATA`
+  tag). The converter reprojects while sampling — the plugin never warps.
+- A source `path` may also be a pool **`.abt` tile** (detected by its `AETH`
+  magic): self-describing — geometry from its own header, values already
+  half-metres. Setting `crs` or `nodata` on a `.abt` source is a converter
+  hard error. The Map Converter uses this for XYZ terrain: the shared
+  downloader (`terrain_adapter.ensure_pool_tiles`) fills the Site-Analysis
+  pool, and the pool tile becomes an ingest source.
+- Both tabs acquire terrain through ONE router: XYZ → shared Rust
+  `download`; local files/folders → direct `sources[]`; only true rendered
+  servers (WMS/WMTS/ArcGIS) are exported through QGIS, per tile. The single
+  engine-subprocess entry point is `terrain_adapter.run_converter_streaming`.
+- `void_fill_m` is optional: pixels no source covers are written as this
+  elevation instead of the VOID sentinel. Site Analysis passes `0.0`
+  (0 m ground outside the DEM); the Map Converter tab omits it (VOID kept).
+- `base_tif` / `swiss_tifs` are DEPRECATED aliases still accepted by the
+  converter for older callers; the plugin no longer emits them, and emitting
+  them alongside `sources` is an error.
+- The converter also has a `plan` subcommand
+  (`plan --south S --north N --west W --east E --resolutions 30,90`) that
+  prints the tile grid as JSON (`aether-plan/1`); the Map Converter worker
+  cross-checks it against the plugin's own enumeration before every run and
+  aborts on mismatch (or on an engine too old to have `plan`).
 
 ## Sensitive Files (DO NOT commit)
 

@@ -111,8 +111,26 @@ class _FingerprintThread(QThread):
 # Dialog
 # ---------------------------------------------------------------------------
 
+#: Every QgsSettings key this dialog writes — the change-detection snapshot
+#: reads exactly these, so a save that alters none of them emits no signal.
+_WATCHED_KEYS = (
+    "waveshed/binary_dir",
+    "waveshed/terrain_dir",
+    "waveshed/cache_dir",
+    "waveshed/max_vram_gb",
+    "waveshed/max_ram_gb",
+    "waveshed/download_connections",
+)
+
+
 class SettingsDialog(QDialog):
     """Waveshed plugin settings dialog."""
+
+    #: Emitted after ``save_settings`` when at least one stored value actually
+    #: changed. The main dialog fans this out to every open tab's
+    #: ``refresh_settings()`` so dropdowns/paths/status derived from settings
+    #: never go stale while the plugin dialog stays open.
+    settings_changed = pyqtSignal()
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -345,8 +363,25 @@ class SettingsDialog(QDialog):
         self._ram_spin.setValue(int(s.value("waveshed/max_ram_gb", 16)))
         self._conn_spin.setValue(int(s.value("waveshed/download_connections", 256)))
 
+    def _snapshot(self) -> dict:
+        """Current stored values of everything this dialog writes.
+
+        String-normalized so a type round-trip through QgsSettings (int in,
+        str out) cannot fake a change.
+        """
+        snap = {k: str(self._settings.value(k, "")) for k in _WATCHED_KEYS}
+        snap["api_key"] = api_key.get_stored_key()
+        return snap
+
     def save_settings(self) -> None:
-        """Persist all settings to QgsSettings. Always saves, no validation dialogs."""
+        """Persist all settings to QgsSettings. Always saves, no validation dialogs.
+
+        Emits :attr:`settings_changed` when a stored value actually changed,
+        and re-checks the binary status so an invalid directory is called out
+        immediately (fail loudly — never silently keep an old discovery
+        result).
+        """
+        before = self._snapshot()
         s = self._settings
         s.setValue("waveshed/binary_dir", self._binary_dir_edit.text().strip())
         s.setValue("waveshed/terrain_dir", self._terrain_dir_edit.text().strip())
@@ -355,6 +390,13 @@ class SettingsDialog(QDialog):
         s.setValue("waveshed/max_ram_gb", self._ram_spin.value())
         s.setValue("waveshed/download_connections", self._conn_spin.value())
         api_key.store_key(self._api_key_edit.text().strip())
+
+        # The saved binary dir is what runs use from now on — re-validate it
+        # NOW so "Binaries: Missing" appears the moment a bad path is saved.
+        self._refresh_binary_status()
+
+        if self._snapshot() != before:
+            self.settings_changed.emit()
 
     def _on_accept(self) -> None:
         """Save and close (standalone dialog mode)."""

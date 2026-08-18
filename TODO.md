@@ -1119,3 +1119,48 @@ waveshed.io release manifest.
 - [ ] Converter fixes: bbox-filter the `.pbf` scan per output tile
   (`ingest.rs:504`); fix the base-DEM cache retain predicate
   (`main.rs:139-145`); bound the pre-load in `main.rs:106-116`.
+
+## Found in live QGIS testing, 2026-08-12 (fix later — analysis confirmed)
+
+- [x] **Map Converter XYZ bypasses the toolkit resampler — checkerboard NOT
+  fixed on this path.** (fixed 2026-08-12: acquisition router + shared
+  `ensure_pool_tiles` downloader; QGIS renders only true rendered servers) The tab renders elevation XYZ through QGIS
+  (`map_converter_tab._resolve_source_on_main_thread`): one whole-extent
+  GeoTIFF at `min(out_res)`, nearest-neighbour decimation inside QGIS's raster
+  pipe, on the MAIN THREAD (UI frozen, progress stuck at 0, no real tile
+  download at native zoom). The converter then ingests at ratio ~1 and has
+  nothing to average. Fix: route elevation-encoded XYZ through
+  `aether_converter download` per zoom group, exactly like Site Analysis's
+  `_try_rust_download`. QGIS render stays only for true rendered servers.
+- [x] **`_resolve_source_on_main_thread` swallows export failures**
+  (`except Exception: pass` → returns the raw source path). Fail loudly.
+  (fixed 2026-08-12: hard RuntimeError naming the layer and the cause)
+- [x] **`_detect_xyz_resolution` still trusts raw `zmax`** — duplicate of the
+  bug `resolve_zmax` fixed; the UI resolution label lies for hand-added layers.
+  (fixed 2026-08-12: replaced by `terrain_adapter.xyz_native_resolution_m`,
+  resolve_zmax-based)
+- [x] **Settings dialog changes don't reach open tabs** (binary dir, cache dir,
+  dropdowns) until the plugin dialog is reopened. Tabs read QgsSettings at
+  construction only; no refresh signal exists.
+  (fixed 2026-08-12: SettingsDialog emits `settings_changed` on save when a
+  value actually changed; the main dialog fans out to per-tab
+  `refresh_settings()` — DEM local-dir entry, asset dropdowns, asset list,
+  Map Converter output default all follow saved settings now, without
+  touching user-entered form state.)
+
+## Acquisition unification follow-up (Addendum A4, 2026-08-12 — note only)
+
+- [ ] **Buildings tile download is the plugin's last Python HTTP downloader.**
+  Terrain download is Rust (`aether_converter download`), but OpenFreeMap
+  building tiles are still fetched by `core/openfreemap.py` (urllib, Python
+  thread pool). Candidate: move a generic vector-tile fetcher into the
+  toolkit (same job-file + `[Download]`/`[Stats]` progress contract) so the
+  plugin sheds its last HTTP downloader and buildings get the same retry /
+  progress machinery as terrain. Do not implement ad hoc — needs a toolkit
+  contract entry first.
+- [ ] **WebP tile decode in the toolkit downloader.** `download.rs` decodes
+  PNG only; MapTiler Terrain-RGB **v2** (and some self-hosted stacks) serve
+  WebP tiles, which currently must fail loudly. Add WebP decode via a pure-
+  Rust decoder (e.g. `image-webp`) behind the same `decode → f32 grid` seam;
+  encoding formula handling (terrarium/terrain-rgb) is codec-independent and
+  unchanged.
