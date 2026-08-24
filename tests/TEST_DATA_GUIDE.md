@@ -10,9 +10,10 @@ buildings pipeline, and how to wire each one up in QGIS. Companion to
 > and writes a QGIS project — `data/torture/waveshed_torture.qgs` — whose layer
 > tree *is* this document: one group per section, one layer per row, each row's
 > expectation in the layer abstract. API keys and paths go in
-> `torture.local.ini` (gitignored; copy of `torture.local.template.ini`); only
-> rows 1.3a, 1.4, 1.8 and 1.9 need one. What got built and what was skipped is
-> written to `data/torture/README.md`.
+> `torture.local.ini` (gitignored; copy of `torture.local.template.ini`); one
+> free MapTiler key covers rows 1.3a and 1.4 and nothing else in the set needs
+> an account. What got built and what was skipped is written to
+> `data/torture/README.md`.
 >
 > Opening it is two steps: run `data/torture/open_in_qgis.bat` (or open the
 > `.qgs`), then click **Enable macros**. The project carries a macro that
@@ -62,6 +63,17 @@ formula. Supporting both IS the generic solution. (A third axis is the image
 5. **Interpretation** dropdown at the bottom of the same dialog — exists only
    on QGIS ≥ 3.28. *Terrarium Terrain* for row 1.1; leave *Default* for
    row 1.2. Older QGIS: no dropdown exists; the plugin infers from the URL.
+
+   > **Correction (measured on QGIS 3.44.7, 2026-08-18):** the only tokens
+   > QGIS honours in a layer URI are **`interpretation=terrariumterrain`** and
+   > **`interpretation=maptilerterrain`**. `terrarium`, `mapboxterrain`,
+   > `terrainrgb` and friends — including the two this guide recommends below
+   > for hand-editing — are silently ignored: the layer stays an ARGB32
+   > picture instead of becoming Float32 elevation. Note also that the plugin's
+   > `xyz_encoding()` matches the substrings `mapbox`/`terrarium`, so it reads
+   > `terrariumterrain` correctly but cannot see `maptilerterrain` at all and
+   > falls back to the URL guess. Row 1.10 of the generated project
+   > reproduces that.
 6. OK, then **double-click the new entry** to add it as a layer.
 7. **Verify before anything else**: right-click layer ▸ *Zoom to Layer* —
    the canvas must show tiles (greyscale-ish when an interpretation is set,
@@ -89,6 +101,7 @@ layer.
 | 1.5 | Ambiguous encoding | copy connection 1.1, edit URL to e.g. `.../terrarium-terrain-rgb-mirror/{z}/{x}/{y}.png` (any URL containing both `terrarium` and `terrain-rgb`) | — | Must raise the encoding-ambiguity error dialog, refuse to run. |
 | 1.6 | Dead endpoint | `https://tiles.example.invalid/terrarium/{z}/{x}/{y}.png` | — | Total fetch failure → hard error, nothing cached, no flat-0 terrain. |
 | 1.7 | Imagery XYZ | `https://tile.openstreetmap.org/{z}/{x}/{y}.png` | — | Classifier: must appear as imagery, never in the DEM picker. |
+| 1.10 | Interpretation-only decode | `http://localhost:8000/neutral-tiles/{z}/{x}/{y}.png` — the 1.3b tiles under a name no `known_services.json` entry matches | Interpretation *MapTiler Terrain* | Nothing in the URL says how these decode, so **only** the interpretation can. QGIS honours it and draws elevation. **Open finding:** the plugin matches the substrings `mapbox`/`terrarium` inside the token and QGIS writes `maptilerterrain`, which contains neither — so it falls back to Terrarium and the ground decodes to ≈ −32350 m. Turns green when the plugin learns the token. |
 
 **Local Terrain-RGB fixture (1.3b)** — grab a few Terrarium tiles, re-encode
 them with the terrain-rgb formula, serve them (`pip install pillow requests`
@@ -161,6 +174,16 @@ gdalbuildvrt mosaic.vrt data/torture/dem/swiss/*.tif
 
 # USGS ASCII DEM (exotic format → materialize):
 gdal_translate -of USGSDEM src.tif ascii.dem
+
+# Rows 2.24-2.26 — three more non-TIFF formats. The folder scanner accepts
+# .tif/.tiff/.dem/.hgt ONLY, so each of these is a LAYER-only input and every
+# one of them goes through materialize_for_converter, which is the thinnest
+# part of that path. 2.26 is the counterpart to the folder case in §2.3: the
+# scanner must refuse the extension while the same file still converts as a
+# layer.
+gdal_translate -of HFA     src.tif erdas.img                  # 2.24
+gdal_translate -of EHdr    src.tif bil/base.bil               # 2.25 (raw + sidecar hdr)
+gdal_translate -of AAIGrid src.tif ignored_formats/base.asc   # 2.26
 ```
 
 *console* — broken-georeferencing fixtures (fail-loudly tests):
@@ -224,7 +247,8 @@ make the request fail**; connection URLs must be bare):
 | 4.1 | WMS imagery | `https://ows.terrestris.de/osm/service?` | `OSM-WMS` | Classifier: **imagery** — never offered as DEM (ARGB32 band-heuristic trap). |
 | 4.2 | WMTS imagery | `https://wmts.geo.admin.ch/EPSG/3857/1.0.0/WMTSCapabilities.xml` | `ch.swisstopo.pixelkarte-farbe` | Same. |
 | 4.3 | WCS elevation | `https://www.wcs.nrw.de/geobasis/wcs_nw_dgm?` | DGM coverage | Coverage provider → real Float32 values; band heuristics may classify as DEM. Third real CRS (EPSG:25832) end-to-end. |
-| 4.4 | ArcGIS ImageServer | `https://elevation.nationalmap.gov/arcgis/rest/services/3DEPElevation/ImageServer` (Browser ▸ ArcGIS REST Servers ▸ New Connection) | 3DEPElevation | Rendered-provider classification path. |
+| 4.4a | ArcGIS ImageServer | `https://elevation.nationalmap.gov/arcgis/rest/services/3DEPElevation/ImageServer` (Browser ▸ ArcGIS REST Servers ▸ New Connection) | 3DEPElevation | Rendered-provider classification path. **Not a project layer**: measured 20–96 s per load and intermittent "Cannot describe coverage", which is a tax on every project open. Ships as a Browser connection; add it by hand when testing the coverage-values path. |
+| 4.4b | The same service as a WMS **picture** | `https://elevation.nationalmap.gov/arcgis/services/3DEPElevation/ImageServer/WMSServer` | `3DEPElevation` | The URL-hint trap. The bytes are a rendering, exactly like the 4.6 hillshade, so the classifier must say **imagery** and the plugin must refuse it as terrain. **Open finding:** `_classify_by_url` matches `elevation` in the host name and returns `dem` before the rendered-provider guard can fire, so it is offered as a DEM with no warning — running an analysis over it fails silently. USA only: use the "Colorado (3DEP)" run-matrix box. |
 | 4.5 | swisstopo WMS | `https://wms.geo.admin.ch/?` | `ch.swisstopo.pixelkarte-farbe` | WMS imagery classification (free, no key). |
 | 4.6 | swisstopo WMS, hillshade trap | `https://wms.geo.admin.ch/?` | `ch.swisstopo.swissalti3d-reliefschattierung` | **Looks like terrain, IS a rendered picture.** Classifier must call it imagery — picking it as DEM is the exact silent failure the URL/provider guard exists for. |
 
