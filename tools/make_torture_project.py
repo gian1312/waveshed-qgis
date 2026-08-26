@@ -1025,6 +1025,32 @@ RUN_MATRIX: Sequence[Dict[str, Any]] = (
      "res_m": "30", "stresses": "Row 2.20: EPSG:5514 — must hard-error, cleanly."},
 )
 
+#: Run-matrix case (by name prefix) -> the row whose ground it is.  The render
+#: check has always used this to point QGIS at the right box; the same mapping
+#: now also fills :attr:`Layer.footprint` for rows :func:`_write_footprints`
+#: cannot reach — it opens LOCAL rasters with GDAL, so a server row gets no
+#: footprint and the torture runner falls back to the reference AOI.  Row 4.3
+#: is a North-Rhine-Westphalia coverage and the reference AOI is Bern, 600 km
+#: outside it: measured, the WCS export over Bern has not one valid pixel, the
+#: converter writes the whole tile as VOID, and the row was reported as a
+#: plugin defect. Over its own box the same path returns 75-262 m of real
+#: ground.
+MATRIX_GROUND: Dict[str, str] = {
+    "NRW": "4.3",
+    "Colorado": "4.4",
+    "Los Angeles": "2.19",
+    "Prague": "2.20",
+    "Dead Sea": "2.4",
+}
+
+
+def matrix_probes() -> Dict[str, List[float]]:
+    """``{row prefix: [west, south, east, north]}`` from :data:`MATRIX_GROUND`."""
+    return {row: [case["west"], case["south"], case["east"], case["north"]]
+            for case in RUN_MATRIX
+            for prefix, row in MATRIX_GROUND.items()
+            if case["name"].startswith(prefix)}
+
 SITES: Sequence[Dict[str, Any]] = (
     {"name": "Bern TX", "lat": 46.9481, "lon": 7.4474, "height_m": 30.0, "mode": "AGL",
      "note": "Primary transmitter for the reference AOI."},
@@ -1199,6 +1225,17 @@ class Layer:
     #: of the same ground agree to a few metres; anything an order of magnitude
     #: past that is a pipeline fault, not a dataset difference.
     expect_agrees_m: float = 0.0
+    #: Minimum percentage of this row's pipeline-tile samples that must be
+    #: REAL terrain (not VOID). Calibrated per fixture: a full-coverage
+    #: source is ~100, a small Bern fixture over a 0.5-deg tile ~4. 0 = only
+    #: the structural "more than none" check applies. This is what catches a
+    #: source half of whose data silently went missing.
+    expect_real_pct: float = 0.0
+    #: (low, high) percentage band the coverage disk's valid pixels must land
+    #: in for this row's canonical pipeline run (full 360-deg, so the ideal
+    #: disk is ~78.5% of the square). A clipped, striped or half-empty disk
+    #: lands outside it. () = the calibration pass fills in the default.
+    expect_cov_valid_pct: Tuple[float, float] = ()
     #: WGS84 [west, south, east, north] of a file raster, filled in by
     #: _write_footprints. The torture runner's tier-B ingest places its test
     #: tile over THIS box — the fixtures are scattered (Bern, the Dead Sea,
@@ -1453,20 +1490,13 @@ def build_catalogue(cfg: Cfg) -> List[Layer]:
             expect="The same Terrain-RGB tiles as 1.3b, served under a name no "
                    "known_services entry matches, so ONLY the interpretation can "
                    "decode them. QGIS honours it (the layer draws as elevation). The "
-                   "plugin looks for 'mapbox'/'terrarium' inside the token and QGIS's "
-                   "token is 'maptilerterrain', which contains neither — so expect the "
-                   "terrarium default and terrain near -32000 m. That is the finding.",
+                   "plugin now reads the token QGIS actually writes — 'maptilerterrain', "
+                   "which contains neither 'mapbox' nor 'terrarium' and so matched nothing "
+                   "when the token was read as a substring. Decoded as Terrarium the same "
+                   "tiles land near -32000 m, which is what this row used to measure.",
             expect_class="dem", expect_encoding="mapbox",
             expect_format="png", expect_elev_m=PROBE_BAND,
-            pipeline_res_m=2, pipeline_range_km=1,
-            known_fail="xyz_encoding() matches the substrings 'mapbox'/'terrarium'; QGIS's "
-                       "token is 'maptilerterrain', which contains neither, so the plugin "
-                       "falls back to Terrarium and the ground decodes to about -32350 m. "
-                       "Open finding — this turns green when the plugin learns the token.",
-            # Scoped: the note covers the encoding verdict and the elevation it
-            # produces, and NOTHING else. Unscoped, it also swallowed "the layer
-            # does not load", which has nothing to do with the finding.
-            known_fail_checks=("encoding", "pipeline", "pipeline.agrees")))
+            pipeline_res_m=2, pipeline_range_km=1))
     # Served from the local fixture, not from AWS. The test is the plugin's
     # ambiguity error, which fires on the URL string before a single tile is
     # fetched — so the tiles never needed to be missing. Pointed at a path that
@@ -1508,7 +1538,7 @@ def build_catalogue(cfg: Cfg) -> List[Layer]:
                         xyz_uri("https://tile.openstreetmap.org/{z}/{x}/{y}.png", zmax=19),
                         "EPSG:3857", checked=True,
                         expect="Must be classified as imagery and never offered in the DEM picker.",
-                        check="reject", expect_class="imagery", expect_format="png",
+                        check="reject", expect_failure="imagery", expect_class="imagery", expect_format="png",
                         expect_tile_px=256))
     # Deliberately absent: api.mapbox.com (row 1.8 of earlier drafts) and
     # nextzen. Mapbox wants payment details for a token, and the only thing the
@@ -1666,13 +1696,13 @@ def build_catalogue(cfg: Cfg) -> List[Layer]:
     layers.append(Layer("4.1", G_SRV, "4.1 terrestris WMS — OSM-WMS (imagery)", "wms",
                         wms_uri("https://ows.terrestris.de/osm/service", "OSM-WMS"), "EPSG:3857",
                         expect="Classifier: imagery. The ARGB32 single-band trap — must never "
-                               "be offered as a DEM.", check="reject", expect_class="imagery"))
+                               "be offered as a DEM.", check="reject", expect_failure="imagery", expect_class="imagery"))
     layers.append(Layer("4.2", G_SRV, "4.2 swisstopo WMTS — pixelkarte-farbe (imagery)", "wms",
                         wmts_uri("https://wmts.geo.admin.ch/EPSG/3857/1.0.0/WMTSCapabilities.xml",
                                  "ch.swisstopo.pixelkarte-farbe", tile_matrix_set="3857_19",
                                  style="ch.swisstopo.pixelkarte-farbe", fmt="image/jpeg",
                                  dimensions="Time=current"), "EPSG:3857",
-                        expect="Same as 4.1, through the WMTS code path.", check="reject",
+                        expect="Same as 4.1, through the WMTS code path.", check="reject", expect_failure="imagery",
                         expect_class="imagery"))
     layers.append(Layer("4.3", G_SRV, "4.3 NRW WCS — nw_dgm (elevation coverage, EPSG:25832)", "wcs",
                         wcs_uri("https://www.wcs.nrw.de/geobasis/wcs_nw_dgm", "nw_dgm",
@@ -1705,28 +1735,25 @@ def build_catalogue(cfg: Cfg) -> List[Layer]:
                                 "ImageServer/WMSServer", "3DEPElevation", crs="EPSG:4326",
                                 fmt="image/png"), "EPSG:4326",
                         expect="The same service as 4.4a, as a PICTURE. Its URL contains "
-                               "'elevation', so _classify_by_url calls it a DEM — but the bytes "
-                               "are a rendering, exactly like the 4.6 hillshade. Running terrain "
-                               "over it is the silent failure to catch. USA only.",
-                        check="reject",
+                               "'elevation', which used to be enough for _classify_by_url to "
+                               "call it a DEM — but the bytes are a rendering, exactly like the "
+                               "4.6 hillshade, and running terrain over it is the silent failure "
+                               "to catch. The provider kind decides now. USA only.",
+                        check="reject", expect_failure="imagery",
                         # This row existed to catch a live defect and shipped
                         # with expect_class blank, which made the runner skip
                         # the check — the one row aimed at the bug was the one
-                        # configured not to look. Measured on QGIS 3.44.7:
-                        # classify_raster_layer() returns "dem" and
-                        # dem_layer_warning() returns None, so the plugin offers
-                        # a rendered picture as terrain with no warning at all.
-                        expect_class="imagery",
-                        known_fail="_classify_by_url matches 'elevation' in "
-                                   "elevation.nationalmap.gov and returns 'dem' before the "
-                                   "rendered-provider guard can fire, so this WMS picture is "
-                                   "offered as a DEM with no warning. Open finding — this "
-                                   "turns green when the URL hints yield to the provider kind.",
-                        known_fail_checks=("classify", "classify.reject")))
+                        # configured not to look. The defect was that
+                        # _classify_by_url matched 'elevation' in
+                        # elevation.nationalmap.gov and returned 'dem' before
+                        # the rendered-provider guard could fire. The provider
+                        # kind decides now: a WMS hands back a picture whatever
+                        # its URL says, so this must classify as imagery.
+                        expect_class="imagery"))
     layers.append(Layer("4.5", G_SRV, "4.5 swisstopo WMS — pixelkarte-farbe (imagery)", "wms",
                         wms_uri("https://wms.geo.admin.ch/", "ch.swisstopo.pixelkarte-farbe",
                                 crs="EPSG:2056"), "EPSG:2056",
-                        expect="WMS imagery classification, free, no key.", check="reject",
+                        expect="WMS imagery classification, free, no key.", check="reject", expect_failure="imagery",
                         expect_class="imagery"))
     layers.append(Layer("4.6", G_SRV, "4.6 swisstopo WMS — swissALTI3D hillshade (THE TRAP)", "wms",
                         wms_uri("https://wms.geo.admin.ch/",
@@ -1734,7 +1761,7 @@ def build_catalogue(cfg: Cfg) -> List[Layer]:
                         "EPSG:2056",
                         expect="Looks like terrain, IS a rendered picture. The classifier must "
                                "call it imagery — picking it as a DEM is the exact silent "
-                               "failure the provider guard exists for.", check="reject",
+                               "failure the provider guard exists for.", check="reject", expect_failure="imagery",
                         expect_class="imagery"))
 
     # ---------------- §5 run matrix -----------------------------------------
@@ -3189,19 +3216,7 @@ render_check()
 
 def write_render_check(cfg: Cfg, layers: Sequence[Layer]) -> Path:
     """The check my own validation could not do: does each layer actually draw?"""
-    probes = {}
-    for case in RUN_MATRIX:
-        box = [case["west"], case["south"], case["east"], case["north"]]
-        if case["name"].startswith("NRW"):
-            probes["4.3"] = box
-        elif case["name"].startswith("Colorado"):
-            probes["4.4"] = box
-        elif case["name"].startswith("Los Angeles"):
-            probes["2.19"] = box
-        elif case["name"].startswith("Prague"):
-            probes["2.20"] = box
-        elif case["name"].startswith("Dead Sea"):
-            probes["2.4"] = box
+    probes = matrix_probes()
     path = cfg.out_dir / "qgis_console_render_check.py"
     empty = ", ".join(f"{l.row} ({l.expect})" if len(l.expect) < 40 else l.row
                       for l in layers if not l.expect_renders)
@@ -3769,7 +3784,9 @@ def write_checklist(cfg: Cfg, layers: Sequence[Layer], project: Path) -> Path:
     add("- [ ] **11.4** F1 — no vertical-datum handling: 45–55 m cross-source offsets in Europe.")
     add("- [ ] **11.5** F5 — no pre-flight against the ~3.86 GB atlas cap (warning sits at 50 GB).")
     add("- [ ] **11.6** F6 — pool has no lock, no atomic write; Cancel does not stop terrain.")
-    add("- [ ] **11.7** F7 — antimeridian and >85° unhandled (run-matrix case 'Fiji').")
+    add("- [ ] **11.7** F7 — >85° latitude unhandled. The ANTIMERIDIAN half is closed: "
+        "`plan` refuses a bbox outside [-180,180]x[-90,90] naming the crossing, and the "
+        "Map Converter aborts on any plan failure (run-matrix case 'Fiji').")
     add("- [ ] **11.8** F8 — grid square in degrees → E–W oversampled by 1/cos(lat).")
     add("- [ ] **11.9** Checkerboard energy on real alpine terrain sits near **8.7 %** even")
     add("  in an ideal pipeline — intrinsic to a running-max horizon test. Do not chase it to zero.")
@@ -3968,6 +3985,26 @@ def write_readme(cfg: Cfg, layers: Sequence[Layer], project: Path) -> Path:
     return path
 
 
+def _fill_matrix_footprints(layers: Sequence[Layer]) -> None:
+    """Give every row named by :data:`MATRIX_GROUND` the ground it belongs on.
+
+    :func:`_write_footprints` measures the real extent of every LOCAL raster
+    and is left to do exactly that — a hand-drawn run-matrix box is never an
+    improvement on a measured one, and row 5.0 outlines what it measured. This
+    fills the rows it cannot reach: a server row has no file to open, so it
+    kept an empty footprint and the torture runner placed its test tile over
+    the reference AOI instead of over the service's own ground.
+    """
+    probes = matrix_probes()
+    for lyr in layers:
+        if lyr.footprint or (lyr.kind == "raster" and lyr.provider == "gdal"):
+            continue
+        box = next((b for prefix, b in probes.items()
+                    if lyr.row.startswith(prefix)), None)
+        if box is not None:
+            lyr.footprint = tuple(box)
+
+
 def _write_footprints(cfg: Cfg, layers: Sequence[Layer]) -> Optional[Path]:
     """One polygon per local raster, so "where is row 2.19?" is a click.
 
@@ -4052,12 +4089,86 @@ def _write_footprints(cfg: Cfg, layers: Sequence[Layer]) -> Optional[Path]:
     return path
 
 
+
+#: Per-row pipeline calibration — part of the CATALOGUE, kept in one table
+#: because it was measured in one sitting (the 2026-08-25 full run) rather
+#: than invented per row. `real` is the expect_real_pct floor; `agrees`
+#: adds expect_agrees_m against the reference source (only meaningful for
+#: rows whose pipeline ground is the Bern probe at 30 m); `elev` is the
+#: plausible band at the row's own probe point.
+#:
+#: Deliberately absent: 2.4 (offset fixture, its values are its own), 2.19
+#: (scaled fixture), 2.9 (a different surface section — probe 632 m vs the
+#: reference's 554.5 m is the fixture, not a fault). Rows 2.10-2.12 keep the
+#: Bern band although their probe pixel is currently VOID — that the
+#: transmitter stands in a hole is a real finding for the suite to report.
+PIPELINE_CALIBRATION = {
+    "1.1":  {"real": 99.0},
+    "1.2":  {"real": 99.0},
+    "1.3a": {"real": 99.0},
+    "1.3b": {"real": 99.0},
+    "1.10": {"real": 99.0},
+    "2.1":  {"real": 99.0, "elev": (300.0, 4600.0)},
+    "2.17": {"real": 99.0, "elev": (300.0, 4600.0)},
+    "2.23": {"real": 99.0, "elev": (300.0, 4600.0)},
+    "2.2":  {"real": 4.0, "agrees": 25.0, "elev": (200.0, 2600.0)},
+    "2.3":  {"real": 4.0, "agrees": 25.0, "elev": (200.0, 2600.0)},
+    "2.4":  {"real": 7.0},
+    "2.5":  {"real": 4.0, "agrees": 25.0, "elev": (200.0, 2600.0)},
+    "2.6":  {"real": 4.0, "agrees": 25.0, "elev": (200.0, 2600.0)},
+    "2.7":  {"real": 4.0, "agrees": 25.0, "elev": (200.0, 2600.0)},
+    "2.8":  {"real": 4.0, "agrees": 25.0, "elev": (200.0, 2600.0)},
+    "2.9":  {"real": 9.0, "elev": (200.0, 2600.0)},
+    "2.10": {"real": 4.0, "elev": (200.0, 2600.0)},
+    "2.11": {"real": 4.0, "elev": (200.0, 2600.0)},
+    "2.12": {"real": 4.0, "elev": (200.0, 2600.0)},
+    "2.13": {"real": 4.0, "agrees": 25.0, "elev": (200.0, 2600.0)},
+    "2.14": {"real": 4.0, "agrees": 25.0, "elev": (200.0, 2600.0)},
+    "2.15": {"real": 4.0, "agrees": 25.0, "elev": (200.0, 2600.0)},
+    "2.18": {"real": 4.0, "agrees": 25.0, "elev": (200.0, 2600.0)},
+    "2.19": {"real": 23.0},
+    "2.21": {"real": 4.0, "agrees": 25.0, "elev": (200.0, 2600.0)},
+    "2.22": {"real": 4.0, "agrees": 25.0, "elev": (200.0, 2600.0)},
+    "2.24": {"real": 4.0, "agrees": 25.0, "elev": (200.0, 2600.0)},
+    "2.25": {"real": 4.0, "agrees": 25.0, "elev": (200.0, 2600.0)},
+    "2.26": {"real": 4.0, "agrees": 25.0, "elev": (200.0, 2600.0)},
+    "4.3":  {"real": 99.0, "elev": (-50.0, 500.0)},
+}
+
+#: The coverage-disk default for a full-circle pipeline run. The geometric
+#: disk is ~78.5% of the square; terrain edges and the engine's own margin
+#: move it a few points either way. Rows may override in the table above.
+DEFAULT_COV_VALID_PCT = (65.0, 85.0)
+
+
+def calibrate_pipeline_expectations(layers: Sequence[Layer]) -> None:
+    """Fold the calibration table into the rows, and default what remains.
+
+    Every `check: both` raster row leaves here with a coverage-disk band and
+    with whatever floors the table declares. Applied in the generator so the
+    manifest, the checklist and the runner can never disagree.
+    """
+    for lyr in layers:
+        cal = PIPELINE_CALIBRATION.get(lyr.row, {})
+        if cal.get("real") and not lyr.expect_real_pct:
+            lyr.expect_real_pct = float(cal["real"])
+        if cal.get("agrees") and not lyr.expect_agrees_m:
+            lyr.expect_agrees_m = float(cal["agrees"])
+        if cal.get("elev") and not lyr.expect_elev_m:
+            lyr.expect_elev_m = tuple(cal["elev"])
+        if (lyr.kind == "raster" and lyr.check == "both"
+                and not lyr.expect_cov_valid_pct):
+            band = cal.get("cov") or DEFAULT_COV_VALID_PCT
+            lyr.expect_cov_valid_pct = tuple(band)
+
+
 def write_manifest(cfg: Cfg, layers: Sequence[Layer], project: Path) -> Path:
     """Machine-readable form of the catalogue, for tools/torture_runner.py.
 
     The expectations live with the rows that define them, so an automated run
     and the human checklist can never disagree about what a row should do.
     """
+    calibrate_pipeline_expectations(layers)
     rows = []
     for lyr in layers:
         rows.append({
@@ -4086,6 +4197,8 @@ def write_manifest(cfg: Cfg, layers: Sequence[Layer], project: Path) -> Path:
             "pipeline_res_m": lyr.pipeline_res_m,
             "pipeline_range_km": lyr.pipeline_range_km,
             "expect_agrees_m": lyr.expect_agrees_m,
+            "expect_real_pct": lyr.expect_real_pct,
+            "expect_cov_valid_pct": list(lyr.expect_cov_valid_pct),
             "footprint": list(lyr.footprint),
             "known_fail": lyr.known_fail,
             "known_fail_checks": list(lyr.known_fail_checks),
@@ -4135,6 +4248,7 @@ def stage_project(cfg: Cfg) -> None:
     print("\n== project ==")
     cfg.out_dir.mkdir(parents=True, exist_ok=True)
     layers = build_catalogue(cfg)
+    _fill_matrix_footprints(layers)
     if _write_footprints(cfg, layers) is not None:
         layers.append(Layer(
             "5.0", G_RUN, "5.0 Fixture footprints — where every local raster sits", "ogr",

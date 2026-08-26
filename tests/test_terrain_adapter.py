@@ -588,7 +588,7 @@ class TestPoolReuse(unittest.TestCase):
             fetched.append([t["filename"] for t in subtiles])
             for t in subtiles:
                 _write_pool_abt(os.path.join(pool, t["filename"]))
-            return True
+            return ta.DownloadOutcome(True)
 
         with mock.patch.object(ta, "get_cache_dir", return_value=root), \
              mock.patch.object(ta, "_try_rust_download",
@@ -690,7 +690,7 @@ class TestBuildingsCacheIdentity(unittest.TestCase):
             fetched.append(len(subtiles))
             for t in subtiles:
                 _write_pool_abt(os.path.join(pool, t["filename"]))
-            return True
+            return ta.DownloadOutcome(True)
 
         with tempfile.TemporaryDirectory() as root:
             with mock.patch.object(ta, "get_cache_dir", return_value=root), \
@@ -1482,6 +1482,21 @@ class TestXyzEncoding(unittest.TestCase):
         src = f"type=xyz&interpretation=terrarium&url={_MAPBOX_URL}"
         self.assertEqual(ta.xyz_encoding(src), ta.ENCODING_TERRARIUM)
 
+    def test_the_two_tokens_qgis_actually_writes_are_understood(self):
+        # Measured on QGIS 3.44.7: `terrariumterrain` and `maptilerterrain` are
+        # the ONLY values it honours, and `maptilerterrain` is its name for the
+        # Mapbox Terrain-RGB family. Read as a substring it matched neither
+        # "mapbox" nor "terrarium", so the plugin fell back to Terrarium and
+        # decoded Terrain-RGB ground to about -32350 m — on a layer QGIS was
+        # drawing correctly as elevation.
+        src = f"type=xyz&interpretation=maptilerterrain&url={_ANON_URL}"
+        self.assertEqual(ta.xyz_encoding(src), ta.ENCODING_MAPBOX)
+        src = f"type=xyz&interpretation=terrariumterrain&url={_ANON_URL}"
+        self.assertEqual(ta.xyz_encoding(src), ta.ENCODING_TERRARIUM)
+        # ...and it still beats a URL that says otherwise.
+        src = f"type=xyz&interpretation=maptilerterrain&url={_MAPZEN_URL}"
+        self.assertEqual(ta.xyz_encoding(src), ta.ENCODING_MAPBOX)
+
     def test_url_naming_neither_family_is_undecided(self):
         self.assertIsNone(ta.xyz_encoding(f"type=xyz&url={_ANON_URL}"))
 
@@ -1615,13 +1630,13 @@ class TestTotalDownloadFailureIsDistinct(unittest.TestCase):
 
     _SPECS = [{"filename": "tile_a.abt"}, {"filename": "tile_b.abt"}]
 
-    def _run_group(self, ok, total, pool):
+    def _run_group(self, ok, total, pool, lines=None):
         logged = []
         calls = []
 
         def run_pass(specs, conn, zoom):
             calls.append((len(specs), conn, zoom))
-            return 0, ok, total
+            return 0, ok, total, list(lines or [])
 
         with mock.patch.object(ta, "_log", side_effect=logged.append):
             result = ta._download_zoom_group(
@@ -1638,8 +1653,12 @@ class TestTotalDownloadFailureIsDistinct(unittest.TestCase):
         self.assertIn("flat 0 m terrain", text)
         # Retrying at half the connections cannot fix a 404 for everything.
         self.assertEqual(len(calls), 1)
-        # And none of it may be left cached as a valid tile.
-        self.assertEqual(flags, ["tile_a.abt.rebuild", "tile_b.abt.rebuild"])
+        # And none of it may be left in the pool AT ALL. Flagging is not
+        # enough: the engine pads every tile to full size before it decides the
+        # run failed, so what is on disk is a complete, readable .abt of 0 m
+        # terrain, and a flagged tile is still linked into a run and still read
+        # straight off the pool by anything that walks it.
+        self.assertEqual(flags, [])
 
     def test_a_partial_failure_still_reads_as_partial(self):
         with tempfile.TemporaryDirectory() as pool:
@@ -1676,7 +1695,8 @@ class TestBuildingDownloadResultIsChecked(unittest.TestCase):
         with tempfile.TemporaryDirectory() as root:
             with mock.patch.object(ta, "get_cache_dir", return_value=root), \
                  mock.patch.object(ta, "_log", side_effect=logged.append), \
-                 mock.patch.object(ta, "_try_rust_download", return_value=True), \
+                 mock.patch.object(ta, "_try_rust_download",
+                                   return_value=ta.DownloadOutcome(True)), \
                  mock.patch.object(ofm, "download_building_tiles",
                                    return_value=download_result), \
                  mock.patch.object(ofm, "tiles_for_bbox",
@@ -2376,7 +2396,7 @@ class TestEnsurePoolTiles(unittest.TestCase):
             self.assertIsNone(pbf_dir, "pool must stay pure terrain")
             for t in subtiles:
                 _write_pool_abt(os.path.join(pool, t["filename"]))
-            return True
+            return ta.DownloadOutcome(True)
 
         with tempfile.TemporaryDirectory() as root:
             with mock.patch.object(ta, "get_cache_dir", return_value=root), \
@@ -2391,8 +2411,9 @@ class TestEnsurePoolTiles(unittest.TestCase):
     def test_failed_download_is_a_hard_error(self):
         with tempfile.TemporaryDirectory() as root:
             with mock.patch.object(ta, "get_cache_dir", return_value=root), \
-                 mock.patch.object(ta, "_try_rust_download",
-                                   return_value=False):
+                 mock.patch.object(
+                     ta, "_try_rust_download",
+                     return_value=ta.DownloadOutcome(False, "")):
                 with self.assertRaises(RuntimeError) as caught:
                     ta.ensure_pool_tiles(_XYZ_SOURCE, self.SPEC, 30)
         self.assertIn("download failed", str(caught.exception).lower())
@@ -2403,7 +2424,7 @@ class TestEnsurePoolTiles(unittest.TestCase):
         with tempfile.TemporaryDirectory() as root:
             with mock.patch.object(ta, "get_cache_dir", return_value=root), \
                  mock.patch.object(ta, "_try_rust_download",
-                                   return_value=True):
+                                   return_value=ta.DownloadOutcome(True)):
                 with self.assertRaises(RuntimeError) as caught:
                     ta.ensure_pool_tiles(_XYZ_SOURCE, self.SPEC, 30)
         self.assertIn(self.SPEC[0]["filename"], str(caught.exception))
@@ -2466,7 +2487,7 @@ class TestDownloadCancellation(unittest.TestCase):
             seen["on_start"] = on_start
             for t in subtiles:
                 _write_pool_abt(os.path.join(pool, t["filename"]))
-            return True
+            return ta.DownloadOutcome(True)
 
         spec = [{"filename": "tile_N48.00E8.00_30m.abt", "ul_lat": 48.0,
                  "ul_lon": 8.0, "size_px": 64, "exact_res_m": 30.0}]
@@ -2499,7 +2520,7 @@ class TestFeedbackProgressSubSpan(unittest.TestCase):
                 progress_cb(1.0, "done")
             for t in subtiles:
                 _write_pool_abt(os.path.join(pool, t["filename"]))
-            return True
+            return ta.DownloadOutcome(True)
 
         with tempfile.TemporaryDirectory() as root:
             with mock.patch.object(ta, "get_cache_dir", return_value=root), \
@@ -2525,3 +2546,402 @@ class TestFeedbackProgressSubSpan(unittest.TestCase):
         captured = self._prepare(None, feedback)
         self.assertIsNone(captured["progress_cb"])
         feedback.setProgress.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# A failed download says WHY, and leaves nothing behind (torture 1.4 / 1.6)
+# ---------------------------------------------------------------------------
+
+#: What `aether_converter download` really prints for torture row 1.4: a
+#: MapTiler layer that serves WebP to the toolkit's PNG-only decoder.
+_WEBP_FAILURE = [
+    "[Download] 100% (4/4) — 0.4 MB/s, 4 errors, 0 in-flight",
+    "[Stats] Tiles: 0/4 OK (0.0% success)",
+    "[Stats] ERRORS (4): decode=4",
+    "Error: 4 tile(s) failed to decode",
+    "Caused by: unsupported image format (the decoder reads PNG only)",
+]
+
+
+class TestDownloadFailureDetail(unittest.TestCase):
+    """The engine's diagnosis, not the plugin's guess."""
+
+    def test_the_cause_lines_are_picked_out(self):
+        detail = ta._download_failure_detail(_WEBP_FAILURE)
+        self.assertIn("decode=4", detail)
+        self.assertIn("Error: 4 tile(s) failed to decode", detail)
+        self.assertIn("Caused by:", detail)
+        # Progress is not a cause.
+        self.assertNotIn("[Download]", detail)
+        self.assertNotIn("Tiles: 0/4 OK", detail)
+
+    def test_it_falls_back_to_the_tail(self):
+        lines = [f"[Download] {i}% (…)" for i in range(20)]
+        self.assertEqual(ta._download_failure_detail(lines, keep=3).splitlines(),
+                         lines[-3:])
+
+    def test_no_output_at_all_is_empty(self):
+        self.assertEqual(ta._download_failure_detail([]), "")
+
+
+class TestFailedDownloadIsReportedAndCachesNothing(unittest.TestCase):
+    """Torture rows 1.4 and 1.6, through the shared acquisition entry point.
+
+    1.4: "fail loudly NAMING THE DECODE ERROR" — a generic "tiles could not be
+    fetched" sends the user to look at their network instead of the codec.
+    1.6: "hard error, NOTHING CACHED, no flat-0 terrain" — the engine pads
+    every output tile to full size BEFORE it decides the run failed, so a
+    complete, valid .abt of 0 m terrain is left on disk; the next run reports a
+    pool HIT and builds a confident coverage over flat sea.
+    """
+
+    SPEC = [{"filename": "tile_N48.00E8.00_30m.abt", "ul_lat": 48.0,
+             "ul_lon": 8.0, "size_px": 64, "exact_res_m": 30.0},
+            {"filename": "tile_N48.00E8.50_30m.abt", "ul_lat": 48.0,
+             "ul_lon": 8.5, "size_px": 64, "exact_res_m": 30.0}]
+
+    def _fake_once(self, rc, lines, calls):
+        def fake_once(exe, job_file, on_line=None, **_kw):
+            with open(job_file) as fh:
+                job = json.load(fh)
+            calls.append(len(job["tiles"]))
+            # Exactly what the engine leaves behind: every output tile padded
+            # to full size, written, and only THEN the run declared failed.
+            for spec in job["tiles"]:
+                _write_pool_abt(os.path.join(job["output_dir"],
+                                             spec["filename"]))
+            return rc, list(lines)
+        return fake_once
+
+    def _run(self, root, rc, lines=_WEBP_FAILURE, calls=None):
+        bm = mock.Mock()
+        bm.find_binary.return_value = "aether_converter"
+        once = self._fake_once(rc, lines, calls if calls is not None else [])
+        with mock.patch.object(ta, "get_cache_dir", return_value=root), \
+             mock.patch.object(ta, "_run_converter_download_once",
+                               side_effect=once):
+            pool = ta._pool_dir(_XYZ_SOURCE)
+            with self.assertRaises(RuntimeError) as caught:
+                ta.ensure_pool_tiles(_XYZ_SOURCE, self.SPEC, 30,
+                                     binary_manager=bm)
+        return str(caught.exception), pool
+
+    def test_the_error_names_the_decode_failure(self):
+        with tempfile.TemporaryDirectory() as root:
+            said, _pool = self._run(root, rc=1)
+        # Verbatim what torture row 1.4 asserts (expect_failure="decode").
+        self.assertIn("decode", said)
+        self.assertIn("download failed", said.lower())
+
+    def test_an_engine_that_exits_0_with_nothing_fetched_also_says_why(self):
+        with tempfile.TemporaryDirectory() as root:
+            said, _pool = self._run(root, rc=0)
+        self.assertIn("decode", said)
+
+    def test_a_silent_engine_still_fails_loudly(self):
+        with tempfile.TemporaryDirectory() as root:
+            said, _pool = self._run(root, rc=1, lines=[])
+        self.assertIn("download failed", said.lower())
+        self.assertIn("exit 1", said)
+
+    def test_the_failure_leaves_no_tile_in_the_pool(self):
+        with tempfile.TemporaryDirectory() as root:
+            _said, pool = self._run(root, rc=1)
+            left = sorted(os.listdir(pool))
+        self.assertEqual(left, [], f"the failed run cached {left}")
+
+    def test_an_exit_0_zero_tile_run_leaves_no_tile_either(self):
+        with tempfile.TemporaryDirectory() as root:
+            _said, pool = self._run(root, rc=0)
+            left = sorted(os.listdir(pool))
+        self.assertEqual(left, [], f"the failed run cached {left}")
+
+    def test_the_next_run_downloads_again_instead_of_hitting_the_pool(self):
+        # The half that turns a one-off failure into a permanent one: a
+        # flagged-but-whole tile is still a tile, and _tile_ready is not the
+        # only thing that reads the pool.
+        calls = []
+        with tempfile.TemporaryDirectory() as root:
+            self._run(root, rc=1, calls=calls)
+            self._run(root, rc=1, calls=calls)
+        self.assertEqual(calls, [2, 2], "the second run reused failed tiles")
+
+
+class TestDropPoolTiles(unittest.TestCase):
+
+    def test_the_tile_and_its_flag_are_both_removed(self):
+        with tempfile.TemporaryDirectory() as d:
+            _write_pool_abt(os.path.join(d, "a.abt"))
+            ta._set_rebuild_flags(d, ["a.abt"], {"a.abt"})
+            self.assertEqual(ta._drop_pool_tiles(d, ["a.abt"]), 1)
+            self.assertEqual(os.listdir(d), [])
+
+    def test_a_tile_that_was_never_written_is_not_counted(self):
+        with tempfile.TemporaryDirectory() as d:
+            self.assertEqual(ta._drop_pool_tiles(d, ["missing.abt"]), 0)
+
+    def test_only_the_named_tiles_go(self):
+        with tempfile.TemporaryDirectory() as d:
+            _write_pool_abt(os.path.join(d, "a.abt"))
+            _write_pool_abt(os.path.join(d, "b.abt"))
+            ta._drop_pool_tiles(d, ["a.abt"])
+            self.assertEqual(sorted(os.listdir(d)), ["b.abt"])
+
+
+# ---------------------------------------------------------------------------
+# prepare_terrain — buildings_file must REACH the converter (torture §3)
+# ---------------------------------------------------------------------------
+
+class _PrepareWithBuildings:
+    """One prepare_terrain run over an XYZ layer plus a buildings source.
+
+    The conversion itself is mocked here (conftest stubs GDAL for the whole
+    session); test_buildings_source.py converts real files with real GDAL.
+    """
+
+    def _prepare(self, root, buildings_file, converted=None,
+                 out_lines=(), readable=True):
+        """Run prepare_terrain over an XYZ layer + buildings; capture the jobs."""
+        layer = mock.Mock()
+        layer.source.return_value = _XYZ_SOURCE
+        bm = mock.Mock()
+        bm.find_binary.return_value = "aether_converter"
+        jobs, logged, resolved = [], [], []
+
+        def fake_resolve(path, src_crs="", log=None):
+            resolved.append((path, src_crs))
+            return converted if converted is not None else path
+
+        def fake_export(dem_layer, dest, bbox, resolution_m):
+            with open(dest, "wb") as fh:
+                fh.write(b"\0" * 8)
+
+        def fake_run_converter(exe, job_file):
+            with open(job_file) as fh:
+                jobs.extend(json.load(fh))
+            for job in jobs:
+                _write_pool_abt(job["output_path"])
+            return list(out_lines)
+
+        from waveshed.core import buildings_source as bsrc
+        with mock.patch.object(ta, "get_cache_dir", return_value=root), \
+             mock.patch.object(ta, "_log", side_effect=logged.append), \
+             mock.patch.object(bsrc, "resolve_buildings_source",
+                               side_effect=fake_resolve), \
+             mock.patch.object(bsrc, "is_converter_readable",
+                               return_value=readable), \
+             mock.patch.object(ta, "_export_via_qgis",
+                               side_effect=fake_export), \
+             mock.patch.object(ta, "_run_converter",
+                               side_effect=fake_run_converter):
+            view = ta.prepare_terrain(layer, 47.4, 8.5, 5.0, 30, bm,
+                                      buildings_file=buildings_file)
+        # The pool the run really used, straight off the jobs it wrote.
+        pool = os.path.dirname(jobs[0]["output_path"]) if jobs else None
+        return {"jobs": jobs, "log": "\n".join(logged), "resolved": resolved,
+                "view": view, "pool": pool}
+
+    @staticmethod
+    def _pool_for(root, buildings):
+        """The pool identity a run with *buildings* would land on."""
+        with mock.patch.object(ta, "get_cache_dir", return_value=root):
+            return ta._pool_dir(_XYZ_SOURCE, ta.buildings_identity(buildings))
+
+    @staticmethod
+    def _flags(out):
+        return sorted(n for n in os.listdir(out["pool"])
+                      if n.endswith(ta._REBUILD_SUFFIX))
+
+    @staticmethod
+    def _tiles(out):
+        return sorted(n for n in os.listdir(out["pool"]) if n.endswith(".abt"))
+
+
+class TestPrepareTerrainResolvesBuildings(_PrepareWithBuildings,
+                                          unittest.TestCase):
+    """Every caller of prepare_terrain gets the Map Converter's conversion.
+
+    The converter reads FlatGeobuf only, so a .geojson/.shp/"|layername=" URI
+    handed over raw is one `[Warn]` line, exit 0, and terrain with no buildings
+    on it.
+    """
+
+    def test_a_geojson_reaches_the_converter_as_an_fgb(self):
+        with tempfile.TemporaryDirectory() as root:
+            fgb = os.path.join(root, "osm_bern_ab12.fgb")
+            open(fgb, "wb").close()
+            out = self._prepare(root, "/data/osm_bern.geojson", converted=fgb)
+        self.assertEqual(out["resolved"], [("/data/osm_bern.geojson", "")])
+        self.assertTrue(out["jobs"])
+        for job in out["jobs"]:
+            self.assertEqual(job["buildings_file"], os.path.abspath(fgb))
+
+    def test_a_sublayer_uri_never_reaches_the_converter(self):
+        # File::open("/d/multi.gpkg|layername=buildings") is ENOENT.
+        with tempfile.TemporaryDirectory() as root:
+            fgb = os.path.join(root, "multi_cd34.fgb")
+            open(fgb, "wb").close()
+            out = self._prepare(root, "/d/multi.gpkg|layername=buildings",
+                                converted=fgb)
+        for job in out["jobs"]:
+            self.assertNotIn("|", job["buildings_file"])
+
+    def test_the_cache_identity_fingerprints_the_converted_file(self):
+        # The identity is computed AFTER the resolution, so two sources that
+        # convert to the same .fgb share a pool and a source that converts to a
+        # different one does not.
+        with tempfile.TemporaryDirectory() as root:
+            fgb = os.path.join(root, "b_ab12.fgb")
+            with open(fgb, "wb") as fh:
+                fh.write(b"x")
+            out = self._prepare(root, "/data/osm_bern.geojson", converted=fgb)
+            self.assertEqual(out["pool"], self._pool_for(root, fgb))
+            self.assertNotEqual(out["pool"],
+                                self._pool_for(root, "/data/osm_bern.geojson"))
+
+    def test_no_buildings_means_no_resolution_and_no_field(self):
+        with tempfile.TemporaryDirectory() as root:
+            out = self._prepare(root, None)
+        self.assertEqual(out["resolved"], [])
+        for job in out["jobs"]:
+            self.assertNotIn("buildings_file", job)
+
+
+class TestBuildingsRequestedButNotApplied(_PrepareWithBuildings,
+                                         unittest.TestCase):
+    """The identity claims buildings; the tiles must really carry them.
+
+    `buildings_missing` already existed for OpenFreeMap. A `buildings_file`
+    that the converter could not use took the same tiles down the same path
+    and reported success.
+    """
+
+    def test_a_clean_run_leaves_the_tiles_pooled(self):
+        with tempfile.TemporaryDirectory() as root:
+            fgb = os.path.join(root, "b.fgb")
+            open(fgb, "wb").close()
+            out = self._prepare(root, fgb, out_lines=["[Info] 1 tile(s)"])
+            flags, tiles = self._flags(out), self._tiles(out)
+        self.assertTrue(tiles)
+        self.assertEqual(flags, [])
+
+    def test_a_converter_complaint_flags_every_tile(self):
+        # ingest.rs: `[Warn] Failed to apply buildings: {e}` — then exit 0.
+        with tempfile.TemporaryDirectory() as root:
+            fgb = os.path.join(root, "b.fgb")
+            open(fgb, "wb").close()
+            out = self._prepare(root, fgb, out_lines=[
+                "[Warn] Failed to apply buildings: Missing magic bytes. "
+                "Is this an fgb file?"])
+            flags, tiles = self._flags(out), self._tiles(out)
+        self.assertTrue(tiles)
+        self.assertEqual(len(flags), len(tiles),
+                         "a tile without its buildings was left reusable")
+        self.assertIn("could not apply the buildings file", out["log"])
+
+    def test_an_unreadable_source_flags_every_tile(self):
+        # Nothing converted it, so the burn cannot happen — known before the
+        # converter even runs.
+        with tempfile.TemporaryDirectory() as root:
+            out = self._prepare(root, "/data/osm_bern.geojson", readable=False)
+            flags, tiles = self._flags(out), self._tiles(out)
+        self.assertTrue(tiles)
+        self.assertEqual(len(flags), len(tiles))
+        self.assertIn("reads FlatGeobuf only", out["log"])
+
+    def test_a_burn_that_raised_nothing_flags_every_tile(self):
+        # ingest.rs `apply_buildings` reports every burn. A source it can read
+        # whose features carry no usable height opens fine, draws nothing and
+        # exits 0 — which is exactly what five torture rows measured.
+        with tempfile.TemporaryDirectory() as root:
+            fgb = os.path.join(root, "b.fgb")
+            open(fgb, "wb").close()
+            out = self._prepare(root, fgb, out_lines=[
+                "[Buildings] b.fgb: 7,233 polygon feature(s) -> 7,233 "
+                "footprint(s), 0 with a height from the data (0 at the 6 m "
+                "default), 0 drawn, 0 px raised - the surface is unchanged"])
+            flags, tiles = self._flags(out), self._tiles(out)
+        self.assertTrue(tiles)
+        self.assertEqual(len(flags), len(tiles),
+                         "a tile whose burn drew nothing was left reusable")
+        self.assertIn("raised no pixel on any tile", out["log"])
+
+    def test_one_empty_tile_among_raised_ones_is_ordinary(self):
+        # The edge tiles of any area lie outside the footprints. Judging this
+        # per tile would flag every ordinary multi-tile run for rebuild.
+        with tempfile.TemporaryDirectory() as root:
+            fgb = os.path.join(root, "b.fgb")
+            open(fgb, "wb").close()
+            out = self._prepare(root, fgb, out_lines=[
+                "[Buildings] b.fgb: 0 polygon feature(s) in this tile's "
+                "extent, no footprint to draw",
+                "[Buildings] b.fgb: 7,233 polygon feature(s) -> 7,233 "
+                "footprint(s), 2,043 with a height from the data (5,190 at "
+                "the 6 m default), 6,470 drawn, 23,601 px raised"])
+            flags, tiles = self._flags(out), self._tiles(out)
+        self.assertTrue(tiles)
+        self.assertEqual(flags, [])
+
+    def test_an_engine_that_reports_nothing_is_not_read_either_way(self):
+        # Older builds printed nothing at all on a successful burn. Silence is
+        # not evidence of failure, and treating it as such would flag every
+        # run against a deployed older engine.
+        with tempfile.TemporaryDirectory() as root:
+            fgb = os.path.join(root, "b.fgb")
+            open(fgb, "wb").close()
+            out = self._prepare(root, fgb, out_lines=["[Rust] Progress: 1/1"])
+            flags = self._flags(out)
+        self.assertEqual(flags, [])
+
+    def test_the_next_run_rebuilds_instead_of_claiming_success(self):
+        with tempfile.TemporaryDirectory() as root:
+            fgb = os.path.join(root, "b.fgb")
+            open(fgb, "wb").close()
+            complaint = ["[Warn] Failed to apply buildings: no such file"]
+            first = self._prepare(root, fgb, out_lines=complaint)
+            second = self._prepare(root, fgb, out_lines=complaint)
+        self.assertTrue(first["jobs"] and second["jobs"],
+                        "the second run hit the cache and skipped the burn")
+
+
+class TestImageryIsRefusedAsTerrain(unittest.TestCase):
+    """prepare_terrain draws the imagery line for every caller (torture §4).
+
+    The Map Converter router refuses imagery itself; Site Analysis, P2P and
+    both Processing algorithms all come through prepare_terrain, which used
+    to have no verdict at all — a WMS basemap went straight to the per-tile
+    QGIS export and its colour bytes were ingested as metres.
+    """
+
+    def test_imagery_layer_is_a_hard_error_before_any_work(self):
+        layer = mock.Mock()
+        layer.name.return_value = "pixelkarte"
+        layer.source.return_value = (
+            "crs=EPSG:2056&format=image/png&layers=pixelkarte"
+            "&url=https://wms.example/")
+        with mock.patch.object(ta, "classify_raster_layer",
+                               return_value="imagery"), \
+             mock.patch.object(ta, "_export_via_qgis") as export:
+            with self.assertRaises(RuntimeError) as caught:
+                ta.prepare_terrain(layer, 47.4, 8.5, 3.0, 30, mock.Mock())
+        msg = str(caught.exception)
+        self.assertIn("pixelkarte", msg)
+        self.assertIn("imagery, not elevation", msg)
+        export.assert_not_called()
+
+    def test_the_verdict_does_not_block_a_terrain_dir_run(self):
+        # With a usable terrain directory the layer is not the source, so
+        # even an imagery verdict on it must not stop the run.
+        layer = mock.Mock()
+        layer.name.return_value = "pixelkarte"
+        layer.source.return_value = "url=https://wms.example/"
+        with tempfile.TemporaryDirectory() as tdir, \
+             mock.patch.object(ta, "classify_raster_layer",
+                               return_value="imagery") as classify, \
+             mock.patch.object(ta, "is_abt_tile_dir", return_value=True), \
+             mock.patch.object(ta, "list_abt_tiles", return_value=["a.abt"]), \
+             mock.patch.object(ta, "_abt_coverage_warning", return_value=""):
+            out = ta.prepare_terrain(layer, 47.4, 8.5, 3.0, 30, mock.Mock(),
+                                     terrain_dir=tdir)
+        self.assertEqual(out, tdir)
+        classify.assert_not_called()

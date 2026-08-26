@@ -27,9 +27,11 @@ import subprocess
 import tempfile
 import time
 import urllib.parse
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, NamedTuple, Optional, Tuple
 
 from osgeo import gdal
+
+from .layer_utils import classify_raster_layer
 
 _SUBPROCESS_FLAGS = (
     subprocess.CREATE_NO_WINDOW if platform.system() == "Windows" else 0
@@ -401,19 +403,37 @@ def _xyz_encoding_hints(url_template: str) -> Tuple[bool, bool]:
     return mapbox, terrarium
 
 
+#: The ONLY two values QGIS itself honours in ``interpretation=`` (measured on
+#: 3.44.7 — ``terrarium``, ``mapboxterrain``, ``terrainrgb`` and the rest are
+#: silently ignored and the layer stays an ARGB32 picture).  Note QGIS's name
+#: for the Mapbox Terrain-RGB family is ``maptilerterrain``, which contains
+#: neither "mapbox" nor "terrarium": read as a substring it matched nothing,
+#: the plugin fell back to Terrarium, and the ground decoded to about
+#: -32350 m — on a layer QGIS was drawing as correct elevation.
+_QGIS_INTERPRETATION = {
+    "terrariumterrain": ENCODING_TERRARIUM,
+    "maptilerterrain": ENCODING_MAPBOX,
+}
+
+
 def xyz_encoding(source: str) -> Optional[str]:
     """Elevation encoding an XYZ URI pins itself to, or None if it pins none.
 
-    ``interpretation=`` wins when QGIS wrote one (``terrarium`` /
-    ``mapboxterrain``); otherwise the URL template decides.  None means the URI
-    is undecided — either it names no known service at all, or it names both
-    families at once.  :func:`resolve_xyz_encoding` turns that into a default
-    or an error; :func:`source_identity` turns it into the historical default
-    so a URI that is later disambiguated lands on the same pool.
+    ``interpretation=`` wins when QGIS wrote one; otherwise the URL template
+    decides.  None means the URI is undecided — either it names no known
+    service at all, or it names both families at once.
+    :func:`resolve_xyz_encoding` turns that into a default or an error;
+    :func:`source_identity` turns it into the historical default so a URI that
+    is later disambiguated lands on the same pool.
     """
     params = dict(urllib.parse.parse_qsl(source))
     interpretation = params.get("interpretation", "").lower()
-    if "mapbox" in interpretation:
+    known = _QGIS_INTERPRETATION.get(interpretation)
+    if known is not None:
+        return known
+    # A hand-written value QGIS ignores still says what the user meant, and
+    # the plugin can honour it even where the canvas will not.
+    if "mapbox" in interpretation or "maptiler" in interpretation:
         return ENCODING_MAPBOX
     if "terrarium" in interpretation:
         return ENCODING_TERRARIUM
@@ -740,6 +760,38 @@ def _set_rebuild_flags(pool_dir: str, names: List[str],
                 os.remove(path)
         except OSError:
             pass
+
+
+def _drop_pool_tiles(pool_dir: str, names: List[str]) -> int:
+    """Remove tiles *names* (and their rebuild flags) from the pool.
+
+    A failed download does NOT leave a half-written file behind: the engine
+    pads every output tile to its full size before it decides the run failed,
+    so what is on disk is a complete, valid, perfectly readable .abt of 0 m
+    terrain. Flagging it for rebuild is not enough — ``_sync_view`` links a
+    flagged tile into the run anyway (a gapped tile still holds usable
+    terrain), and anything reading the pool directly sees a whole tile. The
+    only way a failure cannot be mistaken for sea level is for the file not to
+    be there.
+
+    Safe because every caller only ever downloads tiles that were NOT already
+    usable in the pool (``_tile_ready`` filtered them), so a previously good
+    pooled tile can never be in *names*.
+
+    Returns how many tiles were removed.
+    """
+    dropped = 0
+    for name in names:
+        try:
+            os.remove(os.path.join(pool_dir, name))
+            dropped += 1
+        except OSError:
+            pass                       # never written, or already gone
+        try:
+            os.remove(os.path.join(pool_dir, name + _REBUILD_SUFFIX))
+        except OSError:
+            pass
+    return dropped
 
 
 def _link_pbf_view(pool_dir: str, view_dir: str, names: List[str]) -> None:
@@ -1266,6 +1318,42 @@ def _abt_has_gaps(path: str, block: int = 64) -> bool:
         return False
 
 
+#: Lines of ``aether_converter download`` output that say WHY a run failed:
+#: anyhow's top-level ``Error:`` (plus the ``Caused by:`` chain under it) and
+#: the engine's own error tally, ``[Stats] ERRORS (12): decode=12``. Everything
+#: else it prints is progress.
+_DOWNLOAD_CAUSE_RE = re.compile(
+    r"^\s*(?:error:|caused by:|\[stats\]\s+errors)", re.IGNORECASE)
+
+
+def _download_failure_detail(lines: List[str], keep: int = 6) -> str:
+    """The engine's own words for why a download failed, or "".
+
+    The converter diagnoses the failure precisely — "decode=12" for a service
+    serving WebP to a PNG-only decoder — and the plugin used to throw all of it
+    away and raise one constant string about tiles that "could not be fetched",
+    which sends the user to look at their network instead of at the codec.
+    Same shape as the ingest path's ``_run_converter``: the cause if the engine
+    named one, else the tail of what it said.
+    """
+    causes = [ln for ln in lines if _DOWNLOAD_CAUSE_RE.match(ln)]
+    return "\n".join((causes or lines)[-keep:])
+
+
+class DownloadOutcome(NamedTuple):
+    """Did the download produce usable tiles, and if not, what did the engine say?
+
+    Truthy exactly when it worked, so every ``if _try_rust_download(...)``
+    caller reads as it always did.
+    """
+
+    ok: bool
+    detail: str = ""
+
+    def __bool__(self) -> bool:
+        return bool(self.ok)
+
+
 #: Printed by ``aether_converter download`` once per run when it has fused a
 #: ``buildings_pbf_dir``. Its absence is how we detect an engine that predates
 #: the feature — see ``_try_rust_download``.
@@ -1275,6 +1363,60 @@ _BUILDINGS_APPLIED_MARKER = "[Buildings]"
 def _buildings_were_applied(lines: List[str]) -> bool:
     """True if the converter reported fusing buildings during this pass."""
     return any(_BUILDINGS_APPLIED_MARKER in ln for ln in lines)
+
+
+#: What ``aether_converter ingest`` says when it cannot use a
+#: ``buildings_file`` — an unreadable format ("Missing magic bytes. Is this an
+#: fgb file?"), a path that is not there, a geometry type it does not draw.
+#: Current engines fail the run outright, so ``_run_converter`` raises before
+#: this is ever consulted; older ones warned and exited 0, and the plugin has
+#: to work against whichever engine is deployed.
+_BUILDINGS_FAILED_MARKER = "failed to apply buildings"
+
+
+def _buildings_complaint(lines: List[str]) -> Optional[str]:
+    """The converter's own complaint about a buildings burn, if it made one.
+
+    An older engine exits 0 either way — a job whose buildings could not be
+    read still writes perfectly good building-free terrain — so this line is
+    all that separates "buildings applied" from "buildings silently dropped".
+    """
+    for line in lines:
+        if _BUILDINGS_FAILED_MARKER in line.lower():
+            return line.strip()
+    return None
+
+
+#: Marker on the per-tile line ``aether_converter ingest`` prints for every
+#: ``buildings_file`` burn (ingest.rs ``apply_buildings``). The PBF path uses
+#: ``[Info] buildings_pbf_dir:`` instead, so within one ingest run these lines
+#: are the buildings-file report and nothing else.
+_BUILDINGS_REPORT_MARKER = "[Buildings]"
+#: How many pixels that tile's burn actually raised.
+_BUILDINGS_RAISED_RE = re.compile(r"(\d[\d,]*)\s+px raised")
+
+
+def _buildings_drew_nothing(lines: List[str]) -> Optional[str]:
+    """The converter's report when a burn raised no pixel anywhere, else None.
+
+    Judged over the WHOLE run, never per tile: the edge tiles of any area lie
+    outside the footprints and legitimately draw nothing, so failing on those
+    would flag every ordinary run for rebuild. If not one tile was raised,
+    though, the burn did not happen — the source may be readable and still
+    carry no usable height — and the pool identity would otherwise claim
+    buildings these pixels do not have.
+
+    Returns None when the engine reported nothing at all: older builds printed
+    nothing on a successful burn, and silence cannot be read either way.
+    """
+    reports = [ln for ln in lines if _BUILDINGS_REPORT_MARKER in ln]
+    if not reports:
+        return None
+    for line in reports:
+        raised = _BUILDINGS_RAISED_RE.search(line)
+        if raised and int(raised.group(1).replace(",", "")) > 0:
+            return None
+    return reports[-1].strip()
 
 
 def _binary_has_buildings_support(exe: str) -> Optional[bool]:
@@ -1306,7 +1448,7 @@ def _try_rust_download(
     progress_cb: Any = None,
     should_cancel: Any = None,
     on_start: Any = None,
-) -> bool:
+) -> DownloadOutcome:
     """Download XYZ tiles via Rust and produce .abt files directly.
 
     *pbf_dir*, when given, is handed to the converter as ``buildings_pbf_dir``
@@ -1319,6 +1461,9 @@ def _try_rust_download(
     buildings. To stop that, a pass that requested buildings and saw no
     ``[Buildings]`` line in the output is treated as a failed fast path: the
     tiles are flagged for rebuild and we fall back to the ingest path.
+
+    Returns a :class:`DownloadOutcome`: falsy when the tiles could not be
+    produced, carrying the engine's own explanation for the caller to raise.
     """
     # Each of the three bail-outs below used to return False without a word,
     # and the caller printed one generic "Rust download unavailable" for all of
@@ -1326,16 +1471,17 @@ def _try_rust_download(
     # the run then spent the whole extract on the slow path before anything
     # mentioned it. Say which one it was.
     if "type=xyz" not in source:
-        _log("  fast download skipped: the DEM layer is not an XYZ tile "
-             "service (only XYZ can be fetched directly)")
-        return False
+        reason = ("the DEM layer is not an XYZ tile service (only XYZ can "
+                  "be fetched directly)")
+        _log(f"  fast download skipped: {reason}")
+        return DownloadOutcome(False, reason)
 
     params = dict(urllib.parse.parse_qsl(source))
     url_raw = params.get("url", "")
     if not url_raw:
-        _log(f"  fast download skipped: no 'url' in the layer source "
-             f"({source[:120]})")
-        return False
+        reason = f"no 'url' in the layer source ({source[:120]})"
+        _log(f"  fast download skipped: {reason}")
+        return DownloadOutcome(False, reason)
 
     url_template = urllib.parse.unquote(url_raw)
 
@@ -1366,7 +1512,7 @@ def _try_rust_download(
         converter_exe = binary_manager.find_binary("aether_converter")
     except RuntimeError as exc:
         _log(f"  fast download skipped: {exc}")
-        return False
+        return DownloadOutcome(False, str(exc))
 
     # Group by the zoom each tile needs for its OWN latitude. A single job-wide
     # zoom taken from the request's bbox centre made a tile's pixels depend on
@@ -1412,7 +1558,9 @@ def _try_rust_download(
     def _run_pass(specs: List[Dict[str, Any]], conn: int, zoom: int):
         """Write + run one download pass for *specs* at *conn* connections.
 
-        Returns ``(returncode, ok_tiles, total_tiles)``.
+        Returns ``(returncode, ok_tiles, total_tiles, lines)`` — the output
+        lines ride along because they are the only place the *reason* for a
+        failure exists (see :func:`_download_failure_detail`).
         """
         job = {
             "url_template": url_template,
@@ -1450,7 +1598,7 @@ def _try_rust_download(
         if pbf_dir and rc == 0:
             buildings_seen.append(_buildings_were_applied(lines))
         ok, total = _parse_download_completeness(lines)
-        return rc, ok, total
+        return rc, ok, total, lines
 
     max_passes = _get_download_max_passes()
     base_conn = _get_download_connections()
@@ -1484,7 +1632,9 @@ def _try_rust_download(
                  "separately from a 'Distribute' build. Refresh it with the "
                  "pipeline's \"Deploy engine to ~/.aether/bin (local test)\" "
                  "action, or with Settings → Download binaries.")
-            return False
+            return DownloadOutcome(
+                False, f"this aether_converter ({converter_exe}) predates "
+                       f"buildings-on-download")
         if supported is None:
             _log(f"  could not read {converter_exe} to check for "
                  "buildings-on-download; assuming it is supported")
@@ -1492,11 +1642,15 @@ def _try_rust_download(
 
     try:
         ok_all = True
+        reasons: List[str] = []
         for zoom in sorted(by_zoom):
-            if not _download_zoom_group(
-                    cache_dir, by_zoom[zoom], zoom, base_conn, max_passes,
-                    _run_pass, _produced):
+            group = _download_zoom_group(
+                cache_dir, by_zoom[zoom], zoom, base_conn, max_passes,
+                _run_pass, _produced)
+            if not group:
                 ok_all = False
+                if group.detail:
+                    reasons.append(f"z{zoom}: {group.detail}")
 
         # The engine's own report is only a warning here, never the gate —
         # see the note on the capability check above. A supporting engine
@@ -1508,7 +1662,7 @@ def _try_rust_download(
                  "the engine has the feature — buildings were applied. Report "
                  "this if the result is missing buildings.")
 
-        return ok_all
+        return DownloadOutcome(ok_all, "\n".join(reasons))
     finally:
         try:
             os.remove(job_file)
@@ -1524,8 +1678,12 @@ def _download_zoom_group(
     max_passes: int,
     _run_pass: Any,
     _produced: Any,
-) -> bool:
-    """Download one homogeneous-zoom group, with the halving retry."""
+) -> DownloadOutcome:
+    """Download one homogeneous-zoom group, with the halving retry.
+
+    A failure carries the engine's own diagnosis (``DownloadOutcome.detail``)
+    and leaves NOTHING of this group in the pool — see :func:`_drop_pool_tiles`.
+    """
     all_names = [s["filename"] for s in tile_specs]
     conn = base_conn
 
@@ -1540,22 +1698,30 @@ def _download_zoom_group(
         specs = tile_specs
         for attempt in range(1, max_passes + 1):
             t = time.perf_counter()
-            rc, ok, total = _run_pass(specs, conn, zoom)
+            rc, ok, total, lines = _run_pass(specs, conn, zoom)
             elapsed = time.perf_counter() - t
             if rc != 0:
-                _log(f"  Rust download failed (exit {rc}) at z={zoom}")
-                return False
+                detail = _download_failure_detail(lines)
+                _log(f"  Rust download failed (exit {rc}) at z={zoom}"
+                     + (f":\n    {detail}" if detail else ""))
+                # The engine pads every output tile to full size BEFORE it
+                # decides the run failed, so a complete, valid .abt of 0 m
+                # terrain is sitting in the pool right now. Leave it and the
+                # next run reports a cache hit over flat sea.
+                gone = _drop_pool_tiles(cache_dir, all_names)
+                _log(f"    {gone} unusable tile(s) removed from the pool")
+                return DownloadOutcome(False, detail or f"exit {rc}")
             if total < 0:
                 # Older converter without completeness stats — trust exit 0.
                 _log(f"  Rust download z={zoom}: {elapsed:.1f}s")
                 _set_rebuild_flags(cache_dir, all_names)
-                return _produced()
+                return DownloadOutcome(_produced())
             if ok >= total:
                 _log(f"  Rust download z={zoom}: {elapsed:.1f}s, "
                      f"{ok}/{total} source tiles (XYZ) OK "
                      f"→ {len(specs)} output tile(s) @ {conn} conn")
                 _set_rebuild_flags(cache_dir, all_names)
-                return True
+                return DownloadOutcome(True)
 
             if ok == 0:
                 # TOTAL failure, which is a different animal from the partial
@@ -1572,8 +1738,16 @@ def _download_zoom_group(
                      f"publishes (check the layer's Max. Zoom Level), or the "
                      f"tile URL/API key is wrong. Over open ocean this is also "
                      f"what an area with genuinely no tiles looks like.")
-                _set_rebuild_flags(cache_dir, all_names, set(all_names))
-                return False
+                # Removed, not flagged: an engine that exits 0 having fetched
+                # nothing leaves exactly the same full-size 0 m tiles behind as
+                # one that exits non-zero, and a flagged tile is still linked
+                # into a run and still read straight off the pool.
+                gone = _drop_pool_tiles(cache_dir, all_names)
+                _log(f"    {gone} flat 0 m tile(s) removed from the pool")
+                detail = _download_failure_detail(lines)
+                return DownloadOutcome(
+                    False,
+                    detail or f"0 of {total} source tile(s) fetched at z{zoom}")
 
             missing = total - ok
             # Which sub-tiles need re-fetching? Ones with a hole in them, and
@@ -1600,7 +1774,7 @@ def _download_zoom_group(
                      f"tile(s) unavailable but every output tile is intact "
                      f"→ complete")
                 _set_rebuild_flags(cache_dir, all_names)
-                return True
+                return DownloadOutcome(True)
 
             if attempt >= max_passes or conn <= _MIN_DOWNLOAD_CONNECTIONS:
                 _log(f"  WARNING: {missing} source tile(s) still failed after "
@@ -1613,7 +1787,8 @@ def _download_zoom_group(
                 # preparation through the far slower path in this same run.
                 _set_rebuild_flags(cache_dir, all_names,
                                    {s["filename"] for s in affected})
-                return _produced()
+                return DownloadOutcome(_produced(),
+                                      _download_failure_detail(lines))
 
             conn = max(_MIN_DOWNLOAD_CONNECTIONS, conn // 2)
             specs = affected
@@ -1622,14 +1797,14 @@ def _download_zoom_group(
                  f"@ {conn} connections (pass {attempt + 1}/{max_passes})")
         _set_rebuild_flags(cache_dir, all_names,
                            {s["filename"] for s in specs})
-        return _produced()
+        return DownloadOutcome(_produced())
     except ConverterCancelled:
         raise                      # cancellation must reach the caller
     except RuntimeError:
         raise
     except Exception as exc:
         _log(f"  Rust download error: {exc}")
-        return False
+        return DownloadOutcome(False, f"{type(exc).__name__}: {exc}")
 
 
 class _DefaultBinaryManager:
@@ -1678,17 +1853,23 @@ def ensure_pool_tiles(
 
     todo = [t for t in subtiles if not _tile_ready(pool_dir, t["filename"])]
     if todo:
-        ok = _try_rust_download(source_uri, pool_dir, {}, resolution_m, todo,
-                                binary_manager, pbf_dir=None,
-                                progress_cb=progress_cb,
-                                should_cancel=should_cancel,
-                                on_start=on_start)
-        if not ok:
+        outcome = _try_rust_download(source_uri, pool_dir, {}, resolution_m,
+                                     todo, binary_manager, pbf_dir=None,
+                                     progress_cb=progress_cb,
+                                     should_cancel=should_cancel,
+                                     on_start=on_start)
+        if not outcome:
+            # The engine diagnosed this precisely — "decode=12" for a service
+            # serving WebP to a PNG-only decoder, a 404 tally for a bad
+            # template — and a constant "could not be fetched" throws that away
+            # and points the user at their network. Same shape as the ingest
+            # path's `_run_converter`: the engine's own words, in the message.
             raise RuntimeError(
                 f"Terrain download failed: {len(todo)} tile(s) could not be "
-                f"fetched from the elevation service. See the "
-                f"Waveshed-Terrain log for the cause (encoding/zoom/URL "
-                f"problems are reported there), fix the layer, and run again."
+                f"fetched from the elevation service. The engine reported:\n"
+                f"{outcome.detail or '(no output)'}\n"
+                f"See the Waveshed-Terrain log for the full output, fix the "
+                f"layer, and run again."
             )
     else:
         _log(f"  pool HIT — all {len(subtiles)} tile(s) already downloaded")
@@ -2440,10 +2621,15 @@ def _gather_source_infos(dem_layer: Any, terrain_dir: Optional[str]
     return [], True
 
 
-def _run_converter(exe: str, job_file: str) -> None:
+def _run_converter(exe: str, job_file: str) -> List[str]:
     # Stream the converter's output into the log so the .abt creation step is
     # visible. Keep a tail for the error message. Uses the one shared
     # subprocess runner (run_converter_streaming).
+    #
+    # The lines come back because exit 0 is not the whole verdict: a buildings
+    # file it could not read is one `[Warn]` line and a successful exit (see
+    # ingest.rs `[Warn] Failed to apply buildings`), so the caller has to read
+    # what it said to know whether the run did what was asked.
     lines: List[str] = []
 
     def handle(line: str) -> None:
@@ -2455,6 +2641,7 @@ def _run_converter(exe: str, job_file: str) -> None:
     if rc != 0:
         tail = "\n".join(lines[-20:])
         raise RuntimeError(f"converter failed ({rc}):\n{tail}")
+    return lines
 
 
 # ---------------------------------------------------------------------------
@@ -2496,6 +2683,31 @@ def prepare_terrain(
             if buildings_file else "")
          + (", buildings=openfreemap" if osm_buildings else ""))
 
+    # A layer that classifies as imagery must never become terrain: a
+    # rendered map service or an RGB basemap hands back a PICTURE, and
+    # ingesting one reads colour values as metres — a confident analysis
+    # over shaded relief. The GUI's "Not a DEM? Use it anyway?" prompt is
+    # advisory; this is where the line is drawn, and it holds for both
+    # tabs and both Processing algorithms (which never see a prompt).
+    # Mirrors _gather_source_infos: the layer is only the source when no
+    # usable terrain directory was given.
+    if (not (terrain_dir and os.path.isdir(terrain_dir))
+            and dem_layer is not None
+            and classify_raster_layer(dem_layer) == "imagery"):
+        try:
+            lname = dem_layer.name() or source
+        except Exception:  # noqa: BLE001 — refusal must not depend on name()
+            lname = source
+        raise RuntimeError(
+            f"Layer '{lname}' classifies as imagery, not elevation — it "
+            "cannot be used as terrain. A map service (WMS / WMTS / "
+            "ArcGIS) or RGB basemap returns a rendered picture; reading "
+            "its pixels as metres would run a confident analysis over "
+            "colours. Use an elevation source: a DEM file or folder, a "
+            "WCS coverage, or an elevation-encoded tile service "
+            "(Terrarium / Terrain-RGB)."
+        )
+
     # A directory of .abt tiles is already an engine input — hand it over
     # untouched. Everything below this point exists to *produce* .abt tiles, so
     # running any of it would rebuild what the Map Converter already built (and
@@ -2524,14 +2736,29 @@ def prepare_terrain(
                                  max_range_km, az_start, az_end)
     expected = [t["filename"] for t in subtiles]
 
-    # One identity covering both sources, so switching either one — or turning
-    # buildings off — lands on a different cache entry.
-    parts = []
+    # The converter reads FlatGeobuf in WGS84 and nothing else, so a GeoJSON, a
+    # shapefile in EPSG:2056 or a "…gpkg|layername=buildings" URI has to be
+    # converted first — otherwise it warns once, exits 0 and writes terrain
+    # with no buildings on it. The Map Converter tab has always done this in
+    # its worker; every other caller of prepare_terrain (both GUI tabs, both
+    # Processing algorithms) passed the raw path straight through. One shared
+    # implementation now: core.buildings_source.
+    #
+    # Before the identity below, so the identity fingerprints the file that is
+    # actually burned in rather than the one that was asked for.
+    # Deferred: buildings_source imports this module for source_fingerprint.
+    from . import buildings_source
     if buildings_file:
-        parts.append(source_fingerprint(buildings_file))
-    if osm_buildings:
-        parts.append(_OSM_BUILDINGS_TOKEN)
-    buildings_id = "+".join(parts) if parts else None
+        resolved_buildings = buildings_source.resolve_buildings_source(
+            buildings_file, log=_log)
+        if resolved_buildings != buildings_file:
+            _log(f"  buildings: {buildings_file} → {resolved_buildings}")
+        buildings_file = resolved_buildings
+
+    # One identity covering both sources, so switching either one — or turning
+    # buildings off — lands on a different cache entry. Shared with the pre-run
+    # estimate, so the GUI prices the pool this run will really use.
+    buildings_id = buildings_identity(buildings_file, osm_buildings)
 
     # The pool holds tiles for this source; the view is what the engine reads.
     pool_dir = _pool_dir(source, buildings_id)
@@ -2581,8 +2808,23 @@ def prepare_terrain(
 
     # Fetch building tiles before the converter runs, so they are on disk when
     # the ingest jobs reference them.
+    #
+    # `buildings_missing` is the reconciliation between what the identity above
+    # CLAIMS these tiles carry and what they will really carry: whenever it
+    # ends up True the tiles are flagged for rebuild, so a pool keyed "with
+    # buildings" never serves a cache hit over building-free terrain. Three
+    # things can set it: an unusable buildings file (here), a failed
+    # OpenFreeMap fetch (below), and the converter's own complaint after the
+    # ingest ran.
     pbf_dir: Optional[str] = None
     buildings_missing = False
+    if buildings_file and not buildings_source.is_converter_readable(
+            buildings_file):
+        _log(f"  WARNING: the converter cannot read {buildings_file} as "
+             f"buildings — it reads FlatGeobuf only, and could not be handed "
+             f"a converted copy of this source. It will warn and write "
+             f"terrain without buildings.")
+        buildings_missing = True
     if osm_buildings:
         # Building tiles pool alongside the terrain tiles — they are globally
         # addressed (z_x_y.pbf), so 30 km -> 31 km reuses every one of them
@@ -2747,8 +2989,27 @@ def prepare_terrain(
 
         t2 = time.perf_counter()
         exe = binary_manager.find_binary("aether_converter")
-        _run_converter(exe, job_file)
+        out_lines = _run_converter(exe, job_file)
         _log(f"  converter: {time.perf_counter() - t2:.1f}s ({len(jobs)} tiles)")
+
+        # Exit 0 is not the verdict on buildings: a file it could not read is
+        # one "[Warn] Failed to apply buildings: …" line and a clean exit, and
+        # the tiles would then be pooled under an identity claiming buildings
+        # they do not carry — a cache HIT, forever, for every later run.
+        if buildings_file:
+            complaint = _buildings_complaint(out_lines)
+            if complaint:
+                _log(f"  WARNING: the converter could not apply the buildings "
+                     f"file: {complaint}")
+                buildings_missing = True
+            else:
+                # Readable is not the same as applied: a source whose features
+                # carry no usable height draws nothing and still exits 0.
+                nothing = _buildings_drew_nothing(out_lines)
+                if nothing:
+                    _log(f"  WARNING: the buildings file was read but raised "
+                         f"no pixel on any tile: {nothing}")
+                    buildings_missing = True
 
         # The converter can exit 0 having skipped a tile it could not build,
         # so flag whatever did not land whole. Buildings that were requested

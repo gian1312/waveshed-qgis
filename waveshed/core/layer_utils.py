@@ -219,6 +219,22 @@ def classify_raster_layer(layer) -> str:
     # band heuristics, which see one non-Byte ARGB32 band and call it a DEM.
     kind = _service_kind(layer, source)
     if kind:
+        if kind == "rendered" and "type=xyz" not in source:
+            # A true map service (WMS / WMTS / ArcGIS MapServer) hands back a
+            # PICTURE of whatever the server drew, and Qt decodes it with
+            # QImage, which refuses 32-bit samples outright — so even one that
+            # offers image/tiff draws nothing at all. An elevation-sounding URL
+            # cannot change that, and it used to win: USGS 3DEP's WMS at
+            # elevation.nationalmap.gov matched the "elevation" hint and was
+            # offered as a DEM, which runs a confident analysis over shaded
+            # relief. The provider kind decides here.
+            #
+            # A TILE service (type=xyz) is the one rendered provider that can
+            # carry elevation, because there the pixel ENCODING is the data
+            # (Terrarium / Terrain-RGB) and the plugin decodes the tiles
+            # itself rather than asking QGIS to draw them. Values from a real
+            # server come from a coverage service (WCS) instead.
+            return "imagery"
         by_url = _classify_by_url(source)
         if by_url is not None:
             return by_url

@@ -95,19 +95,33 @@ Six statuses, and the distinction between them is the point:
   XPASS   a documented finding that no longer reproduces — the note is stale,
           and this FAILS the run, because the suite must go red when reality
           changes in either direction
-  SKIP    the check does not apply, or its prerequisite is genuinely absent
+  SKIP    the check does not apply, or its prerequisite is genuinely absent —
+          and it FAILS the run: a prerequisite someone forgot is a hole
   NOTRUN  the manifest declares this check and it did not execute — a hole in
-          the run, counted and reported rather than silently omitted
+          the run, counted, reported, and it FAILS the run
 
 Results go to ``data/torture/results.json`` and a Markdown summary, which names
 the tiers and filters the run used — a filtered re-run overwrites the same two
 files, and its report says PARTIAL rather than PASSED so nobody reads a slice
 as the whole set. Exit code: 0 = everything the manifest declares ran and
-passed; 1 = something FAILED (or XPASSed); 2 = the run was INCOMPLETE (skips,
-not-runs, or a catalogue row this build could not produce) — pass
-``--allow-incomplete`` to accept that as success. A suite that quietly drops
-half its checks and still exits 0 is the failure mode this replaces, so a run
-that made no checks at all is never a pass either.
+passed; 1 = something FAILED, XPASSed, SKIPped or did not run — a check that
+does not run is a failed run, and no flag changes that (``--allow-incomplete``
+is accepted for old command lines and ignored); 2 = the invocation itself was
+unusable (no manifest, bad --tier, a --rows filter that selects nothing, or a
+run that made zero checks). A suite that quietly drops half its checks and
+still exits 0 is the failure mode this replaces.
+
+Run procedure (Windows)::
+
+  1. Plugin code changed?     python deploy.py        (installs, restarts QGIS)
+  2. Catalogue changed?       python tools\\make_torture_project.py
+  3. Tiers a/b: QGIS console or standalone — they test whatever waveshed is
+     loaded, and say which in the plugin.import line.
+     Tier C: STANDALONE ONLY —
+       "C:\\OSGeo4W\\bin\\python-qgis.bat" tools\\torture_runner.py --tier c
+     It drives the GUI workers synchronously (a live QGIS would freeze for
+     the whole tier), and standalone the import is guaranteed to be THIS
+     repo's plugin — the plugin.pairing check refuses anything else.
 """
 
 from __future__ import annotations
@@ -379,7 +393,10 @@ def start_qgis():
             "        (or any python that can import qgis.core)")
     prefix = os.environ.get("QGIS_PREFIX_PATH", "/usr")
     QgsApplication.setPrefixPath(prefix, True)
-    app = QgsApplication([], False)
+    # GUI enabled: tier C drives the tabs' own main-thread resolve, whose
+    # progress dialog is a real widget. Offscreen, it draws to nowhere —
+    # but it must be constructible, exactly as in the GUI.
+    app = QgsApplication([], True)
     app.initQgis()
     return app
 
@@ -674,7 +691,9 @@ def tier_a(manifest: Dict[str, Any], results: Results, only: Sequence[str],
     try:
         from waveshed.core import terrain_adapter as adapter
         from waveshed.core.layer_utils import classify_raster_layer, dem_layer_warning
-        results.add("-", "plugin.import", "import the waveshed plugin", PASS)
+        loaded, version = _plugin_identity()
+        results.add("-", "plugin.import", "import the waveshed plugin", PASS,
+                    f"waveshed {version} at {loaded}")
     except ImportError as exc:
         # This is not a detail. Without the plugin the run loses every verdict
         # check it exists to make — the classifier, the encoding resolver, the
@@ -1412,22 +1431,13 @@ def _refusal_is_the_right_one(row: Dict[str, Any], complaint: str, source: str,
 
 
 # ---------------------------------------------------------------------------
-# Tier C — the pipeline, end to end, driven through the plugin
+# The per-row cache environment (tier C proper starts further down)
 # ---------------------------------------------------------------------------
 #
-# Nothing here re-implements the plugin. Every stage is a call into it:
-#
-#   route a source        map_converter_tab._resolve_source_on_main_thread
-#   enumerate tiles       map_converter_tab._snap_bbox / _enumerate_tiles
-#   build ingest jobs     map_converter_tab._build_tile_jobs
-#   download XYZ          terrain_adapter.ensure_pool_tiles
-#   read a .abt back      core.abt.read_header / read_tile
-#   build a core job      core.job_builder.build_coverage_job / build_p2p_job
-#   purge the cache       terrain_adapter.clear_cache
-#
-# The engine binaries are the real ones. There is no stub anywhere in this
-# file, and there must never be: a test double for the component under test
-# proves only that the double behaves like the double.
+# The engine binaries are the real ones, discovered by the plugin's own
+# binary_manager. There is no stub anywhere in this file, and there must
+# never be: a test double for the component under test proves only that the
+# double behaves like the double.
 
 
 class Pipeline:
@@ -1442,10 +1452,8 @@ class Pipeline:
     sharing one pool measures history, not the code.
     """
 
-    def __init__(self, scratch: Path, binaries: Dict[str, Path],
-                 keep: bool = False) -> None:
+    def __init__(self, scratch: Path, keep: bool = False) -> None:
         self.scratch = scratch
-        self.binaries = binaries
         self.keep = keep
         self._previous_cache: Optional[str] = None
 
@@ -1474,47 +1482,49 @@ class Pipeline:
         if not self.keep:
             shutil.rmtree(self.scratch, ignore_errors=True)
 
-    # -- engine ------------------------------------------------------------
-    def engine(self, name: str, args: Sequence[Any], timeout: int) -> Tuple[int, str]:
-        exe = self.binaries[name]
-        try:
-            done = subprocess.run([str(exe)] + [str(a) for a in args],
-                                  capture_output=True, text=True,
-                                  encoding="utf-8", errors="replace",
-                                  timeout=timeout)
-        except subprocess.TimeoutExpired:
-            return 124, f"no answer within {timeout}s"
-        return done.returncode, " ".join(((done.stdout or "") + " "
-                                          + (done.stderr or "")).split())
-
 
 def _plugin_modules():
     """The plugin entry points the pipeline drives. Imported once, lazily."""
     from waveshed.core import abt as abt_mod
+    from waveshed.core import buildings_source
+    from waveshed.core import result_loader
     from waveshed.core import terrain_adapter as adapter
     from waveshed.core.job_builder import (CoverageParams, P2PParams,
-                                           build_coverage_job, build_p2p_job)
+                                           antenna_height_error,
+                                           build_coverage_job, build_p2p_job,
+                                           model_warnings)
+    from waveshed.core.layer_utils import dem_layer_warning
     from waveshed.gui import map_converter_tab as mc
-    return {"abt": abt_mod, "adapter": adapter, "mc": mc,
+    from waveshed.gui import p2p_tab as p2p
+    from waveshed.gui import site_analysis_tab as sat
+    return {"abt": abt_mod, "adapter": adapter, "mc": mc, "sat": sat,
+            "p2p": p2p, "result_loader": result_loader,
+            "buildings_source": buildings_source,
             "CoverageParams": CoverageParams, "P2PParams": P2PParams,
             "build_coverage_job": build_coverage_job,
-            "build_p2p_job": build_p2p_job}
+            "build_p2p_job": build_p2p_job,
+            "antenna_height_error": antenna_height_error,
+            "model_warnings": model_warnings,
+            "dem_layer_warning": dem_layer_warning}
 
 
 #: What ``aether_converter`` writes, in i16 counts, for a pixel no source
-#: covered. Measured, because the plugin has no constant for it — and that is
-#: the point of ``_check_void_sentinel``: the plugin's own validity floor
-#: (MIN_VALID_ELEV_M, -5000 m = -10000 counts) sits one count BELOW this, so
-#: every hole reads as valid ground at -4999.5 m.
+#: covered. Stated here as the engine's own number, deliberately NOT imported
+#: from the plugin — ``_check_void_sentinel`` compares the plugin's validity
+#: floor against it, and a floor derived from the same constant it is being
+#: checked against would pass by construction. The floor used to be -5000
+#: *metres* (-10000 counts), one count BELOW this, so every hole read as valid
+#: ground 5 km down.
 CONVERTER_VOID_COUNTS = -9999
 
 
 def _real_mask(grid, plugin):
     """Pixels that are terrain: above the plugin's floor AND not the sentinel.
 
-    The second half is a workaround for the defect ``_check_void_sentinel``
-    reports. Dropping it would make every comparison here treat a hole as
-    ground, which is exactly the mistake being measured.
+    The second half is belt and braces: the plugin's floor now rejects the
+    sentinel on its own (that is what ``_check_void_sentinel`` asserts), but a
+    comparison here that treated a hole as ground would be measuring the very
+    mistake this suite exists to catch, so it is stated rather than assumed.
     """
     abt_mod = plugin["abt"]
     floor = abt_mod.MIN_VALID_ELEV_M / abt_mod.ELEV_STEP_M
@@ -1562,117 +1572,248 @@ def abt_at(grids, lat: float, lon: float, plugin) -> Optional[float]:
     return None
 
 
+# ---------------------------------------------------------------------------
+# Tier C — the pipeline, end to end, through the SHIPPED workers
+# ---------------------------------------------------------------------------
+#
+# Nothing here re-implements the plugin, and nothing here drives a layer of
+# the plugin below the one the user's click drives. Every run goes through
+# the object the GUI itself constructs:
+#
+#   Map Converter    map_converter_tab.resolve_sources_with_progress (main
+#                    thread, imagery guard, per-tile renders) and then
+#                    map_converter_tab._MapConverterWorker.run — plan
+#                    cross-check, XYZ pool download, _build_tile_jobs, ONE
+#                    array job file through run_converter_streaming.
+#   Site Analysis    site_analysis_tab._SiteAnalysisWorker.run —
+#                    prepare_terrain (wedge, buildings, void-fill),
+#                    build_coverage_job + write_job_file, licensed
+#                    aether_core through run_converter_streaming,
+#                    aether_export, and then result_loader on what came out.
+#   P2P              p2p_tab._P2PWorker.run, fed by the tab's own
+#                    _write_temp_batch_csv.
+#   Processing       processing.run("waveshed:coverage", …) — the scripted
+#                    surface, which shows the user no prompt at all.
+#
+# The runner's own code is limited to three jobs: build the inputs a user
+# would type, collect the workers' signals, and assert what came out. If a
+# stage looks missing here, it is because the worker owns it.
+
 def _layer_entry(row: Dict[str, Any], layer, plugin, resolutions: Sequence[int],
                  extent: Optional[Dict[str, float]] = None):
-    """One Map Converter stack entry for this row, built the tab's own way."""
+    """One Map Converter stack entry for this row — the user's Add Layer."""
     mc = plugin["mc"]
     kind = "buildings" if row.get("kind") == "vector" else "raster"
+    # native_res_m through the tab's OWN detection: it decides the export
+    # resolution of a rendered service (min(native, finest output)), so
+    # leaving it None made the runner render at a coarser grid than the GUI
+    # — and manufactured the very cross-tab agreement tier C measures.
+    native = None
+    if kind == "raster" and layer is not None:
+        try:
+            native = mc._detect_resolution(layer)
+        except Exception:  # noqa: BLE001 — the tab tolerates no-detection too
+            native = None
     return mc._LayerEntry(
         layer_type=kind,
         source_path=layer.source() if layer is not None else row["source"],
         qgis_layer=layer,
         crs_authid=row.get("crs") or "EPSG:4326",
+        native_res_m=native,
         target_resolutions=list(resolutions),
-        extent=extent,
+        extent=dict(extent) if extent else None,
     )
 
 
-def _acquire(row, layer, plugin, pipe: Pipeline, bbox, resolutions, timeout):
-    """Terrain for one row, through the plugin's own router.
+def _run_worker(worker, timeout: int) -> Dict[str, Any]:
+    """Start a shipped worker QThread and wait for its verdict.
 
-    ``_resolve_source_on_main_thread`` is the single place that decides how a
-    source is acquired — xyz through the shared downloader, a file untouched,
-    a WMS/WMTS/ArcGIS service exported per tile through QGIS. Calling it here
-    rather than deciding ourselves is the whole point: a router the test
-    reimplements is a router the test cannot check.
+    Signals are collected over DIRECT connections (list appends are
+    thread-safe; there is no event loop to queue through), the thread gets
+    *timeout* seconds, and a worker that will not finish is cancelled
+    through its own ``cancel()`` — the same kill path the GUI's Cancel
+    button takes.
+    """
+    from qgis.PyQt.QtCore import Qt
+    state: Dict[str, Any] = {"ok": None, "err": None, "log": []}
 
-    Returns ``(abt_paths, kind, note)``.
+    def _took(value):
+        state["ok"] = value
+
+    def _failed(message):
+        state["err"] = str(message)
+
+    worker.finished_ok.connect(_took, Qt.DirectConnection)
+    worker.finished_err.connect(_failed, Qt.DirectConnection)
+    if hasattr(worker, "log_line"):
+        worker.log_line.connect(state["log"].append, Qt.DirectConnection)
+    worker.status.connect(state["log"].append, Qt.DirectConnection)
+    worker.start()
+    if not worker.wait(int(timeout) * 1000):
+        try:
+            worker.cancel()
+        except Exception:
+            pass
+        worker.wait(15000)
+        state["err"] = (state["err"]
+                        or f"no answer within {timeout}s — the worker was cancelled")
+    if state["ok"] is None and state["err"] is None:
+        state["err"] = ("the worker finished without emitting a verdict "
+                        "(cancelled mid-run?)")
+    return state
+
+
+#: Complaints the RUNNER synthesises when a worker never answers. They must
+#: never satisfy a must-fail/reject expectation — a hung worker is not a
+#: refusal, and row 1.6's "any loud refusal" contract would otherwise be met
+#: by the runner talking to itself.
+_SYNTHESIZED_COMPLAINTS = ("no answer within", "finished without emitting a verdict")
+
+
+def _is_synthesized(said: str) -> bool:
+    low = said.lower()
+    return any(marker in low for marker in _SYNTHESIZED_COMPLAINTS)
+
+
+def _worker_complaint(state: Dict[str, Any]) -> str:
+    """The worker's verdict PLUS the engine's own words.
+
+    A worker reports engine failure as "Converter failed (exit code N). See
+    log." — the refusal the catalogue wants named (the file, the codec, the
+    reason) is in the streamed log lines. Both go into the complaint, or a
+    correct refusal reads as an anonymous one.
+    """
+    tail = " ".join(line for line in state.get("log", [])[-15:])
+    return " ".join(f"{state.get('err') or ''} {tail}".split())
+
+
+def _mc_convert(rows_layers, plugin, out_dir: Path, resolutions, timeout: int,
+                buildings=None, overwrite: bool = True,
+                bbox: Optional[Dict[str, float]] = None) -> Dict[str, Any]:
+    """One REAL Map Converter run over a stack of catalogue rows.
+
+    *rows_layers* is ``[(row, layer), …]`` in stack priority order (entry 0
+    wins). *buildings* is an optional ``(row, layer)`` appended as a
+    buildings entry. A plugin refusal in the main-thread resolve (the
+    imagery guard, an unloaded layer, a failed render) propagates as
+    ``RuntimeError`` — exactly what the GUI shows as a blocking dialog.
+
+    Returns ``{"ok": output_dir|None, "err": message|None, "log": […],
+    "tiles": [abt paths]}``.
     """
     mc = plugin["mc"]
-    adapter = plugin["adapter"]
-    expected = mc._enumerate_tiles(mc._snap_bbox(bbox, list(resolutions)),
-                                   list(resolutions))
-    entry = _layer_entry(row, layer, plugin, resolutions, bbox)
-    resolved = mc._resolve_source_on_main_thread(entry, expected)
-    kind = resolved.get("kind") if isinstance(resolved, dict) else "buildings"
-
-    tmp = pipe.scratch / "src"
-    tmp.mkdir(parents=True, exist_ok=True)
-    out = pipe.scratch / "abt"
-    out.mkdir(parents=True, exist_ok=True)
-    if kind == "file":
-        info = adapter.source_file_info(resolved["path"], row.get("crs") or None)
-        entries = [{"kind": "files", "infos": [info]}]
-    elif kind == "rendered":
-        entries = [{"kind": "rendered", "tiles": resolved["tiles"]}]
-    elif kind == "xyz":
-        # The MAP CONVERTER route for an XYZ layer: the shared pool fills
-        # first, then each pool tile becomes an ingest source. Site Analysis
-        # takes the pool tiles as terrain directly and never ingests them, so
-        # the two tabs really are two paths here — which is exactly why the
-        # `both_tabs` check compares them rather than assuming.
-        pool = {}
-        for res in sorted({r for r, _t in expected}):
-            subtiles = [t for r, t in expected if r == res]
-            pool[res] = adapter.ensure_pool_tiles(resolved["uri"], subtiles, res)
-        entries = [{"kind": "xyz", "pool": pool}]
-    else:
-        raise RuntimeError(f"unroutable source kind {kind!r}")
-
-    jobs, temps = mc._build_tile_jobs(expected, str(out), True, entries, None, str(tmp))
-    made = []
-    for job in jobs:
-        job_file = tmp / (Path(job["output_path"]).stem + ".json")
-        job_file.write_text(json.dumps(job), encoding="utf-8")
-        code, said = pipe.engine("aether_converter",
-                                 ["ingest", "--job-file", job_file], timeout)
-        if code != 0:
-            raise RuntimeError(f"ingest exit {code}: {_tail(said, 260)}")
-        made.append(job["output_path"])
-    for temp in temps:
-        try:
-            os.remove(temp)
-        except OSError:
-            pass
-    return made, kind, f"{len(made)} ingested tile(s)"
+    abt_mod = plugin["abt"]
+    entries = [_layer_entry(row, layer, plugin, resolutions, bbox)
+               for row, layer in rows_layers]
+    if buildings is not None:
+        brow, blayer = buildings
+        entries.append(mc._LayerEntry(
+            layer_type="buildings",
+            source_path=blayer.source() if blayer is not None else brow["source"],
+            qgis_layer=blayer,
+            crs_authid=brow.get("crs") or "",
+            extent=dict(bbox) if bbox else None))
+    out_dir.mkdir(parents=True, exist_ok=True)
+    _combined, render_jobs = mc._pending_render_jobs(
+        entries, list(resolutions), str(out_dir), overwrite)
+    resolved = mc.resolve_sources_with_progress(entries, None,
+                                                render_jobs=render_jobs)
+    if resolved is None:
+        return {"ok": None, "err": "the resolve dialog reported cancelled — "
+                                   "impossible headless, so this is a bug",
+                "log": [], "tiles": []}
+    worker = mc._MapConverterWorker(entries, str(out_dir), list(resolutions),
+                                    resolved, overwrite=overwrite)
+    state = _run_worker(worker, timeout)
+    state["tiles"] = abt_mod.list_tiles(str(out_dir)) if state["ok"] else []
+    return state
 
 
-def _acquire_site_analysis(row, layer, plugin, lat, lon, resolution, range_km,
-                           buildings: Optional[str] = None):
-    """Terrain the Site Analysis way: ``terrain_adapter.prepare_terrain``.
+def _sa_analyse(row_label: str, layer, plugin, out_dir: Path, jobs, timeout: int,
+                terrain_dir: str = "", osm_buildings: bool = False,
+                results: Optional["Results"] = None) -> Dict[str, Any]:
+    """One REAL Site Analysis run: the tab's preflight, then its worker.
 
-    That is the public entry point all four of the plugin's own callers use
-    (both GUI tabs and both Processing algorithms), and it is the only route
-    that burns buildings into the surface. Returns the .abt directory.
+    *jobs* is ``[(CoverageParams, display_name), …]`` — what the tab's
+    _build_jobs produces from the user's tables. The tab's own hard gate
+    (``antenna_height_error``) is enforced; its advisory prompts
+    (``dem_layer_warning``, ``model_warnings``) are recorded as notes, the
+    runner answering "run anyway" exactly like a determined user.
     """
     adapter = plugin["adapter"]
-    return adapter.prepare_terrain(
-        dem_layer=layer, tx_lat=lat, tx_lon=lon, max_range_km=range_km,
-        resolution_m=resolution, binary_manager=adapter._DefaultBinaryManager(),
-        buildings_file=buildings)
+    for params, name in jobs:
+        err = plugin["antenna_height_error"](params)
+        if err:
+            return {"ok": None, "err": f"the tab would refuse this job: {err}",
+                    "log": []}
+        if results is not None:
+            for warning in plugin["model_warnings"](params):
+                results.note(f"{row_label} {name}: model warning — "
+                             f"{getattr(warning, 'message', warning)}")
+    if layer is not None and results is not None:
+        advisory = plugin["dem_layer_warning"](layer)
+        if advisory:
+            results.note(f"{row_label}: the tab would prompt — "
+                         f"{_shorten(advisory, 100)} (answered: use it anyway)")
+    out_dir.mkdir(parents=True, exist_ok=True)
+    sat = plugin["sat"]
+    worker = sat._SiteAnalysisWorker(list(jobs), layer, str(out_dir),
+                                     terrain_dir or "",
+                                     osm_buildings=osm_buildings)
+    return _run_worker(worker, timeout)
 
 
-def _agree(a_dir, b_dir, plugin) -> Tuple[bool, str]:
-    """Do two terrain directories hold the same elevations?
+def _coverage_params(plugin, lat: float, lon: float, resolution: int,
+                     range_km: int, name: str, model: str = "ITM",
+                     az: Tuple[float, float] = (0.0, 360.0)):
+    """The canonical torture job — one place, so every run means the same."""
+    return plugin["CoverageParams"](
+        tx_lat=lat, tx_lon=lon, tx_height=30.0, tx_mode="AGL",
+        freq_mhz=900.0, erp_watts=10.0, rx_height=2.0, rx_mode="AGL",
+        model=model, resolution_m=resolution, max_range_km=range_km,
+        backend="CPU", output_name=name, max_ram_gb=8, max_vram_gb=4,
+        az_start=az[0], az_end=az[1])
 
-    The checklist's own rule: every case runs through Site Analysis AND the
-    Map Converter, and "a divergence between them is a bug by definition".
-    Nothing else in this suite has ever compared the two.
-    """
+
+def _sa_view_dir(source: str, lat: float, lon: float, range_km: float,
+                 resolution: int, plugin,
+                 az: Tuple[float, float] = (0.0, 360.0)) -> str:
+    """Where prepare_terrain put this run's .abt view — the plugin's OWN
+    cache identity, asked rather than guessed."""
+    adapter = plugin["adapter"]
+    bbox = adapter._compute_sector_bbox(lat, lon, range_km, az[0], az[1])
+    subtiles = adapter._compute_subtiles(bbox, resolution, lat, lon, range_km,
+                                         az[0], az[1])
+    buildings_id = adapter.buildings_identity(None, False)
+    return os.path.join(adapter.get_cache_dir(), adapter._VIEW_DIRNAME,
+                        adapter._cache_key(source, subtiles, resolution,
+                                           buildings_id))
+
+
+#: Verdicts from :func:`_agree`.  ``DIFFER`` is a difference this suite
+#: MEASURED; ``INCOMPARABLE`` is the absence of a measurement and must never be
+#: read as one.  The buildings rows take "not the same" as proof that the
+#: buildings were burned, so a two-valued answer let an unreadable or disjoint
+#: pair of terrain directories pass as a successful burn.
+SAME, DIFFER, INCOMPARABLE = "same", "differ", "incomparable"
+
+
+def _agree(a_dir, b_dir, plugin) -> Tuple[str, str]:
+    """Do two terrain directories hold the same elevations? ``(verdict, why)``."""
     import numpy as np
     abt_mod = plugin["abt"]
     a = {Path(p).name: p for p in abt_mod.list_tiles(str(a_dir))}
     b = {Path(p).name: p for p in abt_mod.list_tiles(str(b_dir))}
     shared = sorted(set(a) & set(b))
     if not shared:
-        return False, (f"no tile in common: Site Analysis wrote {sorted(a)[:2]}, "
-                       f"the Map Converter wrote {sorted(b)[:2]}")
+        return INCOMPARABLE, (f"no tile in common: one side wrote {sorted(a)[:2]}, "
+                              f"the other {sorted(b)[:2]}")
     worst, n = 0.0, 0
     for name in shared:
         ga = abt_mod.read_tile(abt_mod.read_header(a[name]))
         gb = abt_mod.read_tile(abt_mod.read_header(b[name]))
         if ga is None or gb is None or ga.shape != gb.shape:
-            return False, f"{name}: unreadable or different shapes"
+            return INCOMPARABLE, f"{name}: unreadable or different shapes"
         mask = _real_mask(ga, plugin) & _real_mask(gb, plugin)
         if not mask.any():
             continue
@@ -1681,43 +1822,67 @@ def _agree(a_dir, b_dir, plugin) -> Tuple[bool, str]:
                                         - gb[mask].astype("int32")).max()))
     worst_m = worst * abt_mod.ELEV_STEP_M
     if not n:
-        return False, "the two paths share no real sample to compare"
+        return INCOMPARABLE, "the two paths share no real sample to compare"
     if worst_m > 0.5:
-        return False, (f"the two tabs disagree by up to {worst_m:,.1f} m over "
-                       f"{n:,} shared samples")
-    return True, f"both tabs agree to {worst_m:,.1f} m over {n:,} samples"
+        return DIFFER, (f"the two sides disagree by up to {worst_m:,.1f} m over "
+                        f"{n:,} shared samples")
+    return SAME, f"both sides agree to {worst_m:,.1f} m over {n:,} samples"
 
 
-def _coverage(plugin, pipe: Pipeline, abt_dir: Path, lat: float, lon: float,
-              resolution: int, range_km: int, name: str, timeout: int,
-              buildings: Optional[str] = None):
-    """A real coverage run + export. ``(rc, said, geotiff or None)``."""
-    params = plugin["CoverageParams"](
-        tx_lat=lat, tx_lon=lon, tx_height=30.0, tx_mode="AGL",
-        freq_mhz=900.0, erp_watts=10.0, rx_height=2.0, rx_mode="AGL",
-        model="ITM", resolution_m=resolution, max_range_km=range_km,
-        backend="CPU", output_name=name, max_ram_gb=8, max_vram_gb=4)
-    job = plugin["build_coverage_job"](params, str(abt_dir), str(pipe.scratch))
-    if buildings:
-        job["processing"]["buildings_file"] = buildings
-    job_file = pipe.scratch / f"{name}_job.json"
-    job_file.write_text(json.dumps(job, indent=1), encoding="utf-8")
-    code, said = pipe.engine("aether_core", ["--config", job_file], timeout)
-    if code != 0:
-        return code, said, None
-    result = next((pipe.scratch / f"{name}{ext}" for ext in (".tiles", ".bit")
-                   if (pipe.scratch / f"{name}{ext}").exists()), None)
-    sidecar = pipe.scratch / f"{name}.json"
-    if result is None or not sidecar.exists():
-        return code, "aether_core exited 0 but wrote no result file", None
-    tif = pipe.scratch / f"{name}.tif"
-    code, said = pipe.engine("aether_export",
-                             ["-i", result, "-j", sidecar, "-o", tif], timeout)
-    return code, said, (tif if code == 0 and tif.exists() else None)
+def _cross_tab_contract(mc_dir, sa_dir, plugin) -> Tuple[bool, str]:
+    """The two tabs' terrain contract, stated in full and then measured.
+
+    (a) They enumerate the SAME tiles — a tile only one side built is a
+        divergence, not a footnote. (b) Where BOTH have data, the values are
+        identical (the same converter wrote both). (c) Site Analysis never
+        has LESS data than the Map Converter — its ``void_fill_m: 0.0``
+        only ever adds. The old check compared the intersection only, so a
+        path that dropped most of its terrain still "agreed".
+    """
+    import numpy as np
+    abt_mod = plugin["abt"]
+    a = {Path(p).name: p for p in abt_mod.list_tiles(str(mc_dir))}
+    b = {Path(p).name: p for p in abt_mod.list_tiles(str(sa_dir))}
+    if set(a) != set(b):
+        only_mc = sorted(set(a) - set(b))[:3]
+        only_sa = sorted(set(b) - set(a))[:3]
+        return False, (f"the two tabs enumerated different tiles — "
+                       f"only Map Converter: {only_mc}, only Site Analysis: {only_sa}")
+    if not a:
+        return False, "neither tab produced a tile"
+    worst = 0.0
+    shared_n = mc_real = sa_real = 0
+    for name in sorted(a):
+        ga = abt_mod.read_tile(abt_mod.read_header(a[name]))
+        gb = abt_mod.read_tile(abt_mod.read_header(b[name]))
+        if ga is None or gb is None or ga.shape != gb.shape:
+            return False, f"{name}: unreadable or different shapes"
+        mask_a = _real_mask(ga, plugin)
+        mask_b = _real_mask(gb, plugin)
+        mc_real += int(mask_a.sum())
+        sa_real += int(mask_b.sum())
+        both = mask_a & mask_b
+        if both.any():
+            shared_n += int(both.sum())
+            worst = max(worst, float(np.abs(ga[both].astype("int32")
+                                            - gb[both].astype("int32")).max()))
+    worst_m = worst * plugin["abt"].ELEV_STEP_M
+    if not shared_n:
+        return False, "the two tabs share no real sample at all"
+    if worst_m > 0.5:
+        return False, (f"where both have data they disagree by up to "
+                       f"{worst_m:,.1f} m over {shared_n:,} samples")
+    if sa_real < mc_real:
+        return False, (f"Site Analysis holds LESS terrain than the Map Converter "
+                       f"({sa_real:,} vs {mc_real:,} real samples) — its fill "
+                       f"only ever adds, so data was lost on the way")
+    return True, (f"same {len(a)} tile(s), identical over {shared_n:,} shared "
+                  f"samples, Site Analysis {sa_real:,} vs Map Converter "
+                  f"{mc_real:,} real (fill only adds)")
 
 
 def coverage_report(path: Path) -> Dict[str, Any]:
-    """What the exported coverage GeoTIFF holds."""
+    """What the exported coverage GeoTIFF holds — values, grid and georef."""
     import numpy as np
     from osgeo import gdal
     gdal.UseExceptions()
@@ -1730,162 +1895,321 @@ def coverage_report(path: Path) -> Dict[str, Any]:
     if nodata is not None:
         mask &= values != nodata
     count = int(mask.sum())
-    out = {"px": f"{width}x{height}", "valid": count,
-           "valid_pct": round(100.0 * count / (width * height), 1)}
+    out: Dict[str, Any] = {
+        "px": f"{width}x{height}", "width": width, "height": height,
+        "valid": count,
+        "valid_pct": round(100.0 * count / (width * height), 1),
+        "bands": int(dataset.RasterCount),
+        "geotransform": list(dataset.GetGeoTransform()),
+        "projection": dataset.GetProjection() or "",
+    }
     if count:
         out["min"] = round(float(values[mask].min()), 1)
         out["max"] = round(float(values[mask].max()), 1)
         out["mean"] = round(float(values[mask].mean()), 2)
+        rows_any = mask.any(axis=1)
+        cols_any = mask.any(axis=0)
+        r0, r1 = int(np.argmax(rows_any)), int(len(rows_any) - 1
+                                               - np.argmax(rows_any[::-1]))
+        c0, c1 = int(np.argmax(cols_any)), int(len(cols_any) - 1
+                                               - np.argmax(cols_any[::-1]))
+        out["gap_rows"] = int((~rows_any[r0:r1 + 1]).sum())
+        out["gap_cols"] = int((~cols_any[c0:c1 + 1]).sum())
     dataset = None
     return out
 
 
-#: Rows whose catalogue ``check`` says the pipeline must NOT produce terrain.
-_MUST_FAIL = ("error",)
-#: Rows the plugin's own router must refuse before any terrain is fetched.
-_MUST_REJECT = ("reject",)
+def _check_coverage(rid: str, tif: Optional[Path], params, row, results: Results,
+                    plugin, prefix: str = "pipeline.cov") -> None:
+    """The coverage the engine produced, held against its own request.
 
-
-def tier_pipeline(manifest: Dict[str, Any], results: Results, only: Sequence[str],
-                  timeout: int, keep: bool) -> None:
-    """Run the WHOLE pipeline for every catalogue row, one clean pool each.
-
-    This is the tier that answers the only question that matters: put this
-    layer in, and does real terrain and a real coverage come out? Everything
-    tier A checks is about the layer; everything here is about the product.
+    Three checks, all planned up front: the GRID matches the job (size,
+    georeferencing, one band, centred on the transmitter), the DISK is as
+    full as the catalogue says a full-circle run over this terrain gets,
+    and there are no STRIPES — an all-nodata row or column strictly inside
+    the footprint is the literal shape of a half-written result. A missing
+    *tif* fails all three by name; nothing is quietly withdrawn.
     """
-    binaries = {}
-    results.plan("-", "engine.present")
-    for name in ("aether_converter", "aether_core", "aether_export"):
-        found = find_binary(name)
-        if found is None:
-            results.add("-", "engine.present", "engine binaries", SKIP,
-                        f"{name} not found (set AETHER_BIN_DIR) — every pipeline check "
-                        f"is a hole in this run, not a pass")
-            return
-        binaries[name] = found
-    results.add("-", "engine.present", "engine binaries", PASS,
-                ", ".join(sorted(p.name for p in binaries.values())))
-
-    plugin = _plugin_modules()
-    _check_void_sentinel(plugin, results)
-    project = open_project(manifest, results)
-    if project is None:
+    grid_id, disk_id, stripe_id = (f"{prefix}.grid", f"{prefix}.disk",
+                                   f"{prefix}.stripes")
+    if tif is None:
+        for check_id, label in ((grid_id, "the coverage grid matches the job"),
+                                (disk_id, "the coverage disk is as full as declared"),
+                                (stripe_id, "the coverage has no stripes or gaps")):
+            results.add(rid, check_id, label, FAIL,
+                        "no coverage was produced to check (see the run above)",
+                        known_fail_for(row, check_id))
         return
-    layers = {l.name(): l for l in project.mapLayers().values()}
-    out_dir = Path(manifest["__manifest_dir__"])
-    scratch_root = out_dir / ".pipeline"
-    shutil.rmtree(scratch_root, ignore_errors=True)
-    scratch_root.mkdir(parents=True, exist_ok=True)
+    cov = coverage_report(tif)
 
-    rows = [r for r in manifest["rows"] if row_selected(r["row"], only)]
-    for row in rows:
-        results.plan(row["row"], "pipeline")
+    # -- grid + georeferencing ------------------------------------------
+    problems = []
+    expected_px = 2.0 * params.max_range_km * 1000.0 / params.resolution_m
+    for axis, got in (("width", cov["width"]), ("height", cov["height"])):
+        if abs(got - expected_px) > max(5.0, expected_px * 0.05):
+            problems.append(f"{axis} {got} px vs ~{expected_px:.0f} expected for "
+                            f"{params.max_range_km} km @ {params.resolution_m} m")
+    if cov["bands"] != 1:
+        problems.append(f"{cov['bands']} bands (a coverage is one)")
+    gt = cov["geotransform"]
+    if abs(gt[1]) > 0:
+        centre_lon = gt[0] + gt[1] * cov["width"] / 2.0
+        centre_lat = gt[3] + gt[5] * cov["height"] / 2.0
+        px_deg = abs(gt[5])
+        if abs(centre_lat - params.tx_lat) > 6 * px_deg or \
+           abs(centre_lon - params.tx_lon) > 6 * px_deg / max(
+               0.2, math.cos(math.radians(params.tx_lat))):
+            problems.append(f"centre {centre_lat:.4f},{centre_lon:.4f} is not the "
+                            f"transmitter {params.tx_lat:.4f},{params.tx_lon:.4f}")
+        wanted_deg = params.resolution_m / 111_111.0
+        if not (0.7 * wanted_deg <= px_deg <= 1.4 * wanted_deg):
+            problems.append(f"pixel height {px_deg:.6f}° vs ~{wanted_deg:.6f}° for "
+                            f"{params.resolution_m} m")
+    else:
+        problems.append("no geotransform on the export at all")
+    proj = cov["projection"]
     try:
-        for row in rows:
-            scratch = scratch_root / row["row"].replace(".", "_")
-            scratch.mkdir(parents=True, exist_ok=True)
-            try:
-                with Pipeline(scratch, binaries, keep) as pipe:
-                    _pipeline_row(row, layers.get(row["name"]), plugin, pipe,
-                                  manifest, results, timeout)
-            except Exception as exc:
-                results.add(row["row"], "pipeline", "the row's pipeline ran to completion",
-                            FAIL, f"the check itself raised {type(exc).__name__}: {exc}")
-        _tier_pipeline_combinations(manifest, results, layers, plugin, binaries,
-                                    scratch_root, timeout, keep)
-    finally:
-        if keep:
-            results.note(f"pipeline scratch kept at {scratch_root}")
-        else:
-            shutil.rmtree(scratch_root, ignore_errors=True)
+        from osgeo import osr
+        srs = osr.SpatialReference(wkt=proj)
+        if not srs.IsGeographic():
+            problems.append("the export's CRS is projected, not WGS84 degrees")
+    except Exception:
+        if "4326" not in proj:
+            problems.append("the export carries no readable CRS")
+    results.add(rid, grid_id, "the coverage grid matches the job",
+                FAIL if problems else PASS,
+                "; ".join(problems) if problems else
+                f"{cov['px']} px, 1 band, WGS84, centred on the transmitter",
+                known_fail_for(row, grid_id))
+
+    # -- disk fullness ---------------------------------------------------
+    band = list(row.get("expect_cov_valid_pct") or []) if row else []
+    if len(band) == 2:
+        lo, hi = float(band[0]), float(band[1])
+        ok = lo <= cov["valid_pct"] <= hi
+        results.add(rid, disk_id, "the coverage disk is as full as declared",
+                    PASS if ok else FAIL,
+                    f"{cov['valid_pct']}% valid vs the catalogue's "
+                    f"{lo:.0f}–{hi:.0f}%"
+                    + ("" if ok else " — a clipped or half-empty disk is a "
+                                    "result nobody asked for"),
+                    known_fail_for(row, disk_id))
+    else:
+        results.add(rid, disk_id, "the coverage disk is as full as declared",
+                    FAIL, "the catalogue declares no expect_cov_valid_pct band "
+                          "for this row — an unmeasured disk is not a pass",
+                    known_fail_for(row, disk_id))
+
+    # -- stripes ---------------------------------------------------------
+    gaps = (cov.get("gap_rows") or 0) + (cov.get("gap_cols") or 0)
+    results.add(rid, stripe_id, "the coverage has no stripes or gaps",
+                PASS if cov.get("valid") and not gaps else FAIL,
+                (f"{cov.get('gap_rows', '?')} empty row(s) and "
+                 f"{cov.get('gap_cols', '?')} empty column(s) strictly inside "
+                 f"the footprint" if cov.get("valid") else "no valid pixel at all"),
+                known_fail_for(row, stripe_id))
 
 
-def _check_agrees_with_reference(row, rid, reference_row, abt_dir, tolerance,
-                                 plugin, pipe, manifest, results, timeout) -> None:
-    """Does this row's terrain match the reference source over the same ground?"""
+def _check_result_loads(rid: str, state: Dict[str, Any], row, results: Results,
+                        plugin, check_id: str = "pipeline.cov.load") -> None:
+    """The exported result must load through the plugin's own loader.
+
+    ``result_loader.load_coverage_result`` is what turns the engine's file
+    into the styled layer the user sees; 800 lines of it previously had no
+    pipeline coverage at all. Loaded, verified, and NOT left in the project.
+    """
+    loaded, problems = 0, []
+    for tif_path, model, display_name in (state.get("ok") or []):
+        try:
+            layer = plugin["result_loader"].load_coverage_result(
+                tif_path, model, display_name)
+            if layer is None or not layer.isValid():
+                problems.append(f"{display_name}: the loader returned an "
+                                f"invalid layer")
+            elif layer.renderer() is None:
+                problems.append(f"{display_name}: loaded with no renderer/styling")
+            else:
+                loaded += 1
+        except Exception as exc:
+            problems.append(f"{display_name}: {type(exc).__name__}: "
+                            f"{_shorten(str(exc), 90)}")
+    results.add(rid, check_id, "the result loads through the plugin's own loader",
+                PASS if loaded and not problems else FAIL,
+                f"{loaded} result(s) loaded and styled"
+                + ("; " + "; ".join(problems[:2]) if problems else ""),
+                known_fail_for(row, check_id))
+
+
+def _abt_asserts(rid: str, row, tiles, plugin, lat: float, lon: float,
+                 results: Results, check_id: str, label: str,
+                 note: str) -> bool:
+    """Everything a terrain directory must prove before a coverage may run.
+
+    Readable; not all-VOID; not constant; not download-failure fill (the
+    plugin's own ``_abt_has_gaps`` plus a 0 m floor the catalogue's band
+    contradicts); a REAL probe pixel at the transmitter (VOID there means
+    the engine computes around a hole exactly where it matters most); the
+    catalogue's elevation band; and the catalogue's real-fraction floor.
+    Returns True when the terrain is sound.
+    """
+    adapter = plugin["adapter"]
+    report = abt_report(tiles, plugin)
+    if "unreadable" in report:
+        results.add(rid, check_id, label, FAIL,
+                    f"the engine wrote {report['unreadable']} and the plugin "
+                    f"cannot read it", known_fail_for(row, check_id))
+        return False
+    if not report["real_px"]:
+        results.add(rid, check_id, label, FAIL,
+                    f"{note}, and every sample is VOID — the source contributed "
+                    f"nothing and the run still said done",
+                    known_fail_for(row, check_id))
+        return False
+    if report["min_m"] == report["max_m"]:
+        results.add(rid, check_id, label, FAIL,
+                    f"{note}, every real sample is {report['min_m']:,.1f} m — a "
+                    f"constant tile is what a silently-failed source writes",
+                    known_fail_for(row, check_id))
+        return False
+
+    problems = []
+    band = row.get("expect_elev_m") or []
+    at = abt_at(report["grids"], lat, lon, plugin)
+    if at is None or at <= plugin["abt"].MIN_VALID_ELEV_M or \
+            at == CONVERTER_VOID_COUNTS * plugin["abt"].ELEV_STEP_M:
+        problems.append(f"the probe pixel at {lat:.4f},{lon:.4f} — the "
+                        f"transmitter — is {'outside the tiles' if at is None else 'VOID'}")
+    elif len(band) == 2 and not (float(band[0]) <= at <= float(band[1])):
+        problems.append(f"{at:,.1f} m at the probe, outside the plausible "
+                        f"{float(band[0]):,.0f}..{float(band[1]):,.0f} m")
+
+    # Download-failure fill: the converter writes a FAILED tile as 0 m. The
+    # plugin ships a detector for exactly that; the suite finally calls it.
+    if len(band) == 2 and float(band[0]) > 0 and report["min_m"] == 0.0:
+        problems.append(f"the tiles bottom out at exactly 0.0 m where the "
+                        f"catalogue's floor is {float(band[0]):,.0f} m — that is "
+                        f"download-failure fill, not terrain")
+    try:
+        gap_checker = getattr(adapter, "_abt_has_gaps", None)
+        if gap_checker is not None:
+            for path in tiles:
+                if gap_checker(str(path)):
+                    problems.append(f"{Path(path).name}: the plugin's own gap "
+                                    f"detector flags failure-fill blocks")
+                    break
+    except Exception as exc:  # noqa: BLE001 — the detector must not hide a row
+        problems.append(f"_abt_has_gaps could not run: {exc}")
+
+    floor_pct = float(row.get("expect_real_pct") or 0.0)
+    real_pct = 100.0 * report["real_px"] / max(report["total_px"], 1)
+    if floor_pct and real_pct < floor_pct:
+        problems.append(f"only {real_pct:.1f}% of samples are real vs the "
+                        f"catalogue's {floor_pct:.0f}% floor")
+
+    detail = (f"{note}, {report['real_px']:,}/{report['total_px']:,} real, "
+              f"{report['min_m']:,.1f}..{report['max_m']:,.1f} m")
+    if at is not None:
+        detail += f", {at:,.1f} m at {lat:.4f},{lon:.4f}"
+    results.add(rid, check_id, label, FAIL if problems else PASS,
+                detail + ("; " + "; ".join(problems) if problems else ""),
+                known_fail_for(row, check_id))
+    return not problems
+
+
+def _check_agrees(rid: str, row, tiles, ref_dir: Optional[Path],
+                  tolerance: float, results: Results, plugin) -> None:
+    """This row's terrain against the catalogue's reference, over the same
+    ground — p95 AND max over the samples BOTH sides call real.
+
+    What this measures: wrong VALUES (a decode error, an offset, a shear).
+    What it deliberately does not: missing samples — the mask intersection
+    excludes them, so stripes and holes are the real-fraction floor's and
+    the probe check's job, not this one's.
+
+    The reference was built ONCE, by its own worker run, into its own
+    directory; nothing here re-acquires anything, so the old aliasing (the
+    reference overwriting the very tiles it was compared against) cannot
+    recur.
+    """
     import numpy as np
     abt_mod = plugin["abt"]
-    by_row = {r["row"]: r for r in manifest["rows"]}
-    ref = by_row.get(reference_row)
-    layers = _project_layers()
-    if ref is None or layers.get(ref["name"]) is None:
+    if ref_dir is None:
         results.add(rid, "pipeline.agrees",
-                    f"agrees with {reference_row} over the same ground", SKIP,
-                    f"the catalogue's reference row {reference_row} is not in the project")
+                    "agrees with the reference over the same ground", FAIL,
+                    "the reference terrain was never built, so this row's "
+                    "terrain was never independently measured",
+                    known_fail_for(row, "pipeline.agrees"))
         return
-    probe = manifest.get("elevation_probe") or {}
-    lat, lon = float(probe.get("lat", 46.945)), float(probe.get("lon", 7.41))
-    adapter = plugin["adapter"]
-    bbox = adapter.analysis_bbox(lat, lon, int(row.get("pipeline_range_km") or 3))
-    ref_paths, _kind, _note = _acquire(ref, layers[ref["name"]], plugin, pipe, bbox,
-                                       [int(row.get("pipeline_res_m") or 30)], timeout)
-    ref_by_name = {Path(p).name: p for p in ref_paths}
-    worst, samples = 0.0, 0
-    for path in abt_mod.list_tiles(str(abt_dir)):
-        other = ref_by_name.get(Path(path).name)
+    ref = {Path(p).name: p for p in abt_mod.list_tiles(str(ref_dir))}
+    diffs = []
+    samples = 0
+    for path in tiles:
+        other = ref.get(Path(path).name)
         if other is None:
             continue
-        mine = abt_mod.read_tile(abt_mod.read_header(path))
-        theirs = abt_mod.read_tile(abt_mod.read_header(other))
+        mine = abt_mod.read_tile(abt_mod.read_header(str(path)))
+        theirs = abt_mod.read_tile(abt_mod.read_header(str(other)))
         if mine is None or theirs is None or mine.shape != theirs.shape:
             continue
         mask = _real_mask(mine, plugin) & _real_mask(theirs, plugin)
         if not mask.any():
             continue
-        diff = np.abs(mine[mask].astype("int32") - theirs[mask].astype("int32"))
+        diffs.append(np.abs(mine[mask].astype("int32")
+                            - theirs[mask].astype("int32")))
         samples += int(mask.sum())
-        worst = max(worst, float(np.mean(diff)) * abt_mod.ELEV_STEP_M)
     if not samples:
         results.add(rid, "pipeline.agrees",
-                    f"agrees with {reference_row} over the same ground", SKIP,
-                    "no tile in common with the reference source")
+                    "agrees with the reference over the same ground", FAIL,
+                    "no shared real sample with the reference — the comparison "
+                    "the catalogue declares could not be made",
+                    known_fail_for(row, "pipeline.agrees"))
         return
-    ok = worst <= tolerance
+    step = abt_mod.ELEV_STEP_M
+    all_diffs = np.concatenate(diffs)
+    p95 = float(np.percentile(all_diffs, 95)) * step
+    worst = float(all_diffs.max()) * step
+    ok = p95 <= tolerance and worst <= 2.0 * tolerance
     results.add(rid, "pipeline.agrees",
-                f"agrees with {reference_row} over the same ground",
+                "agrees with the reference over the same ground",
                 PASS if ok else FAIL,
-                f"mean |difference| {worst:,.1f} m over {samples:,} shared samples"
-                + ("" if ok else f", the catalogue allows {tolerance:,.0f} m — this "
-                                 f"source's terrain is wrong, not merely different"),
+                f"p95 |difference| {p95:,.1f} m, max {worst:,.1f} m over "
+                f"{samples:,} shared samples (catalogue allows p95 "
+                f"{tolerance:,.0f} m, max {2 * tolerance:,.0f} m)"
+                + ("" if ok else " — this source's terrain is wrong, not "
+                                 "merely different"),
                 known_fail_for(row, "pipeline.agrees"))
 
 
-def _check_nothing_cached(row, rid, plugin, results: Results) -> None:
-    """After a refusal, the pool must hold nothing a later run would reuse.
+def _check_nothing_cached(row, rid, plugin, results: Results, pipe) -> None:
+    """After a refusal, the run's cache must hold nothing a later run reuses.
 
-    Row 1.6's contract in full is "hard error, NOTHING CACHED, no flat-0
-    terrain". The hard error is the easy half. The other half is what turns a
-    one-off failure into a permanent one: a failed download leaves a full-size
-    all-zero .abt in the pool, and every run after it reports a cache hit and
-    produces a confident coverage over flat sea.
+    The row ran inside its own redirected cache (the Pipeline's), so whatever
+    the refusal left behind is in there and nowhere else — pool, views, all
+    of it is scanned. The old version asked ``_pool_dir(row["source"])``,
+    whose identity never matched the live layer's source for file rows and
+    does not exist at all for rendered ones, so it PASSed 7 of its 11 rows
+    on the emptiness of a directory nothing had ever written.
     """
-    adapter = plugin["adapter"]
     abt_mod = plugin["abt"]
-    results.plan(rid, "pipeline.nothing_cached")
-    try:
-        pool = adapter._pool_dir(row["source"])
-    except Exception as exc:
-        results.add(rid, "pipeline.nothing_cached", "the refusal cached nothing reusable",
-                    FAIL, f"the pool directory could not be resolved: {exc}")
-        return
-    left = abt_mod.list_tiles(pool) if os.path.isdir(pool) else []
-    reusable = []
-    for path in left:
-        grid = abt_mod.read_tile(abt_mod.read_header(path))
+    left, reusable = [], []
+    for path in sorted(Path(pipe.cache).rglob("*.abt")):
+        left.append(path)
+        grid = abt_mod.read_tile(abt_mod.read_header(str(path)))
         if grid is None:
             continue
         real = _real_mask(grid, plugin)
-        reusable.append((Path(path).name, int(real.sum()), int(grid.size)))
+        if int(real.sum()):
+            reusable.append((path.name, int(real.sum()), int(grid.size)))
     if not reusable:
         results.add(rid, "pipeline.nothing_cached", "the refusal cached nothing reusable",
-                    PASS, f"{len(left)} file(s) left in the pool, none of them usable terrain",
+                    PASS, f"{len(left)} .abt file(s) anywhere in the run's cache, "
+                          f"none of them usable terrain",
                     known_fail_for(row, "pipeline.nothing_cached"))
         return
     name, real, total = reusable[0]
     results.add(rid, "pipeline.nothing_cached", "the refusal cached nothing reusable",
                 FAIL,
-                f"the failed run left {name} in the pool ({real:,}/{total:,} samples the "
+                f"the failed run left {name} in the cache ({real:,}/{total:,} samples the "
                 f"plugin calls terrain). The next run of this layer reports a cache hit, "
                 f"skips the download and builds a coverage over it",
                 known_fail_for(row, "pipeline.nothing_cached"))
@@ -1895,11 +2219,11 @@ def _check_void_sentinel(plugin, results: Results) -> None:
     """The plugin's "is this terrain?" rule must reject the engine's own VOID.
 
     ``aether_converter`` writes -9999 COUNTS (-4999.5 m) for a pixel no source
-    covered. The plugin's validity floor is ``MIN_VALID_ELEV_M = -5000.0 m``,
-    i.e. -10000 counts — one count BELOW the sentinel — so ``src >
-    MIN_VALID_ELEV_M`` (abt.paste_tile, raster_tools) calls every hole valid
-    ground 5 km down instead of no-data. Nothing in the suite looked at the two
-    numbers together, and they are one count apart.
+    covered. The floor's HISTORY is why this check exists: it once sat one
+    count below the sentinel, so ``src > MIN_VALID_ELEV_M`` called every hole
+    valid ground instead of no-data. The check computes from the live
+    constants, whatever their current values, so a regression reopens it
+    loudly.
     """
     abt_mod = plugin["abt"]
     results.plan("-", "void.sentinel")
@@ -1916,482 +2240,355 @@ def _check_void_sentinel(plugin, results: Results) -> None:
                    f"{void_m:,.1f} m instead of no-data"))
 
 
-def _pipeline_row(row, layer, plugin, pipe: Pipeline, manifest, results,
-                  timeout: int) -> None:
-    """Acquire → ingest/download → .abt → coverage → export, for one row."""
+#: Rows whose catalogue ``check`` says the pipeline must NOT produce terrain.
+_MUST_FAIL = ("error",)
+#: Rows the plugin's own router must refuse before any terrain is fetched.
+_MUST_REJECT = ("reject",)
+
+
+def _probe_for(row, manifest) -> Tuple[float, float]:
+    probe = manifest.get("elevation_probe") or {}
+    box = row.get("footprint") or []
+    if len(box) == 4:
+        return (box[1] + box[3]) / 2.0, (box[0] + box[2]) / 2.0
+    return (float(probe.get("lat", 46.945)), float(probe.get("lon", 7.41)))
+
+
+def _agrees_applies(row, manifest, plugin) -> bool:
+    """Does the catalogue's reference comparison apply to this row's run?
+
+    Structural, and measured in TILES rather than degrees: the catalogue
+    declares a tolerance, the row runs at the reference's 30 m, and the
+    row's enumerated tile set shares at least one tile with the
+    reference's. A degree-radius gate silently excluded 2.8, whose AOI
+    centre is 0.10 deg west of the probe and whose single tile is
+    nevertheless the reference tile itself.
+    """
+    if float(row.get("expect_agrees_m") or 0.0) <= 0:
+        return False
+    if int(row.get("pipeline_res_m") or 30) != 30:
+        return False
+    if row["row"] == manifest.get("reference_row"):
+        return False
+    return bool(_row_tiles(row, manifest, plugin) & _reference_tiles(manifest, plugin))
+
+
+def _row_tiles(row, manifest, plugin) -> set:
+    mc = plugin["mc"]
     adapter = plugin["adapter"]
+    lat, lon = _probe_for(row, manifest)
+    bbox = adapter.analysis_bbox(lat, lon, int(row.get("pipeline_range_km") or 3))
+    return {t["filename"] for _r, t in
+            mc._enumerate_tiles(mc._snap_bbox(bbox, [30]), [30])}
+
+
+def _reference_tiles(manifest, plugin) -> set:
+    mc = plugin["mc"]
+    adapter = plugin["adapter"]
+    probe = manifest.get("elevation_probe") or {}
+    lat = float(probe.get("lat", 46.945))
+    lon = float(probe.get("lon", 7.41))
+    bbox = adapter.analysis_bbox(lat, lon, 3)
+    return {t["filename"] for _r, t in
+            mc._enumerate_tiles(mc._snap_bbox(bbox, [30]), [30])}
+
+
+def _plugin_identity() -> Tuple[str, str]:
+    """``(path, version)`` of the waveshed package the imports resolved to."""
+    import waveshed
+    pkg = Path(waveshed.__file__).resolve().parent
+    version = "unknown"
+    try:
+        for line in (pkg / "metadata.txt").read_text(encoding="utf-8").splitlines():
+            if line.startswith("version="):
+                version = line.split("=", 1)[1].strip()
+                break
+    except OSError:
+        pass
+    return str(pkg), version
+
+
+#: Everything this runner drives on the plugin. A pairing that lacks one of
+#: these would otherwise die as an AttributeError mid-run — which on
+#: 2026-08-26 meant one crash line and 283 NOTRUNs.
+_REQUIRED_PLUGIN_SURFACE = (
+    ("mc", ("_pending_render_jobs", "_union_extent", "_detect_resolution",
+            "resolve_sources_with_progress", "_MapConverterWorker",
+            "_enumerate_tiles", "_snap_bbox", "_LayerEntry")),
+    ("sat", ("_SiteAnalysisWorker",)),
+    ("p2p", ("_P2PWorker", "_write_temp_batch_csv")),
+    ("adapter", ("prepare_terrain", "analysis_bbox", "_compute_sector_bbox",
+                 "_compute_subtiles", "_cache_key", "buildings_identity",
+                 "_abt_has_gaps", "ensure_pool_tiles")),
+    ("result_loader", ("load_coverage_result",)),
+)
+
+
+def _pairing_problem(loaded_pkg: str, repo: Optional[Path], plugin) -> Optional[str]:
+    """Why this runner must not test the waveshed it imported, or None.
+
+    Tier C's subject is THIS repo's plugin: the runner and the workers it
+    drives are one change set. So the import must resolve inside the repo —
+    a standalone run guarantees that, while the QGIS console's preloaded
+    installed copy silently wins every import — and the copy must carry
+    every function the runner calls.
+    """
+    if repo is not None:
+        loaded = Path(loaded_pkg).resolve()
+        try:
+            inside = loaded.is_relative_to(repo.resolve())
+        except AttributeError:                      # Python < 3.9
+            inside = str(loaded).startswith(str(repo.resolve()))
+        if not inside:
+            return (f"the imported waveshed lives at {loaded_pkg}, not under this "
+                    f"repo ({repo}) — that is the installed/loaded copy, which this "
+                    f"runner cannot vouch for. Run tier C standalone from the repo; "
+                    f"to refresh the installed plugin, run deploy.py and restart QGIS")
+    missing = []
+    for key, names in _REQUIRED_PLUGIN_SURFACE:
+        module = plugin.get(key)
+        missing += [f"{key}.{name}" for name in names
+                    if not hasattr(module, name)]
+    if missing:
+        return (f"the imported plugin lacks {', '.join(missing[:4])}"
+                + (f" (+{len(missing) - 4} more)" if len(missing) > 4 else "")
+                + " — plugin and runner are from different change sets; "
+                  "bring both to the same checkout (deploy.py + restart QGIS, "
+                  "or git pull the missing half)")
+    return None
+
+
+def _check_plugin_pairing(plugin, results: Results) -> bool:
+    """The FIRST tier-C check: which plugin is under test, and is it ours.
+
+    Runs before anything else is planned, deliberately: on a bad pairing the
+    run FAILS here with one line instead of declaring ~280 checks whose only
+    possible fate is a wall of NOTRUNs. Aborting before declaring is not a
+    silent skip — the run is red and says exactly why nothing else ran.
+    """
+    results.plan("-", "plugin.pairing")
+    loaded, version = _plugin_identity()
+    problem = _pairing_problem(loaded, REPO, plugin)
+    results.add("-", "plugin.pairing", "the plugin under test is this repo's",
+                FAIL if problem else PASS,
+                problem or f"waveshed {version} at {loaded}")
+    return problem is None
+
+
+def _plan_pipeline_row(row, manifest, results: Results, plugin) -> None:
+    """Declare EVERY check this row's pipeline will file, before it runs.
+
+    The accounting rule this rewrite exists for: a check that is declared
+    and does not execute is a NOTRUN, and a NOTRUN fails the run. Nothing
+    may decide mid-flight that a check "did not apply".
+    """
+    rid = row["row"]
+    check = row.get("check")
+    results.plan(rid, "pipeline")
+    if check in _MUST_REJECT:
+        results.plan(rid, "pipeline.sa_refuses")
+        results.plan(rid, "pipeline.nothing_cached")
+        return
+    if check in _MUST_FAIL:
+        results.plan(rid, "pipeline.nothing_cached")
+        return
+    if row.get("kind") == "vector":
+        if check == "buildings":
+            results.plan(rid, "pipeline.cov_delta")
+        return
+    if check == "both" and row.get("kind") == "raster":
+        results.plan(rid, "pipeline.sa")
+        results.plan(rid, "pipeline.both_tabs")
+        if _agrees_applies(row, manifest, plugin):
+            results.plan(rid, "pipeline.agrees")
+        for suffix in ("grid", "disk", "stripes", "load"):
+            results.plan(rid, f"pipeline.cov.{suffix}")
+
+
+def _pipeline_row(row, layer, plugin, pipe: "Pipeline", manifest, results,
+                  timeout: int, ref_dir: Optional[Path]) -> None:
+    """One row, end to end, through the shipped workers."""
     rid = row["row"]
     if layer is None:
         results.add(rid, "pipeline", "terrain out of this layer", FAIL,
                     "the layer is not in the project, so nothing can be run through it")
         return
-
     if row.get("kind") == "vector":
         _pipeline_vector_row(row, layer, plugin, pipe, manifest, results, timeout)
         return
+
     resolution = int(row.get("pipeline_res_m") or 30)
     range_km = int(row.get("pipeline_range_km") or 3)
-    probe = manifest.get("elevation_probe") or {}
-    box = row.get("footprint") or []
-    lat, lon = ((box[1] + box[3]) / 2.0, (box[0] + box[2]) / 2.0) if len(box) == 4 else (
-        float(probe.get("lat", 46.945)), float(probe.get("lon", 7.41)))
+    lat, lon = _probe_for(row, manifest)
+    adapter = plugin["adapter"]
     bbox = adapter.analysis_bbox(lat, lon, range_km)
-
     must_fail = row.get("check") in _MUST_FAIL
     must_reject = row.get("check") in _MUST_REJECT
 
+    # ---- Map Converter, the real one -----------------------------------
+    mc_out = pipe.scratch / "mc"
     try:
-        paths, kind, note = _acquire(row, layer, plugin, pipe, bbox,
-                                     [resolution], timeout)
-    except Exception as exc:
-        said = " ".join(str(exc).split())
-        if must_reject:
+        state = _mc_convert([(row, layer)], plugin, mc_out, [resolution],
+                            timeout, bbox=bbox)
+    except RuntimeError as exc:
+        state = {"ok": None, "err": str(exc), "log": [], "tiles": []}
+    said = _worker_complaint(state)
+
+    if must_reject:
+        wanted = (row.get("expect_failure") or "").strip().lower()
+        if state["ok"] is not None:
+            results.add(rid, "pipeline", "the plugin refuses to run this as terrain",
+                        FAIL, f"it did not refuse — {len(state['tiles'])} tile(s) were "
+                              f"produced from a layer the catalogue says must never be "
+                              f"offered as terrain", known_fail_for(row, "pipeline"))
+        elif _is_synthesized(said) or (wanted and wanted not in said.lower()):
+            results.add(rid, "pipeline", "the plugin refuses to run this as terrain",
+                        FAIL, f"it refused, but not for the catalogue's reason "
+                              f"({wanted!r}): {_shorten(said, 110)} — a network hiccup "
+                              f"or a runner timeout must not count as the classifier "
+                              f"working", known_fail_for(row, "pipeline"))
+        else:
             results.add(rid, "pipeline", "the plugin refuses to run this as terrain",
                         PASS, _shorten(said, 110), known_fail_for(row, "pipeline"))
-        elif must_fail:
+        _reject_sa_check(row, layer, plugin, pipe, results, lat, lon,
+                         resolution, range_km, timeout)
+        _check_nothing_cached(row, rid, plugin, results, pipe)
+        return
+
+    if must_fail:
+        if state["ok"] is not None:
+            results.add(rid, "pipeline", "the pipeline fails, loudly and for the right reason",
+                        FAIL, f"it succeeded — {len(state['tiles'])} tile(s). The catalogue "
+                              f"says this source must be refused, and terrain nobody can "
+                              f"trust is worse than none", known_fail_for(row, "pipeline"))
+        elif _is_synthesized(said):
+            results.add(rid, "pipeline", "the pipeline fails, loudly and for the right reason",
+                        FAIL, f"the runner's own timeout/cancel is not a refusal: "
+                              f"{_shorten(said, 110)}", known_fail_for(row, "pipeline"))
+        else:
             ok, why = _refusal_is_the_right_one(row, said, row["source"], 1)
             results.add(rid, "pipeline", "the pipeline fails, loudly and for the right reason",
                         PASS if ok else FAIL, why, known_fail_for(row, "pipeline"))
-            _check_nothing_cached(row, rid, plugin, results)
-        else:
-            results.add(rid, "pipeline", "terrain out of this layer", FAIL,
-                        _tail(said, 240), known_fail_for(row, "pipeline"))
+        _check_nothing_cached(row, rid, plugin, results, pipe)
         return
 
-    if must_reject:
-        results.add(rid, "pipeline", "the plugin refuses to run this as terrain", FAIL,
-                    f"it did not refuse — {note} were produced from a layer the catalogue "
-                    f"says must never be offered as terrain",
+    if row.get("check") != "both":
+        # Planned as bare `pipeline` only — a raster row with an unknown
+        # check must fail HERE, not wander into the both-row flow and file
+        # six checks nobody declared.
+        results.add(rid, "pipeline", "this layer drives a real run", FAIL,
+                    f"no pipeline role is defined for check={row.get('check')!r}")
+        return
+    if state["ok"] is None:
+        results.add(rid, "pipeline", "terrain out of this layer, through the real Map Converter",
+                    FAIL, _tail(said, 240), known_fail_for(row, "pipeline"))
+        return
+    tiles = state["tiles"]
+    expected_names = {t["filename"] for _r, t in plugin["mc"]._enumerate_tiles(
+        plugin["mc"]._snap_bbox(bbox, [resolution]), [resolution])}
+    got_names = {Path(t).name for t in tiles}
+    if got_names != expected_names:
+        results.add(rid, "pipeline",
+                    "terrain out of this layer, through the real Map Converter",
+                    FAIL, f"the run produced tiles {sorted(got_names)[:3]} where the "
+                          f"plugin's own enumeration says {sorted(expected_names)[:3]} "
+                          f"— a dropped or extra tile, before values were even read",
                     known_fail_for(row, "pipeline"))
         return
-    if must_fail:
-        results.add(rid, "pipeline", "the pipeline fails, loudly and for the right reason",
-                    FAIL, f"it succeeded — {note}. The catalogue says this source must be "
-                          f"refused, and terrain nobody can trust is worse than none",
-                    known_fail_for(row, "pipeline"))
-        return
+    terrain_ok = _abt_asserts(rid, row, tiles, plugin, lat, lon, results,
+                              "pipeline",
+                              "terrain out of this layer, through the real Map Converter",
+                              f"{len(tiles)} tile(s) via the Map Converter worker")
 
-    report = abt_report(paths, plugin)
-    if "unreadable" in report:
-        results.add(rid, "pipeline", "terrain out of this layer", FAIL,
-                    f"the engine wrote {report['unreadable']} and the plugin cannot read it",
-                    known_fail_for(row, "pipeline"))
-        return
-    if not report["real_px"]:
-        results.add(rid, "pipeline", "terrain out of this layer", FAIL,
-                    f"{note}, and every sample is VOID — the source contributed nothing "
-                    f"and the engine still exited 0", known_fail_for(row, "pipeline"))
-        return
-    if report["min_m"] == report["max_m"]:
-        results.add(rid, "pipeline", "terrain out of this layer", FAIL,
-                    f"{note}, every real sample is {report['min_m']:,.1f} m — a constant "
-                    f"tile is what a silently-failed source writes, not terrain",
-                    known_fail_for(row, "pipeline"))
-        return
+    # ---- the catalogue's independent reference -------------------------
+    if _agrees_applies(row, manifest, plugin):
+        _check_agrees(rid, row, tiles, ref_dir,
+                      float(row.get("expect_agrees_m") or 0.0), results, plugin)
 
-    at = abt_at(report["grids"], lat, lon, plugin)
-    band = row.get("expect_elev_m") or []
-    detail = (f"{kind}: {note}, {report['real_px']:,}/{report['total_px']:,} real, "
-              f"{report['min_m']:,.1f}..{report['max_m']:,.1f} m")
-    if at is not None:
-        detail += f", {at:,.1f} m at {lat:.4f},{lon:.4f}"
-    if len(band) == 2 and at is not None and not (float(band[0]) <= at <= float(band[1])):
-        results.add(rid, "pipeline", "terrain out of this layer", FAIL,
-                    detail + f" — outside the plausible {float(band[0]):,.0f}.."
-                             f"{float(band[1]):,.0f} m for this probe",
-                    known_fail_for(row, "pipeline"))
-        return
+    # ---- Site Analysis, the real one, end to end -----------------------
+    params = _coverage_params(plugin, lat, lon, resolution, range_km,
+                              f"cov_{rid.replace('.', '_')}")
+    sa_out = pipe.scratch / "sa"
+    sa_state = _sa_analyse(rid, layer, plugin, sa_out,
+                           [(params, f"torture {rid}")], timeout * 3,
+                           results=results)
+    if sa_state["ok"] is not None:
+        results.add(rid, "pipeline.sa", "a real Site Analysis run, end to end",
+                    PASS, f"{len(sa_state['ok'])} result(s) out of the worker",
+                    known_fail_for(row, "pipeline.sa"))
+    else:
+        results.add(rid, "pipeline.sa", "a real Site Analysis run, end to end",
+                    FAIL, _tail(" ".join((sa_state["err"] or "").split()), 200),
+                    known_fail_for(row, "pipeline.sa"))
 
-    abt_dir = pipe.scratch / "terrain"
-    abt_dir.mkdir(exist_ok=True)
-    for path in paths:
-        target = abt_dir / Path(path).name
-        if not target.exists():
-            try:
-                os.link(path, target)
-            except OSError:
-                target.write_bytes(Path(path).read_bytes())
+    # ---- the two tabs against each other -------------------------------
+    sa_view = _sa_view_dir(layer.source(), lat, lon, float(range_km),
+                           resolution, plugin)
+    if os.path.isdir(sa_view):
+        ok, why = _cross_tab_contract(mc_out, sa_view, plugin)
+        results.add(rid, "pipeline.both_tabs",
+                    "Site Analysis and the Map Converter build the same terrain",
+                    PASS if ok else FAIL, why,
+                    known_fail_for(row, "pipeline.both_tabs"))
+    else:
+        results.add(rid, "pipeline.both_tabs",
+                    "Site Analysis and the Map Converter build the same terrain",
+                    FAIL, "the Site Analysis run left no terrain view to compare "
+                          "(its run failed before terrain, or the cache identity "
+                          "moved)", known_fail_for(row, "pipeline.both_tabs"))
 
-    # The other tab. The catalogue runs every `check: both` row through Site
-    # Analysis AND the Map Converter, and its own header says a divergence
-    # between them is a bug by definition — so the two are built and compared,
-    # not just each declared to work on its own.
-    if row.get("check") in ("both", "buildings"):
-        results.plan(rid, "pipeline.both_tabs")
-        try:
-            sa_dir = _acquire_site_analysis(row, layer, plugin, lat, lon,
-                                            resolution, range_km)
-            same, why = _agree(sa_dir, abt_dir, plugin)
-            results.add(rid, "pipeline.both_tabs",
-                        "Site Analysis and the Map Converter build the same terrain",
-                        PASS if same else FAIL, why,
-                        known_fail_for(row, "pipeline.both_tabs"))
-        except Exception as exc:
-            results.add(rid, "pipeline.both_tabs",
-                        "Site Analysis and the Map Converter build the same terrain",
-                        FAIL, f"the Site Analysis path failed where the Map Converter "
-                              f"succeeded: {type(exc).__name__}: "
-                              f"{' '.join(str(exc).split())[:120]}",
-                        known_fail_for(row, "pipeline.both_tabs"))
-    # Against the catalogue's reference source, over the same ground. Two
-    # independent DEMs of the same place agree to a few metres; a source an
-    # order of magnitude past that is not a dataset difference, it is a fault
-    # somewhere in acquisition — and it is invisible to every other check here,
-    # because wrong-but-plausible terrain produces a wrong-but-plausible
-    # coverage.
-    tolerance = float(row.get("expect_agrees_m") or 0.0)
-    reference_row = manifest.get("reference_row")
-    if tolerance and reference_row and rid != reference_row:
-        results.plan(rid, "pipeline.agrees")
-        _check_agrees_with_reference(row, rid, reference_row, abt_dir, tolerance,
-                                     plugin, pipe, manifest, results, timeout)
-
-    name = f"cov_{rid.replace('.', '_')}"
-    code, said, tif = _coverage(plugin, pipe, abt_dir, lat, lon, resolution,
-                                range_km, name, timeout)
-    if tif is None:
-        results.add(rid, "pipeline", "terrain out of this layer, and a coverage over it",
-                    FAIL, detail + f" — but the run failed (exit {code}): {_tail(said, 170)}",
-                    known_fail_for(row, "pipeline"))
-        return
-    cov = coverage_report(tif)
-    if not cov.get("valid"):
-        results.add(rid, "pipeline", "terrain out of this layer, and a coverage over it",
-                    FAIL, detail + " — the coverage exported with no valid pixel in it",
-                    known_fail_for(row, "pipeline"))
-        return
-    results.add(rid, "pipeline", "terrain out of this layer, and a coverage over it",
-                PASS, detail + f" | coverage {cov['px']} {cov['valid_pct']}% valid, "
-                               f"{cov['min']}..{cov['max']} dB",
-                known_fail_for(row, "pipeline"))
+    # ---- the coverage itself -------------------------------------------
+    tif = None
+    if sa_state["ok"]:
+        tif_path = sa_state["ok"][0][0]
+        tif = Path(tif_path) if os.path.isfile(tif_path) else None
+    _check_coverage(rid, tif, params, row, results, plugin)
+    _check_result_loads(rid, sa_state, row, results, plugin)
+    if not terrain_ok:
+        results.note(f"{rid}: the coverage checks above ran over terrain that "
+                     f"already failed its own asserts — fix the terrain first")
 
 
-#: The Map Converter stack combinations the catalogue implies but no single
-#: row can express. Each names the ROLE a row must play; the rows themselves
-#: are picked from the manifest, so this list never goes stale against it.
-_COMBINATIONS = (
-    {"name": "files + files (priority order)", "roles": ("dem", "dem2"),
-     "resolutions": (30,),
-     "asserts": "priority"},
-    {"name": "xyz under files (mixed acquisition)", "roles": ("xyz", "dem"),
-     "resolutions": (30,),
-     "asserts": "terrain"},
-    {"name": "files under xyz (reversed priority)", "roles": ("dem", "xyz"),
-     "resolutions": (30,),
-     "asserts": "terrain"},
-    {"name": "rendered service under files", "roles": ("rendered", "dem"),
-     "resolutions": (30,),
-     "asserts": "terrain"},
-    {"name": "two resolutions in one run", "roles": ("dem",),
-     "resolutions": (30, 90),
-     "asserts": "multires"},
-    {"name": "files + buildings", "roles": ("dem",), "buildings": True,
-     "resolutions": (30,),
-     "asserts": "terrain"},
-    {"name": "rerun with overwrite off", "roles": ("dem",),
-     "resolutions": (30,),
-     "asserts": "skip_existing"},
-)
+def _reject_sa_check(row, layer, plugin, pipe, results, lat, lon, resolution,
+                     range_km, timeout) -> None:
+    """A reject row must be refused on the Site Analysis surface too.
 
-
-def _pick_roles(manifest: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
-    """One manifest row per role the combination matrix needs."""
-    rows = manifest["rows"]
-    probe = manifest.get("elevation_probe") or {}
-    lat, lon = float(probe.get("lat", 46.945)), float(probe.get("lon", 7.41))
-
-    def over_probe(row) -> bool:
-        box = row.get("footprint") or []
-        return (len(box) == 4 and box[0] <= lon <= box[2] and box[1] <= lat <= box[3])
-
-    dems = [r for r in rows if r["provider"] == "gdal" and r.get("check") == "both"
-            and over_probe(r)]
-    xyz = [r for r in rows if "type=xyz" in r["source"] and r.get("check") == "both"
-           and r.get("expect_class") == "dem"]
-    # A rendered ELEVATION service. An imagery basemap is deliberately excluded:
-    # the catalogue marks those `check: reject`, and whether the plugin refuses
-    # them is asserted per row, not here.
-    rendered = [r for r in rows if r["provider"] in ("wms", "wcs")
-                and "type=xyz" not in r["source"]
-                and r.get("check") not in ("reject",)
-                and r.get("expect_class") != "imagery"]
-    buildings = [r for r in rows if r.get("check") == "buildings"]
-    picked = {}
-    if dems:
-        picked["dem"] = dems[0]
-    if len(dems) > 1:
-        picked["dem2"] = dems[1]
-    if xyz:
-        picked["xyz"] = xyz[0]
-    if rendered:
-        picked["rendered"] = rendered[0]
-    if buildings:
-        picked["buildings"] = buildings[0]
-    return picked
-
-
-def _entries_for_roles(roles, picked, layers, plugin, pipe, bbox, resolutions,
-                       timeout):
-    """Resolved stack entries, in priority order, through the plugin's router."""
-    mc = plugin["mc"]
-    adapter = plugin["adapter"]
-    expected = mc._enumerate_tiles(mc._snap_bbox(bbox, list(resolutions)),
-                                   list(resolutions))
-    entries = []
-    for role in roles:
-        row = picked[role]
-        layer = layers.get(row["name"])
-        entry = _layer_entry(row, layer, plugin, resolutions, bbox)
-        resolved = mc._resolve_source_on_main_thread(entry, expected)
-        kind = resolved["kind"]
-        if kind == "file":
-            info = adapter.source_file_info(resolved["path"], row.get("crs") or None)
-            entries.append({"kind": "files", "infos": [info]})
-        elif kind == "rendered":
-            entries.append({"kind": "rendered", "tiles": resolved["tiles"]})
-        elif kind == "xyz":
-            pool = {}
-            for res in sorted({r for r, _t in expected}):
-                subtiles = [t for r, t in expected if r == res]
-                pool[res] = adapter.ensure_pool_tiles(resolved["uri"], subtiles, res)
-            entries.append({"kind": "xyz", "pool": pool})
-        else:
-            raise RuntimeError(f"unroutable role {role!r} ({kind})")
-    return expected, entries
-
-
-def _tier_pipeline_combinations(manifest, results, layers, plugin, binaries,
-                                scratch_root: Path, timeout: int,
-                                keep: bool = False) -> None:
-    """Run the Map Converter over STACKS, not just single layers.
-
-    A converter that handles every source in isolation and drops the second
-    one, or takes them in the wrong priority order, or builds only the first
-    of two requested resolutions, passes every per-row check in this file.
-    These are the cases only a stack can express.
-    """
-    adapter = plugin["adapter"]
-    mc = plugin["mc"]
-    picked = _pick_roles(manifest)
-    probe = manifest.get("elevation_probe") or {}
-    lat, lon = float(probe.get("lat", 46.945)), float(probe.get("lon", 7.41))
-
-    for combo in _COMBINATIONS:
-        label = combo["name"]
-        check_id = f"mc:{label}"
-        results.plan("mc", check_id)
-        missing = [r for r in combo["roles"] if r not in picked]
-        if combo.get("buildings") and "buildings" not in picked:
-            missing.append("buildings")
-        if missing:
-            results.add("mc", check_id, label, SKIP,
-                        f"the catalogue has no row to play {', '.join(missing)}")
-            continue
-        scratch = scratch_root / ("mc_" + re.sub(r"[^a-z0-9]+", "_", label.lower()))
-        scratch.mkdir(parents=True, exist_ok=True)
-        try:
-            with Pipeline(scratch, binaries, keep) as pipe:
-                _run_combination(combo, label, check_id, picked, layers, plugin,
-                                 pipe, adapter, mc, lat, lon, results, timeout)
-        except Exception as exc:
-            results.add("mc", check_id, label, FAIL,
-                        f"{type(exc).__name__}: {' '.join(str(exc).split())[:170]}")
-
-
-def _run_combination(combo, label, check_id, picked, layers, plugin, pipe,
-                     adapter, mc, lat, lon, results, timeout) -> None:
-    resolutions = list(combo["resolutions"])
-    bbox = adapter.analysis_bbox(lat, lon, 3)
-    expected, entries = _entries_for_roles(combo["roles"], picked, layers, plugin,
-                                           pipe, bbox, resolutions, timeout)
-    out = pipe.scratch / "abt"; out.mkdir(parents=True, exist_ok=True)
-    tmp = pipe.scratch / "src"; tmp.mkdir(parents=True, exist_ok=True)
-    buildings = None
-    if combo.get("buildings"):
-        row = picked["buildings"]
-        layer = layers.get(row["name"])
-        entry = _layer_entry(row, layer, plugin, resolutions, bbox)
-        buildings = mc._resolve_source_on_main_thread(entry, expected)
-
-    jobs, temps = mc._build_tile_jobs(expected, str(out), True, entries,
-                                      buildings, str(tmp))
-    if not jobs:
-        results.add("mc", check_id, label, FAIL,
-                    "the plugin produced no ingest job for this stack")
-        return
-    stacked = max(len(j["sources"]) for j in jobs)
-    if stacked < len(entries):
-        results.add("mc", check_id, label, FAIL,
-                    f"{len(entries)} entries in the stack but at most {stacked} reached "
-                    f"the converter — an entry was dropped before ingest")
-        return
-    for job in jobs:
-        job_file = tmp / (Path(job["output_path"]).stem + ".json")
-        job_file.write_text(json.dumps(job), encoding="utf-8")
-        code, said = pipe.engine("aether_converter",
-                                 ["ingest", "--job-file", job_file], timeout)
-        if code != 0:
-            results.add("mc", check_id, label, FAIL,
-                        f"ingest exit {code}: {_tail(said, 200)}")
-            return
-    for temp in temps:
-        try:
-            os.remove(temp)
-        except OSError:
-            pass
-
-    produced = sorted(Path(j["output_path"]).name for j in jobs)
-    report = abt_report([j["output_path"] for j in jobs], plugin)
-    if not report.get("real_px"):
-        results.add("mc", check_id, label, FAIL,
-                    f"{len(jobs)} tile(s) written and every sample is VOID")
-        return
-    detail = (f"{len(entries)} entries -> {len(jobs)} tile(s), "
-              f"{report['min_m']:,.1f}..{report['max_m']:,.1f} m")
-
-    if combo["asserts"] == "multires":
-        wanted = {res for res, _t in expected}
-        got = {int(n.rsplit('_', 1)[1].split('m')[0]) for n in produced
-               if '_' in n and 'm' in n.rsplit('_', 1)[1]}
-        if got != wanted:
-            results.add("mc", check_id, label, FAIL,
-                        f"asked for {sorted(wanted)} m, the run produced {sorted(got)} m")
-            return
-        detail += f", resolutions {sorted(got)} m"
-    elif combo["asserts"] == "priority":
-        # Entry 0 is highest priority: the converter takes the first valid
-        # sample per pixel, so the result must follow the FIRST source where
-        # it has data — not the second, and not a blend.
-        first = picked[combo["roles"][0]]
-        alone = _single_source_abt(first, layers, plugin, pipe, adapter, mc,
-                                   bbox, resolutions, timeout, "first")
-        if alone is None:
-            results.add("mc", check_id, label, SKIP,
-                        "the priority reference tile could not be built")
-            return
-        same, why = _same_terrain(alone, [j["output_path"] for j in jobs], plugin)
-        if not same:
-            results.add("mc", check_id, label, FAIL,
-                        f"the stack does not follow its highest-priority source: {why}")
-            return
-        detail += f", follows {first['row']} (highest priority) — {why}"
-    elif combo["asserts"] == "skip_existing":
-        again, _t = mc._build_tile_jobs(expected, str(out), False, entries, None, str(tmp))
-        if again:
-            results.add("mc", check_id, label, FAIL,
-                        f"overwrite=False still produced {len(again)} job(s) for tiles "
-                        f"that already exist — every rerun rebuilds the whole set")
-            return
-        detail += ", rerun with overwrite=False built nothing again"
-    results.add("mc", check_id, label, PASS, detail)
-
-
-def _single_source_abt(row, layers, plugin, pipe, adapter, mc, bbox, resolutions,
-                       timeout, tag):
-    """The same tile built from ONE source, as the priority reference."""
-    layer = layers.get(row["name"])
-    if layer is None:
-        return None
-    expected = mc._enumerate_tiles(mc._snap_bbox(bbox, list(resolutions)),
-                                   list(resolutions))
-    entry = _layer_entry(row, layer, plugin, resolutions, bbox)
-    resolved = mc._resolve_source_on_main_thread(entry, expected)
-    if resolved.get("kind") != "file":
-        return None
-    info = adapter.source_file_info(resolved["path"], row.get("crs") or None)
-    out = pipe.scratch / tag; out.mkdir(parents=True, exist_ok=True)
-    tmp = pipe.scratch / (tag + "_src"); tmp.mkdir(parents=True, exist_ok=True)
-    jobs, temps = mc._build_tile_jobs(expected, str(out), True,
-                                      [{"kind": "files", "infos": [info]}], None, str(tmp))
-    made = []
-    for job in jobs:
-        job_file = tmp / (Path(job["output_path"]).stem + ".json")
-        job_file.write_text(json.dumps(job), encoding="utf-8")
-        code, _said = pipe.engine("aether_converter",
-                                  ["ingest", "--job-file", job_file], timeout)
-        if code != 0:
-            return None
-        made.append(job["output_path"])
-    for temp in temps:
-        try:
-            os.remove(temp)
-        except OSError:
-            pass
-    return made
-
-
-def _same_terrain(reference: Sequence[str], produced: Sequence[str], plugin):
-    """Do the stack's tiles follow the reference where the reference has data?"""
-    import numpy as np
-    abt_mod = plugin["abt"]
-    by_name = {Path(p).name: p for p in produced}
-    checked = 0
-    worst = 0.0
-    for path in reference:
-        other = by_name.get(Path(path).name)
-        if other is None:
-            return False, f"the stack produced no {Path(path).name}"
-        a = abt_mod.read_tile(abt_mod.read_header(str(path)))
-        b = abt_mod.read_tile(abt_mod.read_header(str(other)))
-        if a is None or b is None:
-            return False, "a tile could not be read back"
-        mask = _real_mask(a, plugin)
-        n = int(mask.sum())
-        if not n:
-            continue
-        diff = np.abs(a[mask].astype("int32") - b[mask].astype("int32"))
-        checked += n
-        worst = max(worst, float(diff.max()) * abt_mod.ELEV_STEP_M)
-    if not checked:
-        return False, "the reference source has no real samples to compare"
-    if worst > 0.0:
-        return False, (f"differs from the highest-priority source by up to {worst:,.1f} m "
-                       f"over {checked:,} samples it covers")
-    return True, f"identical over the {checked:,} samples it covers"
-
-
-def _reference_terrain(manifest, layers, plugin, pipe, results, timeout):
-    """A known-good .abt directory over the reference AOI, for the rows that
-    are not themselves terrain (buildings, sites, links).
-
-    Built from the catalogue's own first ``check: both`` local DEM over the
-    probe, so a buildings or P2P failure can never be blamed on the terrain.
-    """
-    adapter = plugin["adapter"]
-    picked = _pick_roles(manifest)
-    row = picked.get("dem")
-    if row is None:
-        return None, None
-    probe = manifest.get("elevation_probe") or {}
-    lat, lon = float(probe.get("lat", 46.945)), float(probe.get("lon", 7.41))
-    bbox = adapter.analysis_bbox(lat, lon, 3)
-    paths, _kind, _note = _acquire(row, layers.get(row["name"]), plugin, pipe,
-                                   bbox, [30], timeout)
-    terrain = pipe.scratch / "reference_terrain"
-    terrain.mkdir(exist_ok=True)
-    for path in paths:
-        target = terrain / Path(path).name
-        if not target.exists():
-            try:
-                os.link(path, target)
-            except OSError:
-                target.write_bytes(Path(path).read_bytes())
-    return terrain, (lat, lon)
-
-
-def _pipeline_vector_row(row, layer, plugin, pipe, manifest, results, timeout):
-    """The pipeline role of a row that is not itself a terrain source.
-
-    Every §3/§5 layer feeds a real run: buildings become a ``buildings_file``
-    on a coverage, sites become transmitters, links become P2P jobs, and the
-    reference geometry is cross-checked against what the engine is actually
-    planned over. "It has features" is not a pipeline test.
+    The Map Converter refusing is half the story: Site Analysis, P2P and
+    both Processing algorithms go through ``prepare_terrain``, which had no
+    guard at all until 2026-08. The worker must end in an error that names
+    the classification, with no terrain and no coverage behind it.
     """
     rid = row["row"]
-    if layer is None:
-        results.add(rid, "pipeline", "this layer drives a real run", FAIL,
-                    "the layer is not in the project")
-        return
+    params = _coverage_params(plugin, lat, lon, resolution, range_km,
+                              f"rej_{rid.replace('.', '_')}")
+    state = _sa_analyse(rid, layer, plugin, pipe.scratch / "sa_reject",
+                        [(params, f"reject {rid}")], timeout)
+    said = " ".join((state["err"] or "").split())
+    wanted = (row.get("expect_failure") or "").strip().lower()
+    if state["ok"] is not None:
+        results.add(rid, "pipeline.sa_refuses",
+                    "Site Analysis refuses it too", FAIL,
+                    "the Site Analysis worker ran it as terrain — the refusal "
+                    "exists only in the Map Converter",
+                    known_fail_for(row, "pipeline.sa_refuses"))
+    elif _is_synthesized(said) or (wanted and wanted not in said.lower()):
+        results.add(rid, "pipeline.sa_refuses",
+                    "Site Analysis refuses it too", FAIL,
+                    f"it failed, but not for the catalogue's reason ({wanted!r}): "
+                    f"{_shorten(said, 110)}",
+                    known_fail_for(row, "pipeline.sa_refuses"))
+    else:
+        results.add(rid, "pipeline.sa_refuses",
+                    "Site Analysis refuses it too", PASS, _shorten(said, 110),
+                    known_fail_for(row, "pipeline.sa_refuses"))
+
+
+# ---------------------------------------------------------------------------
+# Rows that are not themselves terrain
+# ---------------------------------------------------------------------------
+
+def _pipeline_vector_row(row, layer, plugin, pipe, manifest, results, timeout):
+    rid = row["row"]
     if row.get("check") == "buildings":
         _pipeline_buildings(row, layer, plugin, pipe, manifest, results, timeout)
     elif rid.startswith("5.2"):
@@ -2408,184 +2605,218 @@ def _pipeline_vector_row(row, layer, plugin, pipe, manifest, results, timeout):
 
 
 def _pipeline_buildings(row, layer, plugin, pipe, manifest, results, timeout):
-    """Buildings must CHANGE the terrain surface, not merely be accepted.
+    """Buildings must change the terrain AND the coverage over it.
 
-    They reach the engine at INGEST — ``prepare_terrain(buildings_file=…)``
-    burns them into the surface — never as a field on a coverage job. Asking
-    for a coverage difference without that is a test of nothing, which is what
-    an earlier version of this check was.
+    Both through the real workers: two Map Converter runs (bare stack, and
+    the same stack plus this buildings layer) prove the burn changed the
+    surface; two Site Analysis runs over those two terrain directories
+    prove the change reaches the number the user reads. "It was accepted"
+    proves nothing; "the dB moved" is the product.
     """
+    rid = row["row"]
     picked = _pick_roles(manifest)
     dem_row = picked.get("dem")
-    if dem_row is None:
-        results.add(row["row"], "pipeline", "buildings change the terrain", SKIP,
-                    "the catalogue has no local DEM to burn them into")
-        return
     layers = _project_layers()
-    dem_layer = layers.get(dem_row["name"])
-    probe = manifest.get("elevation_probe") or {}
-    lat, lon = float(probe.get("lat", 46.945)), float(probe.get("lon", 7.41))
-    source = layer.source()
-    plain = source.partition("|")[0]
-    if not os.path.exists(plain):
-        results.add(row["row"], "pipeline", "buildings change the terrain", FAIL,
-                    f"the buildings source does not exist: {plain}")
+    dem_layer = layers.get(dem_row["name"]) if dem_row else None
+    if dem_row is None or dem_layer is None:
+        results.add(rid, "pipeline", "buildings change the terrain", FAIL,
+                    "the catalogue has no loadable local DEM to burn them into")
+        results.add(rid, "pipeline.cov_delta", "buildings change the coverage",
+                    FAIL, "no DEM, so no coverage either")
         return
-    bare = _acquire_site_analysis(dem_row, dem_layer, plugin, lat, lon, 30, 3)
-    built = _acquire_site_analysis(dem_row, dem_layer, plugin, lat, lon, 30, 3,
-                                   buildings=source)
-    same, why = _agree(bare, built, plugin)
-    detail = f"burning {Path(plain).name} into {dem_row['row']} "
-    if same:
-        # Say what the source carries, so a reader can tell a plugin defect
-        # from a fixture that has nothing to burn. The converter's ladder is
-        # absolute roof Z, then an explicit height/render_height, then a
-        # guess — a 2D polygon with no heights may legitimately raise nothing.
-        detail += (f"changed nothing. The cache identity still claims buildings were "
-                   f"applied, and no warning was raised. {_buildings_shape(plain)}")
+    lat, lon = _probe_for(dem_row, manifest)
+    adapter = plugin["adapter"]
+    bbox = adapter.analysis_bbox(lat, lon, 3)
+
+    bare = _mc_convert([(dem_row, dem_layer)], plugin, pipe.scratch / "bare",
+                       [30], timeout, bbox=bbox)
+    built = _mc_convert([(dem_row, dem_layer)], plugin, pipe.scratch / "built",
+                        [30], timeout, buildings=(row, layer), bbox=bbox)
+    if bare["ok"] is None or built["ok"] is None:
+        results.add(rid, "pipeline", "buildings change the terrain", FAIL,
+                    f"a converter run failed before the comparison: "
+                    f"{_tail((bare['err'] or built['err'] or ''), 180)}",
+                    known_fail_for(row, "pipeline"))
+        results.add(rid, "pipeline.cov_delta", "buildings change the coverage",
+                    FAIL, "no terrain pair to run over",
+                    known_fail_for(row, "pipeline.cov_delta"))
+        return
+    verdict, why = _agree(pipe.scratch / "bare", pipe.scratch / "built", plugin)
+    detail = f"burning {Path(layer.source().partition('|')[0]).name} into {dem_row['row']} "
+    if verdict == INCOMPARABLE:
+        detail += f"could not be measured against the bare surface: {why}"
+    elif verdict == SAME:
+        detail += (f"changed nothing, and no warning was raised. "
+                   f"{_buildings_shape(layer.source())}")
     else:
         detail += f"raised the surface ({why.split(' over ')[0]})"
-    results.add(row["row"], "pipeline", "buildings change the terrain",
-                FAIL if same else PASS, detail, known_fail_for(row, "pipeline"))
+    results.add(rid, "pipeline", "buildings change the terrain",
+                PASS if verdict == DIFFER else FAIL, detail,
+                known_fail_for(row, "pipeline"))
 
-
-def _buildings_shape(path: str) -> str:
-    """What a buildings source actually carries, for the failure message."""
-    try:
-        from osgeo import ogr
-        source = ogr.Open(path)
-        layer = source.GetLayer(0)
-        names = {layer.GetLayerDefn().GetFieldDefn(i).GetName()
-                 for i in range(layer.GetLayerDefn().GetFieldCount())}
-        total = layer.GetFeatureCount()
-        heighted = sum(1 for f in layer
-                       if any(f.GetField(n) not in (None, "") for n in
-                              ("height", "render_height") if n in names))
-        has_z = ogr.GT_HasZ(layer.GetGeomType())
-        return (f"Source: {total:,} features, {heighted:,} with a height attribute, "
-                f"geometry {'has' if has_z else 'has NO'} Z (absolute roof elevation).")
-    except Exception as exc:
-        return f"(the source could not be inspected: {type(exc).__name__})"
+    # The coverage delta — real Site Analysis runs over the two terrain
+    # directories (the GUI's own flow for file buildings: Map Converter
+    # builds the terrain, Site Analysis runs over it as a terrain dir).
+    params = _coverage_params(plugin, lat, lon, 30, 3,
+                              f"bld_{rid.replace('.', '_')}")
+    run_a = _sa_analyse(rid, dem_layer, plugin, pipe.scratch / "cov_bare",
+                        [(params, "bare")], timeout * 3,
+                        terrain_dir=str(pipe.scratch / "bare"))
+    run_b = _sa_analyse(rid, dem_layer, plugin, pipe.scratch / "cov_built",
+                        [(params, "built")], timeout * 3,
+                        terrain_dir=str(pipe.scratch / "built"))
+    if not (run_a["ok"] and run_b["ok"]):
+        results.add(rid, "pipeline.cov_delta", "buildings change the coverage",
+                    FAIL, f"a coverage run failed: "
+                          f"{_tail((run_a['err'] or run_b['err'] or ''), 180)}",
+                    known_fail_for(row, "pipeline.cov_delta"))
+        return
+    import numpy as np
+    from osgeo import gdal
+    gdal.UseExceptions()
+    va = gdal.Open(run_a["ok"][0][0]).ReadAsArray()
+    vb = gdal.Open(run_b["ok"][0][0]).ReadAsArray()
+    changed = (0 if va is None or vb is None or va.shape != vb.shape
+               else int((va != vb).sum()))
+    results.add(rid, "pipeline.cov_delta", "buildings change the coverage",
+                PASS if changed else FAIL,
+                f"{changed:,} coverage pixel(s) moved when the buildings went in"
+                + ("" if changed else " — the burn reached the terrain but not "
+                                      "the number the user reads"),
+                known_fail_for(row, "pipeline.cov_delta"))
 
 
 def _pipeline_sites(row, layer, plugin, pipe, manifest, results, timeout):
-    """Every site the reference terrain covers must work as a transmitter.
+    """EVERY site runs as a transmitter — each on terrain over its own ground.
 
-    The catalogue scatters sites deliberately — Bern, the Dead Sea, the Andes,
-    Fiji — so a site outside this terrain is not a failure, it is a site with
-    its own ground. It is counted and named, never silently dropped.
+    The catalogue scatters the sites deliberately (Bern, the Dead Sea, the
+    Andes, Fiji). The old check ran only the ones the Bern reference box
+    happened to cover and passed with two thirds of the layer untested.
+    Now each site gets its own Site Analysis run over the catalogue's
+    global reference service; a site that cannot run fails the row.
     """
-    terrain, _centre = _reference_terrain(manifest, _project_layers(), plugin,
-                                          pipe, results, timeout)
-    if terrain is None:
-        results.add(row["row"], "pipeline", "every site runs as a transmitter", SKIP,
-                    "no reference terrain")
+    rid = row["row"]
+    by_row = {r["row"]: r for r in manifest["rows"]}
+    ref = by_row.get(manifest.get("reference_row"))
+    layers = _project_layers()
+    dem_layer = layers.get(ref["name"]) if ref else None
+    if dem_layer is None:
+        results.add(rid, "pipeline", "every site runs as a transmitter", FAIL,
+                    "the catalogue's reference service is not in the project, so "
+                    "no site has terrain to run over")
         return
-    covered = _terrain_bbox(terrain, plugin)
-    ran, failed, elsewhere = 0, [], 0
+    ran, failed = 0, []
     names = layer.fields().names()
     for index, feature in enumerate(layer.getFeatures()):
         point = feature.geometry().asPoint()
         label = str(feature["name"]) if "name" in names else f"site {index}"
-        if not _inside(covered, point.y(), point.x()):
-            elsewhere += 1
-            continue
-        code, said, tif = _coverage(plugin, pipe, terrain, point.y(), point.x(),
-                                    30, 3, f"site_{index}", timeout)
-        if tif is None:
-            failed.append(f"{label}: exit {code} {_tail(said, 150)}")
-        else:
+        params = _coverage_params(plugin, point.y(), point.x(), 30, 3,
+                                  f"site_{index}")
+        state = _sa_analyse(rid, dem_layer, plugin,
+                            pipe.scratch / f"site_{index}",
+                            [(params, label)], timeout * 3)
+        if state["ok"]:
             ran += 1
-    detail = f"{ran} site(s) produced a coverage"
-    if elsewhere:
-        detail += f", {elsewhere} stand on ground this terrain does not cover"
+        else:
+            failed.append(f"{label}: {_tail(' '.join((state['err'] or '').split()), 120)}")
+    detail = f"{ran} of {ran + len(failed)} site(s) produced a coverage on its own ground"
     if failed:
         detail += "; " + "; ".join(failed[:2])
-    results.add(row["row"], "pipeline", "every site runs as a transmitter",
+    results.add(rid, "pipeline", "every site runs as a transmitter",
                 PASS if ran and not failed else FAIL, detail,
                 known_fail_for(row, "pipeline"))
 
 
 def _pipeline_links(row, layer, plugin, pipe, manifest, results, timeout):
-    """Every P2P link in the layer must run as a real P2P job.
+    """EVERY link runs as a real P2P job, through the P2P tab's own worker.
 
-    The receiver's position is not a field on the job: the plugin writes a
-    two-line batch CSV (``p2p_tab._write_temp_batch_csv``) and hands it to
-    ``build_p2p_job(batch_file=…)``. Using its own writer is the difference
-    between testing the contract and inventing one.
+    The batch CSV comes from ``p2p_tab._write_temp_batch_csv`` and the run
+    from ``p2p_tab._P2PWorker`` — terrain, job file, licensed engine and
+    output land exactly where the tab puts them. Links far from Bern get
+    terrain over their own ground from the catalogue's reference service.
     """
-    from waveshed.gui.p2p_tab import _write_temp_batch_csv
-
-    terrain, centre = _reference_terrain(manifest, _project_layers(), plugin,
-                                         pipe, results, timeout)
-    if terrain is None:
-        results.add(row["row"], "pipeline", "every link runs as a P2P job", SKIP,
-                    "no reference terrain")
+    rid = row["row"]
+    p2p = plugin["p2p"]
+    by_row = {r["row"]: r for r in manifest["rows"]}
+    ref = by_row.get(manifest.get("reference_row"))
+    layers = _project_layers()
+    dem_layer = layers.get(ref["name"]) if ref else None
+    if dem_layer is None:
+        results.add(rid, "pipeline", "every link runs as a P2P job", FAIL,
+                    "the catalogue's reference service is not in the project")
         return
-    covered = _terrain_bbox(terrain, plugin)
-    ran, failed, elsewhere = 0, [], 0
+    ran, failed = 0, []
     for index, feature in enumerate(layer.getFeatures()):
         points = feature.geometry().asPolyline()
         if len(points) < 2:
-            failed.append("a link with fewer than two endpoints")
+            failed.append(f"link {index}: fewer than two endpoints")
             continue
-        if not all(_inside(covered, p.y(), p.x()) for p in (points[0], points[-1])):
-            elsewhere += 1          # its own ground, and its own row
-            continue
-        csv_path = _write_temp_batch_csv(points[0].y(), points[0].x(), 30.0, "AGL",
-                                         points[-1].y(), points[-1].x(), 2.0, "AGL")
+        csv_path = p2p._write_temp_batch_csv(
+            points[0].y(), points[0].x(), 30.0, "AGL",
+            points[-1].y(), points[-1].x(), 2.0, "AGL")
         params = plugin["P2PParams"](
             tx_lat=points[0].y(), tx_lon=points[0].x(), tx_height=30.0,
             tx_mode="AGL", freq_mhz=900.0, erp_watts=10.0, rx_height=2.0,
             rx_mode="AGL", model="ITM", resolution_m=30, max_range_km=60,
-            backend="CPU", output_name=f"p2p_{index}", max_ram_gb=8, max_vram_gb=4)
-        job = plugin["build_p2p_job"](params, str(terrain), str(pipe.scratch),
-                                      batch_file=csv_path)
-        job_file = pipe.scratch / f"p2p_{index}_job.json"
-        job_file.write_text(json.dumps(job, indent=1), encoding="utf-8")
-        code, said = pipe.engine("aether_core", ["--config", job_file], timeout)
+            backend="CPU", output_name=f"p2p_{index}", max_ram_gb=8,
+            max_vram_gb=4)
+        worker = p2p._P2PWorker(params, dem_layer,
+                                str(pipe.scratch / f"p2p_{index}"), csv_path)
+        state = _run_worker(worker, timeout * 3)
         try:
             os.remove(csv_path)
         except OSError:
             pass
-        if code != 0:
-            failed.append(f"link {index}: {_tail(said, 160)}")
-        else:
+        if state["ok"]:
             ran += 1
-    detail = f"{ran} link(s) ran over the reference terrain"
-    if elsewhere:
-        detail += f", {elsewhere} sit on ground this terrain does not cover"
+        else:
+            failed.append(f"link {index}: {_tail(' '.join((state['err'] or '').split()), 120)}")
+    detail = f"{ran} of {ran + len(failed)} link(s) ran over their own ground"
     if failed:
         detail += "; " + "; ".join(failed[:2])
-    results.add(row["row"], "pipeline", "every link runs as a P2P job",
+    results.add(rid, "pipeline", "every link runs as a P2P job",
                 PASS if ran and not failed else FAIL, detail,
                 known_fail_for(row, "pipeline"))
 
 
-def _terrain_bbox(abt_dir, plugin) -> Dict[str, float]:
-    """The ground a terrain directory covers, from the tiles' own headers."""
-    abt_mod = plugin["abt"]
-    box = None
-    for path in abt_mod.list_tiles(str(abt_dir)):
-        header = abt_mod.read_header(path)
-        if header is None:
-            continue
-        span = header.pixel_res * header.size
-        edges = {"north": header.ul_lat, "south": header.ul_lat - span,
-                 "west": header.ul_lon, "east": header.ul_lon + span}
-        if box is None:
-            box = edges
-        else:
-            box = {"north": max(box["north"], edges["north"]),
-                   "south": min(box["south"], edges["south"]),
-                   "west": min(box["west"], edges["west"]),
-                   "east": max(box["east"], edges["east"])}
-    return box or {"north": 90.0, "south": -90.0, "west": -180.0, "east": 180.0}
+#: Attributes the converter's height ladder reads off a building feature, in
+#: the order it tries them. Kept in step with `aether_converter`'s own ladder
+#: (`buildings.rs` HeightSource) — the point of the message is to say what the
+#: converter could have used, so a stale list understates the fixture.
+_BUILDING_HEIGHT_FIELDS = ("height", "render_height", "building:height",
+                           "levels", "building:levels", "building_levels")
 
 
-def _inside(box: Dict[str, float], lat: float, lon: float) -> bool:
-    return (box["south"] <= lat <= box["north"]
-            and box["west"] <= lon <= box["east"])
+def _buildings_shape(uri: str) -> str:
+    """What a buildings source actually carries, for the failure message.
+
+    *uri* is the LAYER uri, not a plain path: a ``…gpkg|layername=buildings``
+    source must be inspected as the sublayer the row selected. Opening the
+    container and taking layer 0 made rows 3.2a and 3.2b — which exist to prove
+    the two sublayers land in different halves of the tile — print byte-
+    identical details.
+    """
+    try:
+        from osgeo import ogr
+        path, _, rest = uri.partition("|")
+        wanted = next((part.split("=", 1)[1] for part in rest.split("|")
+                       if part.startswith("layername=")), None)
+        source = ogr.Open(path)
+        layer = source.GetLayerByName(wanted) if wanted else source.GetLayer(0)
+        if layer is None:
+            return f"(the source has no layer named {wanted!r})"
+        names = {layer.GetLayerDefn().GetFieldDefn(i).GetName()
+                 for i in range(layer.GetLayerDefn().GetFieldCount())}
+        usable = [n for n in _BUILDING_HEIGHT_FIELDS if n in names]
+        total = layer.GetFeatureCount()
+        heighted = sum(1 for f in layer
+                       if any(f.GetField(n) not in (None, "") for n in usable))
+        has_z = ogr.GT_HasZ(layer.GetGeomType())
+        return (f"Source: layer {layer.GetName()!r}, {total:,} features, "
+                f"{heighted:,} carrying one of {usable or '(no height field)'}, "
+                f"geometry {'has' if has_z else 'has NO'} Z (absolute roof elevation).")
+    except Exception as exc:
+        return f"(the source could not be inspected: {type(exc).__name__})"
 
 
 def _pipeline_run_matrix(row, layer, manifest, results):
@@ -2638,11 +2869,724 @@ def _pipeline_footprints(row, layer, plugin, manifest, results):
         checked += 1
         if drift > 0.01:
             wrong.append(f"{rid}: off by {drift:.4f}°")
+    total = sum(1 for _f in layer.getFeatures())
     results.add(row["row"], "pipeline", "every footprint is where its raster really is",
                 PASS if checked and not wrong else FAIL,
-                f"{checked} footprints match the plugin's own bounds"
+                f"{checked} of {total} footprints match the plugin's own bounds"
+                + (f" ({total - checked} are remote/vsi sources with no local "
+                   f"file to compare)" if total != checked else "")
                 + ("; " + "; ".join(wrong[:3]) if wrong else ""),
                 known_fail_for(row, "pipeline"))
+
+
+# ---------------------------------------------------------------------------
+# Map Converter stacks, and the run-level matrix
+# ---------------------------------------------------------------------------
+
+#: The Map Converter stack combinations the catalogue implies but no single
+#: row can express. Each names the ROLE a row must play; the rows themselves
+#: are picked from the manifest, so this list never goes stale against it.
+#: ``priority`` proves both halves of the sources[] contract with SOLO runs:
+#: the stack equals the top source where it has data, and equals the base
+#: where the top has none — so a converter that drops the second source, or
+#: takes them in the wrong order, or blends, fails by measurement.
+_COMBINATIONS = (
+    {"name": "files + files (priority order)", "roles": ("dem2", "dem"),
+     "resolutions": (30,), "asserts": "priority"},
+    {"name": "file over xyz (mixed acquisition)", "roles": ("dem2", "xyz"),
+     "resolutions": (30,), "asserts": "priority"},
+    {"name": "xyz over file (reversed priority)", "roles": ("xyz", "dem"),
+     "resolutions": (30,), "asserts": "priority_top"},
+    {"name": "rendered service under files", "roles": ("rendered", "dem"),
+     "resolutions": (30,), "asserts": "inert_top"},
+    {"name": "two resolutions in one run", "roles": ("dem",),
+     "resolutions": (30, 90), "asserts": "multires"},
+    {"name": "files + buildings", "roles": ("dem",), "buildings": True,
+     "resolutions": (30,), "asserts": "burn"},
+    {"name": "rerun with overwrite off", "roles": ("dem",),
+     "resolutions": (30,), "asserts": "skip_existing"},
+)
+
+
+def _pick_roles(manifest: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    """One manifest row per role the combination matrix needs."""
+    rows = manifest["rows"]
+    probe = manifest.get("elevation_probe") or {}
+    lat, lon = float(probe.get("lat", 46.945)), float(probe.get("lon", 7.41))
+
+    def over_probe(row) -> bool:
+        box = row.get("footprint") or []
+        return (len(box) == 4 and box[0] <= lon <= box[2] and box[1] <= lat <= box[3])
+
+    dems = [r for r in rows if r["provider"] == "gdal" and r.get("check") == "both"
+            and over_probe(r)]
+    # dem must COVER the probe tile (a full source is the only honest base),
+    # dem2 must NOT (a partial top is the only way both halves of the
+    # priority contract are measurable). expect_real_pct is the catalogue's
+    # own statement of each fixture's coverage.
+    full = [r for r in dems if float(r.get("expect_real_pct") or 0) >= 90.0]
+    partial = [r for r in dems if 0 < float(r.get("expect_real_pct") or 0) < 90.0]
+    dems = (full[:1] + partial[:1]) if full and partial else dems
+    xyz = [r for r in rows if "type=xyz" in r["source"] and r.get("check") == "both"
+           and r.get("expect_class") == "dem"]
+    # A rendered ELEVATION service. An imagery basemap is deliberately excluded:
+    # the catalogue marks those `check: reject`, and whether the plugin refuses
+    # them is asserted per row, not here.
+    rendered = [r for r in rows if r["provider"] in ("wms", "wcs")
+                and "type=xyz" not in r["source"]
+                and r.get("check") not in ("reject",)
+                and r.get("expect_class") != "imagery"]
+    buildings = [r for r in rows if r.get("check") == "buildings"]
+    picked = {}
+    if dems:
+        picked["dem"] = dems[0]
+    if len(dems) > 1:
+        picked["dem2"] = dems[1]          # the partial one, when both exist
+    if xyz:
+        picked["xyz"] = xyz[0]
+    if rendered:
+        picked["rendered"] = rendered[0]
+    if buildings:
+        picked["buildings"] = buildings[0]
+    return picked
+
+
+def _stack_follows(stack_tiles, top_dir, base_dir, plugin,
+                   require_base: bool = True) -> Tuple[bool, str]:
+    """Both halves of the priority contract, by measurement against solos.
+
+    Where the TOP solo has data the stack must equal it exactly; where the
+    top has none and the BASE solo does, the stack must equal the base.
+    With *require_base* (the default) a run in which the base never got to
+    contribute FAILS — "takes the base's 0 samples" is not a measurement,
+    and a converter that drops the second source entirely sailed through
+    exactly that hole. ``require_base=False`` is for the one deliberate
+    top-covers-everything case, and says so in its verdict.
+    """
+    import numpy as np
+    abt_mod = plugin["abt"]
+    top = {Path(p).name: p for p in abt_mod.list_tiles(str(top_dir))}
+    base = {Path(p).name: p for p in abt_mod.list_tiles(str(base_dir))}
+    top_n = base_n = 0
+    for path in stack_tiles:
+        name = Path(path).name
+        s = abt_mod.read_tile(abt_mod.read_header(str(path)))
+        if s is None:
+            return False, f"{name}: the stack tile is unreadable"
+        t = (abt_mod.read_tile(abt_mod.read_header(top[name]))
+             if name in top else None)
+        b = (abt_mod.read_tile(abt_mod.read_header(base[name]))
+             if name in base else None)
+        mask_t = _real_mask(t, plugin) if t is not None else None
+        if mask_t is not None and mask_t.any():
+            if int(np.abs(s[mask_t].astype("int32")
+                          - t[mask_t].astype("int32")).max()) > 0:
+                return False, (f"{name}: the stack does not follow its "
+                               f"highest-priority source where it has data")
+            top_n += int(mask_t.sum())
+        if b is not None:
+            mask_b = _real_mask(b, plugin)
+            if mask_t is not None:
+                mask_b &= ~mask_t
+            if mask_b.any():
+                if int(np.abs(s[mask_b].astype("int32")
+                              - b[mask_b].astype("int32")).max()) > 0:
+                    return False, (f"{name}: where the top source has no data "
+                                   f"the base's samples were not used — the "
+                                   f"second source is dropped or corrupted")
+                base_n += int(mask_b.sum())
+    if not top_n:
+        return False, "the top source contributed no sample at all — priority untestable"
+    if require_base and not base_n:
+        return False, ("the top source covers every sample, so the base's "
+                       "contribution was never measured — this combination "
+                       "cannot prove the second source is read at all")
+    if base_n:
+        return True, (f"follows the top source over {top_n:,} samples and takes "
+                      f"the base's {base_n:,} where the top has none")
+    return True, (f"follows the top source over {top_n:,} samples (top covers "
+                  f"everything — priority half only; contribution is proved by "
+                  f"the sibling combination)")
+
+
+def _identical_terrain(a_dir, b_dir, plugin) -> Tuple[bool, str]:
+    """Are two terrain directories EXACTLY the same — tiles, values, voids?
+
+    The inert-top contract: an empty top source must leave the base as its
+    solo run built it, byte for byte. Mask-intersection agreement (:func:`_agree`)
+    cannot say that — it ignores every sample only one side calls real.
+    """
+    import numpy as np
+    abt_mod = plugin["abt"]
+    a = {Path(p).name: p for p in abt_mod.list_tiles(str(a_dir))}
+    b = {Path(p).name: p for p in abt_mod.list_tiles(str(b_dir))}
+    if set(a) != set(b):
+        return False, f"different tile sets ({sorted(set(a) ^ set(b))[:3]})"
+    if not a:
+        return False, "no tiles on either side"
+    for name in sorted(a):
+        ga = abt_mod.read_tile(abt_mod.read_header(a[name]))
+        gb = abt_mod.read_tile(abt_mod.read_header(b[name]))
+        if ga is None or gb is None:
+            return False, f"{name}: unreadable"
+        if ga.shape != gb.shape or not np.array_equal(ga, gb):
+            diff = int((ga != gb).sum()) if ga.shape == gb.shape else -1
+            return False, (f"{name}: {diff:,} sample(s) differ (voids included)"
+                           if diff >= 0 else f"{name}: different shapes")
+    total = sum(int(abt_mod.read_tile(abt_mod.read_header(p)).size)
+                for p in a.values())
+    return True, f"{len(a)} tile(s), {total:,} samples equal, voids included"
+
+
+def _tier_pipeline_combinations(manifest, results, layers, plugin,
+                                scratch_root: Path, timeout: int,
+                                keep: bool = False) -> None:
+    """Run the Map Converter over STACKS, through the real worker.
+
+    A converter that handles every source in isolation and drops the second
+    one, or takes them in the wrong priority order, or builds only the first
+    of two requested resolutions, passes every per-row check in this file.
+    These are the cases only a stack can express — and each one is proved by
+    solo runs and pixel measurement, never by counting job-file entries.
+    """
+    adapter = plugin["adapter"]
+    picked = _pick_roles(manifest)
+    probe = manifest.get("elevation_probe") or {}
+    lat, lon = float(probe.get("lat", 46.945)), float(probe.get("lon", 7.41))
+
+    for combo in _COMBINATIONS:
+        label = combo["name"]
+        check_id = f"mc:{label}"
+        missing = [r for r in combo["roles"] if r not in picked]
+        if combo.get("buildings") and "buildings" not in picked:
+            missing.append("buildings")
+        if missing:
+            results.add("mc", check_id, label, FAIL,
+                        f"the catalogue has no row to play {', '.join(missing)} — "
+                        f"a combination that cannot be cast is a hole, not a skip")
+            continue
+        scratch = scratch_root / ("mc_" + re.sub(r"[^a-z0-9]+", "_", label.lower()))
+        scratch.mkdir(parents=True, exist_ok=True)
+        try:
+            with Pipeline(scratch, keep) as pipe:
+                _run_combination(combo, label, check_id, picked, layers, plugin,
+                                 pipe, adapter, lat, lon, results, timeout)
+        except Exception as exc:
+            results.add("mc", check_id, label, FAIL,
+                        f"{type(exc).__name__}: {' '.join(str(exc).split())[:170]}")
+
+
+def _run_combination(combo, label, check_id, picked, layers, plugin, pipe,
+                     adapter, lat, lon, results, timeout) -> None:
+    resolutions = list(combo["resolutions"])
+    bbox = adapter.analysis_bbox(lat, lon, 3)
+    stack = [(picked[role], layers.get(picked[role]["name"]))
+             for role in combo["roles"]]
+    if any(layer is None for _row, layer in stack):
+        results.add("mc", check_id, label, FAIL,
+                    "a role's layer is not in the project")
+        return
+    buildings = None
+    if combo.get("buildings"):
+        brow = picked["buildings"]
+        blayer = layers.get(brow["name"])
+        if blayer is None:
+            results.add("mc", check_id, label, FAIL,
+                        "the buildings layer is not in the project")
+            return
+        buildings = (brow, blayer)
+
+    out = pipe.scratch / "stack"
+    state = _mc_convert(stack, plugin, out, resolutions, timeout * 3,
+                        buildings=buildings, bbox=bbox)
+    if state["ok"] is None:
+        results.add("mc", check_id, label, FAIL,
+                    f"the worker failed: {_tail(state['err'] or '', 200)}")
+        return
+    if not state["tiles"]:
+        results.add("mc", check_id, label, FAIL,
+                    "the worker reported done and produced no tile")
+        return
+    report = abt_report(state["tiles"], plugin)
+    if not report.get("real_px"):
+        results.add("mc", check_id, label, FAIL,
+                    f"{len(state['tiles'])} tile(s) written and every sample is VOID")
+        return
+    # The same sanity every row's terrain gets — the saboteur proved a
+    # constant-500 m converter passed three combos green while printing
+    # "500.0..500.0 m" in its own detail line.
+    if report["min_m"] == report["max_m"]:
+        results.add("mc", check_id, label, FAIL,
+                    f"every real sample is {report['min_m']:,.1f} m — a constant "
+                    f"tile is what a silently-failed source writes, not terrain")
+        return
+    at = abt_at(report["grids"], lat, lon, plugin)
+    if at is None or at == CONVERTER_VOID_COUNTS * plugin["abt"].ELEV_STEP_M:
+        results.add("mc", check_id, label, FAIL,
+                    f"the probe pixel at {lat:.4f},{lon:.4f} is "
+                    f"{'outside the tiles' if at is None else 'VOID'}")
+        return
+    detail = (f"{len(stack)} entr(ies) -> {len(state['tiles'])} tile(s), "
+              f"{report['min_m']:,.1f}..{report['max_m']:,.1f} m")
+
+    def solo(role: str) -> Optional[Path]:
+        row = picked[role]
+        solo_out = pipe.scratch / f"solo_{role}"
+        try:
+            solo_state = _mc_convert([(row, layers.get(row["name"]))], plugin,
+                                     solo_out, resolutions, timeout * 3,
+                                     bbox=bbox)
+        except RuntimeError:
+            return None
+        return solo_out if solo_state["ok"] is not None else None
+
+    asserts = combo["asserts"]
+    if asserts in ("priority", "priority_top"):
+        top_dir = solo(combo["roles"][0])
+        base_dir = solo(combo["roles"][1])
+        if top_dir is None or base_dir is None:
+            results.add("mc", check_id, label, FAIL,
+                        "a solo reference run failed, so priority was never measured")
+            return
+        ok, why = _stack_follows(state["tiles"], top_dir, base_dir, plugin,
+                                 require_base=(asserts == "priority"))
+        if not ok:
+            results.add("mc", check_id, label, FAIL, why)
+            return
+        detail += f"; {why}"
+    elif asserts == "inert_top":
+        # The top source has no data over this ground (the rendered service's
+        # footprint is elsewhere) — the contract is that an empty top leaves
+        # the base EXACTLY as its solo run built it.
+        base_dir = solo(combo["roles"][1])
+        if base_dir is None:
+            results.add("mc", check_id, label, FAIL,
+                        "the base solo run failed, so nothing was measured")
+            return
+        # EXACT equality, voids included. _agree intersects the real masks,
+        # so a stack with half its samples VOIDed "agreed to 0.0 m" with a
+        # pristine base — the saboteur walked straight through that.
+        ok, why = _identical_terrain(base_dir, out, plugin)
+        if not ok:
+            results.add("mc", check_id, label, FAIL,
+                        f"stacking an empty top source changed the base: {why}")
+            return
+        detail += f"; empty top left the base byte-identical ({why})"
+    elif asserts == "multires":
+        wanted = set(resolutions)
+        produced = sorted(Path(p).name for p in state["tiles"])
+        got = {int(n.rsplit('_', 1)[1].split('m')[0]) for n in produced
+               if '_' in n and 'm' in n.rsplit('_', 1)[1]}
+        if got != wanted:
+            results.add("mc", check_id, label, FAIL,
+                        f"asked for {sorted(wanted)} m, the run produced {sorted(got)} m")
+            return
+        detail += f", resolutions {sorted(got)} m"
+    elif asserts == "burn":
+        bare_dir = solo(combo["roles"][0])
+        if bare_dir is None:
+            results.add("mc", check_id, label, FAIL,
+                        "the bare solo run failed, so the burn was never measured")
+            return
+        verdict, why = _agree(bare_dir, out, plugin)
+        if verdict != DIFFER:
+            results.add("mc", check_id, label, FAIL,
+                        f"the buildings changed nothing measurable: {why}. "
+                        f"{_buildings_shape(picked['buildings']['source'])}")
+            return
+        detail += f"; buildings raised the surface ({why.split(' over ')[0]})"
+    elif asserts == "skip_existing":
+        stamps = {p: os.stat(p).st_mtime_ns for p in state["tiles"]}
+        again = _mc_convert(stack, plugin, out, resolutions, timeout * 3,
+                            buildings=buildings, overwrite=False, bbox=bbox)
+        if again["ok"] is None:
+            results.add("mc", check_id, label, FAIL,
+                        f"the overwrite-off rerun failed: {_tail(again['err'] or '', 160)}")
+            return
+        rebuilt = [Path(p).name for p, stamp in stamps.items()
+                   if os.stat(p).st_mtime_ns != stamp]
+        if rebuilt:
+            results.add("mc", check_id, label, FAIL,
+                        f"overwrite=False still rebuilt {len(rebuilt)} existing "
+                        f"tile(s): {rebuilt[:3]}")
+            return
+        if not any("already exist" in line for line in again["log"]):
+            results.add("mc", check_id, label, FAIL,
+                        "the rerun rebuilt nothing but never took the worker's "
+                        "own all-tiles-exist path — the skip happened somewhere "
+                        "this check does not understand")
+            return
+        # The PARTIAL path too: with one tile deleted, overwrite=False must
+        # rebuild exactly that tile — the pre-filter alone cannot prove the
+        # rebuild half works.
+        victim = state["tiles"][0]
+        os.remove(victim)
+        third = _mc_convert(stack, plugin, out, resolutions, timeout * 3,
+                            buildings=buildings, overwrite=False, bbox=bbox)
+        if third["ok"] is None or not os.path.exists(victim):
+            results.add("mc", check_id, label, FAIL,
+                        f"with one tile deleted, overwrite=False did not rebuild "
+                        f"it: {_tail(third['err'] or 'worker ok, tile missing', 140)}")
+            return
+        untouched = [Path(p).name for p, stamp in stamps.items()
+                     if p != victim and os.stat(p).st_mtime_ns != stamp]
+        if untouched:
+            results.add("mc", check_id, label, FAIL,
+                        f"rebuilding one missing tile also rebuilt {untouched[:3]}")
+            return
+        detail += (", rerun rebuilt nothing (worker's own skip path), and a "
+                   "deleted tile was rebuilt alone")
+    results.add("mc", check_id, label, PASS, detail)
+
+
+#: Run-level cases that vary what every per-row run holds constant: the
+#: sector wedge, the propagation model, and the scripted (Processing)
+#: surface — including the one refusal a script never gets prompted about.
+_MATRIX_CASES = ("matrix:wedge", "matrix:model LOS",
+                 "matrix:processing coverage", "matrix:processing refuses imagery")
+
+
+def _tier_matrix_cases(manifest, results, layers, plugin, scratch_root: Path,
+                       timeout: int, keep: bool) -> None:
+    by_row = {r["row"]: r for r in manifest["rows"]}
+    ref = by_row.get(manifest.get("reference_row"))
+    ref_layer = layers.get(ref["name"]) if ref else None
+    probe = manifest.get("elevation_probe") or {}
+    lat, lon = float(probe.get("lat", 46.945)), float(probe.get("lon", 7.41))
+
+    # -- wedge ------------------------------------------------------------
+    check_id = "matrix:wedge"
+    if ref_layer is None:
+        results.add("mx", check_id, "a sector wedge confines the coverage", FAIL,
+                    "the reference row is not in the project")
+    else:
+        scratch = scratch_root / "mx_wedge"
+        scratch.mkdir(parents=True, exist_ok=True)
+        try:
+            with Pipeline(scratch, keep) as pipe:
+                params = _coverage_params(plugin, lat, lon, 30, 3, "wedge",
+                                          az=(40.0, 140.0))
+                state = _sa_analyse("mx", ref_layer, plugin,
+                                    pipe.scratch / "out",
+                                    [(params, "wedge 40-140")], timeout * 3)
+                if not state["ok"]:
+                    results.add("mx", check_id, "a sector wedge confines the coverage",
+                                FAIL, _tail(" ".join((state["err"] or "").split()), 180))
+                else:
+                    ok, why = _wedge_confined(state["ok"][0][0], lat, lon,
+                                              40.0, 140.0)
+                    results.add("mx", check_id,
+                                "a sector wedge confines the coverage",
+                                PASS if ok else FAIL, why)
+        except Exception as exc:
+            results.add("mx", check_id, "a sector wedge confines the coverage",
+                        FAIL, f"{type(exc).__name__}: {_shorten(str(exc), 160)}")
+
+    # -- another model ----------------------------------------------------
+    check_id = "matrix:model LOS"
+    if ref_layer is None:
+        results.add("mx", check_id, "a LOS run produces a sound grid", FAIL,
+                    "the reference row is not in the project")
+    else:
+        scratch = scratch_root / "mx_los"
+        scratch.mkdir(parents=True, exist_ok=True)
+        try:
+            with Pipeline(scratch, keep) as pipe:
+                params = _coverage_params(plugin, lat, lon, 30, 3, "los",
+                                          model="LOS")
+                state = _sa_analyse("mx", ref_layer, plugin,
+                                    pipe.scratch / "out",
+                                    [(params, "LOS")], timeout * 3)
+                if not state["ok"]:
+                    results.add("mx", check_id, "a LOS run produces a sound grid",
+                                FAIL, _tail(" ".join((state["err"] or "").split()), 180))
+                else:
+                    ok, why = _sound_grid(coverage_report(Path(state["ok"][0][0])),
+                                          3, 30)
+                    results.add("mx", check_id, "a LOS run produces a sound grid",
+                                PASS if ok else FAIL, why)
+        except Exception as exc:
+            results.add("mx", check_id, "a LOS run produces a sound grid",
+                        FAIL, f"{type(exc).__name__}: {_shorten(str(exc), 160)}")
+
+    # -- the scripted surface --------------------------------------------
+    check_id = "matrix:processing coverage"
+    if ref_layer is None:
+        results.add("mx", check_id, "the Processing algorithm runs end to end",
+                    FAIL, "the reference row is not in the project")
+    else:
+        scratch = scratch_root / "mx_proc"
+        scratch.mkdir(parents=True, exist_ok=True)
+        try:
+            with Pipeline(scratch, keep) as pipe:
+                _run_processing_coverage(ref_layer, lat, lon,
+                                         pipe.scratch / "out")
+                tifs = sorted((pipe.scratch / "out").rglob("*.tif"))
+                if not tifs:
+                    results.add("mx", check_id,
+                                "the Processing algorithm runs end to end", FAIL,
+                                "processing.run returned without writing a GeoTIFF")
+                else:
+                    ok, why = _sound_grid(coverage_report(tifs[0]), 3, 30)
+                    results.add("mx", check_id,
+                                "the Processing algorithm runs end to end",
+                                PASS if ok else FAIL,
+                                f"{len(tifs)} GeoTIFF(s); {why}")
+        except Exception as exc:
+            results.add("mx", check_id, "the Processing algorithm runs end to end",
+                        FAIL, f"{type(exc).__name__}: {_shorten(str(exc), 200)}")
+
+    # -- the scripted surface must refuse imagery -------------------------
+    check_id = "matrix:processing refuses imagery"
+    reject = next((r for r in manifest["rows"]
+                   if r.get("check") in _MUST_REJECT
+                   and layers.get(r["name"]) is not None), None)
+    if reject is None:
+        results.add("mx", check_id, "Processing refuses imagery as a DEM", FAIL,
+                    "no reject row is loaded to try")
+    else:
+        scratch = scratch_root / "mx_proc_reject"
+        scratch.mkdir(parents=True, exist_ok=True)
+        try:
+            with Pipeline(scratch, keep) as pipe:
+                try:
+                    _run_processing_coverage(layers[reject["name"]], lat, lon,
+                                             pipe.scratch / "out")
+                    results.add("mx", check_id,
+                                "Processing refuses imagery as a DEM", FAIL,
+                                f"the algorithm ran {reject['row']} as terrain with "
+                                f"no prompt and no refusal — the scripted surface "
+                                f"has no user to warn")
+                except Exception as exc:
+                    said = " ".join(str(exc).split())
+                    ok = "imagery" in said.lower()
+                    results.add("mx", check_id,
+                                "Processing refuses imagery as a DEM",
+                                PASS if ok else FAIL,
+                                _shorten(said, 140) if ok else
+                                f"it failed, but not on the classifier: "
+                                f"{_shorten(said, 120)}")
+        except Exception as exc:
+            results.add("mx", check_id, "Processing refuses imagery as a DEM",
+                        FAIL, f"{type(exc).__name__}: {_shorten(str(exc), 160)}")
+
+
+def _sound_grid(cov: Dict[str, Any], range_km: float, resolution_m: float
+                ) -> Tuple[bool, str]:
+    """One verdict for "this coverage grid is structurally sound"."""
+    expected = 2.0 * range_km * 1000.0 / resolution_m
+    problems = []
+    if not cov.get("valid"):
+        problems.append("no valid pixel")
+    if cov.get("bands") != 1:
+        problems.append(f"{cov.get('bands')} bands")
+    if cov.get("gap_rows") or cov.get("gap_cols"):
+        problems.append(f"{cov.get('gap_rows')}/{cov.get('gap_cols')} interior gaps")
+    for axis in ("width", "height"):
+        if abs(cov.get(axis, 0) - expected) > max(5.0, expected * 0.05):
+            problems.append(f"{axis} {cov.get(axis)} vs ~{expected:.0f}")
+    detail = (f"{cov.get('px')} px, {cov.get('valid_pct')}% valid, "
+              f"{cov.get('gap_rows', '?')}/{cov.get('gap_cols', '?')} interior gaps")
+    return (not problems), (detail if not problems
+                            else detail + " — " + "; ".join(problems))
+
+
+def _wedge_confined(tif_path: str, lat: float, lon: float, az0: float,
+                    az1: float, margin: float = 10.0) -> Tuple[bool, str]:
+    """Are the coverage's valid pixels inside the requested sector?"""
+    import numpy as np
+    from osgeo import gdal
+    gdal.UseExceptions()
+    ds = gdal.Open(tif_path)
+    band = ds.GetRasterBand(1)
+    values = band.ReadAsArray().astype("float64")
+    nodata = band.GetNoDataValue()
+    mask = np.isfinite(values)
+    if nodata is not None:
+        mask &= values != nodata
+    if not mask.any():
+        return False, "the wedge run produced no valid pixel at all"
+    gt = ds.GetGeoTransform()
+    ys, xs = np.nonzero(mask)
+    px_lon = gt[0] + (xs + 0.5) * gt[1]
+    px_lat = gt[3] + (ys + 0.5) * gt[5]
+    de = (px_lon - lon) * math.cos(math.radians(lat))
+    dn = px_lat - lat
+    az = (np.degrees(np.arctan2(de, dn))) % 360.0
+    inside = ((az >= (az0 - margin) % 360.0) & (az <= az1 + margin)
+              if az0 - margin >= 0 else
+              (az >= 0) & (az <= az1 + margin) | (az >= (az0 - margin) % 360.0))
+    near = (np.abs(de) < 3e-4) & (np.abs(dn) < 3e-4)   # the tx pixel itself
+    stray = int((~inside & ~near).sum())
+    total = int(mask.sum())
+    sector_px = ((az1 - az0) % 360.0 or 360.0) / 360.0 * math.pi / 4.0 \
+        * mask.shape[0] * mask.shape[1]
+    if total < 0.2 * sector_px:
+        return False, (f"only {total:,} valid px where the {az0:.0f}–{az1:.0f}° "
+                       f"sector holds ~{sector_px:,.0f} — a nearly-empty wedge "
+                       f"confines nothing")
+    ok = stray <= max(5, total // 100)
+    return ok, (f"{total:,} valid px, {stray:,} outside {az0:.0f}–{az1:.0f}° "
+                f"(±{margin:.0f}°)")
+
+
+def _run_processing_coverage(layer, lat: float, lon: float, out_dir: Path):
+    """The scripted surface, exactly as a model or batch job drives it."""
+    from qgis.core import QgsApplication
+    # Headless, QGIS's own `processing` plugin is not on sys.path (inside the
+    # GUI the plugin manager puts it there). Same framework, same path QGIS
+    # ships it at — nothing is stubbed.
+    plugins_dir = os.path.join(QgsApplication.pkgDataPath(), "python", "plugins")
+    if plugins_dir not in sys.path and os.path.isdir(plugins_dir):
+        sys.path.append(plugins_dir)
+    from qgis import processing as qgis_processing
+    from processing.core.Processing import Processing
+    Processing.initialize()
+    registry = QgsApplication.processingRegistry()
+    if registry.providerById("waveshed") is None:
+        from waveshed.provider import AetherProvider
+        registry.addProvider(AetherProvider())
+    out_dir.mkdir(parents=True, exist_ok=True)
+    return qgis_processing.run("waveshed:coverage", {
+        "INPUT_DEM": layer, "TX_LAT": float(lat), "TX_LON": float(lon),
+        "TX_HEIGHT": 30.0, "FREQ_MHZ": 900.0, "ERP_WATTS": 10.0,
+        "MODEL": 1,          # ITM
+        "RESOLUTION": 3,     # index into VALID_RESOLUTIONS -> 30 m
+        "MAX_RANGE": 3, "BACKEND": 2,   # CPU
+        "OUTPUT_DIR": str(out_dir),
+    })
+
+
+def _build_reference(manifest, results: Results, layers, plugin,
+                     scratch_root: Path, timeout: int,
+                     keep: bool) -> Optional[Path]:
+    """The catalogue's reference terrain, built ONCE, kept for the whole tier.
+
+    Its own worker run, its own cache, its own output directory — nothing a
+    row later acquires can touch these tiles, which is the property the old
+    per-row re-acquisition destroyed (the reference overwrote, via hard
+    links, the very tiles it was about to be compared with).
+    """
+    by_row = {r["row"]: r for r in manifest["rows"]}
+    ref = by_row.get(manifest.get("reference_row"))
+    layer = layers.get(ref["name"]) if ref else None
+    results.plan("-", "reference.terrain")
+    if ref is None or layer is None:
+        results.add("-", "reference.terrain", "the reference terrain is built once",
+                    FAIL, "the catalogue's reference row is not in the project")
+        return None
+    probe = manifest.get("elevation_probe") or {}
+    lat, lon = float(probe.get("lat", 46.945)), float(probe.get("lon", 7.41))
+    adapter = plugin["adapter"]
+    ref_dir = scratch_root / "reference_terrain"
+    scratch = scratch_root / "reference_scratch"
+    scratch.mkdir(parents=True, exist_ok=True)
+    try:
+        with Pipeline(scratch, keep) as pipe:
+            state = _mc_convert([(ref, layer)], plugin, ref_dir, [30],
+                                timeout * 3,
+                                bbox=adapter.analysis_bbox(lat, lon, 3))
+    except RuntimeError as exc:
+        state = {"ok": None, "err": str(exc), "tiles": []}
+    if state["ok"] is None or not state["tiles"]:
+        why = _worker_complaint(state) or \
+            "the worker reported success but wrote no tile"
+        results.add("-", "reference.terrain", "the reference terrain is built once",
+                    FAIL, f"the reference run failed — every agreement check "
+                          f"below fails with it: {_tail(why, 160)}")
+        return None
+    report = abt_report(state["tiles"], plugin)
+    results.add("-", "reference.terrain", "the reference terrain is built once",
+                PASS, f"{len(state['tiles'])} tile(s), "
+                      f"{report.get('min_m', 0):,.1f}..{report.get('max_m', 0):,.1f} m, "
+                      f"kept at {ref_dir.name}/ for every row's agreement check")
+    return ref_dir
+
+
+def tier_pipeline(manifest: Dict[str, Any], results: Results, only: Sequence[str],
+                  timeout: int, keep: bool) -> None:
+    """Run the WHOLE pipeline for every catalogue row, one clean cache each.
+
+    This is the tier that answers the only question that matters: put this
+    layer in, click Run, and does the thing the USER would get come out
+    right? Every run below goes through the shipped workers; every check
+    below was declared before the first one started, so anything that does
+    not run is a NOTRUN — and a NOTRUN fails the run.
+    """
+    try:
+        plugin = _plugin_modules()
+    except Exception as exc:
+        results.plan("-", "plugin.pairing")
+        results.add("-", "plugin.pairing", "the plugin under test is this repo's",
+                    FAIL, f"the plugin could not even be imported: "
+                          f"{type(exc).__name__}: {_shorten(str(exc), 140)}")
+        return
+    if not _check_plugin_pairing(plugin, results):
+        return
+    project = None
+
+    # Declare EVERYTHING first. A crash after this point leaves NOTRUNs, not
+    # silence.
+    rows = [r for r in manifest["rows"] if row_selected(r["row"], only)]
+    results.plan("-", "engine.present")
+    results.plan("-", "void.sentinel")
+    results.plan("-", "project.open")
+    results.plan("-", "reference.terrain")
+    for row in rows:
+        _plan_pipeline_row(row, manifest, results, plugin)
+    for combo in _COMBINATIONS:
+        results.plan("mc", f"mc:{combo['name']}")
+    for case in _MATRIX_CASES:
+        results.plan("mx", case)
+
+    binaries = {}
+    already = ("-", "engine.present") in results.executed
+    for name in ("aether_converter", "aether_core", "aether_export"):
+        found = find_binary(name)
+        if found is None:
+            if not already:
+                results.add("-", "engine.present", "engine binaries", FAIL,
+                            f"{name} not found (set AETHER_BIN_DIR) — every pipeline "
+                            f"check below is NOTRUN, and a NOTRUN fails the run")
+            return
+        binaries[name] = found
+    if not already:
+        results.add("-", "engine.present", "engine binaries", PASS,
+                    ", ".join(sorted(p.name for p in binaries.values())))
+
+    _check_void_sentinel(plugin, results)
+    project = open_project(manifest, results)
+    if project is None:
+        return
+    layers = {l.name(): l for l in project.mapLayers().values()}
+    out_dir = Path(manifest["__manifest_dir__"])
+    scratch_root = out_dir / ".pipeline"
+    shutil.rmtree(scratch_root, ignore_errors=True)
+    scratch_root.mkdir(parents=True, exist_ok=True)
+
+    try:
+        ref_dir = _build_reference(manifest, results, layers, plugin,
+                                   scratch_root, timeout, keep)
+        for row in rows:
+            scratch = scratch_root / row["row"].replace(".", "_")
+            scratch.mkdir(parents=True, exist_ok=True)
+            try:
+                with Pipeline(scratch, keep) as pipe:
+                    _pipeline_row(row, layers.get(row["name"]), plugin, pipe,
+                                  manifest, results, timeout, ref_dir)
+            except Exception as exc:
+                results.add(row["row"], "pipeline.crashed",
+                            "the row's pipeline ran to completion", FAIL,
+                            f"the check itself raised {type(exc).__name__}: {exc}")
+        _tier_pipeline_combinations(manifest, results, layers, plugin,
+                                    scratch_root, timeout, keep)
+        _tier_matrix_cases(manifest, results, layers, plugin, scratch_root,
+                           timeout, keep)
+    finally:
+        if keep:
+            results.note(f"pipeline scratch kept at {scratch_root}")
+        else:
+            shutil.rmtree(scratch_root, ignore_errors=True)
 
 
 def _project_layers() -> Dict[str, Any]:
@@ -2700,8 +3644,10 @@ def write_report(results: Results, manifest: Dict[str, Any], out_dir: Path,
     lines = [f"# Torture run — {payload['when']}", "", scope, "", headline, ""]
     if payload["failed"] or payload["unexpected_passes"]:
         lines.append("Result: **FAILED**")
-    elif payload["skipped"] or payload["not_run"] or skipped_rows:
-        lines.append("Result: **INCOMPLETE** — some checks the catalogue declares did not run.")
+    elif payload["skipped"] or payload["not_run"] or unbuilt:
+        lines.append("Result: **FAILED** — checks the catalogue declares did not run "
+                     "(skipped, not run, or their row was never built), and a check "
+                     "that does not run is a failed run.")
     elif partial:
         lines.append("Result: **PARTIAL** — everything in this run's scope passed, but the "
                      "run covered only part of the catalogue. This file has replaced whatever "
@@ -2843,9 +3789,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument("--timeout", type=int, default=180,
                         help="seconds for one engine subprocess (default 180)")
     parser.add_argument("--allow-incomplete", action="store_true",
-                        help="exit 0 even when checks were skipped or never ran")
+                        help="DEPRECATED and ignored: a check that did not run "
+                             "fails the run, always")
     parser.add_argument("--allow-missing-plugin", action="store_true",
-                        help="treat an unimportable waveshed package as a skip, not a failure")
+                        help="DEPRECATED: a skip now fails the run too, so this "
+                             "changes the label, never the outcome")
     parser.add_argument("--port", type=int, default=8000,
                         help="port for the local tile fixture (default 8000)")
     if argv is None and running_inside_qgis():
@@ -2877,6 +3825,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     manifest["__manifest_dir__"] = str(out_dir)
     only = [r.strip() for r in args.rows.split(",") if r.strip()]
     cases = [c.strip() for c in args.cases.split(",") if c.strip()]
+    if only and not any(row_selected(r["row"], only) for r in manifest["rows"]):
+        print(f"[error] --rows {args.rows!r} selects no catalogue row at all. "
+              f"Running nothing is not a pass.")
+        return 2
 
     print(f"torture runner — project build {manifest['build']}, {len(manifest['rows'])} rows")
     results = Results()
@@ -2901,9 +3853,27 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             tier_b(manifest, results, only, cases, args.timeout)
         if "c" in args.tier:
             print("\n== tier C: the whole pipeline, one clean cache per row ==")
-            if app is None and not running_inside_qgis():
-                app = start_qgis()
-            tier_pipeline(manifest, results, only, args.timeout, args.keep_scratch)
+            if running_inside_qgis():
+                # Two reasons, both hard: the tier drives the shipped workers
+                # SYNCHRONOUSLY (a live QGIS would freeze for the whole tier,
+                # with per-row progress dialogs on top), and the console's
+                # preloaded plugin wins every import, so the code under test
+                # would be whatever was installed, not this repo.
+                results.plan("-", "tierc.standalone")
+                results.add("-", "tierc.standalone", "tier C runs standalone", FAIL,
+                            "tier C cannot run inside a live QGIS: it drives the "
+                            "GUI workers synchronously (this session would freeze "
+                            "for the whole tier) and the console's loaded plugin "
+                            "may not be this repo's. Run it standalone: "
+                            "\"C:\\OSGeo4W\\bin\\python-qgis.bat\" "
+                            "tools/torture_runner.py --tier c   (tiers a and b "
+                            "remain console-runnable). To refresh the installed "
+                            "plugin first: python deploy.py, then restart QGIS.")
+            else:
+                if app is None:
+                    app = start_qgis()
+                tier_pipeline(manifest, results, only, args.timeout,
+                              args.keep_scratch)
     except Exception as exc:
         # Not swallowed — recorded as a failing check, so the report is still
         # written and everything tier A already established survives. This used
@@ -2929,10 +3899,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print("[error] the run made no checks at all. That is never a pass.")
         return 2
     incomplete = payload["skipped"] or payload["not_run"] or payload["rows_not_built"]
-    if incomplete and not args.allow_incomplete:
-        print("[incomplete] the run did not cover everything the catalogue declares. "
-              "Pass --allow-incomplete to accept that as success.")
-        return 2
+    if incomplete:
+        if args.allow_incomplete:
+            print("[note] --allow-incomplete is deprecated and ignored.")
+        print("[failed] checks were skipped or never ran. A check that does not "
+              "run is a failed run — there is no flag that changes that.")
+        return 1
     return 0
 
 
@@ -2952,7 +3924,12 @@ def _check_fixture_server(manifest: Dict[str, Any], results: Results,
 
 
 def run(*rows: str, tier: str = "ab", **kwargs):
-    """Callable entry point, for when you want to re-run it from the console."""
+    """Callable entry point, for when you want to re-run it from the console.
+
+    Defaults to tiers a+b: tier C refuses to run inside a live QGIS (it
+    drives the GUI workers synchronously and must test this repo's plugin,
+    not the console's loaded copy) — run it standalone instead.
+    """
     argv = ["--tier", tier]
     if rows:
         argv += ["--rows", ",".join(rows)]

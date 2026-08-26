@@ -70,13 +70,17 @@ def load_abt(path: str):
 
 
 # i16 at/under this renders as NaN/transparent in the map-converter inspector
-# (it keeps only elev*0.5 > -5000 m).
-NODATA_I16 = -10000
+# (it keeps only elev > MIN_VALID_ELEV_M, the converter's own -5000-COUNT
+# floor = -2500 m). This module reads .abt without importing the plugin, so the
+# value is repeated here; keep it in step with abt.MIN_VALID_ELEV_COUNTS. It
+# used to be -10000, one count below the -9999 void sentinel, which reported an
+# all-holes tile as hole-free.
+NODATA_I16 = -5000
 
 
 def zero_blocks(elev, block: int):
     """List of (r0, c0) top-left px of block-sized cells that are entirely a
-    'hole' — a nodata sentinel (<= -5000 m, the inspector's NaN) or all zero."""
+    'hole' — a nodata sentinel (<= -2500 m, the inspector's NaN) or all zero."""
     h, w = elev.shape
     nbr, nbc = h // block, w // block
     if nbr == 0 or nbc == 0:

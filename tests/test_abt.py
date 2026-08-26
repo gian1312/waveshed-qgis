@@ -210,6 +210,19 @@ class TestPasteTile(unittest.TestCase):
         abt.paste_tile(canvas, void, 0, 0)
         self.assertEqual(canvas.tolist(), [[3.0, 9.0]])
 
+    def test_the_converters_own_void_does_not_erase_a_neighbour(self):
+        # The value that regressed: aether_converter writes -9999 COUNTS for a
+        # pixel no source covered, which is -4999.5 m — not MOSAIC_NODATA_M's
+        # -9999 m. A floor of -5000 m sits one count below it, so every hole
+        # was pasted over good terrain as ground 5 km down.
+        converter_void_m = -9999 * abt.ELEV_STEP_M
+        self.assertGreater(converter_void_m, -5000.0)
+        canvas = self._canvas((1, 2))
+        abt.paste_tile(canvas, np.array([[3.0, 4.0]], dtype=np.float32), 0, 0)
+        void = np.array([[converter_void_m, 9.0]], dtype=np.float32)
+        abt.paste_tile(canvas, void, 0, 0)
+        self.assertEqual(canvas.tolist(), [[3.0, 9.0]])
+
 
 @unittest.skipUnless(_HAVE_NUMPY, "numpy not available")
 class TestBuildMosaic(unittest.TestCase):

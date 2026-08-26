@@ -16,6 +16,8 @@
     {"match": "mapzen.com", "max_zoom": 15},
     {"match": "mapzen", "encoding": "terrarium"},
     {"match": "api.mapbox.com", "max_zoom": 15},
+    {"match": "maptiler.com/tiles/terrain-rgb-v2", "max_zoom": 14, "encoding": "mapbox"},
+    {"match": "maptiler.com/tiles/terrain-rgb/", "max_zoom": 12, "encoding": "mapbox"},
     {"match": "terrarium", "encoding": "terrarium"},
     {"match": "aws-terrain", "encoding": "terrarium"},
     {"match": "terrain-rgb", "encoding": "mapbox"},

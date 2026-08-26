@@ -28,6 +28,7 @@ from waveshed.gui.map_converter_tab import (
     _fgb_translate_options,
     phase_progress,
 )
+import waveshed.core.buildings_source as buildings_source
 import waveshed.core.terrain_adapter as ta
 from waveshed.core.terrain_adapter import _tile_params
 import waveshed.gui.map_converter_tab as mct
@@ -307,7 +308,10 @@ class TestSublayerUris(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as out_dir:
             worker = _MapConverterWorker([], out_dir, [30], [])
-            with mock.patch.object(mct, "_convert_to_fgb",
+            # Patched where the conversion now LIVES (core.buildings_source),
+            # which is also what the Site Analysis path calls — one copy, one
+            # patch point.
+            with mock.patch.object(buildings_source, "_convert_to_fgb",
                                    side_effect=fake_convert):
                 result = worker._resolve_buildings(
                     {"resolved_source": uri, "crs_authid": "EPSG:4326"})
@@ -1185,6 +1189,48 @@ class TestImageryXyzIsRefused(unittest.TestCase):
                                return_value="dem"):
             resolved = mct._resolve_source_on_main_thread(self._entry(), [])
         self.assertEqual(resolved["kind"], "xyz")
+
+
+class TestImageryRenderedIsRefused(unittest.TestCase):
+    """A WMS/WMTS/ArcGIS picture must never be rendered into terrain.
+
+    Torture §4 (4.1, 4.2, 4.4b, 4.5, 4.6): the imagery guard used to live
+    only on the xyz branch, so a rendered service fell through and its
+    basemap bytes were ingested as metres.
+    """
+
+    def _entry(self):
+        layer = mock.Mock()
+        layer.name.return_value = "osm-wms"
+        layer.source.return_value = (
+            "contextualWMSLegend=0&crs=EPSG:3857&format=image/png"
+            "&layers=OSM-WMS&url=https://ows.example/service")
+        return _LayerEntry(layer_type="raster",
+                           source_path=layer.source(),
+                           qgis_layer=layer,
+                           extent={"south": 47.0, "north": 47.1,
+                                   "west": 8.0, "east": 8.1})
+
+    def test_imagery_verdict_is_a_hard_error_before_any_render(self):
+        with mock.patch.object(mct, "classify_raster_layer",
+                               return_value="imagery"), \
+             mock.patch.object(mct, "_render_tiles_via_qgis") as render:
+            with self.assertRaises(RuntimeError) as caught:
+                mct._resolve_source_on_main_thread(self._entry(), [])
+        msg = str(caught.exception)
+        self.assertIn("osm-wms", msg)
+        self.assertIn("imagery, not elevation", msg)
+        render.assert_not_called()
+
+    def test_elevation_verdict_still_renders(self):
+        # Row 4.3: a WCS coverage classifies as elevation and must keep
+        # flowing through the rendered branch untouched.
+        with mock.patch.object(mct, "classify_raster_layer",
+                               return_value="dem"), \
+             mock.patch.object(mct, "_render_tiles_via_qgis",
+                               return_value={"t.abt": "/tmp/t.tif"}):
+            resolved = mct._resolve_source_on_main_thread(self._entry(), [])
+        self.assertEqual(resolved["kind"], "rendered")
 
 
 class TestBuildingsFailureIsHard(unittest.TestCase):

@@ -291,5 +291,8 @@ Confirmed open findings; see `tmp/terrain-audit-plan.html` for the full set.
 - **No pre-flight against the ~3.86 GB atlas cap**; the warning threshold is 50 GB (F5).
 - **The pool has no lock and no atomic write** — concurrent runs corrupt tiles that then cache
   forever, and Cancel does not stop the terrain phase (F6).
-- **Antimeridian/polar are unhandled** — past ±85° you get real terrain from 85°N (F7).
+- **Polar is unhandled** — past ±85° you get real terrain from 85°N (F7). The
+  antimeridian half of F7 is closed: `aether_converter plan` refuses a bbox reaching
+  outside `[-180,180] x [-90,90]` and names the crossing, and the Map Converter aborts
+  on any plan failure, so it fails loudly instead of wrapping.
 - **Grid is square in degrees**, so E-W resolution is over-sampled by 1/cos(lat) (F8).

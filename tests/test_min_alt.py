@@ -655,6 +655,15 @@ class TestAmslArithmetic(unittest.TestCase):
         self.assertEqual(self._amsl([[100]], [[MOSAIC_NODATA_M]]),
                          [[ma.MIN_ALT_SENTINEL]])
 
+    def test_the_converters_own_void_blanks_the_pixel(self):
+        # -9999 COUNTS = -4999.5 m is what the converter writes for an
+        # uncovered pixel, and it is NOT MOSAIC_NODATA_M. Against a -5000 m
+        # floor it read as valid ground and every hole got a confident
+        # min-altitude 5 km below sea level.
+        from waveshed.core.abt import ELEV_STEP_M
+        self.assertEqual(self._amsl([[100]], [[-9999 * ELEV_STEP_M]]),
+                         [[ma.MIN_ALT_SENTINEL]])
+
     def test_nan_terrain_blanks_the_pixel(self):
         # A warped float DEM spells its own no-data as NaN.
         self.assertEqual(self._amsl([[100]], [[float("nan")]]),

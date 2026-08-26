@@ -118,10 +118,25 @@ class TestRenderedServiceLayers(unittest.TestCase):
         lyr = _ProviderLayer(provider="wms", source=src, bands=1, dtype=_FLOAT32)
         self.assertEqual(classify_raster_layer(lyr), "imagery")
 
-    def test_wms_elevation_service_is_still_a_dem(self):
+    def test_an_elevation_sounding_wms_is_imagery_anyway(self):
+        # USGS 3DEP's WMS lives at elevation.nationalmap.gov and serves shaded
+        # relief. The URL hint used to win and the layer was offered as a DEM,
+        # so an analysis ran over a picture of terrain and failed silently.
+        # A WMS cannot deliver values at all: Qt decodes the response with
+        # QImage, which refuses 32-bit samples, so even image/tiff draws
+        # nothing. The provider kind wins over the URL.
         src = ("crs=EPSG:4326&format=image/tiff&layers=elevation"
-               "&url=https://example.org/dem/wms")
+               "&url=https://elevation.nationalmap.gov/arcgis/services/dem/wms")
         lyr = _ProviderLayer(provider="wms", source=src, bands=1, dtype=_FLOAT32)
+        self.assertEqual(classify_raster_layer(lyr), "imagery")
+
+    def test_a_wcs_elevation_service_is_still_a_dem(self):
+        # The counterpart: a COVERAGE service does return real values, so the
+        # elevation hint is trustworthy there. This is where 3DEP's values
+        # actually come from.
+        src = ("cache=PreferNetwork&crs=EPSG:4326&format=GeoTIFF"
+               "&identifier=elevation&url=https://example.org/dem/wcs")
+        lyr = _ProviderLayer(provider="wcs", source=src, bands=1, dtype=_FLOAT32)
         self.assertEqual(classify_raster_layer(lyr), "dem")
 
     def test_wmts_basemap_is_imagery(self):

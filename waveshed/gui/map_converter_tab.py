@@ -10,7 +10,6 @@ The parent dialog must provide ``self.iface`` (QgisInterface).
 
 from __future__ import annotations
 
-import hashlib
 import json
 import math
 import os
@@ -62,6 +61,18 @@ from qgis.gui import QgsMapLayerComboBox, QgsRubberBand
 
 from ..core import terrain_adapter
 from ..core.binary_manager import find_binary
+# The vector→FlatGeobuf machinery lives in core/ (business logic, no GUI): the
+# Site Analysis path needs it just as much, and two copies of a conversion
+# cache key is two caches. Imported back under its own names so this module
+# reads exactly as it did when it owned them.
+from ..core.buildings_source import (  # noqa: F401 — re-exported for tests
+    _convert_to_fgb,
+    _fgb_cache_name,
+    _fgb_translate_options,
+    _split_sublayer,
+    fgb_cache_dir,
+    resolve_buildings_source,
+)
 from ..core.layer_utils import classify_raster_layer
 from ..core.terrain_adapter import (
     ABT_EXTENT_DEG,
@@ -71,7 +82,6 @@ from ..core.terrain_adapter import (
     _tile_params,
     bboxes_intersect,
     build_tile_sources,
-    source_fingerprint,
 )
 
 TAG = "Waveshed"
@@ -306,120 +316,6 @@ def _detect_folder_resolution(folder: str) -> Optional[float]:
 # from terrain_adapter.source_file_info (GDAL geotransform + a QGIS coordinate
 # transform for ANY CRS). The historical LV95-only approximation and the
 # CRS special-casing that surrounded it are gone.
-
-
-def _fgb_translate_options(src_crs: str = "") -> List[str]:
-    """GDAL VectorTranslate options for a → FlatGeobuf/WGS84 conversion.
-
-    A file with no embedded CRS reprojects to garbage unless GDAL is told what
-    it is already in, so *src_crs* (the detected or user-supplied CRS) is
-    passed as ``-s_srs`` when known.
-    """
-    options = [
-        "-f", "FlatGeobuf",
-        "-t_srs", "EPSG:4326",
-        "-nlt", "PROMOTE_TO_MULTI",
-        "-lco", "SPATIAL_INDEX=YES",
-        "-skipfailures",
-    ]
-    if src_crs:
-        options += ["-s_srs", src_crs]
-    return options
-
-
-def _split_sublayer(uri: str) -> Tuple[str, str]:
-    """Split a QGIS OGR URI into ``(file path, sublayer name)``.
-
-    QGIS hands a GeoPackage/GDB/KML sublayer over as
-    ``…/x.gpkg|layername=buildings``. Neither ``os.path.isfile`` nor
-    ``os.path.splitext`` understands that suffix, so the extension test in
-    ``_resolve_buildings`` never matched — no conversion happened and the raw
-    URI went to the converter, which cannot open it and only warns. Anything
-    other than ``layername=`` (``layerid=``, ``geometrytype=``, …) yields an
-    empty name, which converts every layer rather than the wrong one.
-    """
-    head, sep, tail = uri.partition("|")
-    if not sep:
-        return uri, ""
-    for part in tail.split("|"):
-        key, _, value = part.partition("=")
-        if key.strip().lower() == "layername":
-            return head, value
-    return head, ""
-
-
-def _fgb_cache_name(src_path: str, src_crs: str = "",
-                    layer_name: str = "") -> str:
-    """File name for a cached conversion of *src_path* declared as *src_crs*.
-
-    The conversion cache lives in a shared temp directory that survives across
-    QGIS sessions, so the name has to pin everything that determines the
-    output. Keying on the base name alone caused three separate faults:
-
-    * two sources sharing a base name (``a/buildings.shp``, ``b/buildings.shp``)
-      returned each other's conversion;
-    * re-declaring a source's CRS reused the conversion made under the old one;
-    * a conversion cached before ``-s_srs`` was honoured kept being returned,
-      so the fix silently never applied.
-
-    Including the source fingerprint and the CRS makes each of those a
-    different file, and leaves pre-existing entries unreachable rather than
-    wrong.
-
-    *layer_name* rides along too: two sublayers of one GeoPackage are two
-    different conversions of the same file.
-    """
-    basename = os.path.splitext(os.path.basename(src_path))[0]
-    ident = f"{source_fingerprint(src_path)}|{src_crs}|{layer_name}"
-    digest = hashlib.md5(ident.encode("utf-8")).hexdigest()[:12]
-    return f"{basename}_{digest}.fgb"
-
-
-def _convert_to_fgb(src_path: str, out_dir: str, src_crs: str = "",
-                    layer_name: str = "") -> Optional[str]:
-    """Convert a vector file (GDB/SHP/GPKG/GeoJSON) to FlatGeobuf via GDAL.
-
-    *src_path* must be a plain filesystem path — GDAL does not understand
-    QGIS's ``|layername=`` suffix, so a container's sublayer is selected with
-    *layer_name* instead (see :func:`_split_sublayer`).
-
-    Returns path to the output .fgb file, or None on failure.
-    """
-    try:
-        from osgeo import gdal, ogr
-        out_path = os.path.join(
-            out_dir, _fgb_cache_name(src_path, src_crs, layer_name))
-        if os.path.exists(out_path):
-            return out_path
-
-        # Convert under a temp name and rename on success, so a conversion that
-        # fails or is interrupted cannot leave a partial .fgb behind that the
-        # next run would return straight out of the cache.
-        tmp_path = out_path + ".part"
-        if os.path.exists(tmp_path):
-            os.remove(tmp_path)
-
-        options = _fgb_translate_options(src_crs)
-        # `layers` is only passed when there is one, so the far commoner
-        # whole-file conversion issues exactly the call it always has.
-        if layer_name:
-            result = gdal.VectorTranslate(tmp_path, src_path, options=options,
-                                          layers=[layer_name])
-        else:
-            result = gdal.VectorTranslate(tmp_path, src_path, options=options)
-        if result is None:
-            if os.path.exists(tmp_path):
-                os.remove(tmp_path)
-            return None
-        result = None  # Close dataset
-        os.replace(tmp_path, out_path)
-        return out_path
-    except Exception as exc:
-        QgsMessageLog.logMessage(
-            f"Vector conversion failed for {src_path}: {exc}",
-            TAG, Qgis.MessageLevel.Warning,
-        )
-        return None
 
 
 # ---------------------------------------------------------------------------
@@ -723,6 +619,50 @@ def _classify_acquisition(source: str) -> str:
     return "rendered"
 
 
+def _union_extent(entries) -> Optional[Dict[str, float]]:
+    """WGS84 union of the raster entries' extents; None when none has one.
+
+    The ONE implementation of the run's combined bbox. ``_on_run``, the
+    worker and the torture runner all take their AOI from here — the run
+    aborts when they disagree, so they must not be three copies.
+    Entries may be ``_LayerEntry`` objects (main thread) or the worker's
+    plain dicts; both spell ``layer_type`` and ``extent``.
+    """
+    combined: Optional[Dict[str, float]] = None
+    for e in entries:
+        layer_type = e["layer_type"] if isinstance(e, dict) else e.layer_type
+        extent = e["extent"] if isinstance(e, dict) else e.extent
+        if layer_type == "buildings" or not extent:
+            continue
+        if combined is None:
+            combined = dict(extent)
+        else:
+            combined["south"] = min(combined["south"], extent["south"])
+            combined["north"] = max(combined["north"], extent["north"])
+            combined["west"] = min(combined["west"], extent["west"])
+            combined["east"] = max(combined["east"], extent["east"])
+    return combined
+
+
+def _pending_render_jobs(entries, out_res, output_dir, overwrite):
+    """``(combined bbox, (res, tile) jobs)`` for a run over *entries*.
+
+    The jobs are the run's enumerated grid minus the tiles that will be
+    skipped as existing — rendered servers must not be exported for tiles
+    nothing will build. ``(None, [])`` when no raster entry has an extent.
+    """
+    combined = _union_extent(entries)
+    if combined is None:
+        return None, []
+    jobs = _enumerate_tiles(_snap_bbox(combined, out_res), out_res)
+    if not overwrite:
+        jobs = [
+            (r, t) for r, t in jobs
+            if not os.path.exists(os.path.join(output_dir, t["filename"]))
+        ]
+    return combined, jobs
+
+
 def _entry_kind(entry: _LayerEntry) -> str:
     """Acquisition kind for a stack entry (``'buildings'`` for vectors)."""
     if entry.layer_type == "buildings":
@@ -865,15 +805,16 @@ def _resolve_source_on_main_thread(
     kind = _classify_acquisition(src)
     if kind == "file":
         return {"kind": "file", "path": src}
-    if kind == "xyz":
-        # Fail loudly BEFORE routing an RGB basemap into the elevation
-        # downloader: Terrarium-decoding a picture yields garbage terrain.
-        # The add-time "Possible Imagery — Add anyway?" prompt lets a user
-        # keep such a layer in the stack for inspection; converting it is
-        # where the line is drawn.
-        if (layer is not None
-                and classify_raster_layer(layer) == "imagery"):
-            lname = layer.name() if hasattr(layer, "name") else src
+    # Fail loudly BEFORE acquiring from ANY service that classifies as
+    # imagery — the xyz downloader would Terrarium-decode a picture into
+    # garbage terrain, and a rendered (WMS/WMTS/ArcGIS) export would ingest
+    # colour bytes as metres. The add-time "Possible Imagery — Add anyway?"
+    # prompt lets a user keep such a layer in the stack for inspection;
+    # converting it is where the line is drawn, whichever branch it takes.
+    if (layer is not None
+            and classify_raster_layer(layer) == "imagery"):
+        lname = layer.name() if hasattr(layer, "name") else src
+        if kind == "xyz":
             raise RuntimeError(
                 f"Layer '{lname}' classifies as imagery, not elevation — "
                 "it cannot be converted to terrain. Its XYZ tiles are an "
@@ -881,6 +822,16 @@ def _resolve_source_on_main_thread(
                 "garbage. Use an elevation-encoded service (Terrarium / "
                 "Mapbox Terrain-RGB) or remove the layer from the stack."
             )
+        raise RuntimeError(
+            f"Layer '{lname}' classifies as imagery, not elevation — it "
+            "cannot be converted to terrain. A rendered map service "
+            "(WMS / WMTS / ArcGIS) returns a picture of whatever the "
+            "server drew; ingesting it would read colour values as "
+            "metres. Use an elevation source (a DEM file or folder, a "
+            "WCS coverage, or a Terrain-RGB tile service) or remove the "
+            "layer from the stack."
+        )
+    if kind == "xyz":
         return {"kind": "xyz", "uri": src,
                 "extent": dict(entry.extent) if entry.extent else None}
     return {"kind": "rendered",
@@ -1136,18 +1087,7 @@ class _MapConverterWorker(QThread):
             self.status.emit("Building tile list...")
             self._log("Phase 2: Building .abt tile jobs...")
 
-            combined = None
-            for entry in self._layers:
-                if entry["layer_type"] == "buildings" or not entry["extent"]:
-                    continue
-                if combined is None:
-                    combined = dict(entry["extent"])
-                else:
-                    combined["south"] = min(combined["south"], entry["extent"]["south"])
-                    combined["north"] = max(combined["north"], entry["extent"]["north"])
-                    combined["west"] = min(combined["west"], entry["extent"]["west"])
-                    combined["east"] = max(combined["east"], entry["extent"]["east"])
-
+            combined = _union_extent(self._layers)
             if combined is None:
                 self.finished_err.emit("No layer has an extent set.")
                 return
@@ -1408,11 +1348,11 @@ class _MapConverterWorker(QThread):
     def _resolve_buildings(self, entry: dict) -> Optional[str]:
         """Resolve a buildings entry to an FGB path.
 
-        The converter reads building geometry in WGS84, so anything declared
-        in another CRS is reprojected here (vector reprojection is the
-        plugin's job — the generic-CRS ingest applies to rasters only).
-        ``.fgb`` inputs used to be handed over untouched, which silently
-        placed buildings at the wrong coordinates.
+        The deferred OSM download is this worker's own business (it needs the
+        entry's extent and the status signal); everything else is the shared
+        vector resolution in ``core.buildings_source`` — the same call the
+        Site Analysis path makes, so both tabs hand the converter the same
+        kind of file for the same source.
         """
         path = entry["resolved_source"]
         src_crs = entry.get("crs_authid", "") or ""
@@ -1421,63 +1361,7 @@ class _MapConverterWorker(QThread):
         if path.startswith("[OSM Download"):
             return self._download_osm_buildings(entry)
 
-        # A container sublayer arrives as "<file>|layername=<x>". Split it off
-        # before every isfile/splitext test below — on the joined URI isfile()
-        # is always False and splitext() yields ".gpkg|layername=x", so the
-        # conversion was skipped twice over and the raw URI reached the
-        # converter, which cannot open it.
-        file_path, sublayer = _split_sublayer(path)
-
-        # GDB → FGB conversion.
-        is_gdb = False
-        if file_path.lower().endswith(".gdb") and os.path.isdir(file_path):
-            is_gdb = True
-        elif os.path.isdir(file_path):
-            try:
-                is_gdb = any(f.lower().endswith(".gdbtable")
-                             for f in os.listdir(file_path))
-            except OSError:
-                pass
-
-        if is_gdb:
-            self._log(f"  Converting GDB → FlatGeobuf: {path}")
-            out_dir = os.path.join(tempfile.gettempdir(), "aether_fgb")
-            os.makedirs(out_dir, exist_ok=True)
-            fgb = _convert_to_fgb(file_path, out_dir, src_crs, sublayer)
-            if fgb:
-                return os.path.abspath(fgb)
-            self._log("  GDB conversion failed.")
-
-        # SHP/GPKG/GeoJSON → FGB.
-        ext = (os.path.splitext(file_path)[1].lower()
-               if os.path.isfile(file_path) else "")
-        if ext in (".shp", ".gpkg", ".geojson"):
-            self._log(f"  Converting {ext} → FlatGeobuf...")
-            out_dir = os.path.join(tempfile.gettempdir(), "aether_fgb")
-            os.makedirs(out_dir, exist_ok=True)
-            fgb = _convert_to_fgb(file_path, out_dir, src_crs, sublayer)
-            if fgb:
-                return os.path.abspath(fgb)
-
-        # Already FlatGeobuf (or an unrecognised container): only safe to pass
-        # straight through when it is already WGS84.
-        if src_crs and src_crs != "EPSG:4326":
-            self._log(f"  Reprojecting buildings {src_crs} → EPSG:4326...")
-            out_dir = os.path.join(tempfile.gettempdir(), "aether_fgb")
-            os.makedirs(out_dir, exist_ok=True)
-            fgb = _convert_to_fgb(file_path, out_dir, src_crs, sublayer)
-            if fgb:
-                return os.path.abspath(fgb)
-            self._log(
-                f"  WARNING: could not reproject buildings from {src_crs}; "
-                "they may be placed incorrectly."
-            )
-
-        # Absolutise the file part only: abspath() on the whole URI prefixes
-        # the cwd to it, and the suffix has to survive for anything downstream
-        # that still understands it.
-        resolved = os.path.abspath(file_path)
-        return f"{resolved}|layername={sublayer}" if sublayer else resolved
+        return resolve_buildings_source(path, src_crs, log=self._log)
 
     def _download_osm_buildings(self, entry: dict) -> Optional[str]:
         """Download buildings from OSM Overpass API."""
@@ -1513,8 +1397,7 @@ class _MapConverterWorker(QThread):
             osm_data = json.loads(raw)
             geojson = MapConverterTab._overpass_to_geojson(osm_data)
 
-            out_dir = os.path.join(tempfile.gettempdir(), "aether_fgb")
-            os.makedirs(out_dir, exist_ok=True)
+            out_dir = fgb_cache_dir()
             geojson_file = os.path.join(out_dir, "osm_buildings.geojson")
             with open(geojson_file, "w") as f:
                 json.dump(geojson, f)
@@ -2521,23 +2404,9 @@ class MapConverterTab(QWidget):
         # before the worker can touch them — per TILE, so enumerate the
         # run's grid now (the same _snap_bbox/_enumerate_tiles the worker
         # repeats). Tiles that will be skipped as existing are not rendered.
-        combined = None
-        for entry in self._layers:
-            if entry.layer_type == "buildings" or not entry.extent:
-                continue
-            if combined is None:
-                combined = dict(entry.extent)
-            else:
-                combined["south"] = min(combined["south"], entry.extent["south"])
-                combined["north"] = max(combined["north"], entry.extent["north"])
-                combined["west"] = min(combined["west"], entry.extent["west"])
-                combined["east"] = max(combined["east"], entry.extent["east"])
-        render_jobs = _enumerate_tiles(_snap_bbox(combined, out_res), out_res)
-        if not self._chk_overwrite.isChecked():
-            render_jobs = [
-                (r, t) for r, t in render_jobs
-                if not os.path.exists(os.path.join(output_dir, t["filename"]))
-            ]
+        _combined, render_jobs = _pending_render_jobs(
+            self._layers, out_res, output_dir,
+            self._chk_overwrite.isChecked())
 
         self._log_msg("Preparing layers (rendered servers render per tile)...")
         self._progress.setValue(phase_progress("resolve", 0.0))

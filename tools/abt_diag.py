@@ -91,8 +91,11 @@ def load_abt(path: str):
 
 
 # A pixel at/under this i16 value renders as NaN/transparent in the map-
-# converter inspector: it keeps only elev*0.5 > -5000 m, i.e. i16 > -10000.
-NODATA_I16 = -10000
+# converter inspector, which keeps only elev > MIN_VALID_ELEV_M. Taken from the
+# plugin rather than restated: this was hard-coded at -10000 (a -5000 *metre*
+# floor), which sits one count below the converter's -9999 void sentinel — so a
+# tile that was nothing but holes was reported as having no holes at all.
+NODATA_I16 = abt_reader.MIN_VALID_ELEV_COUNTS
 
 
 def hole_blocks(elev, block: int):
@@ -419,7 +422,7 @@ def main() -> int:
     fetched = [p for p in probes if p.get("role") == "GAP"]
     print("\n--- read this ---")
     if not gaps:
-        print("No hole blocks found (no <=-5000 m nodata sentinel, no zeros). If "
+        print("No hole blocks found (no <=-2500 m nodata sentinel, no zeros). If "
               "you still see NaN stripes, they're thinner than one --block; lower "
               "--block or tell me and I'll switch to per-row/col nodata scanning.")
     else:

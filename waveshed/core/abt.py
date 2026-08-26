@@ -46,10 +46,17 @@ ELEV_STEP_M = 0.5
 #: Value written for "no tile covered this pixel" in a mosaic.
 MOSAIC_NODATA_M = -9999.0
 
-#: Elevations below this are fill/void rather than terrain (the Dead Sea shore,
-#: the deepest land on Earth, is about -430 m — anything under -5000 m is a
-#: converter gap, not a place).
-MIN_VALID_ELEV_M = -5000.0
+#: The engine's own no-data floor, in STORED COUNTS.  aether_converter samples
+#: with ``v > -5000`` on the raw int16 (docs/CONTRACT.md §6, "No-data pixels"),
+#: and writes -9999 counts for a pixel no source covered.  Both numbers are in
+#: the half-metre unit, so the floor is -2500 m — read as -5000 *metres* it
+#: lands one count BELOW the void sentinel and every hole reads as valid ground
+#: at -4999.5 m.  The Dead Sea shore, the deepest land on Earth, is about
+#: -430 m, so nothing real is lost.
+MIN_VALID_ELEV_COUNTS = -5000
+
+#: Elevations at or below this are fill/void rather than terrain.
+MIN_VALID_ELEV_M = MIN_VALID_ELEV_COUNTS * ELEV_STEP_M   # -2500.0
 
 #: Largest mosaic edge, in pixels.  A whole terrain cache can span degrees at
 #: 10 m; assembling that at native resolution would allocate tens of GB, and
