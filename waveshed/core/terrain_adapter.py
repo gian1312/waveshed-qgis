@@ -581,7 +581,15 @@ def resolve_zmax(source: str) -> Tuple[int, Optional[str]]:
 #       Pixels may move by up to one source sample where a projected CRS used
 #       to go through the warp — accepted within the same schema, alongside
 #       the area-averaging change it ships with.
-_CACHE_SCHEMA = "v4"
+#   v5: the converter's sampling registration moved — the averaging window is
+#       anchored on each output cell's CENTRE (the footprint the contract
+#       always promised) instead of its NW corner, and RasterPixelIsPoint
+#       sources (Copernicus, SRTM) are shifted half a source pixel to their
+#       true corner origin. Same tile geometry, every stored elevation may
+#       move by up to one source sample; missing XYZ tiles are now VOID
+#       instead of 0 m fill. A v4 pool would keep serving the misregistered
+#       tiles forever.
+_CACHE_SCHEMA = "v5"
 
 
 def source_identity(source: str) -> str:
@@ -1288,15 +1296,9 @@ def _run_converter_download_once(
 _MIN_DOWNLOAD_CONNECTIONS = 32
 
 
-def _abt_has_gaps(path: str, block: int = 64) -> bool:
-    """True if the .abt contains a fully-zero block of *block*×*block* pixels.
-
-    The converter writes a *failed* XYZ tile as 0 m (aether_converter
-    download.rs), so a failed tile leaves a zero block. We use this to pick
-    which sub-tiles to re-download. Genuine sea-level 0 (ocean) also trips it,
-    but the retry loop stops on the download's own OK/total count, so a
-    legitimately-zero tile can't loop forever.
-    """
+def _abt_block_any(path: str, predicate, block: int = 64) -> bool:
+    """True if any *block*×*block* pixel block of the .abt satisfies *predicate*
+    on every pixel. Returns False for a file it cannot open or parse."""
     try:
         import numpy as np
         with open(path, "rb") as fh:
@@ -1312,10 +1314,35 @@ def _abt_has_gaps(path: str, block: int = 64) -> bool:
         rows = body[:need].reshape(size, stride)
         elev = np.ascontiguousarray(rows[:, : size * 2]).view(np.int16)
         h = (size // block) * block
-        zc = (elev[:h, :h] == 0).reshape(h // block, block, h // block, block)
-        return bool(zc.all(axis=(1, 3)).any())
+        hit = predicate(elev[:h, :h]).reshape(h // block, block, h // block, block)
+        return bool(hit.all(axis=(1, 3)).any())
     except Exception:
         return False
+
+
+def _abt_has_zero_fill(path: str, block: int = 64) -> bool:
+    """True if the .abt contains a fully-zero block of *block*×*block* pixels.
+
+    A converter OLDER than the missing-tile fix wrote a failed XYZ tile as
+    0 m marked real, so a zero block is the signature of failure fill from
+    such a build. Kept as the honesty backstop (the torture suite calls it);
+    genuine sea-level 0 (ocean) also trips it, which is why it only ever
+    flags, never deletes.
+    """
+    return _abt_block_any(path, lambda e: e == 0, block)
+
+
+def _abt_has_holes(path: str, block: int = 64) -> bool:
+    """True if the .abt contains a fully-VOID block of *block*×*block* pixels.
+
+    The converter writes a *failed* XYZ tile as the -9999 void sentinel, so
+    a failed tile leaves a void block. Used to pick which sub-tiles to
+    re-download. Genuine no-coverage voids (past a fixture's edge, ocean in
+    a bathymetry-less set) also trip it, but the retry loop is bounded by
+    its own pass count, so a legitimately-void tile can't loop forever.
+    """
+    from . import abt
+    return _abt_block_any(path, lambda e: e <= abt.MIN_VALID_ELEV_COUNTS, block)
 
 
 #: Lines of ``aether_converter download`` output that say WHY a run failed:
@@ -1750,13 +1777,15 @@ def _download_zoom_group(
                     detail or f"0 of {total} source tile(s) fetched at z{zoom}")
 
             missing = total - ok
-            # Which sub-tiles need re-fetching? Ones with a hole in them, and
-            # ones never written at all — _abt_has_gaps cannot see the latter,
-            # since it reports False for a file it cannot open.
+            # Which sub-tiles need re-fetching? Ones with a hole in them
+            # (VOID blocks from the current converter, zero blocks from an
+            # older one), and ones never written at all — the block scans
+            # cannot see the latter, reporting False for an unopenable file.
             affected = []
             for s in tile_specs:
                 path = os.path.join(cache_dir, s["filename"])
-                if not os.path.exists(path) or _abt_has_gaps(path):
+                if (not os.path.exists(path) or _abt_has_holes(path)
+                        or _abt_has_zero_fill(path)):
                     affected.append(s)
             if not affected:
                 # Source tiles were unavailable, but no output tile ended up
@@ -2551,7 +2580,52 @@ def _warn_if_bbox_exceeds_source(ds, bbox: Dict[str, float],
     _warn_if_bbox_exceeds_bounds(src, bbox, source_key)
 
 
-def _export_via_qgis(dem_layer: Any, dest: str, bbox: Dict[str, float], resolution_m: int) -> None:
+def layer_native_resolution_m(layer: Any) -> Optional[float]:
+    """Auto-detect a raster layer's ground sampling in metres, or ``None``.
+
+    Lives beside the renderer that consumes it: the export resolution rule
+    below needs it on BOTH tabs, and the Map Converter's copy used to be the
+    only one — which is how Site Analysis came to export a WCS at the output
+    resolution (the server's own pyramid answer, up to 24 m off on slopes)
+    while the Map Converter exported near-native.
+    """
+    from qgis.core import QgsRasterLayer
+    if not isinstance(layer, QgsRasterLayer):
+        return None
+    provider = layer.dataProvider()
+    if provider is None or provider.xSize() <= 0:
+        return None
+    try:
+        ext = provider.extent()
+        crs = layer.crs()
+        if crs.isGeographic():
+            clat = (ext.yMinimum() + ext.yMaximum()) / 2.0
+            cos_lat = max(math.cos(math.radians(clat)), 0.01)
+            x_m = ext.width() / provider.xSize() * 111_111 * cos_lat
+            y_m = ext.height() / provider.ySize() * 111_111
+            return round(min(x_m, y_m), 1)
+        return round(min(ext.width() / provider.xSize(),
+                         ext.height() / provider.ySize()), 1)
+    except Exception:
+        return None
+
+
+def render_resolution_m(native_res_m: Optional[float],
+                        output_res_m: float) -> float:
+    """Pixel size a rendered server is exported at, in metres.
+
+    The FINER of (native resolution, requested output resolution), so the
+    export never undersamples the output grid and the converter's
+    area-averaging engages on the way down. ONE rule for BOTH tabs — the
+    two sides must hand the converter the same pixels or their terrain
+    diverges (measured: up to 61 m on NRW WCS slopes when Site Analysis
+    exported at the output resolution instead).
+    """
+    return (min(float(native_res_m), float(output_res_m))
+            if native_res_m else float(output_res_m))
+
+
+def _export_via_qgis(dem_layer: Any, dest: str, bbox: Dict[str, float], resolution_m: float) -> None:
     from qgis.core import (
         QgsCoordinateReferenceSystem, QgsProject,
         QgsRasterFileWriter, QgsRasterPipe, QgsRasterProjector, QgsRectangle,
@@ -2921,6 +2995,11 @@ def prepare_terrain(
     temp_tifs: List[str] = []
     try:
         infos, use_qgis_export = _gather_source_infos(dem_layer, terrain_dir)
+        if use_qgis_export:
+            # One provider query for the run; the shared rule keeps this
+            # export identical to the Map Converter's for the same layer.
+            render_res = render_resolution_m(
+                layer_native_resolution_m(dem_layer), float(resolution_m))
         if infos:
             union = _union_bbox([i["wgs84_bounds"] for i in infos])
             # Tell the user (once per run) if the range spills past the data.
@@ -2960,7 +3039,7 @@ def prepare_terrain(
                     f"{t['filename']}.tif",
                 )
                 t1 = time.perf_counter()
-                _export_via_qgis(dem_layer, tile_tif, sub_bbox, resolution_m)
+                _export_via_qgis(dem_layer, tile_tif, sub_bbox, render_res)
                 temp_tifs.append(tile_tif)
                 _log(f"  export {t['filename']}: "
                      f"{time.perf_counter() - t1:.1f}s, "

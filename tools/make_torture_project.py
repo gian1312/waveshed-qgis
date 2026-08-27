@@ -1225,6 +1225,17 @@ class Layer:
     #: of the same ground agree to a few metres; anything an order of magnitude
     #: past that is a pipeline fault, not a dataset difference.
     expect_agrees_m: float = 0.0
+    #: Worst single-pixel |difference| vs the reference before the row is
+    #: wrong. 0 = the runner's default of 4x expect_agrees_m. Only rows whose
+    #: REFERENCE is known-imperfect on extreme slopes raise this (arbitrated
+    #: against a third source before believing either side).
+    expect_agrees_max_m: float = 0.0
+    #: p99.9 |difference| ceiling vs the reference, in metres. 0 = not
+    #: checked. A row that raises expect_agrees_max_m should bound its tail
+    #: here instead: the p99.9 band stays tight where a raised max would
+    #: otherwise let sub-0.1% corruption hide inside the reference's own
+    #: cliff error.
+    expect_agrees_p999_m: float = 0.0
     #: Minimum percentage of this row's pipeline-tile samples that must be
     #: REAL terrain (not VOID). Calibrated per fixture: a full-coverage
     #: source is ~100, a small Bern fixture over a 0.5-deg tile ~4. 0 = only
@@ -1496,6 +1507,7 @@ def build_catalogue(cfg: Cfg) -> List[Layer]:
                    "tiles land near -32000 m, which is what this row used to measure.",
             expect_class="dem", expect_encoding="mapbox",
             expect_format="png", expect_elev_m=PROBE_BAND,
+            expect_tile_px=256,
             pipeline_res_m=2, pipeline_range_km=1))
     # Served from the local fixture, not from AWS. The test is the plugin's
     # ambiguity error, which fires on the URL string before a single tile is
@@ -4105,7 +4117,22 @@ def _write_footprints(cfg: Cfg, layers: Sequence[Layer]) -> Optional[Path]:
 PIPELINE_CALIBRATION = {
     "1.1":  {"real": 99.0},
     "1.2":  {"real": 99.0},
-    "1.3a": {"real": 99.0},
+    # 1.3a: measured after the 512 px assembly fix, and arbitrated against
+    # Copernicus GLO-30 over all 3.43 M samples: MapTiler agrees with
+    # Copernicus to rms 3.4 m with ZERO pixels past 100 m; the AWS terrarium
+    # REFERENCE carries the outliers (766 px of >100 m error, max 222 m,
+    # SRTM layover on 45-degree-plus cliffs). The worst |diff| (220 m) is
+    # therefore reference error, so a max ceiling on this row measures
+    # terrarium's cliff quality, not the pipeline: 300 keeps a gross-
+    # corruption bound (36% over the measured max, 4.5x under the pre-fix
+    # 1357 m regression) and the tail is bounded tightly at p99.9 <= 100 m
+    # (measured 62.0). p95 stays at the default 25 (measured 19.5) — that is
+    # the clause that caught the real defect at 555 m.
+    "1.3a": {"real": 99.0, "agrees_max": 300.0, "agrees_p999": 100.0},
+    # 1.3b/1.10 keep the standard 99: with missing z13 tiles repaired from
+    # the fixture's own z12 parents (download.rs fill_from_parents) the
+    # measured real fraction is 100.0000%, and a lost source tile with no
+    # usable ancestor still costs 3.8-6.6 pp — past the floor.
     "1.3b": {"real": 99.0},
     "1.10": {"real": 99.0},
     "2.1":  {"real": 99.0, "elev": (300.0, 4600.0)},
@@ -4154,6 +4181,10 @@ def calibrate_pipeline_expectations(layers: Sequence[Layer]) -> None:
             lyr.expect_real_pct = float(cal["real"])
         if cal.get("agrees") and not lyr.expect_agrees_m:
             lyr.expect_agrees_m = float(cal["agrees"])
+        if cal.get("agrees_max") and not lyr.expect_agrees_max_m:
+            lyr.expect_agrees_max_m = float(cal["agrees_max"])
+        if cal.get("agrees_p999") and not lyr.expect_agrees_p999_m:
+            lyr.expect_agrees_p999_m = float(cal["agrees_p999"])
         if cal.get("elev") and not lyr.expect_elev_m:
             lyr.expect_elev_m = tuple(cal["elev"])
         if (lyr.kind == "raster" and lyr.check == "both"
@@ -4197,6 +4228,8 @@ def write_manifest(cfg: Cfg, layers: Sequence[Layer], project: Path) -> Path:
             "pipeline_res_m": lyr.pipeline_res_m,
             "pipeline_range_km": lyr.pipeline_range_km,
             "expect_agrees_m": lyr.expect_agrees_m,
+            "expect_agrees_max_m": lyr.expect_agrees_max_m,
+            "expect_agrees_p999_m": lyr.expect_agrees_p999_m,
             "expect_real_pct": lyr.expect_real_pct,
             "expect_cov_valid_pct": list(lyr.expect_cov_valid_pct),
             "footprint": list(lyr.footprint),

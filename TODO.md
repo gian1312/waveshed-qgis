@@ -2,6 +2,29 @@
 
 Running list of follow-up work. Keep items short; link to the code site.
 
+## High priority
+
+- [ ] **Deduplicate the XYZ tile-mosaic assembly — the WASM copy still carries
+  the 2026-08-26 download defects.** The tiles→`.abt` assembly exists three
+  times in aether-tools: `run_download_async` and `run_download_mem` in
+  `crates/aether_converter/src/download.rs` (both fixed: tile size read from
+  the PNG, missing tiles → `-9999` VOID), and
+  `crates/aether_converter_wasm/src/lib.rs:45 assemble_terrain`, a separate
+  browser entry for Web-Worker-decoded tiles that was NOT fixed: hardcoded
+  256 px stride (folds 512 px @2x tiles into terrain hundreds of metres
+  wrong), zero-fill for missing tiles (fake sea level marked real), and
+  pre-contract-v2.0 point sampling instead of area-averaging. The waveshed.io
+  browser pipeline produces exactly the terrain the torture suite just caught
+  in the plugin. Fix by collapsing all three onto one shared assembly (the
+  fixed `run_download_mem` machinery is the obvious core), then delete
+  `assemble_terrain`'s inline copy. Needs a wasm32 toolchain to build/test
+  (`wasm-pack build --release --target web crates/aether_converter_wasm`);
+  not installable in the dev container — do it where the WASM crates build.
+  Related smaller holes found in the same review, fix while there:
+  `run_download_mem` never applies the >50%-lost fatal rule
+  (`fetch_failure_is_fatal`), and `decode_png` decodes palette/indexed PNGs
+  as garbage instead of refusing them.
+
 ## Terrain / live download
 
 - [ ] **Test the live XYZ download with services other than Mapzen Global

@@ -878,3 +878,14 @@ def test_the_required_surface_matches_the_real_repo_plugin():
         module = importlib.import_module(modules[key])
         missing = [n for n in names if not hasattr(module, n)]
         assert not missing, f"{modules[key]} lacks {missing}"
+
+
+def test_tier_c_refuses_only_a_borrowed_qgis(monkeypatch):
+    # 2026-08-26: after tiers a/b the runner's OWN QgsApplication exists, and
+    # a guard built on "does an instance exist" refused a standalone
+    # --tier abc run. The distinguishing fact is ownership, not existence.
+    monkeypatch.setattr(tr, "running_inside_qgis", lambda: True)
+    assert tr.borrowed_qgis(None) is True          # console: refuse
+    assert tr.borrowed_qgis(object()) is False     # our own app: run
+    monkeypatch.setattr(tr, "running_inside_qgis", lambda: False)
+    assert tr.borrowed_qgis(None) is False         # standalone, c-only: run

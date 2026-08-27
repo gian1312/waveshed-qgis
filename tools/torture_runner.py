@@ -118,7 +118,9 @@ Run procedure (Windows)::
   3. Tiers a/b: QGIS console or standalone — they test whatever waveshed is
      loaded, and say which in the plugin.import line.
      Tier C: STANDALONE ONLY —
-       "C:\\OSGeo4W\\bin\\python-qgis.bat" tools\\torture_runner.py --tier c
+       run_torture.bat [--rows ... --tier ...]     (repo root; finds
+       python-qgis.bat via TORTURE_PYQGIS, torture.local.ini's qgis_exe,
+       or the default OSGeo4W / Program Files locations)
      It drives the GUI workers synchronously (a live QGIS would freeze for
      the whole tier), and standalone the import is guaranteed to be THIS
      repo's plugin — the plugin.pairing check refuses anything else.
@@ -374,6 +376,50 @@ def running_inside_qgis() -> bool:
     return QgsApplication.instance() is not None
 
 
+def borrowed_qgis(app) -> bool:
+    """True when a QgsApplication exists that THIS RUN did not create.
+
+    That is the QGIS-console case tier C must refuse. ``running_inside_qgis``
+    alone cannot decide it: after tiers a/b the runner's OWN application
+    exists, and 2026-08-26 the guard read that as "inside a live QGIS" and
+    refused a perfectly standalone --tier abc run.
+    """
+    return app is None and running_inside_qgis()
+
+
+def _default_profile_folder() -> str:
+    """The desktop QGIS profile folder, or "" when none exists.
+
+    A standalone QgsApplication started WITHOUT a profile folder reads an
+    empty settings store — so on 2026-08-26 a fully licensed machine
+    reported "API key required" on every engine run: the Waveshed key (and
+    binary dir) live in QgsSettings inside the DESKTOP profile. Honouring
+    ``profiles.ini``'s defaultProfile keeps named-profile setups working.
+    """
+    import platform as _platform
+    system = _platform.system()
+    if system == "Windows":
+        root = Path(os.environ.get("APPDATA", "")) / "QGIS" / "QGIS3"
+    elif system == "Darwin":
+        root = Path.home() / "Library" / "Application Support" / "QGIS" / "QGIS3"
+    else:
+        root = Path.home() / ".local" / "share" / "QGIS" / "QGIS3"
+    profiles = root / "profiles"
+    name = "default"
+    ini = profiles / "profiles.ini"
+    if ini.is_file():
+        try:
+            import configparser
+            parser = configparser.ConfigParser()
+            parser.read(str(ini), encoding="utf-8")
+            name = parser.get("core", "defaultProfile",
+                              fallback="default") or "default"
+        except Exception:  # noqa: BLE001 — an unreadable ini means "default"
+            name = "default"
+    folder = profiles / name
+    return str(folder) if folder.is_dir() else ""
+
+
 def start_qgis():
     """The QGIS application to use, or None when QGIS is already running.
 
@@ -393,10 +439,25 @@ def start_qgis():
             "        (or any python that can import qgis.core)")
     prefix = os.environ.get("QGIS_PREFIX_PATH", "/usr")
     QgsApplication.setPrefixPath(prefix, True)
+    # The desktop app sets the Qt org/app identity and the settings path
+    # BEFORE anything reads a setting; QgsApplication alone does neither, so
+    # a standalone QgsSettings resolved to ".../Unknown Organization.ini"
+    # and every stored value — the Waveshed API key above all — read as
+    # empty (2026-08-26, reproduced; the constructor's profileFolder alone
+    # does not fix it). These four calls make QgsSettings land on the
+    # desktop profile's <profile>/QGIS/QGIS3.ini, verified by fileName().
+    from qgis.PyQt.QtCore import QCoreApplication, QSettings
+    QCoreApplication.setOrganizationName("QGIS")
+    QCoreApplication.setOrganizationDomain("qgis.org")
+    QCoreApplication.setApplicationName("QGIS3")
+    QSettings.setDefaultFormat(QSettings.IniFormat)
+    profile = _default_profile_folder()
+    if profile:
+        QSettings.setPath(QSettings.IniFormat, QSettings.UserScope, profile)
     # GUI enabled: tier C drives the tabs' own main-thread resolve, whose
     # progress dialog is a real widget. Offscreen, it draws to nowhere —
     # but it must be constructible, exactly as in the GUI.
-    app = QgsApplication([], True)
+    app = QgsApplication([], True, profile)
     app.initQgis()
     return app
 
@@ -637,6 +698,8 @@ def _plan_row_checks(row: Dict[str, Any], results: Results) -> None:
         results.plan(name, "zmax")
     if row.get("expect_service_zmax"):
         results.plan(name, "zmax.service_limit")
+    if row.get("expect_tile_px") and "type=xyz" in (row.get("source") or ""):
+        results.plan(name, "xyz.tile_px")
     if row.get("min_scale"):
         results.plan(name, "min_scale")
     if "type=xyz" not in (row.get("source") or ""):
@@ -761,6 +824,7 @@ def _check_row(row, by_name, manifest, results, out_dir, adapter,
     if isinstance(layer, QgsRasterLayer):
         _check_raster_verdicts(row, layer, results, adapter,
                                classify_raster_layer, dem_layer_warning)
+        _check_tile_px(row, layer.source() or "", results, manifest, adapter)
     else:
         # The raster verdicts were planned from the row's own fields. If the
         # project layer is not a raster the catalogue and the project disagree
@@ -773,7 +837,7 @@ def _check_row(row, by_name, manifest, results, out_dir, adapter,
                         FAIL, f"the project layer is a {type(layer).__name__}, so none of "
                               f"this row's raster expectations can be checked")
         for check_id in ("classify", "classify.reject", "encoding", "zmax",
-                         "zmax.service_limit"):
+                         "zmax.service_limit", "xyz.tile_px"):
             results.unplan(row["row"], check_id)
     if not isinstance(layer, QgsVectorLayer):
         results.unplan(row["row"], "features")
@@ -1017,6 +1081,69 @@ def _check_service_zmax(row: Dict[str, Any], source: str, results: Results,
                 f"the plugin knows this service stops at z{expected}",
                 PASS if ok else FAIL, detail,
                 known_fail_for(row, "zmax.service_limit"))
+
+
+def _check_tile_px(row: Dict[str, Any], source: str, results: Results,
+                   manifest, adapter) -> None:
+    """The tile edge this service REALLY serves, measured on one tile.
+
+    ``expect_tile_px`` was written into the manifest and read by nobody —
+    the classic way a catalogue field rots. A 512 px (@2x) service
+    assembled with 256 px maths folds every tile into terrain that is
+    hundreds of metres wrong (the 1.3a defect), so the suite fetches ONE
+    tile through the layer's own URL template and measures the actual
+    image. The zoom is the one the PLUGIN would fetch at — its own
+    ``resolve_zmax`` clamp — never the URI's raw ``zmax``: row 1.2 carries
+    QGIS's default zmax=18 on purpose, and terrarium answers 404 above z15.
+    """
+    check_id = "xyz.tile_px"
+    expected = int(row.get("expect_tile_px") or 0)
+    if not expected or "type=xyz" not in (source or ""):
+        results.unplan(row["row"], check_id)
+        return
+    label = f"the service serves {expected} px tiles"
+    probe = (manifest or {}).get("elevation_probe") or {}
+    lat = float(probe.get("lat", 46.945))
+    lon = float(probe.get("lon", 7.41))
+    z = int_param(uri_params(source), "zmax", 15)
+    if adapter is not None:
+        try:
+            z = int(adapter.resolve_zmax(source)[0])
+        except Exception:
+            pass  # the URI's own zmax stays the fallback
+    n = 1 << z
+    x = min(n - 1, max(0, int((lon + 180.0) / 360.0 * n)))
+    y = min(n - 1, max(0, int(
+        (1.0 - math.asinh(math.tan(math.radians(lat))) / math.pi) / 2.0 * n)))
+    url = (xyz_template(source).replace("{z}", str(z))
+           .replace("{x}", str(x)).replace("{y}", str(y)))
+    try:
+        import urllib.request
+        req = urllib.request.Request(
+            url, headers={"User-Agent": "waveshed-torture/1"})
+        with urllib.request.urlopen(req, timeout=20) as reply:
+            data = reply.read()
+    except Exception as exc:
+        results.add(row["row"], check_id, label, FAIL,
+                    f"could not fetch {url}: {type(exc).__name__}: "
+                    f"{_shorten(str(exc), 90)}",
+                    known_fail_for(row, check_id))
+        return
+    from qgis.PyQt.QtGui import QImage
+    img = QImage.fromData(data)
+    if img.isNull():
+        results.add(row["row"], check_id, label, FAIL,
+                    f"{url} answered {len(data)} bytes that decode as no "
+                    f"image (first bytes {data[:8]!r})",
+                    known_fail_for(row, check_id))
+        return
+    w, h = img.width(), img.height()
+    ok = w == expected and h == expected
+    results.add(row["row"], check_id, label, PASS if ok else FAIL,
+                f"z{z} tile measures {w}x{h} px"
+                + ("" if ok else f" — the catalogue says {expected}, and the "
+                                 f"resolution maths runs on the real size"),
+                known_fail_for(row, check_id))
 
 
 def _check_min_scale(row: Dict[str, Any], layer, results: Results) -> None:
@@ -1748,8 +1875,13 @@ def _sa_analyse(row_label: str, layer, plugin, out_dir: Path, jobs, timeout: int
                     "log": []}
         if results is not None:
             for warning in plugin["model_warnings"](params):
-                results.note(f"{row_label} {name}: model warning — "
-                             f"{getattr(warning, 'message', warning)}")
+                message = f"model warning — {getattr(warning, 'message', warning)}"
+                # Once per unique message: the canonical torture parameters
+                # trip the same two ITM advisories on every row, and 60
+                # repeats bury the findings between them.
+                if not any(message in note for note in results.notes):
+                    results.note(f"{row_label} {name}: {message} "
+                                 f"(same warning from later rows not repeated)")
     if layer is not None and results is not None:
         advisory = plugin["dem_layer_warning"](layer)
         if advisory:
@@ -1798,8 +1930,26 @@ def _sa_view_dir(source: str, lat: float, lon: float, range_km: float,
 SAME, DIFFER, INCOMPARABLE = "same", "differ", "incomparable"
 
 
-def _agree(a_dir, b_dir, plugin) -> Tuple[str, str]:
-    """Do two terrain directories hold the same elevations? ``(verdict, why)``."""
+def _bbox_mask(header, shape, bbox):
+    """Pixels of a tile whose CENTRES fall inside a north/south/east/west box."""
+    import numpy as np
+    res = header.pixel_res
+    lats = header.ul_lat - (np.arange(shape[0]) + 0.5) * res
+    lons = header.ul_lon + (np.arange(shape[1]) + 0.5) * res
+    rows = (lats <= bbox["north"]) & (lats >= bbox["south"])
+    cols = (lons >= bbox["west"]) & (lons <= bbox["east"])
+    return rows[:, None] & cols[None, :]
+
+
+def _agree(a_dir, b_dir, plugin, bbox=None) -> Tuple[str, str]:
+    """Do two terrain directories hold the same elevations? ``(verdict, why)``.
+
+    With *bbox* the comparison is restricted to the pixels inside it — the
+    ground a coverage over that box can actually see. A burn outside the box
+    must NOT count as "the buildings changed the terrain": the coverage
+    provably cannot react to it, and the pass would vouch for a delta the
+    next check then measures as zero.
+    """
     import numpy as np
     abt_mod = plugin["abt"]
     a = {Path(p).name: p for p in abt_mod.list_tiles(str(a_dir))}
@@ -1810,11 +1960,14 @@ def _agree(a_dir, b_dir, plugin) -> Tuple[str, str]:
                               f"the other {sorted(b)[:2]}")
     worst, n = 0.0, 0
     for name in shared:
-        ga = abt_mod.read_tile(abt_mod.read_header(a[name]))
+        header_a = abt_mod.read_header(a[name])
+        ga = abt_mod.read_tile(header_a)
         gb = abt_mod.read_tile(abt_mod.read_header(b[name]))
         if ga is None or gb is None or ga.shape != gb.shape:
             return INCOMPARABLE, f"{name}: unreadable or different shapes"
         mask = _real_mask(ga, plugin) & _real_mask(gb, plugin)
+        if bbox is not None:
+            mask &= _bbox_mask(header_a, ga.shape, bbox)
         if not mask.any():
             continue
         n += int(mask.sum())
@@ -1881,6 +2034,46 @@ def _cross_tab_contract(mc_dir, sa_dir, plugin) -> Tuple[bool, str]:
                   f"{mc_real:,} real (fill only adds)")
 
 
+#: Coincident-flank pixels that make an empty grid line a dropped WRITE
+#: rather than terrain. Measured, not guessed: replaying aether_core's own
+#: LOS sweep + polar->cartesian scatter over 15 real Swiss sites, the largest
+#: flank coincidence a genuine terrain shadow produced was 2 pixels; the
+#: smallest an injected dropped line produced was 9 (typically 35-94).
+_STRIPE_QUORUM = 5
+
+
+def _stripe_lines(line_valid, line_at, quorum: int = _STRIPE_QUORUM) -> List[int]:
+    """Empty grid lines a write DROPPED, as opposed to terrain shadow.
+
+    The valid-pixel bounding box alone is the wrong frame: the footprint is
+    a DISK, so its outermost lines are short slivers a sparse LOS result
+    legitimately leaves empty — and in LOS mode nodata does not even mean
+    "not written" (the engine's 1-bit output writes 0 for shadow,
+    out-of-range and never-computed alike). A dropped line is different in
+    kind: the lines either side of the empty run still hold data at the very
+    same positions, because they sample the same ground. So an empty run
+    counts only when its two flanking lines are BOTH valid at ``quorum`` or
+    more coincident positions.
+    """
+    import numpy as np
+    n = len(line_valid)
+    first = int(np.argmax(line_valid))
+    last = n - 1 - int(np.argmax(line_valid[::-1]))
+    flagged: List[int] = []
+    k = first + 1
+    while k < last:
+        if line_valid[k]:
+            k += 1
+            continue
+        j = k
+        while not line_valid[j]:  # `last` is valid, so this terminates
+            j += 1
+        if int((line_at(k - 1) & line_at(j)).sum()) >= quorum:
+            flagged.extend(range(k, j))
+        k = j
+    return flagged
+
+
 def coverage_report(path: Path) -> Dict[str, Any]:
     """What the exported coverage GeoTIFF holds — values, grid and georef."""
     import numpy as np
@@ -1907,14 +2100,12 @@ def coverage_report(path: Path) -> Dict[str, Any]:
         out["min"] = round(float(values[mask].min()), 1)
         out["max"] = round(float(values[mask].max()), 1)
         out["mean"] = round(float(values[mask].mean()), 2)
-        rows_any = mask.any(axis=1)
-        cols_any = mask.any(axis=0)
-        r0, r1 = int(np.argmax(rows_any)), int(len(rows_any) - 1
-                                               - np.argmax(rows_any[::-1]))
-        c0, c1 = int(np.argmax(cols_any)), int(len(cols_any) - 1
-                                               - np.argmax(cols_any[::-1]))
-        out["gap_rows"] = int((~rows_any[r0:r1 + 1]).sum())
-        out["gap_cols"] = int((~cols_any[c0:c1 + 1]).sum())
+        gap_row_idx = _stripe_lines(mask.any(axis=1), lambda k: mask[k, :])
+        gap_col_idx = _stripe_lines(mask.any(axis=0), lambda k: mask[:, k])
+        out["gap_rows"] = len(gap_row_idx)
+        out["gap_cols"] = len(gap_col_idx)
+        out["gap_row_idx"] = gap_row_idx
+        out["gap_col_idx"] = gap_col_idx
     dataset = None
     return out
 
@@ -2004,9 +2195,10 @@ def _check_coverage(rid: str, tif: Optional[Path], params, row, results: Results
     gaps = (cov.get("gap_rows") or 0) + (cov.get("gap_cols") or 0)
     results.add(rid, stripe_id, "the coverage has no stripes or gaps",
                 PASS if cov.get("valid") and not gaps else FAIL,
-                (f"{cov.get('gap_rows', '?')} empty row(s) and "
-                 f"{cov.get('gap_cols', '?')} empty column(s) strictly inside "
-                 f"the footprint" if cov.get("valid") else "no valid pixel at all"),
+                (f"{cov.get('gap_rows', '?')} dropped row(s) and "
+                 f"{cov.get('gap_cols', '?')} dropped column(s) strictly inside "
+                 f"the footprint" + _gap_lines_suffix(cov)
+                 if cov.get("valid") else "no valid pixel at all"),
                 known_fail_for(row, stripe_id))
 
 
@@ -2046,7 +2238,7 @@ def _abt_asserts(rid: str, row, tiles, plugin, lat: float, lon: float,
     """Everything a terrain directory must prove before a coverage may run.
 
     Readable; not all-VOID; not constant; not download-failure fill (the
-    plugin's own ``_abt_has_gaps`` plus a 0 m floor the catalogue's band
+    plugin's own ``_abt_has_zero_fill`` plus a 0 m floor the catalogue's band
     contradicts); a REAL probe pixel at the transmitter (VOID there means
     the engine computes around a hole exactly where it matters most); the
     catalogue's elevation band; and the catalogue's real-fraction floor.
@@ -2090,15 +2282,16 @@ def _abt_asserts(rid: str, row, tiles, plugin, lat: float, lon: float,
                         f"catalogue's floor is {float(band[0]):,.0f} m — that is "
                         f"download-failure fill, not terrain")
     try:
-        gap_checker = getattr(adapter, "_abt_has_gaps", None)
+        gap_checker = getattr(adapter, "_abt_has_zero_fill", None)
         if gap_checker is not None:
             for path in tiles:
                 if gap_checker(str(path)):
-                    problems.append(f"{Path(path).name}: the plugin's own gap "
-                                    f"detector flags failure-fill blocks")
+                    problems.append(f"{Path(path).name}: the plugin's own "
+                                    f"zero-fill detector flags failure-fill "
+                                    f"blocks (an old converter wrote these)")
                     break
     except Exception as exc:  # noqa: BLE001 — the detector must not hide a row
-        problems.append(f"_abt_has_gaps could not run: {exc}")
+        problems.append(f"_abt_has_zero_fill could not run: {exc}")
 
     floor_pct = float(row.get("expect_real_pct") or 0.0)
     real_pct = 100.0 * report["real_px"] / max(report["total_px"], 1)
@@ -2168,15 +2361,33 @@ def _check_agrees(rid: str, row, tiles, ref_dir: Optional[Path],
     all_diffs = np.concatenate(diffs)
     p95 = float(np.percentile(all_diffs, 95)) * step
     worst = float(all_diffs.max()) * step
-    ok = p95 <= tolerance and worst <= 2.0 * tolerance
+    # max at 4x, not 2x: the 2026-08-26 licensed run measured genuine
+    # cross-source single-pixel outliers of 51-60 m (steep Bern terrain,
+    # swissALTI-derived fixtures vs AWS terrarium) at a p95 of 13-20 m —
+    # honest data, not a defect. The genuine defect that day (1.3a) failed
+    # on p95 alone at 555 m, so the max clause only needs to catch gross
+    # localized corruption, not shave healthy outliers. A row whose
+    # REFERENCE is known-imperfect on extreme slopes (arbitrated against a
+    # third source) may carry its own ceiling in the catalogue
+    # (expect_agrees_max_m); p95 keeps the real guard.
+    max_allowed = float(row.get("expect_agrees_max_m") or 0.0) or 4.0 * tolerance
+    # A row that raises its max also bounds the TAIL (expect_agrees_p999_m),
+    # so sub-0.1% corruption cannot hide inside the reference's own cliff
+    # error; p95 keeps the real guard either way.
+    p999_allowed = float(row.get("expect_agrees_p999_m") or 0.0)
+    p999 = float(np.percentile(all_diffs, 99.9)) * step
+    ok = p95 <= tolerance and worst <= max_allowed and \
+        (not p999_allowed or p999 <= p999_allowed)
+    detail = (f"p95 |difference| {p95:,.1f} m, max {worst:,.1f} m over "
+              f"{samples:,} shared samples (catalogue allows p95 "
+              f"{tolerance:,.0f} m, max {max_allowed:,.0f} m)")
+    if p999_allowed:
+        detail += f"; p99.9 {p999:,.1f} m vs the catalogue's {p999_allowed:,.0f} m"
     results.add(rid, "pipeline.agrees",
                 "agrees with the reference over the same ground",
                 PASS if ok else FAIL,
-                f"p95 |difference| {p95:,.1f} m, max {worst:,.1f} m over "
-                f"{samples:,} shared samples (catalogue allows p95 "
-                f"{tolerance:,.0f} m, max {2 * tolerance:,.0f} m)"
-                + ("" if ok else " — this source's terrain is wrong, not "
-                                 "merely different"),
+                detail + ("" if ok else " — this source's terrain is wrong, "
+                                        "not merely different"),
                 known_fail_for(row, "pipeline.agrees"))
 
 
@@ -2247,11 +2458,22 @@ _MUST_REJECT = ("reject",)
 
 
 def _probe_for(row, manifest) -> Tuple[float, float]:
+    """Transmitter site for a row's pipeline run.
+
+    The catalogue's elevation probe anchors every pipeline over the same
+    ground whenever the row's footprint contains it — the coverage bands
+    are calibrated there, and the buildings fixtures sit around it (a
+    footprint-centre transmitter put the 1x1-degree rows 50 km into the
+    High Alps, where a Bern building burn can never move a coverage
+    pixel). Footprints that do not contain the probe run at their centre.
+    """
     probe = manifest.get("elevation_probe") or {}
+    lat = float(probe.get("lat", 46.945))
+    lon = float(probe.get("lon", 7.41))
     box = row.get("footprint") or []
-    if len(box) == 4:
+    if len(box) == 4 and not (box[0] <= lon <= box[2] and box[1] <= lat <= box[3]):
         return (box[1] + box[3]) / 2.0, (box[0] + box[2]) / 2.0
-    return (float(probe.get("lat", 46.945)), float(probe.get("lon", 7.41)))
+    return lat, lon
 
 
 def _agrees_applies(row, manifest, plugin) -> bool:
@@ -2319,7 +2541,7 @@ _REQUIRED_PLUGIN_SURFACE = (
     ("p2p", ("_P2PWorker", "_write_temp_batch_csv")),
     ("adapter", ("prepare_terrain", "analysis_bbox", "_compute_sector_bbox",
                  "_compute_subtiles", "_cache_key", "buildings_identity",
-                 "_abt_has_gaps", "ensure_pool_tiles")),
+                 "_abt_has_zero_fill", "_abt_has_holes", "ensure_pool_tiles")),
     ("result_loader", ("load_coverage_result",)),
 )
 
@@ -2641,15 +2863,18 @@ def _pipeline_buildings(row, layer, plugin, pipe, manifest, results, timeout):
                     FAIL, "no terrain pair to run over",
                     known_fail_for(row, "pipeline.cov_delta"))
         return
-    verdict, why = _agree(pipe.scratch / "bare", pipe.scratch / "built", plugin)
+    # Restricted to the analysis bbox: a burn the coverage cannot see must
+    # not pass as "the buildings changed the terrain".
+    verdict, why = _agree(pipe.scratch / "bare", pipe.scratch / "built", plugin,
+                          bbox=bbox)
     detail = f"burning {Path(layer.source().partition('|')[0]).name} into {dem_row['row']} "
     if verdict == INCOMPARABLE:
         detail += f"could not be measured against the bare surface: {why}"
     elif verdict == SAME:
-        detail += (f"changed nothing, and no warning was raised. "
-                   f"{_buildings_shape(layer.source())}")
+        detail += (f"changed nothing inside the analysis box, and no warning "
+                   f"was raised. {_buildings_shape(layer.source())}")
     else:
-        detail += f"raised the surface ({why.split(' over ')[0]})"
+        detail += f"raised the surface inside the analysis box ({why.split(' over ')[0]})"
     results.add(rid, "pipeline", "buildings change the terrain",
                 PASS if verdict == DIFFER else FAIL, detail,
                 known_fail_for(row, "pipeline"))
@@ -2676,8 +2901,16 @@ def _pipeline_buildings(row, layer, plugin, pipe, manifest, results, timeout):
     gdal.UseExceptions()
     va = gdal.Open(run_a["ok"][0][0]).ReadAsArray()
     vb = gdal.Open(run_b["ok"][0][0]).ReadAsArray()
-    changed = (0 if va is None or vb is None or va.shape != vb.shape
-               else int((va != vb).sum()))
+    if va is None or vb is None or va.shape != vb.shape:
+        # An unreadable or mismatched pair is NOT "0 pixels moved" — that
+        # message accuses the product of a defect the runner never measured.
+        results.add(rid, "pipeline.cov_delta", "buildings change the coverage",
+                    FAIL,
+                    f"the two coverages could not be compared: "
+                    f"{'unreadable result' if va is None or vb is None else f'shapes {va.shape} vs {vb.shape}'}",
+                    known_fail_for(row, "pipeline.cov_delta"))
+        return
+    changed = int((va != vb).sum())
     results.add(rid, "pipeline.cov_delta", "buildings change the coverage",
                 PASS if changed else FAIL,
                 f"{changed:,} coverage pixel(s) moved when the buildings went in"
@@ -3371,6 +3604,16 @@ def _tier_matrix_cases(manifest, results, layers, plugin, scratch_root: Path,
                         FAIL, f"{type(exc).__name__}: {_shorten(str(exc), 160)}")
 
 
+def _gap_lines_suffix(cov: Dict[str, Any]) -> str:
+    """Name the dropped lines, so a stripe FAIL says WHICH lines died."""
+    parts = []
+    if cov.get("gap_row_idx"):
+        parts.append(f"rows {','.join(map(str, cov['gap_row_idx'][:8]))}")
+    if cov.get("gap_col_idx"):
+        parts.append(f"cols {','.join(map(str, cov['gap_col_idx'][:8]))}")
+    return f" ({'; '.join(parts)})" if parts else ""
+
+
 def _sound_grid(cov: Dict[str, Any], range_km: float, resolution_m: float
                 ) -> Tuple[bool, str]:
     """One verdict for "this coverage grid is structurally sound"."""
@@ -3381,12 +3624,14 @@ def _sound_grid(cov: Dict[str, Any], range_km: float, resolution_m: float
     if cov.get("bands") != 1:
         problems.append(f"{cov.get('bands')} bands")
     if cov.get("gap_rows") or cov.get("gap_cols"):
-        problems.append(f"{cov.get('gap_rows')}/{cov.get('gap_cols')} interior gaps")
+        problems.append(f"{cov.get('gap_rows')}/{cov.get('gap_cols')} dropped "
+                        f"interior lines{_gap_lines_suffix(cov)}")
     for axis in ("width", "height"):
         if abs(cov.get(axis, 0) - expected) > max(5.0, expected * 0.05):
             problems.append(f"{axis} {cov.get(axis)} vs ~{expected:.0f}")
     detail = (f"{cov.get('px')} px, {cov.get('valid_pct')}% valid, "
-              f"{cov.get('gap_rows', '?')}/{cov.get('gap_cols', '?')} interior gaps")
+              f"{cov.get('gap_rows', '?')}/{cov.get('gap_cols', '?')} dropped "
+              f"interior lines")
     return (not problems), (detail if not problems
                             else detail + " — " + "; ".join(problems))
 
@@ -3430,8 +3675,20 @@ def _wedge_confined(tif_path: str, lat: float, lon: float, az0: float,
                 f"(±{margin:.0f}°)")
 
 
+#: The registered AetherProvider, pinned for the process lifetime.
+#: `QgsProcessingRegistry.addProvider` is a sip /Transfer/: it parents the
+#: Python provider to the registry's *Python wrapper*, a throwaway local.
+#: Without this reference the wrapper is collected between calls, the Python
+#: subclass (and its algorithms) die while the C++ shells survive, and the
+#: next `processing.run` fails with "Error creating algorithm from
+#: createInstance()". The shipped plugin is immune — plugin.py keeps
+#: `self.provider` alive — so this is runner bootstrap, not product.
+_PROCESSING_PROVIDER = None
+
+
 def _run_processing_coverage(layer, lat: float, lon: float, out_dir: Path):
     """The scripted surface, exactly as a model or batch job drives it."""
+    global _PROCESSING_PROVIDER
     from qgis.core import QgsApplication
     # Headless, QGIS's own `processing` plugin is not on sys.path (inside the
     # GUI the plugin manager puts it there). Same framework, same path QGIS
@@ -3443,9 +3700,15 @@ def _run_processing_coverage(layer, lat: float, lon: float, out_dir: Path):
     from processing.core.Processing import Processing
     Processing.initialize()
     registry = QgsApplication.processingRegistry()
-    if registry.providerById("waveshed") is None:
-        from waveshed.provider import AetherProvider
-        registry.addProvider(AetherProvider())
+    from waveshed.provider import AetherProvider
+    existing = registry.providerById("waveshed")
+    if not isinstance(existing, AetherProvider):
+        # `is None` cannot see a zombie: a dead Python provider still
+        # answers as a bare QgsProcessingProvider wrapper.
+        if existing is not None:
+            registry.removeProvider("waveshed")
+        _PROCESSING_PROVIDER = AetherProvider()
+        registry.addProvider(_PROCESSING_PROVIDER)
     out_dir.mkdir(parents=True, exist_ok=True)
     return qgis_processing.run("waveshed:coverage", {
         "INPUT_DEM": layer, "TX_LAT": float(lat), "TX_LON": float(lon),
@@ -3853,7 +4116,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             tier_b(manifest, results, only, cases, args.timeout)
         if "c" in args.tier:
             print("\n== tier C: the whole pipeline, one clean cache per row ==")
-            if running_inside_qgis():
+            if borrowed_qgis(app):
                 # Two reasons, both hard: the tier drives the shipped workers
                 # SYNCHRONOUSLY (a live QGIS would freeze for the whole tier,
                 # with per-row progress dialogs on top), and the console's
@@ -3865,10 +4128,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                             "GUI workers synchronously (this session would freeze "
                             "for the whole tier) and the console's loaded plugin "
                             "may not be this repo's. Run it standalone: "
-                            "\"C:\\OSGeo4W\\bin\\python-qgis.bat\" "
-                            "tools/torture_runner.py --tier c   (tiers a and b "
-                            "remain console-runnable). To refresh the installed "
-                            "plugin first: python deploy.py, then restart QGIS.")
+                            "run_torture.bat --tier c   (at the repo root — it "
+                            "finds python-qgis.bat itself; tiers a and b remain "
+                            "console-runnable). To refresh the installed plugin "
+                            "first: python deploy.py, then restart QGIS.")
             else:
                 if app is None:
                     app = start_qgis()

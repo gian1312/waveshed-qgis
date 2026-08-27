@@ -641,7 +641,8 @@ class TestDownloadCompleteness(unittest.TestCase):
         _write_pool_abt(os.path.join(pool_dir, self.TILE))
         with mock.patch.object(ta, "_run_converter_download_once",
                                return_value=(0, [f"[Stats] Tiles: {ok}/{total} OK"])), \
-             mock.patch.object(ta, "_abt_has_gaps", return_value=has_gaps):
+             mock.patch.object(ta, "_abt_has_holes", return_value=has_gaps), \
+             mock.patch.object(ta, "_abt_has_zero_fill", return_value=False):
             return ta._try_rust_download(_XYZ_SOURCE, pool_dir, self.BBOX, 30,
                                          subtiles, bm)
 
@@ -830,10 +831,11 @@ class TestExtentWarningOncePerRun(unittest.TestCase):
             self.assertEqual(self._warns(logs), 0)
 
 
-def _write_abt(path, size=128, zero_block=None):
+def _write_abt(path, size=128, zero_block=None, fill_value=0):
     """Write a minimal valid .abt (44-byte header + int16 rows padded to stride).
 
-    zero_block = (row0, col0, n) zeroes an n×n region; else all pixels = 500 m.
+    zero_block = (row0, col0, n) sets an n×n region to *fill_value*
+    (default 0); else all pixels = 500 m.
     """
     stride = (size * 2 + 255) & ~255
     hdr = (b"AETH" + struct.pack("<HH", 1, size)
@@ -843,7 +845,7 @@ def _write_abt(path, size=128, zero_block=None):
     elev = np.full((size, size), 500, dtype=np.int16)
     if zero_block:
         r0, c0, n = zero_block
-        elev[r0:r0 + n, c0:c0 + n] = 0
+        elev[r0:r0 + n, c0:c0 + n] = fill_value
     body = np.zeros((size, stride), dtype=np.uint8)
     body[:, : size * 2] = np.ascontiguousarray(elev).view(np.uint8).reshape(
         size, size * 2)
@@ -854,34 +856,46 @@ def _write_abt(path, size=128, zero_block=None):
 
 @unittest.skipUnless(_HAVE_NUMPY, "numpy not available")
 class TestDownloadGapDetection(unittest.TestCase):
-    """_abt_has_gaps flags the zero block a failed XYZ tile leaves."""
+    """The block scans flag what a failed XYZ tile leaves behind:
+    _abt_has_zero_fill the 0 m blocks an OLD converter wrote,
+    _abt_has_holes the VOID blocks the current one writes."""
 
-    def test_aligned_zero_block_is_a_gap(self):
+    def test_aligned_zero_block_is_zero_fill(self):
         with tempfile.TemporaryDirectory() as d:
             p = os.path.join(d, "t.abt")
             _write_abt(p, size=128, zero_block=(64, 64, 64))
-            self.assertTrue(ta._abt_has_gaps(p, block=64))
+            self.assertTrue(ta._abt_has_zero_fill(p, block=64))
+            self.assertFalse(ta._abt_has_holes(p, block=64))
 
-    def test_large_unaligned_zero_region_is_a_gap(self):
+    def test_large_unaligned_zero_region_is_zero_fill(self):
         # A real failed tile (~150 px) is bigger than the 64-block, so it always
         # fully contains an aligned block regardless of offset.
         with tempfile.TemporaryDirectory() as d:
             p = os.path.join(d, "t.abt")
             _write_abt(p, size=256, zero_block=(30, 30, 130))
-            self.assertTrue(ta._abt_has_gaps(p, block=64))
+            self.assertTrue(ta._abt_has_zero_fill(p, block=64))
+
+    def test_void_block_is_a_hole_not_zero_fill(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "t.abt")
+            _write_abt(p, size=128, zero_block=(64, 64, 64), fill_value=-9999)
+            self.assertTrue(ta._abt_has_holes(p, block=64))
+            self.assertFalse(ta._abt_has_zero_fill(p, block=64))
 
     def test_all_nonzero_is_clean(self):
         with tempfile.TemporaryDirectory() as d:
             p = os.path.join(d, "t.abt")
             _write_abt(p, size=128, zero_block=None)
-            self.assertFalse(ta._abt_has_gaps(p, block=64))
+            self.assertFalse(ta._abt_has_zero_fill(p, block=64))
+            self.assertFalse(ta._abt_has_holes(p, block=64))
 
     def test_non_abt_is_not_a_gap(self):
         with tempfile.TemporaryDirectory() as d:
             p = os.path.join(d, "x.abt")
             with open(p, "wb") as fh:
                 fh.write(b"not an abt file")
-            self.assertFalse(ta._abt_has_gaps(p))
+            self.assertFalse(ta._abt_has_zero_fill(p))
+            self.assertFalse(ta._abt_has_holes(p))
 
 
 @unittest.skipUnless(_HAVE_NUMPY, "numpy not available")
@@ -1171,7 +1185,8 @@ class TestBuildingsOnTheFastPath(unittest.TestCase):
                                side_effect=fake_run), \
              mock.patch.object(ta, "_binary_has_buildings_support",
                                return_value=supported), \
-             mock.patch.object(ta, "_abt_has_gaps", return_value=False):
+             mock.patch.object(ta, "_abt_has_holes", return_value=False), \
+             mock.patch.object(ta, "_abt_has_zero_fill", return_value=False):
             ok = ta._try_rust_download(_XYZ_SOURCE, pool_dir, self.BBOX, 30,
                                        subtiles, bm, pbf_dir=pbf_dir)
         return ok, seen
@@ -2361,7 +2376,8 @@ class TestTryRustDownloadReportsProgress(unittest.TestCase):
             _write_pool_abt(os.path.join(pool, self.TILE))
             with mock.patch.object(ta, "_run_converter_download_once",
                                    side_effect=fake_once), \
-                 mock.patch.object(ta, "_abt_has_gaps", return_value=False):
+                 mock.patch.object(ta, "_abt_has_holes", return_value=False), \
+             mock.patch.object(ta, "_abt_has_zero_fill", return_value=False):
                 ok = ta._try_rust_download(
                     _XYZ_SOURCE, pool, self.BBOX, 30, subtiles, bm,
                     progress_cb=lambda frac, label: fracs.append(frac))
@@ -2945,3 +2961,33 @@ class TestImageryIsRefusedAsTerrain(unittest.TestCase):
                                      terrain_dir=tdir)
         self.assertEqual(out, tdir)
         classify.assert_not_called()
+
+
+class TestRenderResolutionRule(unittest.TestCase):
+    """ONE export-resolution rule for rendered servers, shared by both tabs.
+
+    Site Analysis used to export a WCS at the OUTPUT resolution — the
+    server's own pyramid answer, up to 24 m off on slopes — while the Map
+    Converter exported near-native; the two tabs then built terrain that
+    disagreed by up to 61 m from the same layer (row 4.3).
+    """
+
+    def test_finer_native_wins(self):
+        self.assertEqual(ta.render_resolution_m(1.0, 30.0), 1.0)
+
+    def test_coarser_native_defers_to_output(self):
+        self.assertEqual(ta.render_resolution_m(90.0, 30.0), 30.0)
+
+    def test_unknown_native_uses_output(self):
+        self.assertEqual(ta.render_resolution_m(None, 30.0), 30.0)
+        self.assertEqual(ta.render_resolution_m(0, 30.0), 30.0)
+
+    def test_map_converter_delegates_to_the_shared_rule(self):
+        from waveshed.gui import map_converter_tab as mc
+        entry = mock.Mock()
+        entry.native_res_m = 1.0
+        jobs = [(30, {}), (90, {})]
+        with mock.patch.object(ta, "render_resolution_m",
+                               wraps=ta.render_resolution_m) as rule:
+            self.assertEqual(mc._render_resolution_m(entry, jobs), 1.0)
+        rule.assert_called_once_with(1.0, 30.0)

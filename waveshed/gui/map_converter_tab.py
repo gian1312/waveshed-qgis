@@ -228,26 +228,13 @@ def _estimate_tile_count_and_mb(
 
 
 def _detect_resolution(layer) -> Optional[float]:
-    """Auto-detect a raster layer's ground resolution in metres."""
-    if not isinstance(layer, QgsRasterLayer):
-        return None
-    provider = layer.dataProvider()
-    if provider is None or provider.xSize() <= 0:
-        return None
-    try:
-        ext = provider.extent()
-        crs = layer.crs()
-        if crs.isGeographic():
-            clat = (ext.yMinimum() + ext.yMaximum()) / 2.0
-            cos_lat = max(math.cos(math.radians(clat)), 0.01)
-            x_m = ext.width() / provider.xSize() * 111_111 * cos_lat
-            y_m = ext.height() / provider.ySize() * 111_111
-            return round(min(x_m, y_m), 1)
-        else:
-            return round(min(ext.width() / provider.xSize(),
-                             ext.height() / provider.ySize()), 1)
-    except Exception:
-        return None
+    """Auto-detect a raster layer's ground resolution in metres.
+
+    Thin alias: the body moved to
+    :func:`terrain_adapter.layer_native_resolution_m` so Site Analysis and
+    this tab share ONE detection (and one export-resolution rule below).
+    """
+    return terrain_adapter.layer_native_resolution_m(layer)
 
 
 # XYZ native resolution: terrain_adapter.xyz_native_resolution_m is the ONE
@@ -695,14 +682,14 @@ def _render_resolution_m(entry: _LayerEntry,
                          render_jobs: List[Tuple[int, Dict[str, Any]]]) -> float:
     """Resolution a rendered server is exported at, in metres.
 
-    The FINER of (detected native resolution, finest requested output
-    resolution), so the export never undersamples the output grid and
-    ingest's area-averaging engages on the way down — this is what removes
-    the WMS aliasing the old whole-extent nearest-neighbour export had.
+    Delegates to :func:`terrain_adapter.render_resolution_m` — the ONE rule
+    both tabs must share (the finer of native and finest requested output),
+    so a rendered server hands the converter the same pixels whichever tab
+    asked. This is what removes the WMS aliasing the old whole-extent
+    nearest-neighbour export had.
     """
     finest_out = float(min((r for r, _t in render_jobs), default=30))
-    native = entry.native_res_m
-    return min(float(native), finest_out) if native else finest_out
+    return terrain_adapter.render_resolution_m(entry.native_res_m, finest_out)
 
 
 class _ResolveCancelled(Exception):
