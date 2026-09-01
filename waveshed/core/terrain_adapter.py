@@ -156,6 +156,14 @@ def _get_download_max_passes() -> int:
 #   [Stats] Tiles: 697340/697343 OK (100.0% success)
 _TILES_OK_RE = re.compile(r"\[Stats\]\s*Tiles:\s*(\d+)\s*/\s*(\d+)\s*OK")
 
+# Matches the converter's no-data tally (CONTRACT changelog item 17), e.g.
+#   [Stats] NO-DATA (HTTP 404): 43 of 49 tile(s) — the service has no data there
+# A 404 is the service answering "no tile here" — data, not failure. The
+# converter writes those pixels as void and exits 0; this count is how the
+# plugin knows the misses are PERMANENT (retrying cannot change them) and that
+# the user must be told part of their area reads as 0 m sea level.
+_NO_DATA_RE = re.compile(r"\[Stats\]\s*NO-DATA\s*\(HTTP 404\):\s*(\d+)\s+of\s+\d+")
+
 
 def _parse_download_completeness(stderr_lines: List[str]) -> Tuple[int, int]:
     """Return ``(ok_tiles, total_tiles)`` from converter stderr.
@@ -169,6 +177,40 @@ def _parse_download_completeness(stderr_lines: List[str]) -> Tuple[int, int]:
         if m:
             ok, total = int(m.group(1)), int(m.group(2))
     return ok, total
+
+
+def _parse_download_no_data(stderr_lines: List[str]) -> int:
+    """Source tiles the service answered 404 for, from converter stderr.
+
+    0 when the line is absent — either nothing was missing or the converter
+    predates the no-data tally, and in both cases the caller must treat the
+    misses as failures (the old, safe reading), never assume they were 404s.
+    """
+    count = 0
+    for line in stderr_lines:
+        m = _NO_DATA_RE.search(line)
+        if m:
+            count = int(m.group(1))
+    return count
+
+
+def _warn_no_data_tiles(zoom: int, no_data: int, total: int) -> None:
+    """The XYZ counterpart of :func:`_warn_if_bbox_exceeds_bounds`.
+
+    An XYZ service publishes no extent, so the only way to learn the
+    requested area reaches past its coverage is the service answering 404 —
+    which the converter reports and this turns into the same user-facing
+    contract the DEM-file path states: missing areas are assumed 0 m (sea
+    level) by Site Analysis, kept as voids by the Map Converter, and the
+    result over them is not reliable.
+    """
+    _log(
+        f"  WARNING: {no_data} of {total} source tile(s) at z{zoom} have no "
+        f"data (HTTP 404) — the requested area reaches past this service's "
+        f"coverage. Missing areas are assumed 0 m (sea level) by Site "
+        f"Analysis and left as no-data by the Map Converter; coverage there "
+        f"is not reliable — use a source that covers the full range."
+    )
 
 
 def get_source_resolution_info(dem_layer: Any) -> str:
@@ -834,11 +876,74 @@ def _link_pbf_view(pool_dir: str, view_dir: str, names: List[str]) -> None:
                 pass
 
 
+def _tile_has_voids(path: str) -> Optional[bool]:
+    """Does the .abt at *path* contain any void/fill sample? None = unreadable.
+
+    Anything at or below the plugin's validity floor counts — the converter's
+    ``-9999`` void sentinel and any legacy fill alike — mirroring the
+    ``> MIN_VALID_ELEV_M`` rule everything else in this package applies.
+    """
+    import numpy as np
+    from . import abt
+    header = abt.read_header(path)
+    if header is None:
+        return None
+    try:
+        mm = np.memmap(path, dtype=np.uint8, mode="r")
+        body = mm[abt.HEADER_SIZE:abt.HEADER_SIZE + header.size * header.stride]
+        rows = body.reshape(header.size, header.stride)
+        samples = rows[:, :header.size * 2].view(np.int16)
+        return bool((samples <= abt.MIN_VALID_ELEV_COUNTS).any())
+    except (OSError, ValueError):
+        return None
+
+
+def _fill_view_voids(src: str, dst: str) -> bool:
+    """Copy pool tile *src* to *dst* with every void sample replaced by 0 m.
+
+    The Site Analysis contract — stated by ``void_fill_m: 0.0`` on the ingest
+    path and by the extent warning — is that ground the source does not cover
+    is 0 m sea level. The download path pools tiles WITH voids (the Map
+    Converter needs them kept), so the fill happens here, per view: the pool
+    stays pristine and only what ``aether_core`` reads is filled. Without
+    this, the engine read the raw ``-9999`` sentinel as terrain 5 km below
+    sea level wherever an XYZ run crossed its service's coverage edge.
+    """
+    import numpy as np
+    from . import abt
+    header = abt.read_header(src)
+    if header is None:
+        return False
+    try:
+        shutil.copy2(src, dst)
+        mm = np.memmap(dst, dtype=np.uint8, mode="r+")
+        body = mm[abt.HEADER_SIZE:abt.HEADER_SIZE + header.size * header.stride]
+        rows = body.reshape(header.size, header.stride)
+        samples = rows[:, :header.size * 2].view(np.int16)
+        filled = int((samples <= abt.MIN_VALID_ELEV_COUNTS).sum())
+        samples[samples <= abt.MIN_VALID_ELEV_COUNTS] = 0
+        mm.flush()
+        del mm
+        _log(f"  view fill: {os.path.basename(dst)} — {filled:,} void "
+             f"sample(s) set to 0 m (sea level) for the engine")
+        return True
+    except (OSError, ValueError) as exc:
+        _log(f"  WARNING: could not fill voids into {os.path.basename(dst)}: "
+             f"{exc}")
+        try:
+            os.remove(dst)
+        except OSError:
+            pass
+        return False
+
+
 def _sync_view(pool_dir: str, view_dir: str, names: List[str]) -> List[str]:
     """Populate *view_dir* with exactly *names*, linked from the pool.
 
     Hardlinks cost nothing; where the filesystem refuses one (a different
     volume, FAT, or Windows without the privilege) we fall back to a copy.
+    A pool tile that contains voids is not linked but COPIED WITH ITS VOIDS
+    FILLED to 0 m — see :func:`_fill_view_voids`; the pool copy keeps them.
     Returns the names that could not be provided.
     """
     os.makedirs(view_dir, exist_ok=True)
@@ -860,7 +965,15 @@ def _sync_view(pool_dir: str, view_dir: str, names: List[str]) -> List[str]:
         src = os.path.join(pool_dir, name)
         dst = os.path.join(view_dir, name)
         if _tile_is_whole(dst):
-            continue
+            try:
+                fresh = os.path.getmtime(dst) >= os.path.getmtime(src)
+            except OSError:
+                fresh = True
+            if fresh:
+                continue
+            # The pool tile was rebuilt since this view was made (a filled
+            # copy does not track the pool the way a hardlink does), so the
+            # view copy is stale — rebuild it below.
         if os.path.exists(dst):
             try:
                 os.remove(dst)      # truncated leftover from a killed run
@@ -868,6 +981,14 @@ def _sync_view(pool_dir: str, view_dir: str, names: List[str]) -> List[str]:
                 pass
         if not _tile_is_whole(src):
             unavailable.append(name)
+            continue
+        # A gapped pool tile (the run crossed the source's coverage edge)
+        # must not reach the engine raw: the view gets a 0 m-filled copy —
+        # the Site Analysis sea-level contract — while the pool keeps its
+        # voids for the Map Converter.
+        if _tile_has_voids(src):
+            if not _fill_view_voids(src, dst):
+                unavailable.append(name)
             continue
         try:
             os.link(src, dst)
@@ -1381,6 +1502,52 @@ class DownloadOutcome(NamedTuple):
         return bool(self.ok)
 
 
+#: Acquisition routes terrain has ACTUALLY been acquired through since the
+#: last :func:`pop_acquisition_routes` — "download" (shared Rust XYZ
+#: downloader), "render" (per-tile QGIS export of a rendered server),
+#: "sources" (local files handed to the converter), "terrain_dir" (a
+#: user-supplied .abt folder). Appended by the one primitive that owns each
+#: route, so a run that silently changed path is visible to the torture
+#: suite: terrain that exists is not the same as terrain that came the way
+#: the catalogue intended.
+_ACQUISITION_ROUTES: List[str] = []
+
+
+def _record_route(route: str) -> None:
+    if len(_ACQUISITION_ROUTES) < 256:
+        _ACQUISITION_ROUTES.append(route)
+
+
+def _source_route(source: str, dem_layer: Any) -> str:
+    """The router-contract route for *source* (the only route its pool can
+    have been filled by — the XYZ render fallback is a hard error now)."""
+    if "type=xyz" in source:
+        return "download"
+    src = source
+    try:
+        if dem_layer is not None:
+            src = dem_layer.source() or source
+    except Exception:  # noqa: BLE001 — routing must not depend on the layer
+        pass
+    base = src.partition("|")[0]
+    if os.path.isfile(base) or src.startswith("/vsi"):
+        return "sources"
+    return "render"
+
+
+def pop_acquisition_routes() -> List[str]:
+    """The routes recorded since the last call, clearing the record.
+
+    Diagnostic surface for the torture runner (``pipeline.route``): it pops
+    before a worker run and after it, and fails the row when the set of
+    routes is not exactly what the catalogue declares — a fallback that
+    still produced terrain is a failed test, not a passed one.
+    """
+    out = list(_ACQUISITION_ROUTES)
+    _ACQUISITION_ROUTES.clear()
+    return out
+
+
 #: Printed by ``aether_converter download`` once per run when it has fused a
 #: ``buildings_pbf_dir``. Its absence is how we detect an engine that predates
 #: the feature — see ``_try_rust_download``.
@@ -1750,21 +1917,41 @@ def _download_zoom_group(
                 _set_rebuild_flags(cache_dir, all_names)
                 return DownloadOutcome(True)
 
+            no_data = _parse_download_no_data(lines)
+            if total - ok == no_data:
+                # Every miss is the service answering HTTP 404 — "no tile
+                # here". That is data, not failure: a bounded source (a local
+                # fixture, a regional DEM service) 404s the whole world
+                # outside its coverage, and the converter wrote those pixels
+                # as void. Retrying cannot change a permanent answer, and
+                # flagging the tiles for rebuild would re-download and re-404
+                # them on every later run — so this is a COMPLETE result. The
+                # user is told, loudly, which part of their area is sea.
+                _warn_no_data_tiles(zoom, no_data, total)
+                _log(f"  Rust download z={zoom}: {elapsed:.1f}s, {ok}/{total} "
+                     f"source tiles OK + {no_data} no-data (404) "
+                     f"→ {len(specs)} output tile(s), voids where the service "
+                     f"has nothing")
+                _set_rebuild_flags(cache_dir, all_names)
+                return DownloadOutcome(True)
+
             if ok == 0:
                 # TOTAL failure, which is a different animal from the partial
-                # one warned about further down: not one source tile arrived,
-                # so every output tile in this group is 0 m end to end and the
-                # analysis would run over a flat sea-level plane and report
-                # success. Retrying at half the connections cannot fix a
-                # service that answers 404 to everything, so say what it is,
+                # one warned about further down: not one source tile arrived
+                # and the misses are NOT all no-data answers (that case
+                # returned as complete above — the converter said which), so
+                # the network died, the key is wrong, or the engine predates
+                # the no-data tally and cannot say. Retrying at half the
+                # connections cannot fix any of those, so say what it is,
                 # make sure none of it is cached, and let the caller fall back.
                 _log(f"  ERROR: Rust download z={zoom}: 0 of {total} source "
                      f"tile(s) fetched — nothing was downloaded, so these "
                      f"tiles would be flat 0 m terrain.")
-                _log(f"    Usual cause: z{zoom} is deeper than this service "
-                     f"publishes (check the layer's Max. Zoom Level), or the "
-                     f"tile URL/API key is wrong. Over open ocean this is also "
-                     f"what an area with genuinely no tiles looks like.")
+                _log(f"    Usual cause: the tile URL/API key is wrong, the "
+                     f"network is down, or this aether_converter is too old "
+                     f"to distinguish no-data (HTTP 404) from failure — "
+                     f"update the engine binaries if the area is simply "
+                     f"outside this service's coverage.")
                 # Removed, not flagged: an engine that exits 0 having fetched
                 # nothing leaves exactly the same full-size 0 m tiles behind as
                 # one that exits non-zero, and a flagged tile is still linked
@@ -1922,6 +2109,7 @@ def ensure_pool_tiles(
             f"elevation service did not provide them — check the layer's "
             f"zoom limit and URL, then run again."
         )
+    _record_route("download")
     return mapping
 
 
@@ -2042,8 +2230,14 @@ def source_file_info(path: str, crs_authid: Optional[str] = None,
         gt = ds.GetGeoTransform(can_return_null=True)
     except TypeError:              # older GDAL bindings lack the kwarg
         gt = ds.GetGeoTransform()
-        if gt == (0.0, 1.0, 0.0, 0.0, 0.0, 1.0):
-            gt = None
+    # The identity transform is GDAL's own "no georeferencing" convention —
+    # and a file can carry it EXPLICITLY (persisted tags), in which case
+    # can_return_null hands it back non-null and the check below never
+    # fired: the file then "covered" lon 0..width, filtered out of every
+    # tile, and converted to a silent all-void batch. Found by the torture
+    # suite's broken-nogt folder case, 2026-08-31.
+    if gt == (0.0, 1.0, 0.0, 0.0, 0.0, 1.0):
+        gt = None
     if gt is None:
         raise RuntimeError(
             f"Terrain source has no georeferencing (no geotransform):\n"
@@ -2183,6 +2377,7 @@ def build_tile_sources(
     only ``EPSG:nnnn`` or a proj string — it then reads the file's own
     GeoKeys, and its error surfaces verbatim if they are unusable.
     """
+    _record_route("sources")
     from qgis.core import QgsCoordinateReferenceSystem
 
     center_lat = (tile_bbox["north"] + tile_bbox["south"]) / 2.0
@@ -2626,6 +2821,7 @@ def render_resolution_m(native_res_m: Optional[float],
 
 
 def _export_via_qgis(dem_layer: Any, dest: str, bbox: Dict[str, float], resolution_m: float) -> None:
+    _record_route("render")
     from qgis.core import (
         QgsCoordinateReferenceSystem, QgsProject,
         QgsRasterFileWriter, QgsRasterPipe, QgsRasterProjector, QgsRectangle,
@@ -2803,6 +2999,7 @@ def prepare_terrain(
             for line in problem.splitlines():
                 if line.strip():
                     _log(f"  WARNING: {line.strip()}")
+        _record_route("terrain_dir")
         return terrain_dir
 
     bbox = _compute_sector_bbox(tx_lat, tx_lon, max_range_km, az_start, az_end)
@@ -2854,6 +3051,11 @@ def prepare_terrain(
         if not gone:
             _log(f"  cache HIT — {len(expected)} tile(s) from the pool "
                  f"({time.perf_counter() - t0:.1f}s)")
+            # A hit re-serves what the source's contract route pooled
+            # earlier (nothing else can fill a pool any more), so it counts
+            # as that route — a warm run must not read as "acquired nothing".
+            _record_route("sources" if terrain_dir
+                          else _source_route(source, dem_layer))
             return view_dir
         _log(f"  {len(gone)} pooled tile(s) vanished between check and link; "
              f"rebuilding those")
@@ -2969,9 +3171,10 @@ def prepare_terrain(
                         int(span_lo + frac * (span_hi - span_lo)))
                 except Exception:  # noqa: BLE001 — progress must never abort
                     pass
-        if _try_rust_download(dem_layer.source(), pool_dir, bbox,
-                              resolution_m, todo, binary_manager,
-                              pbf_dir=pbf_dir, progress_cb=progress_cb):
+        outcome = _try_rust_download(dem_layer.source(), pool_dir, bbox,
+                                     resolution_m, todo, binary_manager,
+                                     pbf_dir=pbf_dir, progress_cb=progress_cb)
+        if outcome:
             # Reached either with buildings fused in (pbf_dir set) or with no
             # buildings at all. In the second case the pool identity may still
             # claim buildings — a failed OpenFreeMap download clears pbf_dir
@@ -2982,8 +3185,19 @@ def prepare_terrain(
                 _log("  buildings were requested but unavailable — tiles "
                      "flagged for rebuild so the next run retries them")
             _finish_view(pool_dir, view_dir, expected, t0)
+            _record_route("download")
             return view_dir
-        _log("  Rust download unavailable, falling back")
+        # NO render fallback for an XYZ elevation service: the router
+        # contract says XYZ goes through the shared Rust downloader, and
+        # rendering the tiles through QGIS instead is the slow aliasing
+        # path the downloader replaced — terrain would appear, silently
+        # built the wrong way. Fail with the engine's own diagnosis.
+        raise RuntimeError(
+            "Terrain download failed for this XYZ elevation service, and "
+            "rendering its tiles through QGIS is not a fallback. "
+            + ((outcome.detail or "").strip()
+               or "The engine gave no further detail — check that the "
+                  "Aether binaries are installed (Waveshed Settings)."))
 
     # Path 2/3: hand the converter the source rasters themselves, per tile.
     # Each job carries `sources[]` — the files (in their OWN CRS) whose WGS84
@@ -3004,6 +3218,26 @@ def prepare_terrain(
             union = _union_bbox([i["wgs84_bounds"] for i in infos])
             # Tell the user (once per run) if the range spills past the data.
             _warn_if_bbox_exceeds_bounds(union, bbox, source)
+        elif use_qgis_export and dem_layer is not None:
+            # A rendered provider (WMS/WMTS/WCS/ArcGIS) has no source files,
+            # but QGIS knows the LAYER's own extent — the one bounds signal
+            # that exists for it. Without this, running an elevation coverage
+            # service over ground it does not publish (the NRW WCS over Bern)
+            # exported empty tiles, the converter wrote them as void, Site
+            # Analysis filled 0 m — and nothing ever told the user their
+            # whole result was sea.
+            try:
+                ext = dem_layer.extent()
+                if ext is not None and not ext.isEmpty():
+                    from qgis.core import QgsCoordinateReferenceSystem
+                    layer_bounds = _bbox_transform(
+                        {"west": ext.xMinimum(), "east": ext.xMaximum(),
+                         "south": ext.yMinimum(), "north": ext.yMaximum()},
+                        dem_layer.crs(),
+                        QgsCoordinateReferenceSystem("EPSG:4326"))
+                    _warn_if_bbox_exceeds_bounds(layer_bounds, bbox, source)
+            except Exception:  # noqa: BLE001 — a warning must never abort a run
+                pass
 
         jobs = []
         for t in todo:

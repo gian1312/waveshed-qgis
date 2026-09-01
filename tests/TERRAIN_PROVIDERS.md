@@ -119,7 +119,7 @@ Add each as a QGIS layer, then run both paths over the same small AOI at the sam
 | 1 | **XYZ / Terrarium** | XYZ connection, `https://s3.amazonaws.com/elevation-tiles-prod/terrarium/{z}/{x}/{y}.png`, **Max Zoom 15**, Interpretation = Terrarium | The shared Rust download path — BOTH tabs use it (pool `.abt` → ingest source in the Map Converter) |
 | 2 | **XYZ, no `interpretation=`** | same, leave Interpretation unset | `xyz_encoding()` URL sniffing; must resolve Terrarium from `elevation-tiles-prod` |
 | 3 | **XYZ / Mapbox Terrain-RGB** | `https://api.mapbox.com/v4/mapbox.terrain-rgb/{z}/{x}/{y}.pngraw?access_token=…` | B2 — must **not** decode as Terrarium (that gives ≈ −32000 m) |
-| 4 | **XYZ, zoom too deep** | provider 1 with **Max Zoom 18** | B1 — must fail loudly, not produce flat 0 m |
+| 4 | **XYZ, zoom too deep** | provider 1 with **Max Zoom 18** | B1 — the plugin's `resolve_zmax` clamp (known_services `max_zoom`) keeps it at z15. For an UNKNOWN service the deep zoom 404s and, per the 2026-08-31 no-data contract, degrades to WARNED 0 m sea level (`[Stats] NO-DATA (HTTP 404)`), never silently |
 | 5 | **WMS / WMTS** elevation | any WCS/WMS DEM service | The QGIS export path; nodata handling differs from the file path (A9) |
 | 6 | **WMS basemap (RGB)** | any imagery WMS | B3 — must be rejected as imagery, not classified as a DEM |
 | 7 | **Single GeoTIFF** | `base_wgs84.tif` | Baseline |
@@ -263,12 +263,20 @@ No built-in switches. The real levers:
 
 Expected messages — match on these, they are contract text:
 
-- Near-total fetch (**strict majority** of tiles failed) → non-zero exit,
+- Near-total fetch (**strict majority of REAL failures** — timeout, connect,
+  403/429, 5xx, decode; **HTTP 404 never counts**, see next bullet) → non-zero exit,
   `Tile download failed: {failed} of {attempted} terrain tiles ({pct}%) could not be fetched; …`
+- **404 is NO-DATA, never failure (2026-08-31, CONTRACT items 17/18):** any
+  number of 404s — all of them included — leaves the run green with
+  `[Stats] NO-DATA (HTTP 404): {n} of {total} tile(s) …`, voids in the pool,
+  0 m sea level in the Site Analysis view, and a
+  `WARNING: … assumed 0 m (sea level) …` line in the terrain log. A bounded
+  source (the torture set's Bern fixture, a regional DEM) 404s the whole
+  world outside its coverage, and running over its edge is a legitimate run.
 - Disk → `Insufficient disk space: need ~{} MB for {} .abt output files, …`
-- Plugin, 0 tiles → `ERROR: Rust download z={zoom}: 0 of {total} source tile(s) fetched — nothing
-  was downloaded, so these tiles would be flat 0 m terrain.` then falls back to the slow path.
-- Below the majority threshold you get only `[Stats] ERRORS (n): timeout=…, HTTP_4xx=…` — a
+- Plugin, 0 tiles fetched and NOT all-404 → `ERROR: Rust download z={zoom}: 0 of {total}
+  source tile(s) fetched — nothing was downloaded, …` then falls back to the slow path.
+- Below the majority threshold you get only `[Stats] ERRORS (n): timeout=…` — a
   partially-failed run still succeeds by design.
 
 `RUST_LOG` does **not** affect `aether_converter` (its log filters are hardcoded); it is set only

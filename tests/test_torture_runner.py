@@ -889,3 +889,135 @@ def test_tier_c_refuses_only_a_borrowed_qgis(monkeypatch):
     assert tr.borrowed_qgis(object()) is False     # our own app: run
     monkeypatch.setattr(tr, "running_inside_qgis", lambda: False)
     assert tr.borrowed_qgis(None) is False         # standalone, c-only: run
+
+
+def test_route_check_fails_a_silent_fallback():
+    """Terrain that exists is not terrain that came the intended way.
+
+    1.3b was observed falling back to the per-tile QGIS render when the
+    fixture server was down — and the run still went green. A fallback that
+    still produced terrain is a failed test, not a passed one.
+    """
+    results = tr.Results()
+    row = {"expect_acquire": "download"}
+    results.plan("t", "pipeline.route")
+    tr._check_route("t", row, ["download"], ["render"], results)
+    entry = results.entries[-1]
+    assert entry["status"] == tr.FAIL
+    assert "Site Analysis acquired via render" in entry["detail"]
+    assert "silent fallback" in entry["detail"]
+
+
+def test_route_check_passes_when_both_tabs_take_the_declared_route():
+    results = tr.Results()
+    row = {"expect_acquire": "sources"}
+    results.plan("t", "pipeline.route")
+    tr._check_route("t", row, ["sources", "sources"], ["sources"], results)
+    assert results.entries[-1]["status"] == tr.PASS
+
+
+def test_route_check_fails_when_nothing_was_recorded():
+    # An empty record is not a pass: either the plugin surface moved or the
+    # run acquired nothing — both are findings, never a shrug.
+    results = tr.Results()
+    row = {"expect_acquire": "download"}
+    results.plan("t", "pipeline.route")
+    tr._check_route("t", row, [], ["download"], results)
+    entry = results.entries[-1]
+    assert entry["status"] == tr.FAIL
+    assert "recorded no acquisition" in entry["detail"]
+
+
+def test_route_check_withdraws_when_the_catalogue_declares_nothing():
+    # Pre-regeneration manifests carry no expect_acquire; the check must
+    # visibly withdraw (unplan), never linger as NOTRUN or silently pass.
+    results = tr.Results()
+    results.plan("t", "pipeline.route")
+    tr._check_route("t", {}, ["download"], ["download"], results)
+    assert not [e for e in results.entries if e["id"] == "pipeline.route"]
+    assert ("t", "pipeline.route") not in results.planned
+
+
+# ---------------------------------------------------------------------------
+# expect_format: the bytes the service really serves
+# ---------------------------------------------------------------------------
+
+def test_sniff_image_format_reads_magic_bytes_not_names():
+    png = b"\x89PNG\r\n\x1a\n" + b"\0" * 16
+    webp = b"RIFF" + b"\x40\0\0\0" + b"WEBP" + b"VP8 " + b"\0" * 16
+    jpeg = b"\xff\xd8\xff\xe0" + b"\0" * 16
+    assert tr.sniff_image_format(png) == "png"
+    assert tr.sniff_image_format(webp) == "webp"
+    assert tr.sniff_image_format(jpeg) == "jpeg"
+    # Row 1.4's whole point: a .png URL answering WebP must read as webp.
+    assert tr.sniff_image_format(webp) != "png"
+    assert tr.sniff_image_format(b"<html>nope</html>").startswith("unknown")
+    assert tr.sniff_image_format(b"").startswith("unknown")
+
+
+def test_a_row_with_expect_format_declares_the_format_check():
+    results = tr.Results()
+    tr._plan_row_checks({"row": "1.4", "name": "x", "source": "type=xyz&url=u",
+                         "crs": "", "expect_format": "webp",
+                         "expect_tile_px": 512}, results)
+    assert ("1.4", "xyz.format") in results.planned
+    assert ("1.4", "xyz.tile_px") in results.planned
+
+
+# ---------------------------------------------------------------------------
+# Over-the-box scenarios and byte-exact tiles are DECLARED, so a scenario
+# that never executes is a NOTRUN, not a vanished check
+# ---------------------------------------------------------------------------
+
+def _both_row(**extra):
+    row = {"row": "1.3b", "name": "x", "source": "type=xyz&url=u", "crs": "",
+           "kind": "raster", "check": "both", "expect_acquire": "download"}
+    row.update(extra)
+    return row
+
+
+def test_a_both_row_declares_byte_exact_tiles():
+    results = tr.Results()
+    tr._plan_pipeline_row(_both_row(), {}, results, {"mc": None})
+    assert ("1.3b", "pipeline.tile_bytes") in results.planned
+
+
+def test_overrun_scenarios_declare_all_five_checks():
+    results = tr.Results()
+    row = _both_row(overrun=[{"id": "tile-overrun"}, {"id": "fully-outside"}])
+    tr._plan_pipeline_row(row, {}, results, {"mc": None})
+    for sid in ("tile-overrun", "fully-outside"):
+        for part in ("run", "warned", "sea", "mc_void", "cov"):
+            assert ("1.3b", f"overrun:{sid}.{part}") in results.planned, \
+                f"overrun:{sid}.{part} must be declared up front"
+
+
+def test_a_links_row_declares_the_verdict_check():
+    results = tr.Results()
+    tr._plan_pipeline_row({"row": "5.3", "name": "links", "kind": "vector",
+                           "check": "none"}, {}, results, {"mc": None})
+    assert ("5.3", "pipeline.verdicts") in results.planned
+
+
+# ---------------------------------------------------------------------------
+# P2P verdicts: excess loss over free space, from the contract CSV
+# ---------------------------------------------------------------------------
+
+def test_excess_loss_reads_the_contract_csv(tmp_path):
+    csv_path = tmp_path / "p2p_0.csv"
+    csv_path.write_text("Source_ID,Target_ID,Signal_dBm,Path_Loss_dB\n"
+                        "Site_0,WP_0,-70.00,130.00\n", encoding="utf-8")
+    # Bern -> Thun is ~24 km; free space at 900 MHz there is ~119 dB, so a
+    # 130 dB path carries ~+11 dB of terrain.
+    excess, detail = tr._excess_loss_db(str(csv_path),
+                                        (46.9481, 7.4474), (46.7580, 7.6280))
+    assert excess is not None and 5.0 < excess < 20.0, detail
+    assert "dB" in detail
+
+
+def test_excess_loss_refuses_a_csv_without_the_frozen_column(tmp_path):
+    csv_path = tmp_path / "p2p_0.csv"
+    csv_path.write_text("a,b\n1,2\n", encoding="utf-8")
+    excess, detail = tr._excess_loss_db(str(csv_path), (46.9, 7.4), (46.8, 7.6))
+    assert excess is None
+    assert "Path_Loss_dB" in detail

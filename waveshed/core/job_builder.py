@@ -177,6 +177,13 @@ TERRAIN_QUANTUM_M = 0.5
 # negative (Dead Sea shore -430 m, Schiphol -4 m) — it is never floored.
 MIN_ANTENNA_AGL_M = 1.0
 
+#: Lowest AMSL antenna elevation accepted anywhere. The Dead Sea shore, the
+#: lowest exposed land on Earth, is about -430 m; -500 m clears it with room
+#: to spare while still rejecting a value typed by accident. The GUI
+#: spinboxes (gui/height_inputs.py) clamp to this same constant; this module
+#: is the gate for every path that has no spinbox.
+MIN_ANTENNA_AMSL_M = -500.0
+
 
 @dataclasses.dataclass(frozen=True)
 class ModelWarning:
@@ -349,13 +356,25 @@ def height_floor_error(
         mode: ``"AGL"`` or ``"AMSL"``.
 
     Returns:
-        The message, or None when the height is acceptable. AMSL always returns
-        None: it is an absolute elevation and is legitimately zero or negative
-        (Dead Sea shore -430 m, Schiphol -4 m), so flooring it would lift such a
-        site hundreds of metres into the air.
+        The message, or None when the height is acceptable. AMSL is an
+        absolute elevation and is legitimately zero or negative (Dead Sea
+        shore -430 m, Schiphol -4 m), so its floor is not the AGL one — it is
+        :data:`MIN_ANTENNA_AMSL_M`, below the lowest exposed land on Earth.
+        The GUI spinboxes clamp to the same constant; this is the gate for
+        the paths that have no spinbox (batch CSVs, the Processing
+        algorithms, direct params), which used to accept any depth at all —
+        the torture suite's gate:amsl-floor check found -501 m sailing
+        through to the engine.
     """
     if (mode or "").upper() != "AGL":
-        return None
+        if height >= MIN_ANTENNA_AMSL_M:
+            return None
+        return (
+            f"{label} is {height:.2f} m AMSL, below the "
+            f"{MIN_ANTENNA_AMSL_M:.0f} m floor — deeper than the lowest "
+            f"exposed land on Earth (the Dead Sea shore, about -430 m). "
+            f"Check the value and its units, or its AGL/AMSL mode."
+        )
     if height >= MIN_ANTENNA_AGL_M:
         return None
     return (

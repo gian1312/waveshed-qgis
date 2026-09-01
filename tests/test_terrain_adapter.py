@@ -13,6 +13,7 @@ import math
 import os
 import struct
 import tempfile
+import time
 import unittest
 import urllib.parse
 from unittest import mock
@@ -2815,12 +2816,28 @@ class TestPrepareTerrainResolvesBuildings(_PrepareWithBuildings,
             self.assertNotEqual(out["pool"],
                                 self._pool_for(root, "/data/osm_bern.geojson"))
 
-    def test_no_buildings_means_no_resolution_and_no_field(self):
-        with tempfile.TemporaryDirectory() as root:
-            out = self._prepare(root, None)
-        self.assertEqual(out["resolved"], [])
-        for job in out["jobs"]:
-            self.assertNotIn("buildings_file", job)
+    def test_no_buildings_means_no_resolution_and_no_silent_fallback(self):
+        # No buildings: an XYZ layer rides the Rust downloader, full stop.
+        # The resolver must not run — and a failed download must RAISE, not
+        # write buildings-free ingest jobs through the old silent fallback
+        # (which is the path this test used to travel).
+        from waveshed.core import buildings_source as bsrc
+        layer = mock.Mock()
+        layer.source.return_value = _XYZ_SOURCE
+        bm = mock.Mock()
+        bm.find_binary.return_value = "aether_converter"
+        with tempfile.TemporaryDirectory() as root, \
+             mock.patch.object(ta, "get_cache_dir", return_value=root), \
+             mock.patch.object(bsrc, "resolve_buildings_source") as resolve, \
+             mock.patch.object(ta, "_try_rust_download",
+                               return_value=ta.DownloadOutcome(
+                                   False, "engine said no")), \
+             mock.patch.object(ta, "_run_converter") as run_conv:
+            with self.assertRaises(RuntimeError) as caught:
+                ta.prepare_terrain(layer, 47.4, 8.5, 5.0, 30, bm)
+        self.assertIn("engine said no", str(caught.exception))
+        resolve.assert_not_called()   # no buildings -> nothing to resolve
+        run_conv.assert_not_called()  # and no ingest job via a fallback
 
 
 class TestBuildingsRequestedButNotApplied(_PrepareWithBuildings,
@@ -2991,3 +3008,217 @@ class TestRenderResolutionRule(unittest.TestCase):
                                wraps=ta.render_resolution_m) as rule:
             self.assertEqual(mc._render_resolution_m(entry, jobs), 1.0)
         rule.assert_called_once_with(1.0, 30.0)
+
+
+class TestNoSilentXyzFallback(unittest.TestCase):
+    """A failed Rust download on an XYZ elevation layer is a hard error.
+
+    The router contract sends XYZ through the shared Rust downloader; the
+    old behaviour logged one line and quietly rendered the tiles through
+    QGIS instead — the slow aliasing path the downloader replaced —
+    producing terrain nobody asked to be built that way. Observed live on
+    1.3b with its fixture server down.
+    """
+
+    def _layer(self):
+        layer = mock.Mock()
+        layer.name.return_value = "terrarium"
+        layer.source.return_value = (
+            "type=xyz&url=https://tiles.example/{z}/{x}/{y}.png&zmax=15")
+        return layer
+
+    def test_failed_download_raises_with_the_engines_words(self):
+        with tempfile.TemporaryDirectory() as root, \
+             mock.patch.object(ta, "get_cache_dir", return_value=root), \
+             mock.patch.object(ta, "classify_raster_layer",
+                               return_value="dem"), \
+             mock.patch.object(
+                 ta, "_try_rust_download",
+                 return_value=ta.DownloadOutcome(
+                     False, "[Stats] ERRORS (4): HTTP_4xx=4")), \
+             mock.patch.object(ta, "_export_via_qgis") as export, \
+             mock.patch.object(ta, "_gather_source_infos") as gather:
+            with self.assertRaises(RuntimeError) as caught:
+                ta.prepare_terrain(self._layer(), 46.945, 7.41, 1.0, 30,
+                                   mock.Mock())
+        msg = str(caught.exception)
+        self.assertIn("HTTP_4xx", msg)          # the engine's own diagnosis
+        self.assertIn("not a fallback", msg)
+        export.assert_not_called()              # no QGIS render happened
+        gather.assert_not_called()              # never reached the file path
+
+    def test_successful_download_records_the_download_route(self):
+        ta.pop_acquisition_routes()
+        with tempfile.TemporaryDirectory() as root, \
+             mock.patch.object(ta, "get_cache_dir", return_value=root), \
+             mock.patch.object(ta, "classify_raster_layer",
+                               return_value="dem"), \
+             mock.patch.object(ta, "_try_rust_download",
+                               return_value=ta.DownloadOutcome(True)), \
+             mock.patch.object(ta, "_finish_view"):
+            out = ta.prepare_terrain(self._layer(), 46.945, 7.41, 1.0, 30,
+                                     mock.Mock())
+        self.assertTrue(out)
+        self.assertEqual(ta.pop_acquisition_routes(), ["download"])
+        self.assertEqual(ta.pop_acquisition_routes(), [],
+                         "pop must clear the record")
+
+
+class TestNoDataDownloads(unittest.TestCase):
+    """HTTP 404 is the service saying "no data here" — never a failure.
+
+    The 2026-08-31 contract: a run over (or past) a bounded source's edge
+    completes; missing tiles are void in the pool, 0 m sea level in the Site
+    Analysis view, and the user is warned. The converter reports the tally on
+    its `[Stats] NO-DATA (HTTP 404)` line; these tests pin the plugin's half.
+    """
+
+    BBOX = {"north": 47.5, "south": 47.0, "east": 8.5, "west": 8.0}
+    TILE = "tile_N48.00E8.00_30m.abt"
+
+    def test_the_no_data_line_parses(self):
+        lines = ["[Stats] Tiles: 6/49 OK (12.2% success)",
+                 "[Stats] ERRORS (43): HTTP_404_no_data=43",
+                 "[Stats] NO-DATA (HTTP 404): 43 of 49 tile(s) — the service "
+                 "has no data there; written as void"]
+        self.assertEqual(ta._parse_download_no_data(lines), 43)
+
+    def test_an_older_converter_reports_zero_no_data(self):
+        # No line -> 0, and the caller must treat the misses as failures (the
+        # old, safe reading) — never assume they were 404s.
+        self.assertEqual(ta._parse_download_no_data(
+            ["[Stats] Tiles: 6/49 OK"]), 0)
+
+    def _download(self, pool_dir, ok, total, no_data):
+        subtiles = [{"filename": self.TILE, "ul_lat": 48.0, "ul_lon": 8.0,
+                     "size_px": 3704, "exact_res_m": 30.0}]
+        bm = mock.Mock()
+        bm.find_binary.return_value = "aether_converter"
+        _write_pool_abt(os.path.join(pool_dir, self.TILE))
+        lines = [f"[Stats] Tiles: {ok}/{total} OK"]
+        if no_data:
+            lines.append(f"[Stats] NO-DATA (HTTP 404): {no_data} of {total} "
+                         f"tile(s) — the service has no data there; written "
+                         f"as void")
+        with mock.patch.object(ta, "_run_converter_download_once",
+                               return_value=(0, lines)), \
+             mock.patch.object(ta, "_abt_has_holes", return_value=True), \
+             mock.patch.object(ta, "_abt_has_zero_fill", return_value=False):
+            return ta._try_rust_download(_XYZ_SOURCE, pool_dir, self.BBOX, 30,
+                                         subtiles, bm)
+
+    def test_all_misses_being_404_is_a_complete_run(self):
+        # The 1.3b-over-the-box shape: 43 of 49 source tiles answer 404. The
+        # output tile HAS holes (the ground really is missing), but retrying a
+        # permanent answer is pointless and flagging the tile for rebuild
+        # would re-download and re-404 it on every later run.
+        with tempfile.TemporaryDirectory() as d:
+            self.assertTrue(self._download(d, ok=6, total=49, no_data=43))
+            self.assertTrue(ta._tile_ready(d, self.TILE),
+                            "a no-data run is complete: no rebuild flag")
+
+    def test_even_every_tile_being_404_is_a_complete_run(self):
+        # Fully outside the source: 0 fetched, all 404 — still complete, still
+        # green; the warning and the sea fill are the user-facing story.
+        with tempfile.TemporaryDirectory() as d:
+            self.assertTrue(self._download(d, ok=0, total=49, no_data=49))
+            self.assertTrue(ta._tile_ready(d, self.TILE))
+
+    def test_mixed_losses_still_flag_for_rebuild(self):
+        # 40 x 404 + 3 real failures: the no-data part is permanent but the
+        # transport part is worth retrying next run, so the gapped tile stays
+        # flagged (the retry passes inside the run are exercised elsewhere).
+        with tempfile.TemporaryDirectory() as d:
+            self.assertTrue(self._download(d, ok=6, total=49, no_data=40))
+            self.assertFalse(ta._tile_ready(d, self.TILE),
+                             "real failures must keep the rebuild flag")
+
+    def test_zero_fetched_with_real_failures_still_fails(self):
+        # 0 fetched and NOT all-404 (an old engine, or the network died):
+        # the old hard path — nothing cached, run failed.
+        with tempfile.TemporaryDirectory() as d:
+            self.assertFalse(self._download(d, ok=0, total=49, no_data=0))
+            self.assertFalse(os.path.exists(os.path.join(d, self.TILE)),
+                             "a failed total loss caches nothing")
+
+
+class TestViewVoidFill(unittest.TestCase):
+    """The Site Analysis view must never hand the engine a void sample.
+
+    `void_fill_m: 0.0` states the contract on the ingest path; the download
+    path pools tiles WITH voids (the Map Converter needs them kept), so the
+    fill happens at view time: the pool copy keeps its voids, the view copy
+    reads 0 m sea level.
+    """
+
+    @staticmethod
+    def _write_gapped_abt(path, size=8):
+        import numpy as np
+        stride = _abt_row_stride(size)
+        hdr = (b"AETH" + struct.pack("<HH", 1, size)
+               + struct.pack("<dddd", 47.0, 8.0, 1.0 / size, 1.0 / size)
+               + struct.pack("<hH", 0, stride))
+        rows = bytearray()
+        for row in range(size):
+            vals = np.full(size, 1200, np.int16)      # 600 m
+            if row >= size // 2:
+                vals[:] = -9999                        # bottom half: void
+            rows += vals.tobytes() + b"\0" * (stride - size * 2)
+        with open(path, "wb") as fh:
+            fh.write(hdr + bytes(rows))
+
+    def test_void_detection_reads_the_samples_not_the_padding(self):
+        with tempfile.TemporaryDirectory() as d:
+            gapped = os.path.join(d, "gapped.abt")
+            self._write_gapped_abt(gapped)
+            whole = os.path.join(d, "whole.abt")
+            _write_pool_abt(whole)                     # all-zero samples: 0 m
+            self.assertTrue(ta._tile_has_voids(gapped))
+            self.assertFalse(ta._tile_has_voids(whole))
+            self.assertIsNone(ta._tile_has_voids(os.path.join(d, "no.abt")))
+
+    def test_sync_view_fills_a_gapped_tile_and_leaves_the_pool_alone(self):
+        from waveshed.core import abt
+        with tempfile.TemporaryDirectory() as pool, \
+                tempfile.TemporaryDirectory() as view:
+            self._write_gapped_abt(os.path.join(pool, "a.abt"))
+            gone = ta._sync_view(pool, view, ["a.abt"])
+            self.assertEqual(gone, [])
+            pool_grid = abt.read_tile(abt.read_header(os.path.join(pool, "a.abt")))
+            view_grid = abt.read_tile(abt.read_header(os.path.join(view, "a.abt")))
+            self.assertTrue((pool_grid[4:] == -9999).all(),
+                            "the POOL keeps its voids — the Map Converter "
+                            "contract depends on them")
+            self.assertTrue((view_grid[4:] == 0).all(),
+                            "the VIEW reads 0 m sea level where the source "
+                            "has nothing")
+            self.assertTrue((view_grid[:4] == 1200).all(),
+                            "real terrain is untouched")
+
+    def test_a_whole_tile_is_still_linked_not_copied(self):
+        with tempfile.TemporaryDirectory() as pool, \
+                tempfile.TemporaryDirectory() as view:
+            _write_pool_abt(os.path.join(pool, "a.abt"))
+            ta._sync_view(pool, view, ["a.abt"])
+            pool_stat = os.stat(os.path.join(pool, "a.abt"))
+            view_stat = os.stat(os.path.join(view, "a.abt"))
+            self.assertEqual((pool_stat.st_dev, pool_stat.st_ino),
+                             (view_stat.st_dev, view_stat.st_ino),
+                             "a void-free tile costs a hardlink, not a copy")
+
+    def test_a_rebuilt_pool_tile_refreshes_a_stale_filled_view(self):
+        from waveshed.core import abt
+        with tempfile.TemporaryDirectory() as pool, \
+                tempfile.TemporaryDirectory() as view:
+            src = os.path.join(pool, "a.abt")
+            self._write_gapped_abt(src)
+            ta._sync_view(pool, view, ["a.abt"])
+            # The pool tile is re-downloaded (now complete) after the view
+            # copy was made: the copy must not shadow the fresh data.
+            time.sleep(0.05)
+            _write_pool_abt(src)                       # rebuilt, void-free
+            os.utime(src)
+            ta._sync_view(pool, view, ["a.abt"])
+            view_grid = abt.read_tile(abt.read_header(os.path.join(view, "a.abt")))
+            self.assertTrue((view_grid == 0).all(),
+                            "the view follows the rebuilt pool tile")

@@ -92,6 +92,19 @@ class TestAltitudeFloor(_CsvCase):
         body = _HEADER + "S,TX,47.0,8.0,0.0,AMSL\nR,RX,47.1,8.1,0.0,AMSL\n"
         self.assertEqual([0.0, 0.0], [e[4] for e in self.parse_alg(body)])
 
+    def test_amsl_below_the_floor_is_rejected(self):
+        # -500 m clears the Dead Sea shore (-430 m) with room to spare; below
+        # it the value is a typo or a unit slip. The floor used to exist only
+        # as a GUI spinbox limit, so every non-GUI path (this CSV parser, the
+        # Processing algorithms) accepted -501, -5000, anything — found by
+        # the torture runner's gate:amsl-floor check, 2026-08-31.
+        body = _HEADER + "S,TX,47.0,8.0,30.0,AGL\nR,RX,47.1,8.1,-501.0,AMSL\n"
+        with self.assertRaises(QgsProcessingException) as ctx:
+            self.parse_alg(body)
+        said = str(ctx.exception)
+        self.assertIn("-500", said)
+        self.assertIn("AMSL", said)
+
     def test_mixed_modes_only_floor_the_agl_row(self):
         body = _HEADER + "S,TX,31.5,35.5,-430.0,AMSL\nR,RX,47.1,8.1,0.2,AGL\n"
         with self.assertRaises(QgsProcessingException) as ctx:

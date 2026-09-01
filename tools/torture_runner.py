@@ -67,6 +67,16 @@ Tier C — the whole pipeline, and the reason this file exists:
   * the Map Converter is also run over STACKS (priority order, mixed
     acquisition kinds, two resolutions at once, buildings, rerun-with-skip),
     which no single row can express;
+  * the catalogue's OVER-THE-BOX scenarios (``overrun:`` checks) run each
+    acquisition route past its source's coverage: the run must complete,
+    warn, read 0 m sea level in the Site Analysis view and keep VOID in Map
+    Converter output — the 2026-08-31 no-data contract, per route;
+  * the FOLDER input (``folder:``), a real conversion per catalogue
+    resolution with byte-exact tile sizes (``sweep:``), the other models and
+    both backends, a multi-tile range, the cache drills and the scripted P2P
+    (``matrix:``), and the height/batch gates (tier A ``gate:``/``batch:``)
+    — the checklist's Phases 3, 7, 8 and 9, automated. A ``--rows`` run
+    skips the case tiers (they are not row-addressable) and says so;
   * every row gets its own cache root, torn down after it. A failed download
     leaves an all-zero tile in the pool and the next run reports a cache hit,
     so a pipeline test sharing one pool measures history, not the code.
@@ -700,6 +710,8 @@ def _plan_row_checks(row: Dict[str, Any], results: Results) -> None:
         results.plan(name, "zmax.service_limit")
     if row.get("expect_tile_px") and "type=xyz" in (row.get("source") or ""):
         results.plan(name, "xyz.tile_px")
+    if row.get("expect_format") and "type=xyz" in (row.get("source") or ""):
+        results.plan(name, "xyz.format")
     if row.get("min_scale"):
         results.plan(name, "min_scale")
     if "type=xyz" not in (row.get("source") or ""):
@@ -787,6 +799,7 @@ def tier_a(manifest: Dict[str, Any], results: Results, only: Sequence[str],
     context = project.transformContext()
     destination = project.crs()
     _check_transforms(manifest, results, context, destination, project)
+    _tier_a_gates(manifest, results, out_dir)
 
     rows = [r for r in manifest["rows"] if row_selected(r["row"], only)]
     if only and not rows:
@@ -1047,9 +1060,12 @@ def _check_service_zmax(row: Dict[str, Any], source: str, results: Results,
     the plugin has never heard of the check passes by echoing its own input.
     That is not the interesting question. The interesting question is what
     happens to the layer a USER adds, which arrives carrying QGIS's default
-    ``zmax=18``: without a ``max_zoom`` entry the plugin cannot clamp it, every
-    request past the real limit fails, the converter writes those tiles as 0 m
-    and the analysis completes, confidently, over a flat sea-level plane.
+    ``zmax=18``: without a ``max_zoom`` entry the plugin cannot clamp it,
+    every request past the real limit answers 404 — which the no-data
+    contract turns into a warned, sea-filled result. Better than the silent
+    flat sea it used to be, but still sea where the user wanted terrain the
+    service DOES publish one zoom down; the clamp is what gets them that
+    terrain.
 
     So this asks the question that cannot be answered by construction: does
     ``known_services.json`` know this service's real limit?
@@ -1075,32 +1091,59 @@ def _check_service_zmax(row: Dict[str, Any], source: str, results: Results,
         ok = False
         detail = (f"known_services.json has no max_zoom for this service ({known!r}), so a "
                   f"hand-added layer keeps QGIS's default zmax=18. Every request past "
-                  f"z{expected} fails, the converter writes those tiles as 0 m, and the "
-                  f"analysis runs over a flat sea. Add \"max_zoom\": {expected}.")
+                  f"z{expected} answers 404 and the run degrades to warned sea level "
+                  f"instead of the terrain the service publishes at z{expected}. "
+                  f"Add \"max_zoom\": {expected}.")
     results.add(row["row"], "zmax.service_limit",
                 f"the plugin knows this service stops at z{expected}",
                 PASS if ok else FAIL, detail,
                 known_fail_for(row, "zmax.service_limit"))
 
 
+#: Magic-byte sniffers for ``expect_format`` — the format the service REALLY
+#: serves, decided from the bytes: row 1.4's service answers WebP for a
+#: ``.png`` request, so neither Content-Type nor the URL's extension counts.
+_FORMAT_MAGIC = {
+    "png": lambda b: b[:8] == b"\x89PNG\r\n\x1a\n",
+    "webp": lambda b: b[:4] == b"RIFF" and b[8:12] == b"WEBP",
+    "jpeg": lambda b: b[:3] == b"\xff\xd8\xff",
+}
+
+
+def sniff_image_format(data: bytes) -> str:
+    """"png" | "webp" | "jpeg" | a hex preview for anything else."""
+    for name, match in _FORMAT_MAGIC.items():
+        if len(data) >= 12 and match(data):
+            return name
+    return f"unknown ({data[:8]!r})"
+
+
 def _check_tile_px(row: Dict[str, Any], source: str, results: Results,
                    manifest, adapter) -> None:
-    """The tile edge this service REALLY serves, measured on one tile.
+    """The tile edge AND byte format this service REALLY serves, on one tile.
 
     ``expect_tile_px`` was written into the manifest and read by nobody —
-    the classic way a catalogue field rots. A 512 px (@2x) service
+    the classic way a catalogue field rots (``expect_format`` rotted the
+    same way until this check learned to read it). A 512 px (@2x) service
     assembled with 256 px maths folds every tile into terrain that is
     hundreds of metres wrong (the 1.3a defect), so the suite fetches ONE
     tile through the layer's own URL template and measures the actual
-    image. The zoom is the one the PLUGIN would fetch at — its own
-    ``resolve_zmax`` clamp — never the URI's raw ``zmax``: row 1.2 carries
-    QGIS's default zmax=18 on purpose, and terrarium answers 404 above z15.
+    image; the same bytes answer ``expect_format`` by magic numbers. The
+    zoom is the one the PLUGIN would fetch at — its own ``resolve_zmax``
+    clamp — never the URI's raw ``zmax``: row 1.2 carries QGIS's default
+    zmax=18 on purpose, and terrarium answers 404 above z15.
     """
     check_id = "xyz.tile_px"
     expected = int(row.get("expect_tile_px") or 0)
-    if not expected or "type=xyz" not in (source or ""):
+    expected_format = (row.get("expect_format") or "").strip().lower()
+    if "type=xyz" not in (source or "") or not (expected or expected_format):
         results.unplan(row["row"], check_id)
+        results.unplan(row["row"], "xyz.format")
         return
+    if not expected:
+        results.unplan(row["row"], check_id)
+    if not expected_format:
+        results.unplan(row["row"], "xyz.format")
     label = f"the service serves {expected} px tiles"
     probe = (manifest or {}).get("elevation_probe") or {}
     lat = float(probe.get("lat", 46.945))
@@ -1124,10 +1167,29 @@ def _check_tile_px(row: Dict[str, Any], source: str, results: Results,
         with urllib.request.urlopen(req, timeout=20) as reply:
             data = reply.read()
     except Exception as exc:
-        results.add(row["row"], check_id, label, FAIL,
-                    f"could not fetch {url}: {type(exc).__name__}: "
-                    f"{_shorten(str(exc), 90)}",
-                    known_fail_for(row, check_id))
+        detail = (f"could not fetch {url}: {type(exc).__name__}: "
+                  f"{_shorten(str(exc), 90)}")
+        if expected:
+            results.add(row["row"], check_id, label, FAIL, detail,
+                        known_fail_for(row, check_id))
+        if expected_format:
+            results.add(row["row"], "xyz.format",
+                        f"the service serves {expected_format} bytes", FAIL,
+                        detail, known_fail_for(row, "xyz.format"))
+        return
+
+    if expected_format:
+        served = sniff_image_format(data)
+        ok = served == expected_format
+        results.add(row["row"], "xyz.format",
+                    f"the service serves {expected_format} bytes",
+                    PASS if ok else FAIL,
+                    f"z{z} tile is {served}"
+                    + ("" if ok else f" — the catalogue says {expected_format}; "
+                                     f"a changed byte format changes what the "
+                                     f"toolkit decoder can read"),
+                    known_fail_for(row, "xyz.format"))
+    if not expected:
         return
     from qgis.PyQt.QtGui import QImage
     img = QImage.fromData(data)
@@ -1229,6 +1291,108 @@ def _check_features(row: Dict[str, Any], layer, results: Results) -> None:
     results.add(row["row"], "features", "has features", PASS if ok else FAIL,
                 f"{count} features" + ("" if ok else f", catalogue expects >= {minimum}"),
                 known_fail_for(row, "features"))
+
+
+def _tier_a_gates(manifest: Dict[str, Any], results: Results,
+                  out_dir: Path) -> None:
+    """The height gates and batch-CSV contracts — checklist Phase 8's
+    parser half, engine-free and therefore tier A's.
+
+    Drives the shipped functions (``antenna_height_error``, the P2P tab's
+    ``_parse_batch_csv``) with the catalogue's own cases: 0.5 m AGL must be
+    rejected on either antenna, -430 m AMSL accepted, -501 m rejected, and
+    every ``batch_cases`` file must be byte-for-byte the one the catalogue
+    describes and parse (or refuse, naming its line and cause) as declared.
+    """
+    gates = ("gate:agl-tx-floor", "gate:agl-rx-floor",
+             "gate:amsl-negative-ok", "gate:amsl-floor")
+    for check_id in gates:
+        results.plan("8", check_id)
+    batch_cases = manifest.get("batch_cases") or []
+    for case in batch_cases:
+        results.plan("8", f"batch:{case['file']}")
+
+    try:
+        from waveshed.core.job_builder import CoverageParams, antenna_height_error
+        from waveshed.gui.p2p_tab import _parse_batch_csv
+    except ImportError as exc:
+        results.add("8", "gate:agl-tx-floor", "the height gates are importable",
+                    FAIL, f"{exc} — every Phase 8 gate check is lost")
+        return
+
+    def params(tx_height=30.0, tx_mode="AGL", rx_height=2.0, rx_mode="AGL"):
+        return CoverageParams(
+            tx_lat=46.9481, tx_lon=7.4474, tx_height=tx_height, tx_mode=tx_mode,
+            freq_mhz=900.0, erp_watts=10.0, rx_height=rx_height, rx_mode=rx_mode,
+            model="ITM", resolution_m=30, max_range_km=3, backend="CPU",
+            output_name="gate", max_ram_gb=8, max_vram_gb=4)
+
+    for check_id, kwargs, want_reject, label in (
+            ("gate:agl-tx-floor", {"tx_height": 0.5}, True,
+             "0.5 m AGL on the transmitter is rejected"),
+            ("gate:agl-rx-floor", {"rx_height": 0.5}, True,
+             "0.5 m AGL on the receiver is rejected"),
+            ("gate:amsl-negative-ok", {"tx_height": -430.0, "tx_mode": "AMSL"},
+             False, "-430 m AMSL is accepted (the Dead Sea site)"),
+            ("gate:amsl-floor", {"tx_height": -501.0, "tx_mode": "AMSL"}, True,
+             "-501 m AMSL is rejected (the floor is -500)")):
+        try:
+            said = antenna_height_error(params(**kwargs))
+        except Exception as exc:  # noqa: BLE001 — a crash is its own failure
+            results.add("8", check_id, label, FAIL,
+                        f"antenna_height_error raised {type(exc).__name__}: {exc}")
+            continue
+        rejected = bool(said)
+        ok = rejected == want_reject
+        results.add("8", check_id, label, PASS if ok else FAIL,
+                    _shorten(" ".join((said or "accepted").split()), 100)
+                    if ok else
+                    (f"accepted — the gate is the only thing between a 0.5 m "
+                     f"antenna and the engine" if want_reject else
+                     f"rejected a legal value: {_shorten(said or '', 90)}"))
+
+    for case in batch_cases:
+        check_id = f"batch:{case['file']}"
+        path = out_dir / "batch" / case["file"]
+        label = (f"{case['file']} is {'accepted' if case['expect'] == 'accept' else 'rejected at its line'}")
+        if not path.is_file():
+            results.add("8", check_id, label, FAIL,
+                        "the fixture is missing — run --stages vectors")
+            continue
+        on_disk = path.read_text(encoding="utf-8-sig").replace("\r\n", "\n")
+        declared = str(case.get("content") or "")
+        if declared and on_disk != declared:
+            results.add("8", check_id, label, FAIL,
+                        "the CSV on disk is not the one the catalogue "
+                        "describes — regenerate (--stages vectors)")
+            continue
+        try:
+            entries = _parse_batch_csv(str(path))
+        except ValueError as exc:
+            said = str(exc)
+            if case["expect"] == "accept":
+                results.add("8", check_id, label, FAIL,
+                            f"the parser refused an accept case: {_shorten(said, 100)}")
+                continue
+            wanted_line = f"Line {case.get('line')}"
+            must = str(case.get("must_name") or "")
+            ok = wanted_line in said and (not must or must in said)
+            results.add("8", check_id, label, PASS if ok else FAIL,
+                        _shorten(said, 100) if ok else
+                        f"refused, but not naming {wanted_line}/{must!r}: "
+                        f"{_shorten(said, 90)}")
+            continue
+        if case["expect"] != "accept":
+            results.add("8", check_id, label, FAIL,
+                        f"the parser accepted {len(entries)} row(s) from a file "
+                        f"the catalogue says must be rejected at line "
+                        f"{case.get('line')}")
+            continue
+        wanted_rows = int(case.get("expect_rows") or 0)
+        ok = not wanted_rows or len(entries) == wanted_rows
+        results.add("8", check_id, label, PASS if ok else FAIL,
+                    f"{len(entries)} row(s) parsed"
+                    + ("" if ok else f", catalogue says {wanted_rows}"))
 
 
 def _check_transforms(manifest: Dict[str, Any], results: Results, context,
@@ -1790,6 +1954,47 @@ def _run_worker(worker, timeout: int) -> Dict[str, Any]:
     return state
 
 
+class _MessageLogTap:
+    """Collects the plugin's own QgsMessageLog lines for the duration.
+
+    The terrain adapter reports through ``QgsMessageLog`` ("Waveshed-Terrain"),
+    not through worker signals — the no-data/sea-level warning, the pool-HIT
+    line and the extent warning all live there. Asserting on them means
+    listening where the plugin actually speaks; re-plumbing the plugin so the
+    harness hears better would test a plugin nobody ships.
+    """
+
+    def __init__(self, tag_prefix: str = "Waveshed") -> None:
+        self.lines: List[str] = []
+        self._tag_prefix = tag_prefix
+
+    def __enter__(self) -> "_MessageLogTap":
+        from qgis.core import QgsApplication
+        from qgis.PyQt.QtCore import Qt
+
+        def _collect(message, tag, _level):
+            if str(tag or "").startswith(self._tag_prefix):
+                self.lines.append(str(message))
+
+        self._collect = _collect        # keep the reference for disconnect
+        # Direct, for the same reason _run_worker collects directly: the
+        # adapter logs from worker threads, and a queued delivery would need
+        # an event loop this runner never spins — the tap read empty.
+        QgsApplication.messageLog().messageReceived.connect(
+            _collect, Qt.DirectConnection)
+        return self
+
+    def __exit__(self, *exc) -> None:
+        from qgis.core import QgsApplication
+        try:
+            QgsApplication.messageLog().messageReceived.disconnect(self._collect)
+        except Exception:  # noqa: BLE001 — a failed disconnect must not mask the run
+            pass
+
+    def text(self) -> str:
+        return "\n".join(self.lines)
+
+
 #: Complaints the RUNNER synthesises when a worker never answers. They must
 #: never satisfy a must-fail/reject expectation — a hung worker is not a
 #: refusal, and row 1.6's "any loud refusal" contract would otherwise be met
@@ -1829,7 +2034,6 @@ def _mc_convert(rows_layers, plugin, out_dir: Path, resolutions, timeout: int,
     "tiles": [abt paths]}``.
     """
     mc = plugin["mc"]
-    abt_mod = plugin["abt"]
     entries = [_layer_entry(row, layer, plugin, resolutions, bbox)
                for row, layer in rows_layers]
     if buildings is not None:
@@ -1840,6 +2044,20 @@ def _mc_convert(rows_layers, plugin, out_dir: Path, resolutions, timeout: int,
             qgis_layer=blayer,
             crs_authid=brow.get("crs") or "",
             extent=dict(bbox) if bbox else None))
+    return _mc_run_entries(entries, plugin, out_dir, resolutions, timeout,
+                           overwrite=overwrite)
+
+
+def _mc_run_entries(entries, plugin, out_dir: Path, resolutions, timeout: int,
+                    overwrite: bool = True) -> Dict[str, Any]:
+    """The Map Converter's own resolve + worker over prebuilt entries.
+
+    The tail every `_mc_convert` caller shares, exposed for the callers whose
+    entry is not a catalogue row — the folder cases build the exact entry the
+    GUI's Add Folder builds and hand it here.
+    """
+    mc = plugin["mc"]
+    abt_mod = plugin["abt"]
     out_dir.mkdir(parents=True, exist_ok=True)
     _combined, render_jobs = mc._pending_render_jobs(
         entries, list(resolutions), str(out_dir), overwrite)
@@ -2426,6 +2644,215 @@ def _check_nothing_cached(row, rid, plugin, results: Results, pipe) -> None:
                 known_fail_for(row, "pipeline.nothing_cached"))
 
 
+def _check_tile_bytes(rid: str, row, tiles, resolution: int, manifest,
+                      results: Results) -> None:
+    """Every produced .abt must be byte-exact for its resolution.
+
+    The size ladder (extent°, size px, bytes) is fixed per resolution and the
+    manifest carries it (``tile_bytes``, from the generator's RES_TABLE) — the
+    cheapest possible proof that a run produced what it says it did, and the
+    check that catches a stride overflow or a half-written tile instantly.
+    """
+    expected = (manifest.get("tile_bytes") or {}).get(str(int(resolution)))
+    if not expected:
+        results.add(rid, "pipeline.tile_bytes",
+                    f"tiles are byte-exact for {resolution} m", FAIL,
+                    f"the catalogue's tile_bytes table has no entry for "
+                    f"{resolution} m — an unmeasured size is not a pass")
+        return
+    wrong = []
+    for path in tiles:
+        try:
+            size = os.path.getsize(path)
+        except OSError:
+            wrong.append(f"{Path(path).name}: unreadable")
+            continue
+        if size != int(expected):
+            wrong.append(f"{Path(path).name}: {size:,} B vs {int(expected):,}")
+    results.add(rid, "pipeline.tile_bytes",
+                f"tiles are byte-exact for {resolution} m",
+                FAIL if wrong else PASS,
+                "; ".join(wrong[:3]) if wrong else
+                f"{len(tiles)} tile(s) at exactly {int(expected):,} B",
+                known_fail_for(row, "pipeline.tile_bytes"))
+
+
+def _view_void_report(view_dir: str, plugin) -> Tuple[int, int]:
+    """``(void_samples, total_samples)`` across a Site Analysis view."""
+    import numpy as np
+    abt_mod = plugin["abt"]
+    voids = total = 0
+    for path in abt_mod.list_tiles(str(view_dir)):
+        grid = abt_mod.read_tile(abt_mod.read_header(path))
+        if grid is None:
+            continue
+        total += int(grid.size)
+        floor = abt_mod.MIN_VALID_ELEV_M / abt_mod.ELEV_STEP_M
+        voids += int(((grid <= floor) | (grid == CONVERTER_VOID_COUNTS)).sum())
+    return voids, total
+
+
+def _pipeline_overrun_scenario(row, scenario, layer, plugin, pipe: "Pipeline",
+                               manifest, results: Results, timeout: int) -> None:
+    """One over-the-box scenario, end to end, through the shipped workers.
+
+    The contract under test (2026-08-31): ground the source has no data for
+    must read **0 m sea level in Site Analysis** (view filled, run green,
+    warning in the terrain log) and **VOID in Map Converter output** — never
+    a download error, never silent −5 km pits, never an unwarned sea.
+    """
+    rid = row["row"]
+    sid = scenario.get("id", "?")
+    adapter = plugin["adapter"]
+    resolution = int(scenario.get("res_m") or 30)
+    range_km = int(scenario.get("range_km") or 3)
+    if scenario.get("center"):
+        lat, lon = float(scenario["center"][0]), float(scenario["center"][1])
+    else:
+        lat, lon = _probe_for(row, manifest)
+    outside = scenario.get("outside") or []
+    inside = scenario.get("inside")
+    warn_substring = (scenario.get("warn") or "sea level").lower()
+    bbox = adapter.analysis_bbox(lat, lon, range_km)
+    step = plugin["abt"].ELEV_STEP_M
+
+    tap = _MessageLogTap()
+    with tap:
+        try:
+            mc_state = _mc_convert([(row, layer)], plugin, pipe.scratch / "mc",
+                                   [resolution], timeout * 3, bbox=bbox)
+        except RuntimeError as exc:
+            mc_state = {"ok": None, "err": str(exc), "log": [], "tiles": []}
+        params = _coverage_params(plugin, lat, lon, resolution, range_km,
+                                  f"ovr_{sid.replace('-', '_')}")
+        sa_state = _sa_analyse(f"{rid} {sid}", layer, plugin,
+                               pipe.scratch / "sa", [(params, sid)],
+                               timeout * 3, results=results)
+
+    mc_ok = mc_state["ok"] is not None and bool(mc_state["tiles"])
+    sa_ok = bool(sa_state["ok"])
+    results.add(rid, f"overrun:{sid}.run", "the over-the-box run completes",
+                PASS if mc_ok and sa_ok else FAIL,
+                (f"{scenario.get('note', '')}".strip() or "both tabs ran")
+                if mc_ok and sa_ok else
+                "Map Converter: " + (_tail(_worker_complaint(mc_state) or "ok", 120)
+                                     if not mc_ok else "ok")
+                + "; Site Analysis: "
+                + (_tail(" ".join((sa_state.get("err") or "").split()), 120)
+                   if not sa_ok else "ok")
+                + " — an over-the-box run must degrade to sea, not error",
+                known_fail_for(row, f"overrun:{sid}.run"))
+
+    said = tap.text().lower()
+    warned = warn_substring in said
+    results.add(rid, f"overrun:{sid}.warned",
+                "the terrain log warns about sea fill",
+                PASS if warned else FAIL,
+                f"the log carries {warn_substring!r}" if warned else
+                f"no {warn_substring!r} anywhere in the terrain log — a user "
+                f"whose result is part sea must be told",
+                known_fail_for(row, f"overrun:{sid}.warned"))
+
+    # -- Map Converter output keeps VOID over the missing ground ----------
+    if not mc_ok:
+        results.add(rid, f"overrun:{sid}.mc_void",
+                    "the Map Converter keeps voids there", FAIL,
+                    "no Map Converter output to check (see the run above)",
+                    known_fail_for(row, f"overrun:{sid}.mc_void"))
+    else:
+        report = abt_report(mc_state["tiles"], plugin)
+        problems = []
+        if "unreadable" in report:
+            problems.append(f"unreadable tile {report['unreadable']}")
+        else:
+            at_out = abt_at(report["grids"], float(outside[0]),
+                            float(outside[1]), plugin) \
+                if len(outside) == 2 else None
+            if len(outside) == 2 and at_out is None:
+                problems.append(f"the outside probe {outside} is not inside "
+                                f"the produced tiles — the scenario is "
+                                f"miswritten, which must not pass")
+            elif len(outside) == 2 and at_out > plugin["abt"].MIN_VALID_ELEV_M:
+                problems.append(f"{at_out:,.1f} m at the outside probe — the "
+                                f"Map Converter must keep no-data as VOID, "
+                                f"not invent ground")
+            if inside:
+                at_in = abt_at(report["grids"], float(inside[0]),
+                               float(inside[1]), plugin)
+                if at_in is None or at_in <= plugin["abt"].MIN_VALID_ELEV_M:
+                    problems.append(f"the inside probe {inside} is "
+                                    f"{'outside the tiles' if at_in is None else 'VOID'}"
+                                    f" — covered ground was lost")
+        results.add(rid, f"overrun:{sid}.mc_void",
+                    "the Map Converter keeps voids there",
+                    FAIL if problems else PASS,
+                    "; ".join(problems) if problems else
+                    f"VOID at the outside probe"
+                    + (", real ground at the inside probe" if inside else "")
+                    + f" ({report.get('real_px', 0):,}/{report.get('total_px', 0):,} real)",
+                    known_fail_for(row, f"overrun:{sid}.mc_void"))
+
+    # -- Site Analysis view: sea outside, terrain inside, no voids at all -
+    view = _sa_view_dir(layer.source(), lat, lon, float(range_km), resolution,
+                        plugin)
+    if not os.path.isdir(view):
+        results.add(rid, f"overrun:{sid}.sea",
+                    "Site Analysis reads 0 m outside the source", FAIL,
+                    "the Site Analysis run left no terrain view (its run "
+                    "failed before terrain, or the cache identity moved)",
+                    known_fail_for(row, f"overrun:{sid}.sea"))
+    else:
+        abt_mod = plugin["abt"]
+        view_tiles = abt_mod.list_tiles(view)
+        grids = [(abt_mod.read_header(p), abt_mod.read_tile(abt_mod.read_header(p)))
+                 for p in view_tiles]
+        grids = [(h, g) for h, g in grids if g is not None]
+        problems = []
+        voids, total = _view_void_report(view, plugin)
+        if voids:
+            problems.append(f"{voids:,}/{total:,} samples in the ENGINE's view "
+                            f"are still void — aether_core would read them as "
+                            f"terrain {CONVERTER_VOID_COUNTS * step:,.1f} m")
+        if len(outside) == 2:
+            at_out = abt_at(grids, float(outside[0]), float(outside[1]), plugin)
+            if at_out is None:
+                problems.append(f"the outside probe {outside} is not inside "
+                                f"the view tiles")
+            elif at_out != 0.0:
+                problems.append(f"{at_out:,.1f} m at the outside probe — the "
+                                f"contract is exactly 0 m (sea level)")
+        if inside:
+            at_in = abt_at(grids, float(inside[0]), float(inside[1]), plugin)
+            if at_in is None or at_in <= 0.0:
+                problems.append(f"the inside probe {inside} reads "
+                                f"{'nothing' if at_in is None else f'{at_in:,.1f} m'}"
+                                f" — covered ground must stay real terrain")
+        results.add(rid, f"overrun:{sid}.sea",
+                    "Site Analysis reads 0 m outside the source",
+                    FAIL if problems else PASS,
+                    "; ".join(problems) if problems else
+                    f"view filled: 0 m at the outside probe, no void reaches "
+                    f"the engine ({total:,} samples)",
+                    known_fail_for(row, f"overrun:{sid}.sea"))
+
+    # -- the coverage the user actually gets ------------------------------
+    tif = None
+    if sa_state["ok"]:
+        tif_path = sa_state["ok"][0][0]
+        tif = Path(tif_path) if os.path.isfile(tif_path) else None
+    if tif is None:
+        results.add(rid, f"overrun:{sid}.cov",
+                    "the coverage over it is a sound grid", FAIL,
+                    "no coverage was produced (see the run above)",
+                    known_fail_for(row, f"overrun:{sid}.cov"))
+    else:
+        ok, why = _sound_grid(coverage_report(tif), range_km, resolution)
+        results.add(rid, f"overrun:{sid}.cov",
+                    "the coverage over it is a sound grid",
+                    PASS if ok else FAIL, why,
+                    known_fail_for(row, f"overrun:{sid}.cov"))
+
+
 def _check_void_sentinel(plugin, results: Results) -> None:
     """The plugin's "is this terrain?" rule must reject the engine's own VOID.
 
@@ -2541,7 +2968,8 @@ _REQUIRED_PLUGIN_SURFACE = (
     ("p2p", ("_P2PWorker", "_write_temp_batch_csv")),
     ("adapter", ("prepare_terrain", "analysis_bbox", "_compute_sector_bbox",
                  "_compute_subtiles", "_cache_key", "buildings_identity",
-                 "_abt_has_zero_fill", "_abt_has_holes", "ensure_pool_tiles")),
+                 "_abt_has_zero_fill", "_abt_has_holes", "ensure_pool_tiles",
+                 "pop_acquisition_routes")),
     ("result_loader", ("load_coverage_result",)),
 )
 
@@ -2617,14 +3045,63 @@ def _plan_pipeline_row(row, manifest, results: Results, plugin) -> None:
     if row.get("kind") == "vector":
         if check == "buildings":
             results.plan(rid, "pipeline.cov_delta")
+        if rid.startswith("5.3"):
+            # The links' verdicts: the obstructed link must cost materially
+            # more than the clear one, per the layer's own expect_obstructed.
+            results.plan(rid, "pipeline.verdicts")
         return
     if check == "both" and row.get("kind") == "raster":
         results.plan(rid, "pipeline.sa")
         results.plan(rid, "pipeline.both_tabs")
+        results.plan(rid, "pipeline.tile_bytes")
+        if row.get("expect_acquire"):
+            results.plan(rid, "pipeline.route")
         if _agrees_applies(row, manifest, plugin):
             results.plan(rid, "pipeline.agrees")
         for suffix in ("grid", "disk", "stripes", "load"):
             results.plan(rid, f"pipeline.cov.{suffix}")
+        # The boundary scenarios — declared like everything else, so a
+        # scenario that never executes is a NOTRUN, not a vanished check.
+        for scenario in row.get("overrun") or []:
+            sid = scenario.get("id", "?")
+            results.plan(rid, f"overrun:{sid}.run")
+            results.plan(rid, f"overrun:{sid}.warned")
+            results.plan(rid, f"overrun:{sid}.sea")
+            results.plan(rid, f"overrun:{sid}.mc_void")
+            results.plan(rid, f"overrun:{sid}.cov")
+
+
+def _check_route(rid: str, row, mc_routes: List[str], sa_routes: List[str],
+                 results: Results) -> None:
+    """Terrain must arrive by the route the catalogue intends.
+
+    A fallback that still produced terrain is a FAILED test, not a passed
+    one — unless the fallback IS the row's intention, in which case the
+    catalogue's ``expect_acquire`` says so. Routes come from the plugin's
+    own ``pop_acquisition_routes``: "download" = the shared Rust XYZ
+    downloader, "render" = per-tile QGIS export of a rendered server,
+    "sources" = local files handed to the converter.
+    """
+    expected = (row.get("expect_acquire") or "").strip()
+    if not expected:
+        results.unplan(rid, "pipeline.route")
+        return
+    problems = []
+    for phase, routes in (("Map Converter", mc_routes),
+                          ("Site Analysis", sa_routes)):
+        got = sorted(set(routes))
+        if not got:
+            problems.append(f"{phase} recorded no acquisition at all — the "
+                            f"plugin surface moved, or nothing was fetched")
+        elif got != [expected]:
+            problems.append(f"{phase} acquired via {'+'.join(got)}")
+    results.add(rid, "pipeline.route",
+                f"terrain arrives the intended way ({expected})",
+                FAIL if problems else PASS,
+                ("; ".join(problems) + " — a silent fallback is a failure, "
+                 "not a pass") if problems else
+                f"both tabs acquired via {expected}",
+                known_fail_for(row, "pipeline.route"))
 
 
 def _pipeline_row(row, layer, plugin, pipe: "Pipeline", manifest, results,
@@ -2646,6 +3123,8 @@ def _pipeline_row(row, layer, plugin, pipe: "Pipeline", manifest, results,
     bbox = adapter.analysis_bbox(lat, lon, range_km)
     must_fail = row.get("check") in _MUST_FAIL
     must_reject = row.get("check") in _MUST_REJECT
+    _pop_routes = getattr(adapter, "pop_acquisition_routes", lambda: [])
+    _pop_routes()  # drop whatever an earlier phase recorded
 
     # ---- Map Converter, the real one -----------------------------------
     mc_out = pipe.scratch / "mc"
@@ -2654,6 +3133,7 @@ def _pipeline_row(row, layer, plugin, pipe: "Pipeline", manifest, results,
                             timeout, bbox=bbox)
     except RuntimeError as exc:
         state = {"ok": None, "err": str(exc), "log": [], "tiles": []}
+    mc_routes = _pop_routes()
     said = _worker_complaint(state)
 
     if must_reject:
@@ -2717,6 +3197,7 @@ def _pipeline_row(row, layer, plugin, pipe: "Pipeline", manifest, results,
                           f"— a dropped or extra tile, before values were even read",
                     known_fail_for(row, "pipeline"))
         return
+    _check_tile_bytes(rid, row, tiles, resolution, manifest, results)
     terrain_ok = _abt_asserts(rid, row, tiles, plugin, lat, lon, results,
                               "pipeline",
                               "terrain out of this layer, through the real Map Converter",
@@ -2734,6 +3215,7 @@ def _pipeline_row(row, layer, plugin, pipe: "Pipeline", manifest, results,
     sa_state = _sa_analyse(rid, layer, plugin, sa_out,
                            [(params, f"torture {rid}")], timeout * 3,
                            results=results)
+    sa_routes = _pop_routes()
     if sa_state["ok"] is not None:
         results.add(rid, "pipeline.sa", "a real Site Analysis run, end to end",
                     PASS, f"{len(sa_state['ok'])} result(s) out of the worker",
@@ -2742,6 +3224,7 @@ def _pipeline_row(row, layer, plugin, pipe: "Pipeline", manifest, results,
         results.add(rid, "pipeline.sa", "a real Site Analysis run, end to end",
                     FAIL, _tail(" ".join((sa_state["err"] or "").split()), 200),
                     known_fail_for(row, "pipeline.sa"))
+    _check_route(rid, row, mc_routes, sa_routes, results)
 
     # ---- the two tabs against each other -------------------------------
     sa_view = _sa_view_dir(layer.source(), lat, lon, float(range_km),
@@ -2943,16 +3426,35 @@ def _pipeline_sites(row, layer, plugin, pipe, manifest, results, timeout):
     for index, feature in enumerate(layer.getFeatures()):
         point = feature.geometry().asPoint()
         label = str(feature["name"]) if "name" in names else f"site {index}"
-        params = _coverage_params(plugin, point.y(), point.x(), 30, 3,
-                                  f"site_{index}")
+        # The site's OWN height and mode — they are the attributes' reason to
+        # exist. Running every site at a canonical 30 m AGL meant the -430 m
+        # AMSL entry (the Dead Sea shore, the catalogue's negative-AMSL case)
+        # was never once run as AMSL by this suite.
+        height = 30.0
+        mode = "AGL"
+        try:
+            if "height_m" in names and feature["height_m"] is not None:
+                height = float(feature["height_m"])
+            if "mode" in names and feature["mode"]:
+                mode = str(feature["mode"]).strip().upper() or "AGL"
+        except (TypeError, ValueError):
+            failed.append(f"{label}: unreadable height_m/mode attributes")
+            continue
+        params = plugin["CoverageParams"](
+            tx_lat=point.y(), tx_lon=point.x(), tx_height=height, tx_mode=mode,
+            freq_mhz=900.0, erp_watts=10.0, rx_height=2.0, rx_mode="AGL",
+            model="ITM", resolution_m=30, max_range_km=3, backend="CPU",
+            output_name=f"site_{index}", max_ram_gb=8, max_vram_gb=4)
         state = _sa_analyse(rid, dem_layer, plugin,
                             pipe.scratch / f"site_{index}",
-                            [(params, label)], timeout * 3)
+                            [(params, f"{label} ({height:g} m {mode})")],
+                            timeout * 3)
         if state["ok"]:
             ran += 1
         else:
             failed.append(f"{label}: {_tail(' '.join((state['err'] or '').split()), 120)}")
-    detail = f"{ran} of {ran + len(failed)} site(s) produced a coverage on its own ground"
+    detail = (f"{ran} of {ran + len(failed)} site(s) produced a coverage on its "
+              f"own ground, each with its own height/mode")
     if failed:
         detail += "; " + "; ".join(failed[:2])
     results.add(rid, "pipeline", "every site runs as a transmitter",
@@ -2979,6 +3481,8 @@ def _pipeline_links(row, layer, plugin, pipe, manifest, results, timeout):
                     "the catalogue's reference service is not in the project")
         return
     ran, failed = 0, []
+    fields = layer.fields().names()
+    verdicts: Dict[str, Dict[str, Any]] = {}
     for index, feature in enumerate(layer.getFeatures()):
         points = feature.geometry().asPolyline()
         if len(points) < 2:
@@ -3002,6 +3506,16 @@ def _pipeline_links(row, layer, plugin, pipe, manifest, results, timeout):
             pass
         if state["ok"]:
             ran += 1
+            expect = (feature["expect_obstructed"]
+                      if "expect_obstructed" in fields else None)
+            if expect is not None and str(expect) not in ("", "NULL"):
+                verdicts[str(feature["name"]) if "name" in fields
+                         else f"link {index}"] = {
+                    "obstructed": str(expect).lower() in ("true", "1"),
+                    "csv": os.path.join(str(state["ok"]), f"p2p_{index}.csv"),
+                    "a": (points[0].y(), points[0].x()),
+                    "b": (points[-1].y(), points[-1].x()),
+                }
         else:
             failed.append(f"link {index}: {_tail(' '.join((state['err'] or '').split()), 120)}")
     detail = f"{ran} of {ran + len(failed)} link(s) ran over their own ground"
@@ -3010,6 +3524,95 @@ def _pipeline_links(row, layer, plugin, pipe, manifest, results, timeout):
     results.add(rid, "pipeline", "every link runs as a P2P job",
                 PASS if ran and not failed else FAIL, detail,
                 known_fail_for(row, "pipeline"))
+    _check_link_verdicts(rid, row, verdicts, results)
+
+
+def _excess_loss_db(csv_path: str, a: Tuple[float, float],
+                    b: Tuple[float, float], freq_mhz: float = 900.0
+                    ) -> Tuple[Optional[float], str]:
+    """``(loss - free_space, detail)`` from an engine P2P result CSV.
+
+    ``Path_Loss_dB`` is a frozen, named column (CONTRACT §5c). Free-space at
+    the same distance and frequency is exact arithmetic, so the difference is
+    pure terrain effect — which is the only number an obstruction verdict can
+    stand on without re-implementing the model.
+    """
+    import csv as _csv
+    try:
+        with open(csv_path, "r", encoding="utf-8") as fh:
+            rows = list(_csv.DictReader(fh))
+    except OSError as exc:
+        return None, f"cannot read {os.path.basename(csv_path)}: {exc}"
+    if not rows or "Path_Loss_dB" not in (rows[0] or {}):
+        return None, (f"{os.path.basename(csv_path)} carries no Path_Loss_dB "
+                      f"column (got {sorted((rows[0] or {}).keys()) if rows else 'no rows'})")
+    try:
+        loss = float(rows[0]["Path_Loss_dB"])
+    except (TypeError, ValueError):
+        return None, f"Path_Loss_dB is not a number: {rows[0]['Path_Loss_dB']!r}"
+    lat1, lon1 = math.radians(a[0]), math.radians(a[1])
+    lat2, lon2 = math.radians(b[0]), math.radians(b[1])
+    h = (math.sin((lat2 - lat1) / 2) ** 2
+         + math.cos(lat1) * math.cos(lat2) * math.sin((lon2 - lon1) / 2) ** 2)
+    d_km = 2 * 6371.0 * math.asin(math.sqrt(h))
+    fspl = 32.44 + 20 * math.log10(max(d_km, 1e-3)) + 20 * math.log10(freq_mhz)
+    return loss - fspl, f"{loss:.1f} dB over {d_km:.1f} km (free space {fspl:.1f})"
+
+
+def _check_link_verdicts(rid: str, row, verdicts: Dict[str, Dict[str, Any]],
+                         results: Results) -> None:
+    """The obstructed link must cost materially more than the clear one.
+
+    Relative, not absolute: ITM adds climate and terrain terms even to a
+    clear path, so a fixed excess-loss threshold would measure the model's
+    constants. What the catalogue's two Bern links exist to prove is the
+    ORDER — Bern->Thun (a ridge in the way) versus Bern->Gurten (line of
+    sight) — and 6 dB is well under any real knife-edge diffraction loss
+    while well over numeric noise.
+    """
+    obstructed = {n: v for n, v in verdicts.items() if v["obstructed"]}
+    clear = {n: v for n, v in verdicts.items() if not v["obstructed"]}
+    if not obstructed or not clear:
+        results.add(rid, "pipeline.verdicts",
+                    "the obstructed link costs more than the clear one", FAIL,
+                    f"the layer declares {len(obstructed)} obstructed and "
+                    f"{len(clear)} clear link(s) that ran — the comparison "
+                    f"needs one of each", known_fail_for(row, "pipeline.verdicts"))
+        return
+    problems, measured = [], []
+    worst_clear = None
+    for name, v in clear.items():
+        excess, detail = _excess_loss_db(v["csv"], v["a"], v["b"])
+        if excess is None:
+            problems.append(f"{name}: {detail}")
+            continue
+        measured.append(f"{name}: excess {excess:+.1f} dB")
+        worst_clear = excess if worst_clear is None else max(worst_clear, excess)
+    best_obstructed = None
+    for name, v in obstructed.items():
+        excess, detail = _excess_loss_db(v["csv"], v["a"], v["b"])
+        if excess is None:
+            problems.append(f"{name}: {detail}")
+            continue
+        measured.append(f"{name}: excess {excess:+.1f} dB")
+        best_obstructed = (excess if best_obstructed is None
+                           else min(best_obstructed, excess))
+    if problems:
+        results.add(rid, "pipeline.verdicts",
+                    "the obstructed link costs more than the clear one", FAIL,
+                    "; ".join(problems[:2]),
+                    known_fail_for(row, "pipeline.verdicts"))
+        return
+    margin = best_obstructed - worst_clear
+    ok = margin >= 6.0
+    results.add(rid, "pipeline.verdicts",
+                "the obstructed link costs more than the clear one",
+                PASS if ok else FAIL,
+                "; ".join(measured) + f" — margin {margin:+.1f} dB"
+                + ("" if ok else " (< 6 dB: the model does not see the ridge "
+                                 "between Bern and Thun, or sees one on the "
+                                 "clear path)"),
+                known_fail_for(row, "pipeline.verdicts"))
 
 
 #: Attributes the converter's height ladder reads off a building feature, in
@@ -3473,10 +4076,17 @@ def _run_combination(combo, label, check_id, picked, layers, plugin, pipe,
 
 
 #: Run-level cases that vary what every per-row run holds constant: the
-#: sector wedge, the propagation model, and the scripted (Processing)
-#: surface — including the one refusal a script never gets prompted about.
+#: sector wedge, the propagation models, the compute backends, the analysis
+#: range, the cache drills and the scripted (Processing) surface — including
+#: the one refusal a script never gets prompted about. Every per-row run uses
+#: ITM/CPU/3 km on purpose (one canonical job, comparable across rows); these
+#: cases are where the OTHER values users click first actually run.
 _MATRIX_CASES = ("matrix:wedge", "matrix:model LOS",
-                 "matrix:processing coverage", "matrix:processing refuses imagery")
+                 "matrix:processing coverage", "matrix:processing refuses imagery",
+                 "matrix:model SIMPLE_LOSS", "matrix:backend AUTO",
+                 "matrix:backend GPU vs CPU", "matrix:range 10 km",
+                 "matrix:cache pool-hit", "matrix:cache rebuild-flag",
+                 "matrix:cache clear", "matrix:processing p2p")
 
 
 def _tier_matrix_cases(manifest, results, layers, plugin, scratch_root: Path,
@@ -3686,8 +4296,8 @@ def _wedge_confined(tif_path: str, lat: float, lon: float, az0: float,
 _PROCESSING_PROVIDER = None
 
 
-def _run_processing_coverage(layer, lat: float, lon: float, out_dir: Path):
-    """The scripted surface, exactly as a model or batch job drives it."""
+def _ensure_waveshed_provider():
+    """QGIS Processing initialised and the waveshed provider registered."""
     global _PROCESSING_PROVIDER
     from qgis.core import QgsApplication
     # Headless, QGIS's own `processing` plugin is not on sys.path (inside the
@@ -3709,6 +4319,12 @@ def _run_processing_coverage(layer, lat: float, lon: float, out_dir: Path):
             registry.removeProvider("waveshed")
         _PROCESSING_PROVIDER = AetherProvider()
         registry.addProvider(_PROCESSING_PROVIDER)
+    return qgis_processing
+
+
+def _run_processing_coverage(layer, lat: float, lon: float, out_dir: Path):
+    """The scripted surface, exactly as a model or batch job drives it."""
+    qgis_processing = _ensure_waveshed_provider()
     out_dir.mkdir(parents=True, exist_ok=True)
     return qgis_processing.run("waveshed:coverage", {
         "INPUT_DEM": layer, "TX_LAT": float(lat), "TX_LON": float(lon),
@@ -3718,6 +4334,543 @@ def _run_processing_coverage(layer, lat: float, lon: float, out_dir: Path):
         "MAX_RANGE": 3, "BACKEND": 2,   # CPU
         "OUTPUT_DIR": str(out_dir),
     })
+
+
+def _run_processing_p2p(layer, tx_lat: float, tx_lon: float, rx_lat: float,
+                        rx_lon: float, out_dir: Path):
+    """The second scripted surface — checklist 8.9's other half."""
+    qgis_processing = _ensure_waveshed_provider()
+    out_dir.mkdir(parents=True, exist_ok=True)
+    return qgis_processing.run("waveshed:p2p", {
+        "INPUT_DEM": layer,
+        "TX_LAT": float(tx_lat), "TX_LON": float(tx_lon), "TX_HEIGHT": 30.0,
+        "RX_LAT": float(rx_lat), "RX_LON": float(rx_lon), "RX_HEIGHT": 2.0,
+        "MODEL": 1,          # ITM
+        "RESOLUTION": 3,     # index into VALID_RESOLUTIONS -> 30 m
+        "BACKEND": 2,        # CPU
+        "OUTPUT_DIR": str(out_dir),
+    })
+
+
+def _tier_matrix_extra(manifest, results: Results, layers, plugin,
+                       scratch_root: Path, timeout: int, keep: bool) -> None:
+    """The matrix cases beyond the original four: the OTHER models, both
+    backends, a multi-tile range, the cache drills and the scripted P2P.
+
+    Every per-row pipeline holds ITM/CPU/3 km constant so rows stay
+    comparable; a user's first click uses the defaults (AUTO backend) and
+    their second changes exactly these knobs — which is why each knob gets
+    one real end-to-end run here.
+    """
+    import numpy as np
+    from osgeo import gdal
+    gdal.UseExceptions()
+    adapter = plugin["adapter"]
+    by_row = {r["row"]: r for r in manifest["rows"]}
+    ref = by_row.get(manifest.get("reference_row"))
+    ref_layer = layers.get(ref["name"]) if ref else None
+    probe = manifest.get("elevation_probe") or {}
+    lat, lon = float(probe.get("lat", 46.945)), float(probe.get("lon", 7.41))
+
+    def sa_case(check_id: str, label: str, run) -> None:
+        """One SA-shaped case: fresh Pipeline, *run(pipe)* -> (ok, detail)."""
+        if ref_layer is None:
+            results.add("mx", check_id, label, FAIL,
+                        "the reference row is not in the project")
+            return
+        scratch = scratch_root / re.sub(r"[^a-z0-9]+", "_", check_id.lower())
+        scratch.mkdir(parents=True, exist_ok=True)
+        try:
+            with Pipeline(scratch, keep) as pipe:
+                ok, why = run(pipe)
+                results.add("mx", check_id, label, PASS if ok else FAIL, why)
+        except Exception as exc:
+            results.add("mx", check_id, label, FAIL,
+                        f"{type(exc).__name__}: {_shorten(str(exc), 160)}")
+
+    def one_sa(pipe, name, **overrides):
+        base = dict(resolution=30, range_km=3, model="ITM")
+        base.update({k: v for k, v in overrides.items()
+                     if k in ("resolution", "range_km", "model")})
+        params = _coverage_params(plugin, lat, lon, base["resolution"],
+                                  base["range_km"], name, model=base["model"])
+        if "backend" in overrides:
+            import dataclasses as _dc
+            params = _dc.replace(params, backend=overrides["backend"])
+        state = _sa_analyse("mx", ref_layer, plugin, pipe.scratch / name,
+                            [(params, name)], timeout * 3)
+        return params, state
+
+    # -- the third model --------------------------------------------------
+    def run_simple_loss(pipe):
+        _params, state = one_sa(pipe, "simple_loss", model="SIMPLE_LOSS")
+        if not state["ok"]:
+            return False, _tail(" ".join((state["err"] or "").split()), 180)
+        return _sound_grid(coverage_report(Path(state["ok"][0][0])), 3, 30)
+    sa_case("matrix:model SIMPLE_LOSS", "a SIMPLE_LOSS run produces a sound grid",
+            run_simple_loss)
+
+    # -- the backend a first click actually uses --------------------------
+    def run_auto(pipe):
+        _params, state = one_sa(pipe, "auto", backend="AUTO")
+        if not state["ok"]:
+            return False, _tail(" ".join((state["err"] or "").split()), 180)
+        ok, why = _sound_grid(coverage_report(Path(state["ok"][0][0])), 3, 30)
+        return ok, f"backend AUTO (the GUI default): {why}"
+    sa_case("matrix:backend AUTO", "the AUTO backend produces a sound grid",
+            run_auto)
+
+    # -- GPU against CPU, same job, same terrain --------------------------
+    def run_gpu_vs_cpu(pipe):
+        _p, cpu = one_sa(pipe, "cpu", backend="CPU")
+        if not cpu["ok"]:
+            return False, ("the CPU half failed: "
+                           + _tail(" ".join((cpu["err"] or "").split()), 150))
+        _p, gpu = one_sa(pipe, "gpu", backend="GPU")
+        if not gpu["ok"]:
+            return False, ("the GPU half failed — a machine that cannot run "
+                           "the GPU backend cannot green this suite: "
+                           + _tail(" ".join((gpu["err"] or "").split()), 150))
+        a = gdal.Open(cpu["ok"][0][0])
+        b = gdal.Open(gpu["ok"][0][0])
+        va = a.GetRasterBand(1).ReadAsArray().astype("float64")
+        vb = b.GetRasterBand(1).ReadAsArray().astype("float64")
+        if va.shape != vb.shape:
+            return False, f"different grids: {va.shape} vs {vb.shape}"
+        na, nb = a.GetRasterBand(1).GetNoDataValue(), b.GetRasterBand(1).GetNoDataValue()
+        mask = np.isfinite(va) & np.isfinite(vb)
+        if na is not None:
+            mask &= va != na
+        if nb is not None:
+            mask &= vb != nb
+        if not mask.any():
+            return False, "the two backends share no valid pixel"
+        diff = np.abs(va[mask] - vb[mask])
+        p95 = float(np.percentile(diff, 95))
+        worst = float(diff.max())
+        agree = int((np.abs(va[mask] - vb[mask]) <= 0.5).sum())
+        ok = p95 <= 2.0
+        return ok, (f"GPU vs CPU over {int(mask.sum()):,} shared px: p95 "
+                    f"|difference| {p95:.2f} dB, max {worst:.2f} dB, "
+                    f"{agree:,} within 0.5 dB"
+                    + ("" if ok else " — the backends disagree beyond "
+                                    "numeric noise (p95 allowance 2 dB)"))
+    sa_case("matrix:backend GPU vs CPU",
+            "GPU and CPU compute the same coverage", run_gpu_vs_cpu)
+
+    # -- a range that spans multiple terrain tiles ------------------------
+    def run_range10(pipe):
+        params, state = one_sa(pipe, "range10", range_km=10)
+        if not state["ok"]:
+            return False, _tail(" ".join((state["err"] or "").split()), 180)
+        mc = plugin["mc"]
+        bbox = adapter.analysis_bbox(lat, lon, 10)
+        expected = {t["filename"] for _r, t in
+                    mc._enumerate_tiles(mc._snap_bbox(bbox, [30]), [30])}
+        view = _sa_view_dir(ref_layer.source(), lat, lon, 10.0, 30, plugin)
+        got = {Path(p).name for p in plugin["abt"].list_tiles(view)} \
+            if os.path.isdir(view) else set()
+        if got != expected:
+            return False, (f"the 10 km terrain view holds {sorted(got)[:3]} "
+                           f"vs the enumeration's {sorted(expected)[:3]} — "
+                           f"a dropped tile at a seam")
+        ok, why = _sound_grid(coverage_report(Path(state["ok"][0][0])), 10, 30)
+        return ok, f"{len(expected)} terrain tile(s) under one disk; {why}"
+    sa_case("matrix:range 10 km",
+            "a 10 km run spans multiple tiles without seams", run_range10)
+
+    # -- the cache drills, against the offline local fixture --------------
+    local = next((r for r in manifest["rows"]
+                  if r.get("check") == "both"
+                  and ("127.0.0.1" in (r.get("source") or "")
+                       or "localhost" in (r.get("source") or ""))), None)
+    local_layer = layers.get(local["name"]) if local else None
+    if local is None or local_layer is None:
+        for check_id in ("matrix:cache pool-hit", "matrix:cache rebuild-flag",
+                         "matrix:cache clear"):
+            results.add("mx", check_id, "cache drill", FAIL,
+                        "no offline local-fixture row is loaded to drill against")
+    else:
+        scratch = scratch_root / "mx_cache"
+        scratch.mkdir(parents=True, exist_ok=True)
+        try:
+            with Pipeline(scratch, keep) as pipe:
+                _cache_drills(local, local_layer, plugin, pipe, manifest,
+                              results, timeout)
+        except Exception as exc:
+            for check_id in ("matrix:cache pool-hit", "matrix:cache rebuild-flag",
+                             "matrix:cache clear"):
+                if ("mx", check_id) not in results.executed:
+                    results.add("mx", check_id, "cache drill", FAIL,
+                                f"{type(exc).__name__}: {_shorten(str(exc), 140)}")
+
+    # -- the scripted P2P surface -----------------------------------------
+    check_id = "matrix:processing p2p"
+    if ref_layer is None:
+        results.add("mx", check_id, "the P2P algorithm runs end to end", FAIL,
+                    "the reference row is not in the project")
+    else:
+        scratch = scratch_root / "mx_proc_p2p"
+        scratch.mkdir(parents=True, exist_ok=True)
+        try:
+            with Pipeline(scratch, keep) as pipe:
+                _run_processing_p2p(ref_layer, lat, lon, 46.9200, 7.4370,
+                                    pipe.scratch / "out")
+                csvs = sorted((pipe.scratch / "out").rglob("*.csv"))
+                if not csvs:
+                    results.add("mx", check_id,
+                                "the P2P algorithm runs end to end", FAIL,
+                                "processing.run returned without writing a "
+                                "result CSV")
+                else:
+                    excess, detail = _excess_loss_db(
+                        str(csvs[0]), (lat, lon), (46.9200, 7.4370),
+                        freq_mhz=433.0)
+                    ok = excess is not None
+                    results.add("mx", check_id,
+                                "the P2P algorithm runs end to end",
+                                PASS if ok else FAIL,
+                                detail if ok else
+                                f"the result CSV is not the contract's: {detail}")
+        except Exception as exc:
+            results.add("mx", check_id, "the P2P algorithm runs end to end",
+                        FAIL, f"{type(exc).__name__}: {_shorten(str(exc), 200)}")
+
+
+def _cache_drills(row, layer, plugin, pipe: "Pipeline", manifest,
+                  results: Results, timeout: int) -> None:
+    """Pool hit, targeted `.rebuild` refetch, Clear cache — offline, real.
+
+    Three runs of the same job against the local fixture: the second must
+    re-download nothing (checklist 9.1), a `.rebuild` flag must refetch
+    exactly its tile (9.2), and the plugin's own Clear cache must leave
+    nothing behind (0.4).
+    """
+    adapter = plugin["adapter"]
+    resolution = int(row.get("pipeline_res_m") or 30)
+    range_km = int(row.get("pipeline_range_km") or 3)
+    lat, lon = _probe_for(row, manifest)
+
+    def run_once(name):
+        params = _coverage_params(plugin, lat, lon, resolution, range_km, name)
+        tap = _MessageLogTap()
+        with tap:
+            state = _sa_analyse("mx", layer, plugin, pipe.scratch / name,
+                                [(params, name)], timeout * 3)
+        return state, tap
+
+    def pool_tiles():
+        root = Path(adapter.get_cache_dir()) / adapter._POOL_DIRNAME
+        return {str(p): os.stat(p).st_mtime_ns
+                for p in sorted(root.rglob("*.abt"))}
+
+    first, _tap = run_once("seed")
+    before = pool_tiles()
+    if not first["ok"] or not before:
+        results.add("mx", "matrix:cache pool-hit",
+                    "a second identical run is a pool hit", FAIL,
+                    "the seeding run failed or pooled nothing: "
+                    + _tail(" ".join((first["err"] or "").split()), 150))
+    else:
+        second, tap = run_once("hit")
+        after = pool_tiles()
+        touched = [Path(p).name for p, stamp in before.items()
+                   if after.get(p) != stamp]
+        hit_logged = "HIT" in tap.text()
+        ok = bool(second["ok"]) and not touched and hit_logged
+        results.add("mx", "matrix:cache pool-hit",
+                    "a second identical run is a pool hit",
+                    PASS if ok else FAIL,
+                    f"{len(before)} pool tile(s) untouched, HIT logged" if ok else
+                    ("; ".join(filter(None, [
+                        None if second["ok"] else "the second run failed",
+                        f"re-downloaded {touched[:3]}" if touched else None,
+                        None if hit_logged else "no HIT line in the terrain log"]))))
+
+    # -- targeted rebuild --------------------------------------------------
+    tiles = pool_tiles()
+    if not tiles:
+        results.add("mx", "matrix:cache rebuild-flag",
+                    "a .rebuild flag refetches exactly its tile", FAIL,
+                    "no pool tile to flag")
+    else:
+        victim = sorted(tiles)[0]
+        open(victim + adapter._REBUILD_SUFFIX, "w").close()
+        third, _tap = run_once("rebuild")
+        after = pool_tiles()
+        rebuilt = [Path(p).name for p, stamp in tiles.items()
+                   if after.get(p) != stamp]
+        flag_cleared = not os.path.exists(victim + adapter._REBUILD_SUFFIX)
+        ok = (bool(third["ok"]) and rebuilt == [Path(victim).name]
+              and flag_cleared)
+        results.add("mx", "matrix:cache rebuild-flag",
+                    "a .rebuild flag refetches exactly its tile",
+                    PASS if ok else FAIL,
+                    f"{Path(victim).name} refetched alone, flag cleared" if ok else
+                    ("; ".join(filter(None, [
+                        None if third["ok"] else "the run failed",
+                        f"rebuilt {rebuilt[:3]} (wanted exactly "
+                        f"[{Path(victim).name}])"
+                        if rebuilt != [Path(victim).name] else None,
+                        None if flag_cleared else "the flag is still set"]))))
+
+    # -- the plugin's own Clear cache --------------------------------------
+    adapter.clear_cache()
+    left = [str(p) for p in Path(pipe.cache).rglob("*.abt")]
+    results.add("mx", "matrix:cache clear",
+                "Clear cache leaves no tile behind",
+                PASS if not left else FAIL,
+                "pool and views empty" if not left else
+                f"{len(left)} .abt file(s) survived (first: {Path(left[0]).name})")
+
+
+def _tier_folder_cases(manifest, results: Results, plugin,
+                       scratch_root: Path, timeout: int, keep: bool) -> None:
+    """The Map Converter's FOLDER input, case by case, from the manifest.
+
+    Checklist Phase 3, automated: each case builds the exact `_LayerEntry`
+    the GUI's Add Folder handler builds (same scanner, same CRS detection,
+    same fallbacks) and drives the shipped resolve + worker. Good folders
+    prove their ground by probe; broken ones must refuse naming the file
+    and the cause the catalogue quotes.
+    """
+    adapter = plugin["adapter"]
+    mc = plugin["mc"]
+    out_dir = Path(manifest["__manifest_dir__"])
+    probe = manifest.get("elevation_probe") or {}
+
+    for case in manifest.get("folder_cases") or []:
+        cid = case.get("id", "?")
+        check_id = f"folder:{cid}"
+        label = f"folder input: {cid}"
+        scratch = scratch_root / ("folder_" + re.sub(r"[^a-z0-9]+", "_", cid.lower()))
+        scratch.mkdir(parents=True, exist_ok=True)
+        try:
+            with Pipeline(scratch, keep) as pipe:
+                _run_folder_case(case, cid, check_id, label, plugin, adapter,
+                                 mc, out_dir, probe, pipe, results, timeout)
+        except Exception as exc:
+            results.add("folder", check_id, label, FAIL,
+                        f"the check itself raised {type(exc).__name__}: "
+                        f"{_shorten(str(exc), 160)}")
+
+
+def _run_folder_case(case, cid, check_id, label, plugin, adapter, mc, out_dir,
+                     probe, pipe: "Pipeline", results: Results,
+                     timeout: int) -> None:
+    if case.get("path") is None:
+        folder = str(pipe.scratch / "empty_folder")
+        os.makedirs(folder, exist_ok=True)
+    else:
+        folder = str(out_dir / case["path"])
+    if not os.path.isdir(folder):
+        results.add("folder", check_id, label, FAIL,
+                    f"the fixture folder is missing: {folder} — run "
+                    f"--stages fabricate")
+        return
+
+    if case.get("scanner_excludes"):
+        listed = {os.path.basename(p)
+                  for p in adapter.list_terrain_files(folder)}
+        if case["scanner_excludes"] in listed:
+            results.add("folder", check_id, label, FAIL,
+                        f"the shared scanner listed {case['scanner_excludes']} "
+                        f"— a {Path(case['scanner_excludes']).suffix} file in "
+                        f"a terrain folder must be ignored")
+            return
+
+    # The entry the GUI's Add Folder builds, via the tab's own helpers.
+    try:
+        crs_id = mc._detect_folder_crs(folder)
+    except Exception:  # noqa: BLE001 — a broken fixture must reach the worker
+        crs_id = None
+    crs_id = crs_id or case.get("ask_crs") or ""
+    try:
+        native = mc._detect_folder_resolution(folder)
+    except Exception:  # noqa: BLE001
+        native = None
+    resolution = int(case.get("res_m") or 30)
+    range_km = int(case.get("range_km") or 3)
+    if case.get("center"):
+        lat, lon = float(case["center"][0]), float(case["center"][1])
+    else:
+        lat = float(probe.get("lat", 46.945))
+        lon = float(probe.get("lon", 7.41))
+    bbox = adapter.analysis_bbox(lat, lon, range_km)
+    entry = mc._LayerEntry(layer_type="raster", source_path=folder,
+                           crs_authid=crs_id, native_res_m=native,
+                           target_resolutions=[resolution], extent=dict(bbox))
+    try:
+        state = _mc_run_entries([entry], plugin, pipe.scratch / "out",
+                                [resolution], timeout * 3)
+    except RuntimeError as exc:
+        state = {"ok": None, "err": str(exc), "log": [], "tiles": []}
+    said = _worker_complaint(state)
+
+    if case.get("expect") == "error":
+        if state["ok"] is not None:
+            results.add("folder", check_id, label, FAIL,
+                        f"it converted {len(state['tiles'])} tile(s) from a "
+                        f"folder the catalogue says must be refused "
+                        f"({case.get('note', '')})")
+            return
+        if _is_synthesized(said):
+            results.add("folder", check_id, label, FAIL,
+                        f"the runner's own timeout is not a refusal: "
+                        f"{_shorten(said, 110)}")
+            return
+        low = said.lower()
+        missing = [m for m in (case.get("must_name") or [])
+                   if str(m).lower() not in low]
+        results.add("folder", check_id, label,
+                    FAIL if missing else PASS,
+                    (f"refused without naming {missing}: {_shorten(said, 100)}"
+                     if missing else _shorten(said, 130)))
+        return
+
+    if state["ok"] is None:
+        results.add("folder", check_id, label, FAIL, _tail(said, 220))
+        return
+    report = abt_report(state["tiles"], plugin)
+    if "unreadable" in report or not report.get("real_px"):
+        results.add("folder", check_id, label, FAIL,
+                    "the run produced tiles with no real sample")
+        return
+    problems = []
+    band = case.get("elev_m") or []
+    for probe_pt in case.get("probes") or []:
+        at = abt_at(report["grids"], float(probe_pt[0]), float(probe_pt[1]),
+                    plugin)
+        if at is None or at <= plugin["abt"].MIN_VALID_ELEV_M:
+            problems.append(f"probe {probe_pt} is "
+                            f"{'outside the tiles' if at is None else 'VOID'}")
+        elif len(band) == 2 and not (float(band[0]) <= at <= float(band[1])):
+            problems.append(f"{at:,.1f} m at {probe_pt}, outside "
+                            f"{band[0]:,.0f}..{band[1]:,.0f} m")
+
+    detail = (f"{report['real_px']:,}/{report['total_px']:,} real, "
+              f"{report.get('min_m', 0):,.1f}..{report.get('max_m', 0):,.1f} m")
+    if case.get("winner"):
+        # The overlap contract, by measurement: a second folder holding ONLY
+        # the winner must produce the same probe elevation.
+        solo_dir = pipe.scratch / "winner_only"
+        solo_dir.mkdir(parents=True, exist_ok=True)
+        source_file = os.path.join(folder, case["winner"])
+        shutil.copy2(source_file, solo_dir / case["winner"])
+        solo_entry = mc._LayerEntry(layer_type="raster",
+                                    source_path=str(solo_dir),
+                                    crs_authid=crs_id, native_res_m=native,
+                                    target_resolutions=[resolution],
+                                    extent=dict(bbox))
+        solo = _mc_run_entries([solo_entry], plugin, pipe.scratch / "solo_out",
+                               [resolution], timeout * 3)
+        if solo["ok"] is None:
+            problems.append("the winner-only reference run failed, so "
+                            "priority was never measured")
+        else:
+            solo_report = abt_report(solo["tiles"], plugin)
+            pt = (case.get("probes") or [[probe.get("lat", 46.945),
+                                          probe.get("lon", 7.41)]])[0]
+            folder_at = abt_at(report["grids"], float(pt[0]), float(pt[1]),
+                               plugin)
+            winner_at = abt_at(solo_report.get("grids", []), float(pt[0]),
+                               float(pt[1]), plugin)
+            delta = float(case.get("loser_delta_m") or 50.0)
+            if folder_at is None or winner_at is None:
+                problems.append("the priority probe fell outside a tile")
+            elif abs(folder_at - winner_at) > 0.5:
+                problems.append(
+                    f"the folder reads {folder_at:,.1f} m where "
+                    f"{case['winner']} alone reads {winner_at:,.1f} m — "
+                    + (f"the LOSER won (delta ~{delta:,.0f} m)"
+                       if abs(abs(folder_at - winner_at) - delta) <= 2.0
+                       else "priority is broken"))
+            else:
+                detail += f"; {case['winner']} won at the probe"
+    results.add("folder", check_id, label, FAIL if problems else PASS,
+                ("; ".join(problems) if problems else detail))
+
+
+def _tier_res_sweep(manifest, results: Results, layers, plugin,
+                    scratch_root: Path, timeout: int, keep: bool) -> None:
+    """One REAL conversion per catalogue resolution — checklist Phase 7.
+
+    Every per-row pipeline runs at one canonical resolution; this is where
+    2/5/10/30/90/250 m each produce actual tiles, checked the cheapest,
+    hardest way there is: tile names against the plugin's own enumeration
+    and file sizes byte-exact against the manifest's ladder.
+    """
+    picked = _pick_roles(manifest)
+    dem_row = picked.get("dem")
+    dem_layer = layers.get(dem_row["name"]) if dem_row else None
+    probe = manifest.get("elevation_probe") or {}
+    lat, lon = float(probe.get("lat", 46.945)), float(probe.get("lon", 7.41))
+    adapter = plugin["adapter"]
+    mc = plugin["mc"]
+
+    for res in manifest.get("resolutions") or []:
+        res = int(res)
+        check_id = f"sweep:{res}m"
+        label = f"a real conversion at {res} m"
+        if dem_row is None or dem_layer is None:
+            results.add("sweep", check_id, label, FAIL,
+                        "the catalogue has no loadable full-coverage local DEM")
+            continue
+        scratch = scratch_root / f"sweep_{res}m"
+        scratch.mkdir(parents=True, exist_ok=True)
+        try:
+            with Pipeline(scratch, keep) as pipe:
+                bbox = adapter.analysis_bbox(lat, lon, 1)
+                state = _mc_convert([(dem_row, dem_layer)], plugin,
+                                    pipe.scratch / "out", [res], timeout * 3,
+                                    bbox=bbox)
+                if state["ok"] is None:
+                    results.add("sweep", check_id, label, FAIL,
+                                _tail(_worker_complaint(state), 200))
+                    continue
+                expected = {t["filename"] for _r, t in mc._enumerate_tiles(
+                    mc._snap_bbox(bbox, [res]), [res])}
+                got = {Path(t).name for t in state["tiles"]}
+                if got != expected:
+                    results.add("sweep", check_id, label, FAIL,
+                                f"produced {sorted(got)[:3]} vs the plugin's "
+                                f"own enumeration {sorted(expected)[:3]}")
+                    continue
+                wanted_bytes = (manifest.get("tile_bytes") or {}).get(str(res))
+                wrong = [Path(p).name for p in state["tiles"]
+                         if wanted_bytes and
+                         os.path.getsize(p) != int(wanted_bytes)]
+                if not wanted_bytes:
+                    results.add("sweep", check_id, label, FAIL,
+                                f"the catalogue's tile_bytes table has no "
+                                f"entry for {res} m")
+                    continue
+                if wrong:
+                    results.add("sweep", check_id, label, FAIL,
+                                f"{wrong[:3]} are not exactly "
+                                f"{int(wanted_bytes):,} B")
+                    continue
+                report = abt_report(state["tiles"], plugin)
+                at = abt_at(report.get("grids", []), lat, lon, plugin)
+                problems = []
+                if not report.get("real_px"):
+                    problems.append("every sample is VOID")
+                elif report["min_m"] == report["max_m"]:
+                    problems.append(f"every real sample is "
+                                    f"{report['min_m']:,.1f} m — constant")
+                if at is None or at <= plugin["abt"].MIN_VALID_ELEV_M:
+                    problems.append("the probe pixel is void or outside")
+                results.add("sweep", check_id, label,
+                            FAIL if problems else PASS,
+                            "; ".join(problems) if problems else
+                            f"{len(got)} tile(s), byte-exact at "
+                            f"{int(wanted_bytes):,} B, "
+                            f"{report['min_m']:,.1f}..{report['max_m']:,.1f} m, "
+                            f"{at:,.1f} m at the probe")
+        except Exception as exc:
+            results.add("sweep", check_id, label, FAIL,
+                        f"the check itself raised {type(exc).__name__}: "
+                        f"{_shorten(str(exc), 160)}")
 
 
 def _build_reference(manifest, results: Results, layers, plugin,
@@ -3797,10 +4950,24 @@ def tier_pipeline(manifest: Dict[str, Any], results: Results, only: Sequence[str
     results.plan("-", "reference.terrain")
     for row in rows:
         _plan_pipeline_row(row, manifest, results, plugin)
-    for combo in _COMBINATIONS:
-        results.plan("mc", f"mc:{combo['name']}")
-    for case in _MATRIX_CASES:
-        results.plan("mx", case)
+    # The case tiers — stacks, matrix, folder inputs, the resolution sweep —
+    # are not row-addressable, so a --rows debug run skips them entirely
+    # (planned nothing, ran nothing, said so; the report is PARTIAL anyway)
+    # instead of dragging an hour of unrelated cases into every repro.
+    run_cases = not only
+    if run_cases:
+        for combo in _COMBINATIONS:
+            results.plan("mc", f"mc:{combo['name']}")
+        for case in _MATRIX_CASES:
+            results.plan("mx", case)
+        for case in manifest.get("folder_cases") or []:
+            results.plan("folder", f"folder:{case.get('id', '?')}")
+        for res in manifest.get("resolutions") or []:
+            results.plan("sweep", f"sweep:{int(res)}m")
+    else:
+        results.note(f"--rows {','.join(only)} selects catalogue rows only — "
+                     f"the case tiers (stacks, matrix, folder, sweep) are "
+                     f"skipped; run without --rows for the full set")
 
     binaries = {}
     already = ("-", "engine.present") in results.executed
@@ -3841,10 +5008,42 @@ def tier_pipeline(manifest: Dict[str, Any], results: Results, only: Sequence[str
                 results.add(row["row"], "pipeline.crashed",
                             "the row's pipeline ran to completion", FAIL,
                             f"the check itself raised {type(exc).__name__}: {exc}")
-        _tier_pipeline_combinations(manifest, results, layers, plugin,
-                                    scratch_root, timeout, keep)
-        _tier_matrix_cases(manifest, results, layers, plugin, scratch_root,
-                           timeout, keep)
+            # The boundary scenarios, each in its OWN cache: an overrun that
+            # shared the row's pool would report the canonical run's tiles as
+            # its own, and vice versa.
+            for scenario in row.get("overrun") or []:
+                sid = str(scenario.get("id", "?"))
+                layer = layers.get(row["name"])
+                if layer is None:
+                    results.add(row["row"], f"overrun:{sid}.run",
+                                "the over-the-box run completes", FAIL,
+                                "the layer is not in the project")
+                    continue
+                ovr_scratch = scratch_root / (
+                    row["row"].replace(".", "_") + "_ovr_" +
+                    re.sub(r"[^a-z0-9]+", "_", sid.lower()))
+                ovr_scratch.mkdir(parents=True, exist_ok=True)
+                try:
+                    with Pipeline(ovr_scratch, keep) as pipe:
+                        _pipeline_overrun_scenario(row, scenario, layer, plugin,
+                                                   pipe, manifest, results,
+                                                   timeout)
+                except Exception as exc:
+                    results.add(row["row"], f"overrun:{sid}.run",
+                                "the over-the-box run completes", FAIL,
+                                f"the check itself raised "
+                                f"{type(exc).__name__}: {exc}")
+        if run_cases:
+            _tier_pipeline_combinations(manifest, results, layers, plugin,
+                                        scratch_root, timeout, keep)
+            _tier_matrix_cases(manifest, results, layers, plugin, scratch_root,
+                               timeout, keep)
+            _tier_matrix_extra(manifest, results, layers, plugin, scratch_root,
+                               timeout, keep)
+            _tier_folder_cases(manifest, results, plugin, scratch_root,
+                               timeout, keep)
+            _tier_res_sweep(manifest, results, layers, plugin, scratch_root,
+                            timeout, keep)
     finally:
         if keep:
             results.note(f"pipeline scratch kept at {scratch_root}")

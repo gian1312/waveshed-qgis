@@ -80,6 +80,20 @@ Defined in `aether_converter/src/ingest.rs` (contract v2.0):
 - `void_fill_m` is optional: pixels no source covers are written as this
   elevation instead of the VOID sentinel. Site Analysis passes `0.0`
   (0 m ground outside the DEM); the Map Converter tab omits it (VOID kept).
+- **No-data contract (2026-08-31, CONTRACT items 17/18): ground a source has
+  no data for degrades to sea, loudly — never an error.** Download: HTTP 404
+  is "no tile here" (own error class + `[Stats] NO-DATA (HTTP 404):` line),
+  excluded from the majority-fatal rule — a run over or past a bounded
+  source's edge exits 0 with voids there; only real failures
+  (timeout/connect/403/429/5xx/decode) can majority-abort. Ingest: a batch
+  with zero covered pixels exits 0 with `[Warn] NO-DATA batch:` instead of
+  bailing. Plugin side: an all-404 miss set is a COMPLETE download (no
+  rebuild flags), `_warn_no_data_tiles`/`_warn_if_bbox_exceeds_bounds` (and
+  the rendered-layer extent check) tell the user "assumed 0 m (sea level)",
+  and `_sync_view` fills pool-tile voids to 0 m in the Site Analysis VIEW
+  only — the pool keeps VOID for the Map Converter, whose output keeps VOID
+  by contract. The torture suite's `overrun:` checks pin all of this per
+  acquisition route.
 - `base_tif` / `swiss_tifs` are DEPRECATED aliases still accepted by the
   converter for older callers; the plugin no longer emits them, and emitting
   them alongside `sources` is an error.

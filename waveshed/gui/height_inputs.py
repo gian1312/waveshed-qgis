@@ -23,12 +23,14 @@ from __future__ import annotations
 
 from typing import Any
 
-from ..core.job_builder import MIN_ANTENNA_AGL_M
+from ..core.job_builder import MIN_ANTENNA_AGL_M, MIN_ANTENNA_AMSL_M
 
-#: Lowest AMSL elevation any height spinbox accepts. The Dead Sea shore, the
-#: lowest exposed land on Earth, is about -430 m; -500 m clears it with room to
-#: spare while still rejecting a value typed by accident.
-MIN_AMSL_M = -500.0
+#: Lowest AMSL elevation any height spinbox accepts — the SAME constant
+#: ``height_floor_error`` gates the spinbox-less paths (batch CSVs, the
+#: Processing algorithms) with, so the dialog and the gate can never drift.
+#: A local -500.0 here drifted exactly that way: the gate had no AMSL floor
+#: at all, and -501 m sailed through every non-GUI path.
+MIN_AMSL_M = MIN_ANTENNA_AMSL_M
 
 
 def bind_height_mode(spin: Any, combo: Any) -> None:

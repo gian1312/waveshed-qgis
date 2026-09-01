@@ -723,6 +723,20 @@ def stage_fabricate(cfg: Cfg, force: bool = False) -> None:
         ds = None
     REPORT.ok("broken/broken_nogt.tif (folder input -> hard error, no filename georeferencing)")
 
+    # One broken file per folder, so each folder case fails on ITS defect: the
+    # scanner sorts, and three broken files in dem/broken/ meant every run
+    # died on broken_nocrs.tif first and the other two contracts never fired.
+    # The originals stay in dem/broken/ (the checklist's mixed-folder drill).
+    for sub, source_file in (("nocrs", nocrs), ("nogt", nogt),
+                             ("truncated", truncated)):
+        iso = out / "dem" / "broken_isolated" / sub
+        iso.mkdir(parents=True, exist_ok=True)
+        target = iso / source_file.name
+        if fresh(target) and source_file.is_file():
+            shutil.copy2(source_file, target)
+    REPORT.ok("broken_isolated/{nocrs,nogt,truncated}/ (one broken file per "
+              "folder — each folder case fails on its own defect)")
+
     # --- swissALTIRegio LV95 tiles -----------------------------------------
     _swiss_tiles(cfg, fresh)
 
@@ -744,6 +758,18 @@ def stage_fabricate(cfg: Cfg, force: bool = False) -> None:
             ds.FlushCache()
             ds = None
         REPORT.ok(f"mosaic.vrt (over {len(swiss_tifs)} LV95 tiles — layer only, never scanned in a folder)")
+
+        # The folder that PROVES the "never scanned" half: a .vrt dropped next
+        # to a real tile. The scanner must use the tile and ignore the .vrt
+        # (whose member paths may not even resolve from here — irrelevant,
+        # because nothing may open it).
+        vrt_folder = out / "dem" / "vrt_in_folder"
+        vrt_folder.mkdir(parents=True, exist_ok=True)
+        if fresh(vrt_folder / swiss_tifs[0].name):
+            shutil.copy2(swiss_tifs[0], vrt_folder / swiss_tifs[0].name)
+        if fresh(vrt_folder / "mosaic.vrt") and vrt.is_file():
+            shutil.copy2(vrt, vrt_folder / "mosaic.vrt")
+        REPORT.ok("vrt_in_folder/ (one LV95 tile + mosaic.vrt — the .vrt must be ignored)")
     else:
         REPORT.skip("mixed_crs/ and mosaic.vrt", "no swissALTIRegio tiles converted")
 
@@ -1051,6 +1077,95 @@ def matrix_probes() -> Dict[str, List[float]]:
             for prefix, row in MATRIX_GROUND.items()
             if case["name"].startswith(prefix)}
 
+#: Map Converter FOLDER-input cases (guide §3 / checklist Phase 3) — the whole
+#: folder-scanner surface, driven by the torture runner through the shipped
+#: worker with exactly the entry the GUI's Add Folder builds. ``path`` is
+#: relative to the torture folder (None = an empty folder the runner makes
+#: fresh in its scratch); ``expect`` is "ok" (probes must be REAL ground in
+#: ``elev_m``) or "error" (the run must fail naming every ``must_name``
+#: substring). ``center``/``res_m``/``range_km`` place the conversion; the
+#: default ground is the Bern probe. ``winner``/``loser_delta_m`` make the
+#: overlap case a measurement (folder equals a solo run of the winner, not
+#: winner+delta); ``scanner_excludes`` asserts the shared scanner leaves the
+#: named file out; ``ask_crs`` is the answer a user would type into the CRS
+#: prompt when the folder carries none (the entry-level fallback).
+FOLDER_CASES: Sequence[Dict[str, Any]] = (
+    {"id": "swiss-folder", "path": "dem/swiss", "expect": "ok",
+     "res_m": 30, "range_km": 3,
+     "probes": [[46.93, 7.30], [46.93, 7.45]], "elev_m": [200.0, 2600.0],
+     "note": "all four LV95 tiles found (recursive, sorted); the probes sit "
+             "either side of the tile seam and both must be real ground — "
+             "a seam offset or a dropped tile voids one of them"},
+    {"id": "mixed-crs", "path": "dem/mixed_crs", "expect": "ok",
+     "res_m": 30, "range_km": 3,
+     "probes": [[46.88, 7.22], [46.93, 7.30]], "elev_m": [200.0, 2600.0],
+     "note": "an LV95 tile and a WGS84 tile in ONE folder: each file read in "
+             "its own CRS (per-file GeoKeys beat the folder guess). One probe "
+             "only the WGS84 halo covers, one under the LV95 tile — both "
+             "real, both plausible, nothing offset by kilometres"},
+    {"id": "overlap-priority", "path": "dem/overlap", "expect": "ok",
+     "res_m": 30, "range_km": 3,
+     "probes": [[PROBE_LAT, PROBE_LON]], "elev_m": [200.0, 2600.0],
+     "winner": "a_base.tif", "loser_delta_m": 50.0,
+     "note": "alphabetically-first wins, identically on every machine: the "
+             "folder's probe equals a solo run of a_base.tif, and is ~50 m "
+             "away from b_base_plus50's value"},
+    {"id": "nested-recursion", "path": "dem/nested", "expect": "ok",
+     "res_m": 30, "range_km": 3,
+     "probes": [[46.93, 7.38], [46.93, 7.44]], "elev_m": [200.0, 2600.0],
+     "note": "west half at the top level, east half in sub/: the scanner is "
+             "recursive and sorted, so a probe in each half must be real"},
+    {"id": "vrt-ignored", "path": "dem/vrt_in_folder", "expect": "ok",
+     "res_m": 30, "range_km": 3,
+     "probes": [[46.93, 7.30]], "elev_m": [200.0, 2600.0],
+     "scanner_excludes": "mosaic.vrt",
+     "note": "a .vrt dropped into a terrain folder is never scanned (row 2.9 "
+             "proves the same file works as a LAYER); the tile beside it is"},
+    {"id": "broken-nocrs", "path": "dem/broken_isolated/nocrs",
+     "expect": "error", "res_m": 30, "range_km": 3,
+     "must_name": ["broken_nocrs.tif", "crs"],
+     "note": "a raster whose projection was stripped: GDAL leaves a LOCAL_CS "
+             "husk QGIS calls 'valid', so the refusal is the CONVERTER's "
+             "GeoKey rule — a hard error naming the file and saying to add "
+             "\"crs\", exactly the contract the fixture documents. (As a "
+             "QGIS layer this cannot fire: QGIS supplies the project CRS; a "
+             "user-typed folder CRS legitimately fills it in.)"},
+    {"id": "broken-nogt", "path": "dem/broken_isolated/nogt",
+     "expect": "error", "res_m": 30, "range_km": 3,
+     "must_name": ["broken_nogt.tif", "no georeferencing"],
+     "note": "no geotransform -> hard error naming the file; filename-derived "
+             "georeferencing was deliberately removed"},
+    {"id": "truncated-tif", "path": "dem/broken_isolated/truncated",
+     "expect": "error", "res_m": 30, "range_km": 3,
+     "must_name": ["truncated.tif"],
+     "note": "40% of a GeoTIFF: the run fails loudly naming the file — never "
+             "skipped, never counted as covered"},
+    {"id": "feet-folder", "path": "dem/" + FOREIGN_CRS_DIR, "expect": "ok",
+     "res_m": 30, "range_km": 3, "center": [34.10, -118.35],
+     "probes": [[34.10, -118.35]], "elev_m": [20.0, 1200.0],
+     "note": "EPSG:2229 (US survey feet) through the folder input over the "
+             "Los Angeles box: +units honored end-to-end — a 3.28 unit slip "
+             "moves the geotransform and voids or implausibles the probe. "
+             "The Krovak file beside it is bounds-filtered out"},
+    {"id": "krovak-folder", "path": "dem/" + FOREIGN_CRS_DIR,
+     "expect": "error", "res_m": 30, "range_km": 3, "center": [50.10, 14.45],
+     "must_name": ["5514"],
+     "note": "EPSG:5514 (Krovak) over the Prague box: unsupported by proj4rs, "
+             "so ingest must hard-error naming the CRS before any tile is "
+             "written — the feet file beside it is bounds-filtered out"},
+    {"id": "unsupported-only", "path": "dem/variants/ignored_formats",
+     "expect": "error", "res_m": 30, "range_km": 3,
+     "must_name": ["No terrain files"],
+     "note": "a folder holding only .asc: the shared scanner refuses the "
+             "extension and the worker errors instead of converting nothing "
+             "(row 2.26 proves the very same file converts as a LAYER)"},
+    {"id": "empty-folder", "path": None, "expect": "error",
+     "res_m": 30, "range_km": 3,
+     "must_name": ["No terrain files"],
+     "note": "an empty folder, made fresh by the runner: the same loud "
+             "refusal, never a silent all-void conversion"},
+)
+
 SITES: Sequence[Dict[str, Any]] = (
     {"name": "Bern TX", "lat": 46.9481, "lon": 7.4474, "height_m": 30.0, "mode": "AGL",
      "note": "Primary transmitter for the reference AOI."},
@@ -1066,10 +1181,18 @@ SITES: Sequence[Dict[str, Any]] = (
      "note": "Antimeridian."},
 )
 
+#: ``expect_obstructed`` is the link's REASON FOR EXISTING, stated where the
+#: torture runner can assert it: the obstructed link must show materially more
+#: excess path loss (loss minus free-space at the same distance/frequency)
+#: than the clear one. None = no verdict declared (the Dead Sea link tests
+#: negative AMSL, not obstruction).
 P2P_LINKS: Sequence[Dict[str, Any]] = (
-    {"name": "Bern -> Thun (obstructed)", "a": (7.4474, 46.9481), "b": (7.6280, 46.7580)},
-    {"name": "Bern -> Gurten (clear)", "a": (7.4474, 46.9481), "b": (7.4370, 46.9200)},
-    {"name": "Dead Sea -> Masada (negative AMSL)", "a": (35.5000, 31.5000), "b": (35.3536, 31.3156)},
+    {"name": "Bern -> Thun (obstructed)", "a": (7.4474, 46.9481), "b": (7.6280, 46.7580),
+     "expect_obstructed": True},
+    {"name": "Bern -> Gurten (clear)", "a": (7.4474, 46.9481), "b": (7.4370, 46.9200),
+     "expect_obstructed": False},
+    {"name": "Dead Sea -> Masada (negative AMSL)", "a": (35.5000, 31.5000), "b": (35.3536, 31.3156),
+     "expect_obstructed": None},
 )
 
 
@@ -1102,7 +1225,8 @@ def stage_vectors(cfg: Cfg, force: bool = False) -> None:
 
     feats = [{
         "type": "Feature",
-        "properties": {"name": lk["name"]},
+        "properties": {"name": lk["name"],
+                       "expect_obstructed": lk.get("expect_obstructed")},
         "geometry": {"type": "LineString", "coordinates": [list(lk["a"]), list(lk["b"])]},
     } for lk in P2P_LINKS]
     (vdir / "p2p_links.geojson").write_text(json.dumps(
@@ -1112,38 +1236,54 @@ def stage_vectors(cfg: Cfg, force: bool = False) -> None:
     _batch_csvs(cfg)
 
 
-def _batch_csvs(cfg: Cfg) -> None:
-    """The BATCH_P2P drills of guide §6 — one file per expected outcome.
+#: The BATCH_P2P drills of guide §6 — content and expectation in ONE table, so
+#: the CSV a file holds and what the manifest says about it cannot disagree.
+#: ``expect`` is "accept" (the parser takes it; the torture runner also runs
+#: the file through the real ``_P2PWorker``) or "reject" (the parser must
+#: refuse it, naming ``line`` and containing ``must_name``, per the checklist's
+#: quoted contract text). The parser is ``p2p_tab._parse_batch_csv``: 6 fields,
+#: ``S``/``R``, lat, lon, altitude, ``AGL``/``AMSL``, rejects by line number —
+#: each rejection case is its own file with the bad row on a known line.
+_BATCH_HEADER = "# type,id,lat,lon,altitude_m,mode\n"
+BATCH_CASES: Sequence[Dict[str, Any]] = (
+    {"file": "batch_ok.csv", "expect": "accept",
+     "content": (_BATCH_HEADER +
+                 "S,bern_tx,46.9481,7.4474,30.0,AGL\n"
+                 "R,thun_rx,46.7580,7.6280,10.0,AGL\n"
+                 "R,gurten_rx,46.9200,7.4370,5.0,AGL\n"),
+     "expect_rows": 3},
+    {"file": "batch_amsl_negative_ok.csv", "expect": "accept",
+     "content": (_BATCH_HEADER +
+                 "S,dead_sea_tx,31.5000,35.5000,-430.0,AMSL\n"
+                 "R,masada_rx,31.3156,35.3536,-380.0,AMSL\n"),
+     "expect_rows": 2},
+    {"file": "batch_reject_agl_half_metre.csv", "expect": "reject",
+     "content": (_BATCH_HEADER +
+                 "S,bern_tx,46.9481,7.4474,30.0,AGL\n"
+                 "R,too_low,46.7580,7.6280,0.5,AGL\n"),
+     "line": 3, "must_name": "1.0"},
+    {"file": "batch_reject_non_numeric.csv", "expect": "reject",
+     "content": (_BATCH_HEADER +
+                 "S,bern_tx,46.9481,7.4474,30.0,AGL\n"
+                 "R,bad_alt,46.7580,7.6280,thirty,AGL\n"),
+     "line": 3, "must_name": "thirty"},
+    {"file": "batch_reject_bad_mode.csv", "expect": "reject",
+     "content": (_BATCH_HEADER +
+                 "S,bern_tx,46.9481,7.4474,30.0,AGL\n"
+                 "R,bad_mode,46.7580,7.6280,10.0,ASL\n"),
+     "line": 3, "must_name": "ASL"},
+)
 
-    The parser (``p2p_tab._parse_batch_csv``) takes 6 fields, ``S``/``R``,
-    lat, lon, altitude, ``AGL``/``AMSL``, and rejects by line number — so each
-    rejection case is its own file with the bad row on a known line.
-    """
+
+def _batch_csvs(cfg: Cfg) -> None:
+    """Write the BATCH_P2P drill files from :data:`BATCH_CASES`."""
     bdir = cfg.out_dir / "batch"
     bdir.mkdir(parents=True, exist_ok=True)
-    header = "# type,id,lat,lon,altitude_m,mode\n"
-
-    files = {
-        "batch_ok.csv": (header +
-                         "S,bern_tx,46.9481,7.4474,30.0,AGL\n"
-                         "R,thun_rx,46.7580,7.6280,10.0,AGL\n"
-                         "R,gurten_rx,46.9200,7.4370,5.0,AGL\n"),
-        "batch_amsl_negative_ok.csv": (header +
-                                       "S,dead_sea_tx,31.5000,35.5000,-430.0,AMSL\n"
-                                       "R,masada_rx,31.3156,35.3536,-380.0,AMSL\n"),
-        "batch_reject_agl_half_metre.csv": (header +
-                                            "S,bern_tx,46.9481,7.4474,30.0,AGL\n"
-                                            "R,too_low,46.7580,7.6280,0.5,AGL\n"),
-        "batch_reject_non_numeric.csv": (header +
-                                         "S,bern_tx,46.9481,7.4474,30.0,AGL\n"
-                                         "R,bad_alt,46.7580,7.6280,thirty,AGL\n"),
-        "batch_reject_bad_mode.csv": (header +
-                                      "S,bern_tx,46.9481,7.4474,30.0,AGL\n"
-                                      "R,bad_mode,46.7580,7.6280,10.0,ASL\n"),
-    }
-    for name, text in files.items():
-        (bdir / name).write_text(text, encoding="utf-8")
-    REPORT.ok(f"batch/ ({len(files)} CSVs: 2 accepted, 3 rejected by line number)")
+    for case in BATCH_CASES:
+        (bdir / case["file"]).write_text(case["content"], encoding="utf-8")
+    accepted = sum(1 for c in BATCH_CASES if c["expect"] == "accept")
+    REPORT.ok(f"batch/ ({len(BATCH_CASES)} CSVs: {accepted} accepted, "
+              f"{len(BATCH_CASES) - accepted} rejected by line number)")
 
 
 # ---------------------------------------------------------------------------
@@ -1187,12 +1327,11 @@ class Layer:
     expect_renders: bool = True  # False for the rows that must draw nothing
     # The image format the service must actually serve, by magic bytes — not by
     # Content-Type and not by the URL's extension, because row 1.4's service
-    # answers WebP for a ".png" request. "" = do not check.
+    # answers WebP for a ".png" request. "" = do not check. Asserted by the
+    # torture runner's xyz.format check on the tile it fetches for
+    # expect_tile_px; a field no check reads is how a catalogue rots
+    # (expect_decode was exactly that, and was removed).
     expect_format: str = ""      # "png" | "webp" | "jpeg"
-    # Whether the toolkit's PNG-only tile decoder can read those bytes.
-    # Defaults to "ok" for png and "error" for anything else, so a row only
-    # spells it out when it means something surprising.
-    expect_decode: str = ""      # "ok" | "error"
     # Plausible ground at the manifest's elevation_probe, in metres, decoded
     # with the encoding THE PLUGIN resolves. This is what separates "the tiles
     # arrived" from "the terrain is real": a black tile, a flat-sea tile and a
@@ -1236,6 +1375,14 @@ class Layer:
     #: otherwise let sub-0.1% corruption hide inside the reference's own
     #: cliff error.
     expect_agrees_p999_m: float = 0.0
+    #: HOW the pipeline must acquire this row's terrain: "download" (the
+    #: shared Rust XYZ downloader), "sources" (local files handed to the
+    #: converter), "render" (per-tile QGIS export of a rendered server).
+    #: Derived from the row's source when left "" (see
+    #: calibrate_pipeline_expectations). The runner fails the row when the
+    #: plugin acquired terrain any other way: a fallback that still produced
+    #: terrain is a failed test, not a passed one.
+    expect_acquire: str = ""
     #: Minimum percentage of this row's pipeline-tile samples that must be
     #: REAL terrain (not VOID). Calibrated per fixture: a full-coverage
     #: source is ~100, a small Bern fixture over a 0.5-deg tile ~4. 0 = only
@@ -1253,6 +1400,16 @@ class Layer:
     #: Los Angeles, Prague) and a tile placed over the reference AOI would come
     #: back empty for three of them and be reported as a hole.
     footprint: Tuple[float, ...] = ()
+    #: Boundary ("run over the box") scenarios the pipeline tier must run for
+    #: this row — the first thing a user does that no on-data run can cover.
+    #: Each is a dict: {id, res_m, range_km, center: [lat, lon] | None (the
+    #: manifest probe), expect: "sea", warn: substring the terrain log must
+    #: carry, outside: [lat, lon] (ground the source does not cover — must
+    #: read 0 m in the Site Analysis view and VOID in Map Converter output),
+    #: inside: [lat, lon] | None (ground it does cover — must stay real),
+    #: note}. The 2026-08-31 contract: ground the source has no data for is
+    #: 0 m sea level (Site Analysis) / kept void (Map Converter), loudly.
+    overrun: Tuple[Dict[str, Any], ...] = ()
     known_fail: str = ""         # documented open finding: reported, does not fail a run
     #: Which checks that note actually covers. An unscoped known_fail used to
     #: turn ANY failure on the row into an expected one, so a note about the
@@ -1437,14 +1594,16 @@ def build_catalogue(cfg: Cfg) -> List[Layer]:
                                    "even for a .png request, so the extension cannot save you.)",
                             check="error", expect_class="dem", expect_encoding="mapbox",
                             expect_zmax=14,
-                            # The whole row: the bytes must BE WebP, and the
-                            # PNG-only toolkit decoder must refuse them. Qt
+                            # The whole row: the bytes must BE WebP (asserted
+                            # by xyz.format on the fetched tile), and the
+                            # PNG-only toolkit decoder must refuse them (the
+                            # must-fail pipeline + expect_failure below). Qt
                             # decodes WebP happily, so "the tiles arrived and
                             # the picture drew" was never evidence of anything.
                             # This goes red the day MapTiler starts serving PNG
                             # here (the row would no longer test a codec) or the
                             # day the toolkit learns WebP (update the row).
-                            expect_format="webp", expect_decode="error",
+                            expect_format="webp",
                             expect_service_zmax=14, expect_tile_px=512,
                             # The row's contract, verbatim: fail loudly NAMING
                             # THE DECODE ERROR. A generic "tiles could not be
@@ -1482,12 +1641,42 @@ def build_catalogue(cfg: Cfg) -> List[Layer]:
                             expect="Same decode path as 1.3a, deterministic and offline — the "
                                    "project serves it itself on open. No key, no internet. "
                                    "Blank outside the Bern box or outside z10-13: it is a "
-                                   "fixture, not a service. Widen it with terrain_rgb_zooms "
-                                   "in torture.local.ini.",
+                                   "fixture, not a service. A run reaching PAST the box must "
+                                   "still succeed: missing tiles are no-data — 0 m sea level "
+                                   "in Site Analysis, voids in the Map Converter — with a "
+                                   "loud warning, never a download error. Widen it with "
+                                   "terrain_rgb_zooms in torture.local.ini.",
                             expect_class="dem", expect_encoding="mapbox",
                             expect_format="png", expect_elev_m=PROBE_BAND,
                             expect_tile_px=256,
-                            pipeline_res_m=2, pipeline_range_km=1))
+                            pipeline_res_m=2, pipeline_range_km=1,
+                            # The first thing a user actually clicks: this very
+                            # row at 30 m (the checklist's own instruction),
+                            # whose 0.5-deg tile reaches far past the fixture.
+                            # The canonical 2 m pipeline above stays fully
+                            # inside the box on purpose; these two do not.
+                            # The outside probes sit beyond the fixture's z10
+                            # PARENT tiles too (those bleed to ~46.80 S), so
+                            # parent repair cannot turn them into terrain.
+                            overrun=(
+                                {"id": "tile-overrun", "res_m": 30, "range_km": 3,
+                                 "center": None, "expect": "sea",
+                                 "warn": "sea level",
+                                 "outside": [46.70, 7.20],
+                                 "inside": [PROBE_LAT, PROBE_LON],
+                                 "note": "the checklist's own '1.3b at 30 m' "
+                                         "step: the 0.5-deg terrain tile is "
+                                         "mostly outside the fixture, the "
+                                         "coverage disk is inside it"},
+                                {"id": "fully-outside", "res_m": 30, "range_km": 3,
+                                 "center": [46.30, 7.41], "expect": "sea",
+                                 "warn": "sea level",
+                                 "outside": [46.30, 7.41],
+                                 "inside": None,
+                                 "note": "an AOI with no fixture tile at any "
+                                         "zoom: every request 404s, the run "
+                                         "still completes over flat sea"},
+                            )))
     else:
         REPORT.skip("row 1.3b (local Terrain-RGB)", "fixture not generated — run --stages fetch")
     neutral_zooms = _fixture_zooms(out / "neutral-tiles")
@@ -1567,7 +1756,29 @@ def build_catalogue(cfg: Cfg) -> List[Layer]:
              "Geographic passthrough — must stay byte-identical to pre-refactor output.")
     add_file("2.2", G_LOCAL, "2.2 base_wgs84.tif (Float32 baseline clip)",
              dem / "base" / "base_wgs84.tif", "EPSG:4326",
-             "The baseline every other fixture derives from.")
+             "The baseline every other fixture derives from. A run past its "
+             "edge warns and reads 0 m (sea level) outside — the sources-path "
+             "half of the boundary contract the XYZ rows state for downloads.",
+             # The local-file counterpart of 1.3b's overruns: the converter's
+             # void_fill_m 0.0 supplies the sea, _warn_if_bbox_exceeds_bounds
+             # the warning. The Map Converter keeps VOID over the same ground.
+             overrun=(
+                 {"id": "edge-overrun", "res_m": 30, "range_km": 3,
+                  "center": [46.945, 7.50], "expect": "sea",
+                  "warn": "sea level",
+                  "outside": [46.945, 7.52],
+                  "inside": [46.945, 7.465],
+                  "note": "the analysis disk straddles the fixture's east "
+                          "edge: real ground west of it, sea east of it"},
+                 {"id": "fully-outside", "res_m": 30, "range_km": 3,
+                  "center": [46.945, 7.60], "expect": "sea",
+                  "warn": "sea level",
+                  "outside": [46.945, 7.60],
+                  "inside": None,
+                  "note": "an AOI the DEM does not touch at all: warned, and "
+                          "completes over flat sea rather than erroring or "
+                          "inventing terrain"},
+             ))
     add_file("2.3", G_LOCAL, "2.3 base_i16.tif (Int16)",
              dem / "base" / "base_i16.tif", "EPSG:4326", "Integer sample type.")
     add_file("2.4", G_LOCAL, "2.4 Dead Sea (negative elevations)",
@@ -1726,7 +1937,24 @@ def build_catalogue(cfg: Cfg) -> List[Layer]:
                                "for its FULL extent (measured: 400 at every pixel size, while a "
                                "150 km box succeeds), and the full extent is exactly what QGIS "
                                "asks for when the canvas is zoomed out past NRW. Zoom to the "
-                               "'NRW' run-matrix box."))
+                               "'NRW' run-matrix box.",
+                        # The rendered-route boundary case: run a German
+                        # coverage service over Bern. The layer's own extent is
+                        # the only bounds signal a rendered provider has; the
+                        # plugin must warn from it and the run must complete
+                        # over sea, not produce a confident void/half-written
+                        # result. (Runs over the live NRW service — needs
+                        # network, like the row itself.)
+                        overrun=(
+                            {"id": "fully-outside", "res_m": 30, "range_km": 3,
+                             "center": [PROBE_LAT, PROBE_LON], "expect": "sea",
+                             "warn": "sea level",
+                             "outside": [PROBE_LAT, PROBE_LON],
+                             "inside": None,
+                             "note": "an elevation WCS run 400 km outside its "
+                                     "coverage: warned via the layer extent, "
+                                     "completes over flat sea"},
+                        )))
     # 3DEP twice, deliberately. The WMS path can only ever hand QGIS a picture:
     # Qt decodes the response with QImage, and QImage refuses 32-bit samples
     # ("Sorry, can not handle images with 32-bit samples"), so a WMS layer asking
@@ -3438,6 +3666,14 @@ def write_checklist(cfg: Cfg, layers: Sequence[Layer], project: Path) -> Path:
             elif lyr.check == "buildings":
                 add("  - [ ] coverage run with this as the buildings source")
                 add("  - [ ] Map Converter run with this layer selected")
+            for scenario in lyr.overrun:
+                where = ("the standard probe" if scenario.get("center") is None
+                         else "{0[0]:.3f}, {0[1]:.3f}".format(scenario["center"]))
+                add(f"  - [ ] over-the-box `{scenario['id']}` — "
+                    f"{scenario['res_m']} m, {scenario['range_km']} km at "
+                    f"{where}: run COMPLETES, the log warns that missing "
+                    f"ground reads 0 m (sea level), Site Analysis shows sea "
+                    f"outside the source, the Map Converter keeps voids there")
             add(f"  - pass: {lyr.expect}")
         add("")
 
@@ -3460,7 +3696,9 @@ def write_checklist(cfg: Cfg, layers: Sequence[Layer], project: Path) -> Path:
     add("its row has data, that every elevation-tile row DECODES to plausible metres")
     add("through the plugin's own encoding verdict, and that the plugin's verdicts")
     add("(dem/imagery, refused-as-terrain, terrarium/mapbox, the z18->z15 clamp)")
-    add("match what this document says — around 340 checks in a couple of minutes.")
+    add("match what this document says — several hundred checks; tier C adds the")
+    add("full pipeline sweep (folders, over-the-box runs, resolutions, backends,")
+    add("models, ranges, cache drills) on a licensed machine.")
     add("It exits 0 only when everything this catalogue declares actually ran and")
     add("passed; 1 on a failure, 2 when the run was incomplete. What is left below")
     add("is what genuinely needs a person: dialog wording, picker contents, and")
@@ -3585,6 +3823,12 @@ def write_checklist(cfg: Cfg, layers: Sequence[Layer], project: Path) -> Path:
     add("These are the cases a QGIS *layer* cannot express. Use the Map Converter's")
     add("folder input, or drive `aether_converter ingest` directly.")
     add("")
+    add("**Automated:** the torture runner's tier C drives every case below through")
+    add("the shipped Map Converter worker (`folder:` checks, from the manifest's")
+    add("`folder_cases`) — probe elevations for the good folders, the exact refusal")
+    add("wording for the broken ones. What is left for a person is the GUI half:")
+    add("the Add Folder dialog's counts, the CRS prompt, the message-box texts.")
+    add("")
     add("- [ ] ⚡ **3.a** `dem/swiss/` as a terrain folder")
     add("  - pass: all 4 LV95 tiles picked up, terrain continuous across tile seams.")
     add("- [ ] **3.b** `dem/mixed_crs/` — one LV95 tile + one WGS84 tile in ONE folder")
@@ -3599,9 +3843,12 @@ def write_checklist(cfg: Cfg, layers: Sequence[Layer], project: Path) -> Path:
     add("- [ ] **3.e** `.vrt` is NOT scanned in a folder — drop `mosaic.vrt` into a")
     add("  terrain folder and confirm it is ignored, while the same file added as a")
     add("  *layer* works (row 2.9).")
-    add("- [ ] **3.f** `dem/broken/broken_nocrs.tif` as a folder input")
-    add("  - pass: hard error naming the file and telling you to add `\"crs\"`. (As a")
-    add("    QGIS layer this never fires — QGIS hands a CRS-less raster the project CRS.)")
+    add("- [ ] **3.f** `dem/broken_isolated/nocrs/` as a folder input")
+    add("  - pass: hard error naming the file and telling you to add `\"crs\"` — the")
+    add("    CONVERTER's GeoKey rule (a stripped projection leaves a LOCAL_CS husk")
+    add("    QGIS calls valid, so the plugin passes it through and the converter")
+    add("    refuses). A CRS you type into the folder prompt legitimately fills it")
+    add("    in. (As a QGIS layer this never fires — QGIS hands it the project CRS.)")
     add("- [ ] **3.g** `dem/broken/broken_nogt.tif` as a folder input")
     add("  - pass: hard error. Filename-based georeferencing was deliberately removed,")
     add("    so there is nothing to fall back on.")
@@ -3624,10 +3871,10 @@ def write_checklist(cfg: Cfg, layers: Sequence[Layer], project: Path) -> Path:
     add("  - pass: fails loudly naming the file. Never skipped, never counted as covered.")
     add("- [ ] **3.k** `dem/variants/ignored_formats/` as a terrain folder — holds only")
     add("  `base.asc`, which the scanner does not accept")
-    add("  - pass: the error lists the accepted extensions instead of reporting an empty")
-    add("    result, and row 2.26 proves the same file loads fine as a layer.")
-    add("  - pass: the error names the four accepted ones (`.tif .tiff .dem .hgt`) and")
-    add("    mentions `.abt` tiles directly in the folder.")
+    add("  - pass: the Add Folder dialog refuses it naming what it accepts")
+    add("    (GeoTIFF/DEM/HGT), and a worker driven with it anyway errors with")
+    add("    `No terrain files in …` — never a silent all-void conversion. Row 2.26")
+    add("    proves the very same file loads and converts fine as a layer.")
     add("")
 
     # ---------------- phase 4 ----------------------------------------------
@@ -3683,6 +3930,12 @@ def write_checklist(cfg: Cfg, layers: Sequence[Layer], project: Path) -> Path:
     add("size are fixed per resolution, and the byte sizes are exact — the cheapest")
     add("check that a run produced what it says it did.")
     add("")
+    add("**Automated:** tier C runs the sweep (`sweep:<res>m` checks) — a real Map")
+    add("Converter conversion per catalogue resolution, tile names against the")
+    add("plugin's own enumeration, file sizes byte-exact against this table, probe")
+    add("elevation real and plausible. Every pipeline row also has its tile sizes")
+    add("checked (`pipeline.tile_bytes`). The hand-run below is for eyeballing.")
+    add("")
     add("| res m | extent° | size px | exact res m | bytes/tile |")
     add("|---|---|---|---|---|")
     for res, extent, size, exact, size_b in RES_TABLE:
@@ -3703,6 +3956,15 @@ def write_checklist(cfg: Cfg, layers: Sequence[Layer], project: Path) -> Path:
     add("")
     add("The height floor is 1.0 m AGL; AMSL is an absolute elevation and may be")
     add("negative (down to -500 m).")
+    add("")
+    add("**Automated:** tier A asserts the height gates (`gate:` checks — 0.5 m AGL")
+    add("rejected for TX and RX, -430 m AMSL accepted, -501 m rejected) and every")
+    add("batch CSV against the manifest's `batch_cases` (accepts parse, rejects name")
+    add("their line and cause). Tier C runs the accepted CSVs through the real P2P")
+    add("worker, runs every 5.2 site WITH ITS OWN height/mode (the -430 m AMSL site")
+    add("runs as AMSL), asserts the obstructed 5.3 link shows materially more excess")
+    add("loss than the clear one, and drives BOTH Processing algorithms. The steps")
+    add("below stay for the dialog halves (what the user sees when a reject fires).")
     add("")
     add("- [ ] ⚡ **8.1** `batch/batch_ok.csv` — 3 rows, accepted, runs.")
     add("- [ ] ⚡ **8.2** `batch/batch_amsl_negative_ok.csv` — -430 m AMSL accepted.")
@@ -3727,18 +3989,30 @@ def write_checklist(cfg: Cfg, layers: Sequence[Layer], project: Path) -> Path:
     # ---------------- phase 9 ----------------------------------------------
     add("## Phase 9 — Cache and operational drills (guide §6)")
     add("")
+    add("**Automated:** 9.1 (pool hit — second identical run re-downloads nothing),")
+    add("9.2 (a `.rebuild` flag refetches exactly that tile) and 0.4's Clear cache")
+    add("run as tier C `matrix:cache …` checks against the offline 1.3b fixture.")
+    add("The fault-injection drills below still need a person and a cable to pull.")
+    add("")
     add("- [ ] ⚡ **9.1** Same area twice → pool hit (fast, no download).")
     add("- [ ] **9.2** `touch <pool>/<tile>.abt.rebuild` → that tile alone is refetched.")
     add("- [ ] **9.3** Kill the network mid-download (Site Analysis)")
     add("  - pass: the run fails; the SECOND run heals via `.rebuild` flags. No")
     add("    permanently-poisoned pool.")
-    add("  - pass: 0 tiles fetched logs `ERROR: Rust download z={zoom}: 0 of {total}")
-    add("    source tile(s) fetched — nothing was downloaded, so these tiles would be")
-    add("    flat 0 m terrain.` and falls back to the slow path.")
-    add("  - pass: a strict majority failed → `Tile download failed: {failed} of")
-    add("    {attempted} terrain tiles ({pct}%) could not be fetched; …`")
+    add("  - pass: 0 tiles fetched AND not all-404 logs `ERROR: Rust download")
+    add("    z={zoom}: 0 of {total} source tile(s) fetched — nothing was")
+    add("    downloaded, …` and falls back to the slow path.")
+    add("  - pass: a strict majority of REAL failures (timeout/connect/403/429/")
+    add("    5xx/decode — HTTP 404 never counts) → `Tile download failed:")
+    add("    {failed} of {attempted} terrain tiles ({pct}%) could not be")
+    add("    fetched; …`")
     add("  - pass: below that threshold the run SUCCEEDS by design, logging only")
-    add("    `[Stats] ERRORS (n): timeout=…, HTTP_4xx=…`")
+    add("    `[Stats] ERRORS (n): timeout=…`")
+    add("  - pass: 404s are NO-DATA, never failure — any number of them (all of")
+    add("    them included) leaves the run green with `[Stats] NO-DATA (HTTP")
+    add("    404): n of m tile(s) …`, a sea-level warning in the terrain log,")
+    add("    voids in the pool and 0 m in the Site Analysis view. The over-the-")
+    add("    box steps in Phase 1/2 pin this; the automated runner asserts it.")
     add("- [ ] **9.4** `waveshed/download_max_passes` = 1 → retries disabled, failures surface.")
     add("- [ ] **9.5** `waveshed/download_connections` (default 256, floor 32) → throttling")
     add("  changes throughput, not results.")
@@ -4191,13 +4465,29 @@ def calibrate_pipeline_expectations(layers: Sequence[Layer]) -> None:
                 and not lyr.expect_cov_valid_pct):
             band = cal.get("cov") or DEFAULT_COV_VALID_PCT
             lyr.expect_cov_valid_pct = tuple(band)
+        if lyr.kind == "raster" and lyr.check == "both" and not lyr.expect_acquire:
+            # The route each source kind is REQUIRED to take (the router
+            # contract): XYZ through the shared Rust downloader, local
+            # files straight into the converter, true rendered servers
+            # through the per-tile QGIS export. A row that intends the
+            # exception sets its own value.
+            if "type=xyz" in (lyr.source or ""):
+                lyr.expect_acquire = "download"
+            elif lyr.provider == "gdal":
+                lyr.expect_acquire = "sources"
+            else:
+                lyr.expect_acquire = "render"
 
 
-def write_manifest(cfg: Cfg, layers: Sequence[Layer], project: Path) -> Path:
+def write_manifest(cfg: Cfg, layers: Sequence[Layer], project: Path,
+                   filename: str = "manifest.json") -> Path:
     """Machine-readable form of the catalogue, for tools/torture_runner.py.
 
     The expectations live with the rows that define them, so an automated run
     and the human checklist can never disagree about what a row should do.
+    *filename* exists for building a PATCHED manifest next to the real one
+    (``manifest_patched.json`` + the runner's ``--manifest``) when new
+    expectations must be tried before the Windows regeneration.
     """
     calibrate_pipeline_expectations(layers)
     rows = []
@@ -4219,7 +4509,6 @@ def write_manifest(cfg: Cfg, layers: Sequence[Layer], project: Path) -> Path:
             "expect_zmax": lyr.expect_zmax,
             "expect_renders": lyr.expect_renders,
             "expect_format": lyr.expect_format,
-            "expect_decode": lyr.expect_decode,
             "expect_elev_m": list(lyr.expect_elev_m),
             "expect_failure": lyr.expect_failure,
             "expect_features": lyr.expect_features,
@@ -4227,12 +4516,14 @@ def write_manifest(cfg: Cfg, layers: Sequence[Layer], project: Path) -> Path:
             "expect_tile_px": lyr.expect_tile_px,
             "pipeline_res_m": lyr.pipeline_res_m,
             "pipeline_range_km": lyr.pipeline_range_km,
+            "expect_acquire": lyr.expect_acquire,
             "expect_agrees_m": lyr.expect_agrees_m,
             "expect_agrees_max_m": lyr.expect_agrees_max_m,
             "expect_agrees_p999_m": lyr.expect_agrees_p999_m,
             "expect_real_pct": lyr.expect_real_pct,
             "expect_cov_valid_pct": list(lyr.expect_cov_valid_pct),
             "footprint": list(lyr.footprint),
+            "overrun": [dict(s) for s in lyr.overrun],
             "known_fail": lyr.known_fail,
             "known_fail_checks": list(lyr.known_fail_checks),
             "min_scale": lyr.min_scale,
@@ -4249,6 +4540,16 @@ def write_manifest(cfg: Cfg, layers: Sequence[Layer], project: Path) -> Path:
             "refused_by": case.get("refused_by", "engine" if case.get("must_fail") else ""),
             "stresses": case["stresses"],
         }
+    # Folder cases whose fixture is on disk; a missing one is recorded the
+    # same way a missing row is — visible, counted, never silently dropped.
+    folder_cases = []
+    for case in FOLDER_CASES:
+        if case["path"] is not None and not (cfg.out_dir / case["path"]).exists():
+            REPORT.skip(f"folder case {case['id']}",
+                        f"missing fixture {case['path']} — run --stages fabricate")
+            continue
+        folder_cases.append(dict(case))
+
     payload = {
         "build": BUILD_STAMP[0],
         "project": project.name,
@@ -4270,11 +4571,60 @@ def write_manifest(cfg: Cfg, layers: Sequence[Layer], project: Path) -> Path:
         # indistinguishable from a row that passed.
         "skipped_rows": [{"what": what, "why": why, "by_design": by_design}
                          for what, why, by_design in REPORT.skipped],
+        # The Map Converter folder-input surface and the BATCH_P2P drills —
+        # catalogue expectations like everything else, executed by the
+        # torture runner's tier C so checklist Phases 3 and 8 stop being
+        # human-only. Batch content ships verbatim so the runner can prove
+        # the CSV on disk is the one the expectation is about.
+        "folder_cases": folder_cases,
+        "batch_cases": [dict(case) for case in BATCH_CASES],
         "rows": rows,
     }
-    path = cfg.out_dir / "manifest.json"
+    path = cfg.out_dir / filename
     path.write_text(json.dumps(payload, indent=1), encoding="utf-8")
     return path
+
+
+def _supersede_stale_results(cfg: Cfg) -> None:
+    """Retire a results.md/json pair written against an OLDER build.
+
+    The 2026-08-31 trap: the project was regenerated the evening after a green
+    679/679 run, and results.md went on saying **PASSED** about a build that no
+    longer existed — the exact "reads green, is stale" failure this suite
+    exists to prevent. On regeneration, results from another build are moved
+    to ``results.superseded.*`` and results.md becomes a STALE stub until the
+    runner is actually run against this build.
+    """
+    results_json = cfg.out_dir / "results.json"
+    results_md = cfg.out_dir / "results.md"
+    if not results_json.is_file() and not results_md.is_file():
+        return
+    old_build = ""
+    try:
+        old_build = json.loads(results_json.read_text(encoding="utf-8")).get("build", "")
+    except (OSError, ValueError):
+        pass
+    if old_build == BUILD_STAMP[0]:
+        return                      # same build (a project-only rewrite) — keep
+    for path in (results_json, results_md):
+        if path.is_file():
+            try:
+                path.replace(path.with_name(
+                    path.stem + ".superseded" + path.suffix))
+            except OSError:
+                pass
+    results_md.write_text(
+        f"# Torture results — STALE\n\n"
+        f"The project was regenerated (`{BUILD_STAMP[0]}`) and no torture run "
+        f"has happened against this build yet. The previous report"
+        + (f" (build `{old_build}`)" if old_build else "")
+        + " was moved to `results.superseded.md` / `.json`.\n\n"
+        f"Run `tools/torture_runner.py` (tier C standalone: `run_torture.bat`) "
+        f"to produce a real report. A green result for an older build says "
+        f"nothing about this one.\n",
+        encoding="utf-8")
+    REPORT.ok("results.md marked STALE (previous run was for another build; "
+              "kept as results.superseded.*)")
 
 
 def stage_project(cfg: Cfg) -> None:
@@ -4305,6 +4655,7 @@ def stage_project(cfg: Cfg) -> None:
     manifest = write_manifest(cfg, layers, project)
     checklist = write_checklist(cfg, layers, project)
     readme = write_readme(cfg, layers, project)
+    _supersede_stale_results(cfg)
     print(f"  [ok]   {len(layers)} layers -> {project}")
     boxes = checklist.read_text(encoding="utf-8").count("- [ ]")
     print(f"  [ok]   {checklist.name} ({boxes} checks)")
