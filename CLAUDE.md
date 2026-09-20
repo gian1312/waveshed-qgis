@@ -93,7 +93,14 @@ Defined in `aether_converter/src/ingest.rs` (contract v2.0):
   and `_sync_view` fills pool-tile voids to 0 m in the Site Analysis VIEW
   only — the pool keeps VOID for the Map Converter, whose output keeps VOID
   by contract. The torture suite's `overrun:` checks pin all of this per
-  acquisition route.
+  acquisition route. Rendered servers (the per-tile QGIS export) state the
+  same contract through `rendered_export_gap`: `writeRaster` reports success
+  for an answer that arrived with holes, so the export is measured against
+  the LAYER's own published extent — empty ground outside it is the coverage
+  edge (already warned by bounds), empty ground inside it is a partial
+  answer and gets its own warning. Without it a dropped block reached the
+  user as silent sea level, visible only as a cross-tab terrain
+  disagreement (row 4.3, 2026-09-20: up to 402 m).
 - `base_tif` / `swiss_tifs` are DEPRECATED aliases still accepted by the
   converter for older callers; the plugin no longer emits them, and emitting
   them alongside `sources` is an error.

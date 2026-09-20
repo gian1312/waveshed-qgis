@@ -51,11 +51,19 @@ def _log(msg: str) -> None:
 # run instead of once per site/height. Cleared by reset_terrain_warnings().
 _warned_extent_sources: set = set()
 
+# Rendered sources already warned about this run (the server answered with
+# empty blocks INSIDE its own published extent — see
+# _warn_rendered_export_gap). Per source, not per tile: one partial answer
+# usually affects several tiles of the same run, and the user needs the fact
+# once. Cleared by reset_terrain_warnings().
+_warned_render_gap_sources: set = set()
+
 
 def reset_terrain_warnings() -> None:
     """Reset per-run terrain warnings. Call once when an analysis run starts so
     the 'range exceeds DEM extent' warning is shown once, not per job."""
     _warned_extent_sources.clear()
+    _warned_render_gap_sources.clear()
 
 
 def get_cache_dir() -> str:
@@ -3006,6 +3014,153 @@ def render_resolution_m(native_res_m: Optional[float],
             if native_res_m else float(output_res_m))
 
 
+def layer_wgs84_bounds(dem_layer: Any) -> Optional[Dict[str, float]]:
+    """A loaded layer's own published extent, in WGS84. ``None`` if unknown.
+
+    The one bounds signal a rendered provider (WMS/WMTS/WCS/ArcGIS) has: it
+    publishes no files, so its declared extent is the only statement of which
+    ground it claims to serve. Used both to warn that a run reaches past the
+    service (:func:`_warn_if_bbox_exceeds_bounds`) and to tell "the service
+    has nothing here" apart from "the service failed to deliver what it
+    publishes" (:func:`rendered_export_gap`).
+    """
+    if dem_layer is None:
+        return None
+    try:
+        from qgis.core import QgsCoordinateReferenceSystem
+        ext = dem_layer.extent()
+        if ext is None or ext.isEmpty():
+            return None
+        return _bbox_transform(
+            {"west": ext.xMinimum(), "east": ext.xMaximum(),
+             "south": ext.yMinimum(), "north": ext.yMaximum()},
+            dem_layer.crs(), QgsCoordinateReferenceSystem("EPSG:4326"))
+    except Exception:  # noqa: BLE001 — a bounds probe must never break a run
+        return None
+
+
+def _bbox_overlap(a: Dict[str, float], b: Dict[str, float]
+                  ) -> Optional[Dict[str, float]]:
+    """The rectangle two WGS84 bboxes share, or ``None`` when they share none."""
+    if not bboxes_intersect(a, b):
+        return None
+    return {"west": max(a["west"], b["west"]),
+            "east": min(a["east"], b["east"]),
+            "south": max(a["south"], b["south"]),
+            "north": min(a["north"], b["north"])}
+
+
+#: Longest edge, in pixels, of the decimated read used to measure how much of
+#: a rendered export came back empty. The question is "is a REGION missing",
+#: not "which pixel" — a full read of a 16384x16384 Float32 export would cost
+#: a gigabyte to answer it.
+_GAP_PROBE_PX = 512
+
+
+def _nodata_fraction(dest: str, window: Dict[str, float]) -> Optional[float]:
+    """Share of *dest*'s samples inside WGS84 *window* that hold no data.
+
+    ``None`` when it cannot be measured (unreadable file, no geotransform, an
+    empty window) — an unmeasurable export is never reported as a gap.
+    Decimated to :data:`_GAP_PROBE_PX` per edge: a server that dropped part of
+    its answer drops blocks, not single pixels.
+    """
+    import numpy as np
+    ds = gdal.Open(dest)
+    if ds is None:
+        return None
+    gt = ds.GetGeoTransform()
+    if not gt or gt[1] == 0 or gt[5] == 0:
+        return None
+    band = ds.GetRasterBand(1)
+    if band is None:
+        return None
+    x0 = int(max(0, math.floor((window["west"] - gt[0]) / gt[1])))
+    x1 = int(min(ds.RasterXSize, math.ceil((window["east"] - gt[0]) / gt[1])))
+    # gt[5] is negative for a north-up raster, so north maps to the low row.
+    y0 = int(max(0, math.floor((window["north"] - gt[3]) / gt[5])))
+    y1 = int(min(ds.RasterYSize, math.ceil((window["south"] - gt[3]) / gt[5])))
+    if x1 <= x0 or y1 <= y0:
+        return None
+    arr = band.ReadAsArray(
+        x0, y0, x1 - x0, y1 - y0,
+        buf_xsize=min(x1 - x0, _GAP_PROBE_PX),
+        buf_ysize=min(y1 - y0, _GAP_PROBE_PX))
+    if arr is None or arr.size == 0:
+        return None
+    arr = np.asarray(arr)
+    missing = np.isnan(arr) if arr.dtype.kind == "f" else np.zeros(arr.shape, bool)
+    nodata = band.GetNoDataValue()
+    if nodata is not None:
+        missing = missing | (arr == nodata)
+    return float(missing.sum()) / float(arr.size)
+
+
+def rendered_export_gap(dem_layer: Any, dest: str,
+                        bbox: Dict[str, float]) -> Optional[float]:
+    """How much of a rendered export came back empty INSIDE what it publishes.
+
+    Ground outside the layer's own extent is allowed to be empty — that is
+    the no-data contract (Site Analysis reads it as 0 m sea level, the Map
+    Converter keeps it VOID), and the run is warned about it by bounds
+    already. Empty ground *inside* the extent is a different fact: the
+    service failed to deliver terrain it claims to serve, and nothing
+    downstream can tell the two apart — the converter sees "no source
+    covered this pixel" either way, ``void_fill_m: 0.0`` turns it into real
+    0 m ground, and the engine then reports confident coverage over sea.
+
+    Returns the fraction (0..1) of the published part of *bbox* that is
+    no-data, or ``None`` when there is nothing published here or the export
+    cannot be measured.
+    """
+    bounds = layer_wgs84_bounds(dem_layer)
+    if bounds is None:
+        return None
+    window = _bbox_overlap(bbox, bounds)
+    if window is None:
+        return None
+    try:
+        return _nodata_fraction(dest, window)
+    except Exception as exc:  # noqa: BLE001 — a probe must never fail an export
+        _log(f"    export gap probe skipped ({exc})")
+        return None
+
+
+def _warn_rendered_export_gap(dem_layer: Any, gap: float,
+                              source_key: str = "") -> None:
+    """Say, once per run per source, that a render came back partly empty.
+
+    The loud half of the no-data contract for the ONE route that had no way
+    to state it: the XYZ path counts 404s (:func:`_warn_no_data_tiles`) and
+    the file path checks bounds (:func:`_warn_if_bbox_exceeds_bounds`), but a
+    rendered server that answers a request inside its own published extent
+    with empty blocks used to reach the user as silent sea level. Measured on
+    the NRW WCS (torture row 4.3): the two tabs' terrain disagreed by up to
+    402 m where one tab's export came back whole and the other's did not, and
+    the only trace anywhere was that cross-tab comparison.
+
+    A warning, not an error: the contract is that missing ground degrades to
+    sea LOUDLY, never that it aborts a run.
+    """
+    if source_key:
+        if source_key in _warned_render_gap_sources:
+            return
+        _warned_render_gap_sources.add(source_key)
+    try:
+        name = dem_layer.name() or source_key
+    except Exception:  # noqa: BLE001
+        name = source_key
+    _log(
+        f"  WARNING: the rendered service '{name}' returned no data for "
+        f"{gap:.1%} of the ground it publishes over this area. That is not "
+        f"the edge of its coverage — it is a partial answer (a dropped "
+        f"block, a capabilities/describe failure, a throttled request). "
+        f"Site Analysis reads those pixels as 0 m (sea level) and the Map "
+        f"Converter keeps them as no-data, so terrain there is not real; "
+        f"re-run the analysis to re-request them."
+    )
+
+
 def _export_via_qgis(dem_layer: Any, dest: str, bbox: Dict[str, float], resolution_m: float) -> None:
     _record_route("render")
     from qgis.core import (
@@ -3044,6 +3199,17 @@ def _export_via_qgis(dem_layer: Any, dest: str, bbox: Dict[str, float], resoluti
     _log(f"    writeRaster: {time.perf_counter() - t:.1f}s (err={err})")
     if err != QgsRasterFileWriter.WriterError.NoError:
         raise RuntimeError(f"writeRaster failed (code {err})")
+
+    # writeRaster reports success for an answer that arrived with holes in
+    # it, so the export has to be looked at. Both tabs render through here,
+    # which is why the check lives here and not in either tab.
+    gap = rendered_export_gap(dem_layer, dest, bbox)
+    if gap:
+        try:
+            source_key = dem_layer.source()
+        except Exception:  # noqa: BLE001
+            source_key = ""
+        _warn_rendered_export_gap(dem_layer, gap, source_key)
 
 
 def _gather_source_infos(dem_layer: Any, terrain_dir: Optional[str]
@@ -3418,18 +3584,13 @@ def prepare_terrain(
             # exported empty tiles, the converter wrote them as void, Site
             # Analysis filled 0 m — and nothing ever told the user their
             # whole result was sea.
-            try:
-                ext = dem_layer.extent()
-                if ext is not None and not ext.isEmpty():
-                    from qgis.core import QgsCoordinateReferenceSystem
-                    layer_bounds = _bbox_transform(
-                        {"west": ext.xMinimum(), "east": ext.xMaximum(),
-                         "south": ext.yMinimum(), "north": ext.yMaximum()},
-                        dem_layer.crs(),
-                        QgsCoordinateReferenceSystem("EPSG:4326"))
-                    _warn_if_bbox_exceeds_bounds(layer_bounds, bbox, source)
-            except Exception:  # noqa: BLE001 — a warning must never abort a run
-                pass
+            # Same bounds :func:`rendered_export_gap` measures the export
+            # against, read by the one helper, so "past the service" and
+            # "the service dropped part of its answer" can never be told
+            # apart by two different ideas of what it publishes.
+            layer_bounds = layer_wgs84_bounds(dem_layer)
+            if layer_bounds is not None:
+                _warn_if_bbox_exceeds_bounds(layer_bounds, bbox, source)
 
         jobs = []
         for t in todo:

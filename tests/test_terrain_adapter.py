@@ -3027,6 +3027,233 @@ class TestRenderResolutionRule(unittest.TestCase):
         rule.assert_called_once_with(1.0, 30.0)
 
 
+class TestServerLayerIdentity(unittest.TestCase):
+    """Two coverages on ONE server are two sources — pool AND view.
+
+    ``source_identity`` normalises an XYZ URI down to the parts that decide
+    the pixels, and both halves of the cache go through it (``_pool_dir``
+    and, since the identity was unified, ``_cache_key``/``_view_dir``). The
+    hazard that unification creates is the opposite of the one it fixed: if
+    the normalisation ever reached a WMS/WMTS/WCS URI, the parameter that
+    SELECTS the coverage (``identifier=``, ``layers=``, ``coverage=``) would
+    be normalised away, two different layers on one host would share one
+    pool, and a Site Analysis view could be served from tiles built for a
+    different product — a DGM answered from a DOM pool, with nothing in the
+    run saying so. Torture row 4.3 (NRW WCS, ``identifier=nw_dgm``) is the
+    live case. Pinned per parameter, on BOTH halves.
+    """
+
+    SERVER = "https://www.wcs.nrw.de/geobasis/wcs_nw_dgm"
+    TILES = _tiles("tile_N51.50E7.00_30m.abt")
+
+    def _wcs(self, **overrides):
+        params = {"cache": "PreferNetwork", "crs": "EPSG:25832",
+                  "format": "GTiff", "identifier": "nw_dgm",
+                  "url": self.SERVER}
+        params.update(overrides)
+        return "&".join(f"{k}={v}" for k, v in sorted(params.items()))
+
+    def _dirs(self, source):
+        with mock.patch.object(ta, "get_cache_dir", return_value="/cache"):
+            return (ta._pool_dir(source),
+                    ta._view_dir(source, self.TILES, 30))
+
+    def test_the_same_layer_lands_on_the_same_pool_and_view(self):
+        self.assertEqual(self._dirs(self._wcs()), self._dirs(self._wcs()))
+
+    def test_a_different_coverage_on_one_server_is_a_different_source(self):
+        pool_a, view_a = self._dirs(self._wcs())
+        pool_b, view_b = self._dirs(self._wcs(identifier="nw_dom"))
+        self.assertNotEqual(pool_a, pool_b)
+        self.assertNotEqual(view_a, view_b)
+
+    def test_every_pixel_selecting_parameter_splits_both_halves(self):
+        base = self._dirs(self._wcs())
+        for param, value in (("identifier", "nw_dom"), ("layers", "other"),
+                             ("coverage", "nw_dom"), ("format", "image/tiff"),
+                             ("crs", "EPSG:4326"), ("version", "1.1.0")):
+            with self.subTest(param=param):
+                other = self._dirs(self._wcs(**{param: value}))
+                self.assertNotEqual(base[0], other[0], f"pool ignores {param}")
+                self.assertNotEqual(base[1], other[1], f"view ignores {param}")
+
+    def test_a_wms_layer_selector_splits_both_halves(self):
+        wms = ("contextualWMSLegend=0&crs=EPSG:2056&format=image/png"
+               "&layers={}&styles&url=https://wms.example/service")
+        pool_a, view_a = self._dirs(wms.format("dem"))
+        pool_b, view_b = self._dirs(wms.format("hillshade"))
+        self.assertNotEqual(pool_a, pool_b)
+        self.assertNotEqual(view_a, view_b)
+
+    def test_a_rendered_uri_is_its_own_identity_verbatim(self):
+        # The normalisation is XYZ-only by construction: anything without
+        # type=xyz is returned untouched, which is what makes the cases above
+        # hold for every server URI shape, including ones not listed here.
+        source = self._wcs()
+        self.assertEqual(ta.source_identity(source), source)
+
+    def test_the_view_path_is_assembled_in_exactly_one_place(self):
+        # _view_dir is the ONE assembly of the view path; a second caller
+        # computing it by hand is how the view moved out from under the pool.
+        with mock.patch.object(ta, "get_cache_dir", return_value="/cache"):
+            self.assertEqual(
+                ta._view_dir(self._wcs(), self.TILES, 30),
+                os.path.join("/cache", ta._VIEW_DIRNAME,
+                             ta._cache_key(self._wcs(), self.TILES, 30)))
+
+    def test_pool_and_view_agree_about_one_respelled_xyz_source(self):
+        # The other half of the same rule, kept from regressing back: the two
+        # halves must not disagree about what "the same source" is.
+        a = f"type=xyz&url={TestSourceIdentity.URL}&zmax=15&zmin=0"
+        b = f"zmin=0&zmax=15&url={TestSourceIdentity.URL}&type=xyz"
+        self.assertEqual(self._dirs(a), self._dirs(b))
+
+
+class _FakeBand:
+    """One band of a rendered export, for the no-data probe."""
+
+    def __init__(self, arr, nodata=None):
+        self._arr = arr
+        self._nodata = nodata
+        self.reads = []
+
+    def GetNoDataValue(self):
+        return self._nodata
+
+    def ReadAsArray(self, x, y, w, h, buf_xsize=None, buf_ysize=None):
+        self.reads.append((x, y, w, h, buf_xsize, buf_ysize))
+        return self._arr[y:y + h, x:x + w]
+
+
+class _FakeDataset:
+    def __init__(self, band, gt, size):
+        self._band = band
+        self._gt = gt
+        self.RasterXSize, self.RasterYSize = size
+
+    def GetGeoTransform(self):
+        return self._gt
+
+    def GetRasterBand(self, n):
+        return self._band
+
+
+@unittest.skipUnless(_HAVE_NUMPY, "numpy required")
+class TestRenderedExportGap(unittest.TestCase):
+    """A rendered server that drops part of its answer must not read as sea.
+
+    The no-data contract says ground a source does not cover degrades to sea
+    LOUDLY. The XYZ route says it by counting 404s and the file route by
+    checking bounds, but the rendered route had no way to say it at all:
+    ``writeRaster`` reports success for an answer that arrived with holes in
+    it, the converter cannot tell an empty block from ground nobody
+    publishes, ``void_fill_m: 0.0`` turns it into real 0 m ground, and Site
+    Analysis then reports confident coverage over sea. Measured on torture
+    row 4.3 (live NRW WCS): the Map Converter's export came back whole and
+    Site Analysis's did not, and the two tabs' terrain disagreed by up to
+    402 m with nothing else in the run saying anything at all.
+    """
+
+    BBOX = {"north": 51.5, "south": 51.0, "west": 7.0, "east": 7.5}
+    NRW = {"north": 52.6, "south": 50.3, "west": 5.8, "east": 9.5}
+
+    def _layer(self, bounds=None):
+        layer = mock.Mock()
+        layer.name.return_value = "4.3 NRW WCS — nw_dgm"
+        layer.source.return_value = "identifier=nw_dgm&url=https://wcs.example"
+        layer.extent.return_value = mock.Mock(isEmpty=lambda: False)
+        self._bounds = self.NRW if bounds is None else bounds
+        return layer
+
+    def _gap(self, layer, frac):
+        with mock.patch.object(ta, "layer_wgs84_bounds",
+                               return_value=self._bounds), \
+             mock.patch.object(ta, "_nodata_fraction", return_value=frac):
+            return ta.rendered_export_gap(layer, "/tmp/x.tif", self.BBOX)
+
+    def test_a_gap_inside_the_published_extent_is_measured(self):
+        self.assertAlmostEqual(self._gap(self._layer(), 0.31), 0.31)
+
+    def test_ground_the_service_does_not_publish_is_not_a_gap(self):
+        # The over-the-box scenario: an export 400 km outside the coverage is
+        # EMPTY on purpose and completes over flat sea. Reporting that as a
+        # failed answer would turn the contract into noise.
+        layer = self._layer(bounds={"north": 47.1, "south": 46.8,
+                                    "west": 7.3, "east": 7.6})
+        self.assertIsNone(self._gap(layer, 1.0))
+
+    def test_a_layer_without_an_extent_is_not_measured(self):
+        layer = self._layer(bounds=None)
+        self._bounds = None
+        self.assertIsNone(self._gap(layer, 1.0))
+
+    def test_an_unmeasurable_export_is_never_reported_as_a_gap(self):
+        self.assertIsNone(self._gap(self._layer(), None))
+
+    def test_a_probe_that_raises_does_not_break_the_export(self):
+        with mock.patch.object(ta, "layer_wgs84_bounds", return_value=self.NRW), \
+             mock.patch.object(ta, "_nodata_fraction",
+                               side_effect=RuntimeError("gdal said no")), \
+             mock.patch.object(ta, "_log"):
+            self.assertIsNone(
+                ta.rendered_export_gap(self._layer(), "/tmp/x.tif", self.BBOX))
+
+    def test_the_window_read_is_clipped_to_the_published_extent(self):
+        # Only the published part of the export is probed, decimated — a full
+        # read of a 16384x16384 float export to answer "is a block missing"
+        # would cost a gigabyte.
+        arr = np.zeros((200, 200), dtype="float32")
+        arr[:100, :] = np.nan                     # north half missing
+        band = _FakeBand(arr, nodata=None)
+        # 0.5 deg over 200 px, upper-left at (7.0, 51.5).
+        ds = _FakeDataset(band, (7.0, 0.0025, 0.0, 51.5, 0.0, -0.0025),
+                          (200, 200))
+        with mock.patch.object(ta.gdal, "Open", return_value=ds, create=True):
+            frac = ta._nodata_fraction("/tmp/x.tif", self.BBOX)
+        self.assertAlmostEqual(frac, 0.5, places=2)
+        self.assertEqual(band.reads[0][:4], (0, 0, 200, 200))
+
+    def test_the_nodata_value_counts_as_missing(self):
+        arr = np.full((100, 100), -9999.0, dtype="float32")
+        arr[:50, :] = 120.0
+        ds = _FakeDataset(_FakeBand(arr, nodata=-9999.0),
+                          (7.0, 0.005, 0.0, 51.5, 0.0, -0.005), (100, 100))
+        with mock.patch.object(ta.gdal, "Open", return_value=ds, create=True):
+            self.assertAlmostEqual(
+                ta._nodata_fraction("/tmp/x.tif", self.BBOX), 0.5, places=2)
+
+    def test_a_full_export_has_no_gap(self):
+        arr = np.full((50, 50), 200.0, dtype="float32")
+        ds = _FakeDataset(_FakeBand(arr, nodata=-9999.0),
+                          (7.0, 0.01, 0.0, 51.5, 0.0, -0.01), (50, 50))
+        with mock.patch.object(ta.gdal, "Open", return_value=ds, create=True):
+            self.assertEqual(ta._nodata_fraction("/tmp/x.tif", self.BBOX), 0.0)
+
+    def test_the_warning_says_sea_level_and_names_the_layer(self):
+        reset_terrain_warnings()
+        logged = []
+        with mock.patch.object(ta, "_log", side_effect=logged.append):
+            ta._warn_rendered_export_gap(self._layer(), 0.42, "wcs-a")
+        text = "\n".join(logged)
+        self.assertIn("WARNING", text)
+        self.assertIn("sea level", text)
+        self.assertIn("nw_dgm", text)
+        self.assertIn("42.0%", text)
+
+    def test_the_warning_is_once_per_source_per_run(self):
+        reset_terrain_warnings()
+        logged = []
+        with mock.patch.object(ta, "_log", side_effect=logged.append):
+            ta._warn_rendered_export_gap(self._layer(), 0.4, "wcs-a")
+            ta._warn_rendered_export_gap(self._layer(), 0.4, "wcs-a")
+            ta._warn_rendered_export_gap(self._layer(), 0.4, "wcs-b")
+        self.assertEqual(len(logged), 2)
+        reset_terrain_warnings()      # a new run says it again
+        with mock.patch.object(ta, "_log", side_effect=logged.append):
+            ta._warn_rendered_export_gap(self._layer(), 0.4, "wcs-a")
+        self.assertEqual(len(logged), 3)
+
+
 class TestNoSilentXyzFallback(unittest.TestCase):
     """A failed Rust download on an XYZ elevation layer is a hard error.
 
