@@ -12,6 +12,7 @@ import json
 import math
 import os
 import struct
+import sys
 import tempfile
 import time
 import unittest
@@ -2287,18 +2288,23 @@ class TestRunConverterStreaming(unittest.TestCase):
     def test_streams_nonempty_lines_and_returns_exit_code(self):
         seen = []
         started = []
-        with mock.patch.object(ta.subprocess, "Popen", _FakeStreamProc):
-            rc = ta.run_converter_streaming(
-                "/bin/conv", ["ingest", "--job-file", "j.json"],
-                seen.append, on_start=started.append)
-        self.assertEqual(rc, 3)
-        self.assertEqual(seen, [
-            "line one",
-            "[Download] 50% (5/10) — 1.0 MB/s, 0 errors, 2 in-flight",
-        ])
-        self.assertEqual(_FakeStreamProc.last.cmd,
-                         ["/bin/conv", "ingest", "--job-file", "j.json"])
-        self.assertEqual(started, [_FakeStreamProc.last])
+        # A REAL job file: the runner refuses to launch on a missing one
+        # (the os error 3 guard), so the mechanics test needs one on disk.
+        with tempfile.TemporaryDirectory() as d:
+            job = os.path.join(d, "j.json")
+            open(job, "w").close()
+            with mock.patch.object(ta.subprocess, "Popen", _FakeStreamProc):
+                rc = ta.run_converter_streaming(
+                    "/bin/conv", ["ingest", "--job-file", job],
+                    seen.append, on_start=started.append)
+            self.assertEqual(rc, 3)
+            self.assertEqual(seen, [
+                "line one",
+                "[Download] 50% (5/10) — 1.0 MB/s, 0 errors, 2 in-flight",
+            ])
+            self.assertEqual(_FakeStreamProc.last.cmd,
+                             ["/bin/conv", "ingest", "--job-file", job])
+            self.assertEqual(started, [_FakeStreamProc.last])
 
     def test_cancel_kills_the_process_and_propagates(self):
         def on_line(_line):
@@ -2310,9 +2316,12 @@ class TestRunConverterStreaming(unittest.TestCase):
         self.assertTrue(_FakeStreamProc.last.terminated)
 
     def test_env_is_forwarded(self):
-        with mock.patch.object(ta.subprocess, "Popen", _FakeStreamProc):
-            ta.run_converter_streaming("/bin/core", ["--config", "c"],
-                                       lambda _l: None, env={"A": "1"})
+        with tempfile.TemporaryDirectory() as d:
+            cfg = os.path.join(d, "c.json")
+            open(cfg, "w").close()
+            with mock.patch.object(ta.subprocess, "Popen", _FakeStreamProc):
+                ta.run_converter_streaming("/bin/core", ["--config", cfg],
+                                           lambda _l: None, env={"A": "1"})
         self.assertEqual(_FakeStreamProc.last.kwargs.get("env"), {"A": "1"})
 
 
@@ -2466,18 +2475,26 @@ class TestDownloadCancellation(unittest.TestCase):
     """Cancel must reach a RUNNING download promptly (review fix 1)."""
 
     def test_should_cancel_kills_the_download_subprocess(self):
-        with mock.patch.object(ta.subprocess, "Popen", _FakeStreamProc):
-            with self.assertRaises(ta.ConverterCancelled):
-                ta._run_converter_download_once(
-                    "/bin/conv", "job.json", should_cancel=lambda: True)
+        # A real job file on disk: the runner's os-error-3 guard refuses to
+        # launch without one.
+        with tempfile.TemporaryDirectory() as d:
+            job = os.path.join(d, "job.json")
+            open(job, "w").close()
+            with mock.patch.object(ta.subprocess, "Popen", _FakeStreamProc):
+                with self.assertRaises(ta.ConverterCancelled):
+                    ta._run_converter_download_once(
+                        "/bin/conv", job, should_cancel=lambda: True)
         self.assertTrue(_FakeStreamProc.last.terminated,
                         "subprocess kept running after cancel")
 
     def test_on_start_exposes_the_download_process(self):
         started = []
-        with mock.patch.object(ta.subprocess, "Popen", _FakeStreamProc):
-            ta._run_converter_download_once(
-                "/bin/conv", "job.json", on_start=started.append)
+        with tempfile.TemporaryDirectory() as d:
+            job = os.path.join(d, "job.json")
+            open(job, "w").close()
+            with mock.patch.object(ta.subprocess, "Popen", _FakeStreamProc):
+                ta._run_converter_download_once(
+                    "/bin/conv", job, on_start=started.append)
         self.assertEqual(started, [_FakeStreamProc.last])
 
     def test_cancellation_is_not_swallowed_by_the_retry_machinery(self):
@@ -3064,6 +3081,81 @@ class TestNoSilentXyzFallback(unittest.TestCase):
                          "pop must clear the record")
 
 
+class TestPreparedViewDirRecorder(unittest.TestCase):
+    """``pop_prepared_view_dirs`` — the torture runner's handle on the
+    directory aether_core was actually pointed at.
+
+    Same shape as the acquisition-route recorder next door: appended by
+    prepare_terrain on EVERY path that returns a usable terrain directory,
+    popped (and cleared) by the harness after each driven run.
+    """
+
+    def setUp(self):
+        ta.pop_prepared_view_dirs()
+
+    def _layer(self):
+        layer = mock.Mock()
+        layer.name.return_value = "terrarium"
+        layer.source.return_value = (
+            "type=xyz&url=https://tiles.example/{z}/{x}/{y}.png&zmax=15")
+        return layer
+
+    def test_download_path_records_the_view_dir_it_returned(self):
+        with tempfile.TemporaryDirectory() as root, \
+             mock.patch.object(ta, "get_cache_dir", return_value=root), \
+             mock.patch.object(ta, "classify_raster_layer",
+                               return_value="dem"), \
+             mock.patch.object(ta, "_try_rust_download",
+                               return_value=ta.DownloadOutcome(True)), \
+             mock.patch.object(ta, "_finish_view"):
+            out = ta.prepare_terrain(self._layer(), 46.945, 7.41, 1.0, 30,
+                                     mock.Mock())
+            recorded = ta.pop_prepared_view_dirs()
+        self.assertEqual(recorded[-1], os.path.abspath(out),
+                         "the last entry must be what the engine was given")
+
+    def test_cache_hit_records_too(self):
+        """An early return is still terrain handed to the engine."""
+        with tempfile.TemporaryDirectory() as root, \
+             mock.patch.object(ta, "get_cache_dir", return_value=root), \
+             mock.patch.object(ta, "classify_raster_layer",
+                               return_value="dem"), \
+             mock.patch.object(ta, "_tile_ready", return_value=True), \
+             mock.patch.object(ta, "_sync_view", return_value=[]):
+            out = ta.prepare_terrain(self._layer(), 46.945, 7.41, 1.0, 30,
+                                     mock.Mock())
+            recorded = ta.pop_prepared_view_dirs()
+        self.assertEqual(recorded[-1], os.path.abspath(out))
+
+    def test_prebuilt_abt_directory_records_too(self):
+        """``terrain_dir`` passes straight through — and is still recorded."""
+        with tempfile.TemporaryDirectory() as tdir, \
+             mock.patch.object(ta, "is_abt_tile_dir", return_value=True), \
+             mock.patch.object(ta, "list_abt_tiles", return_value=["a.abt"]), \
+             mock.patch.object(ta, "_abt_coverage_warning", return_value=""):
+            out = ta.prepare_terrain(None, 46.945, 7.41, 1.0, 30, mock.Mock(),
+                                     terrain_dir=tdir)
+            recorded = ta.pop_prepared_view_dirs()
+        self.assertEqual(out, tdir)
+        self.assertEqual(recorded[-1], os.path.abspath(tdir))
+
+    def test_pop_returns_a_copy_and_clears(self):
+        ta._record_view_dir("/tmp/one")
+        ta._record_view_dir("/tmp/two")
+        first = ta.pop_prepared_view_dirs()
+        self.assertEqual(first, [os.path.abspath("/tmp/one"),
+                                 os.path.abspath("/tmp/two")])
+        self.assertEqual(ta.pop_prepared_view_dirs(), [],
+                         "pop must clear the record")
+        first.append("mutating the copy must not touch the module list")
+        self.assertEqual(ta.pop_prepared_view_dirs(), [])
+
+    def test_the_record_is_capped(self):
+        for i in range(300):
+            ta._record_view_dir(f"/tmp/v{i}")
+        self.assertEqual(len(ta.pop_prepared_view_dirs()), 256)
+
+
 class TestNoDataDownloads(unittest.TestCase):
     """HTTP 404 is the service saying "no data here" — never a failure.
 
@@ -3140,6 +3232,30 @@ class TestNoDataDownloads(unittest.TestCase):
             self.assertFalse(self._download(d, ok=0, total=49, no_data=0))
             self.assertFalse(os.path.exists(os.path.join(d, self.TILE)),
                              "a failed total loss caches nothing")
+
+    def test_zero_fetched_mixed_404_and_failures_degrades_not_aborts(self):
+        # 0 fetched, 40 x 404 + 9 real failures (the 1.3b shape when the local
+        # fixture server also dropped connections): the engine exited 0, so
+        # the 404 ground is permanent sea and only the real failures are worth
+        # retrying — the run must degrade to partial terrain, never take the
+        # total-failure abort that drops the pool.
+        with tempfile.TemporaryDirectory() as d:
+            self.assertTrue(self._download(d, ok=0, total=49, no_data=40))
+            self.assertTrue(os.path.exists(os.path.join(d, self.TILE)),
+                            "the padded tile stays in the pool")
+            self.assertFalse(ta._tile_ready(d, self.TILE),
+                             "real failures must keep the rebuild flag")
+
+    def test_mixed_losses_still_warn_about_sea_level(self):
+        # The sea-level warning must not depend on the misses being ALL 404 —
+        # a user whose result is part sea must be told even when real
+        # failures rode along (the torture 'warned' check scans for it).
+        with tempfile.TemporaryDirectory() as d:
+            logged = []
+            with mock.patch.object(ta, "_log", side_effect=logged.append):
+                self.assertTrue(self._download(d, ok=6, total=49, no_data=40))
+            self.assertTrue(any("sea level" in line for line in logged),
+                            f"no 'sea level' in the terrain log: {logged}")
 
 
 class TestViewVoidFill(unittest.TestCase):
@@ -3222,3 +3338,156 @@ class TestViewVoidFill(unittest.TestCase):
             view_grid = abt.read_tile(abt.read_header(os.path.join(view, "a.abt")))
             self.assertTrue((view_grid == 0).all(),
                             "the view follows the rebuilt pool tile")
+
+
+class TestLaunchPreflight(unittest.TestCase):
+    """A vanished directory must be re-made, or NAMED.
+
+    The Windows converter answers a missing directory component with
+    ERROR_PATH_NOT_FOUND — "The system cannot find the path specified (os
+    error 3)" — and names nothing at all, so a run that lost its pool, its
+    view or a scratch source is indistinguishable from one that lost the job
+    file. These are the two halves of the answer: re-make what is ours to
+    make, and fail with the offending path in the message for the rest.
+    """
+
+    def test_ensure_engine_dirs_creates_and_tolerates_existing(self):
+        with tempfile.TemporaryDirectory() as root:
+            a = os.path.join(root, "pool", "deep")
+            ta.ensure_engine_dirs(a, None, "")
+            self.assertTrue(os.path.isdir(a))
+            ta.ensure_engine_dirs(a)          # exist_ok — never raises
+
+    def test_missing_job_file_is_reported_by_path(self):
+        with tempfile.TemporaryDirectory() as root:
+            gone = os.path.join(root, "views", "deadbeef", "batch_job.json")
+            with self.assertRaises(RuntimeError) as caught:
+                ta.run_converter_streaming(
+                    "aether_converter", ["ingest", "--job-file", gone],
+                    lambda line: None)
+        msg = str(caught.exception)
+        self.assertIn(gone, msg)
+        self.assertIn("MISSING", msg,
+                      "the message must say which directory went missing")
+
+    def test_missing_core_config_is_reported_too(self):
+        with tempfile.TemporaryDirectory() as root:
+            gone = os.path.join(root, "nope", "job.json")
+            with self.assertRaises(RuntimeError) as caught:
+                ta.run_converter_streaming(
+                    "aether_core", ["--config", gone], lambda line: None)
+        self.assertIn(gone, str(caught.exception))
+
+    def test_an_existing_job_file_is_not_the_preflights_business(self):
+        # The guard must not turn into a second failure mode: a job file that
+        # IS there passes straight through to the launch (which then fails on
+        # the fake executable, not on the preflight).
+        with tempfile.TemporaryDirectory() as root:
+            job = os.path.join(root, "job.json")
+            with open(job, "w") as fh:
+                fh.write("{}")
+            with self.assertRaises((OSError, ValueError)):
+                ta.run_converter_streaming(
+                    os.path.join(root, "no_such_exe"),
+                    ["ingest", "--job-file", job], lambda line: None)
+
+    def test_preflight_names_a_vanished_source(self):
+        with tempfile.TemporaryDirectory() as root:
+            jobs = [{
+                "output_path": os.path.join(root, "pool", "t.abt"),
+                "sources": [{"path": os.path.join(root, "scratch", "a.tif")}],
+            }]
+            with self.assertRaises(RuntimeError) as caught:
+                ta.preflight_ingest_jobs(jobs)
+        self.assertIn("a.tif", str(caught.exception))
+
+    def test_preflight_remakes_the_output_directory(self):
+        with tempfile.TemporaryDirectory() as root:
+            src = os.path.join(root, "a.tif")
+            open(src, "w").close()
+            pool = os.path.join(root, "pool")
+            jobs = [{"output_path": os.path.join(pool, "t.abt"),
+                     "sources": [{"path": src}]}]
+            ta.preflight_ingest_jobs(jobs)     # must not raise
+            self.assertTrue(os.path.isdir(pool),
+                            "the pool is ours to re-create, not to complain "
+                            "about")
+
+    def test_preflight_leaves_buildings_alone(self):
+        """Buildings that cannot be read DEGRADE (a warning plus rebuild
+        flags) — the preflight must not turn that contract into an abort."""
+        with tempfile.TemporaryDirectory() as root:
+            src = os.path.join(root, "a.tif")
+            open(src, "w").close()
+            jobs = [{"output_path": os.path.join(root, "pool", "t.abt"),
+                     "sources": [{"path": src}],
+                     "buildings_file": "/nowhere/osm.fgb",
+                     "buildings_pbf_dir": "/nowhere/_buildings"}]
+            ta.preflight_ingest_jobs(jobs)     # must not raise
+
+
+class TestCacheIdentityIsComputedOneWay(unittest.TestCase):
+    """The pool and the view must agree on what "the same source" is.
+
+    ``_cache_key`` used to hash the raw layer URI while ``_pool_dir`` hashed
+    ``source_identity``, so re-adding the same XYZ service with its URI
+    parameters in another order kept the pool and moved the view to a fresh
+    directory — the view identity moving underneath a pool that did not.
+    """
+
+    URL = "https://tiles.example/{z}/{x}/{y}.png"
+    TILES = [{"filename": "tile_N47.00E008.00_30m.abt"}]
+
+    def test_respelled_xyz_uri_keeps_both_halves(self):
+        a = f"type=xyz&url={self.URL}&zmax=15&zmin=0"
+        b = f"zmin=0&zmax=15&url={self.URL}&type=xyz"
+        self.assertEqual(ta._cache_key(a, self.TILES, 30),
+                         ta._cache_key(b, self.TILES, 30))
+        with mock.patch.object(ta, "get_cache_dir", return_value="/tmp/x"):
+            self.assertEqual(ta._pool_dir(a), ta._pool_dir(b))
+
+    def test_a_different_service_is_still_a_different_view(self):
+        a = f"type=xyz&url={self.URL}&zmax=15"
+        b = "type=xyz&url=https://other.example/{z}/{x}/{y}.png&zmax=15"
+        self.assertNotEqual(ta._cache_key(a, self.TILES, 30),
+                            ta._cache_key(b, self.TILES, 30))
+
+    def test_view_dir_is_the_one_assembly_point(self):
+        with tempfile.TemporaryDirectory() as root:
+            with mock.patch.object(ta, "get_cache_dir", return_value=root):
+                got = ta._view_dir("src", self.TILES, 30)
+                self.assertEqual(
+                    got,
+                    os.path.join(root, ta._VIEW_DIRNAME,
+                                 ta._cache_key("src", self.TILES, 30)))
+
+
+class TestCacheRootIsAbsolute(unittest.TestCase):
+    """A relative cache root would make every identity depend on the process
+    working directory, which QGIS moves — so the same identity computed twice
+    in one run could name two different directories."""
+
+    def _with_setting(self, value):
+        settings = mock.Mock()
+        settings.value.side_effect = lambda _k, d=None: value if value is not None else d
+        qgis_core = sys.modules["qgis.core"]
+        return mock.patch.object(qgis_core, "QgsSettings",
+                                 return_value=settings)
+
+    def test_relative_setting_is_absolutised(self):
+        with self._with_setting("relative/cache"):
+            root = ta.get_cache_dir()
+        self.assertTrue(os.path.isabs(root), root)
+        self.assertTrue(root.endswith(os.path.join("relative", "cache")))
+
+    def test_blank_setting_falls_back_to_the_default(self):
+        with self._with_setting("   "):
+            root = ta.get_cache_dir()
+        self.assertEqual(root, os.path.abspath(
+            os.path.expanduser("~/.aether/cache")))
+
+    def test_tilde_is_expanded(self):
+        with self._with_setting("~/somewhere/else"):
+            root = ta.get_cache_dir()
+        self.assertTrue(os.path.isabs(root), root)
+        self.assertNotIn("~", root)

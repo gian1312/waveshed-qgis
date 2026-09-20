@@ -59,8 +59,22 @@ def reset_terrain_warnings() -> None:
 
 
 def get_cache_dir() -> str:
+    """Absolute path of the terrain cache root.
+
+    Every pool and view directory is built by joining onto this, and those
+    paths are handed to an engine subprocess that resolves them itself. A
+    QgsSettings value that is blank, ``~``-relative or plain relative would
+    therefore make the whole cache identity depend on the process working
+    directory — which QGIS moves (file dialogs, Processing) — so the same
+    identity computed twice in one run could name two different directories
+    and the converter would die on the one that was never created. Normalised
+    here, once, so that cannot happen.
+    """
     from qgis.core import QgsSettings
-    return QgsSettings().value("waveshed/cache_dir", os.path.expanduser("~/.aether/cache"))
+    default = os.path.expanduser("~/.aether/cache")
+    raw = QgsSettings().value("waveshed/cache_dir", default)
+    root = str(raw).strip() if raw is not None else ""
+    return os.path.abspath(os.path.expanduser(root or default))
 
 
 # A cache entry directory is named by _cache_key, i.e. an md5 hex digest.
@@ -711,12 +725,33 @@ def _cache_key(source: str, subtiles: List[Dict[str, Any]], resolution_m: int,
     Buildings are baked into the .abt pixels, so a cache built without them
     must never be reused for a run that wants them (or one that wants a
     different building set).
+
+    The source term goes through :func:`source_identity`, the SAME
+    normalisation ``_pool_dir`` applies. It used to hash the raw layer URI,
+    so the two halves of one cache disagreed about what "the same source" is:
+    re-adding an XYZ layer with the parameters in another order (or with
+    ``zmin=``/``interpretation=`` spelled differently) kept the pool and moved
+    the view to a fresh directory — the view identity moving underneath a
+    pool that did not.
     """
     names = ",".join(sorted(t["filename"] for t in subtiles))
-    key = f"{_CACHE_SCHEMA}|{source}|{names}|{resolution_m}"
+    key = (f"{_CACHE_SCHEMA}|{source_identity(source)}|{names}"
+           f"|{resolution_m}")
     if buildings:
         key += f"|{source_fingerprint(buildings)}"
     return hashlib.md5(key.encode()).hexdigest()
+
+
+def _view_dir(source: str, subtiles: List[Dict[str, Any]],
+              resolution_m: int, buildings: Optional[str] = None) -> str:
+    """Absolute view directory for one run — the directory the engine reads.
+
+    The counterpart of :func:`_pool_dir`, and the ONE place the view path is
+    assembled, so no caller can compute it a second time and land somewhere
+    else (see :func:`get_cache_dir` on why a second computation could move).
+    """
+    return os.path.join(get_cache_dir(), _VIEW_DIRNAME,
+                        _cache_key(source, subtiles, resolution_m, buildings))
 
 
 # ---------------------------------------------------------------------------
@@ -1297,6 +1332,110 @@ class ConverterCancelled(Exception):
     """
 
 
+# ---------------------------------------------------------------------------
+# Launch preflight
+# ---------------------------------------------------------------------------
+#
+# Windows answers a missing DIRECTORY component with ERROR_PATH_NOT_FOUND,
+# which Rust surfaces as "The system cannot find the path specified (os error
+# 3)" and which names nothing at all. A run that dies that way leaves no way
+# to tell whether the pool, the view, the job file's parent or a source's
+# folder is the one that went missing. These helpers (a) re-create the
+# directories the engine is about to write into immediately before the
+# launch, so a dir that disappeared since it was first made is simply made
+# again, and (b) fail with the offending PATH in the message when something
+# the engine must read is genuinely absent.
+
+def ensure_engine_dirs(*dirs: Optional[str]) -> None:
+    """``makedirs(exist_ok=True)`` for every non-empty directory in *dirs*.
+
+    Call it immediately before a job file is written or the engine is
+    launched, however early the same directory was created: on Windows these
+    have been observed to vanish between the two.
+    """
+    for d in dirs:
+        if not d:
+            continue
+        try:
+            os.makedirs(d, exist_ok=True)
+        except OSError as exc:
+            raise RuntimeError(
+                f"Terrain cache directory could not be created: {d} ({exc})"
+            ) from exc
+
+
+def _missing_path_detail(path: str) -> str:
+    """``path``, plus the nearest ancestor that DOES exist — the whole point
+    of the message is to say which directory went missing."""
+    parent = os.path.dirname(os.path.abspath(path))
+    probe = parent
+    while probe and not os.path.isdir(probe):
+        nxt = os.path.dirname(probe)
+        if nxt == probe:
+            break
+        probe = nxt
+    if os.path.isdir(parent):
+        return f"{path} (its directory {parent} exists)"
+    return f"{path} (its directory {parent} is MISSING; nearest existing "\
+           f"ancestor: {probe or '<none>'})"
+
+
+def _assert_job_file_readable(args: List[str]) -> None:
+    """Raise if a ``--job-file`` / ``--config`` argument names a missing file.
+
+    Both aether_converter subcommands and aether_core take their whole input
+    as one file path; the engine reading it and finding nothing reports
+    os error 3 with no path in it. Checked here — the single Popen site — so
+    every caller gets the same named diagnosis.
+    """
+    for flag in ("--job-file", "--config"):
+        if flag not in args:
+            continue
+        idx = args.index(flag)
+        if idx + 1 >= len(args):
+            continue
+        path = args[idx + 1]
+        if not os.path.isfile(path):
+            raise RuntimeError(
+                f"The engine job file vanished before launch: "
+                f"{_missing_path_detail(path)}"
+            )
+
+
+def preflight_ingest_jobs(jobs: List[Dict[str, Any]]) -> None:
+    """Check every path an ingest batch depends on, naming the first missing.
+
+    Verifies that each job's ``output_path`` has a parent directory (making
+    it if it is not there — the pool and the output folder are ours to
+    create) and that every ``sources[]`` entry is really on disk. Without
+    this the converter dies on the first one with os error 3 and says
+    nothing about which path it was.
+
+    Deliberately says nothing about ``buildings_file`` /
+    ``buildings_pbf_dir``: buildings that cannot be read DEGRADE — one
+    warning, tiles flagged for rebuild, terrain without them — and turning
+    that into an abort here would break the contract prepare_terrain
+    implements a few hundred lines down.
+    """
+    for job in jobs:
+        out = job.get("output_path")
+        if out:
+            parent = os.path.dirname(os.path.abspath(out))
+            ensure_engine_dirs(parent)
+            if not os.path.isdir(parent):
+                raise RuntimeError(
+                    f"Terrain output directory is missing and could not be "
+                    f"created: {_missing_path_detail(out)}"
+                )
+        for src in job.get("sources", []):
+            path = src.get("path") if isinstance(src, dict) else src
+            if path and not os.path.exists(path):
+                raise RuntimeError(
+                    f"Terrain source vanished before the converter ran: "
+                    f"{_missing_path_detail(path)}"
+                )
+
+
 def run_converter_streaming(exe: str, args: List[str], on_line: Any,
                             on_start: Any = None,
                             env: Optional[Dict[str, str]] = None) -> int:
@@ -1312,7 +1451,12 @@ def run_converter_streaming(exe: str, args: List[str], on_line: Any,
     Every engine invocation (aether_converter download/ingest, aether_core)
     goes through here so pipe handling, encoding and cancellation exist
     exactly once.
+
+    Raises RuntimeError NAMING the missing path when the job/config file the
+    arguments point at is not there at launch time — see
+    :func:`_assert_job_file_readable`.
     """
+    _assert_job_file_readable(args)
     with subprocess.Popen(
         [exe, *args],
         stdout=subprocess.PIPE,
@@ -1548,6 +1692,32 @@ def pop_acquisition_routes() -> List[str]:
     return out
 
 
+#: Absolute terrain directories :func:`prepare_terrain` has handed the engine
+#: since the last :func:`pop_prepared_view_dirs` — one entry per successful
+#: return, whichever way it came (a cache hit, a download, an ingest, or a
+#: user-supplied .abt folder passed straight through). Capped the same way as
+#: ``_ACQUISITION_ROUTES``: a long QGIS session must not grow a list forever.
+_PREPARED_VIEW_DIRS: List[str] = []
+
+
+def _record_view_dir(view_dir: str) -> None:
+    if len(_PREPARED_VIEW_DIRS) < 256:
+        _PREPARED_VIEW_DIRS.append(os.path.abspath(view_dir))
+
+
+def pop_prepared_view_dirs() -> List[str]:
+    """The terrain directories recorded since the last call, clearing them.
+
+    Diagnostic surface for the torture runner: it pops before a driven run
+    and reads the LAST entry after it, which is the directory aether_core was
+    actually pointed at — so a row can inspect the .abt tiles the engine read
+    rather than guessing at the cache key that produced them.
+    """
+    out = list(_PREPARED_VIEW_DIRS)
+    _PREPARED_VIEW_DIRS.clear()
+    return out
+
+
 #: Printed by ``aether_converter download`` once per run when it has fused a
 #: ``buildings_pbf_dir``. Its absence is how we detect an engine that predates
 #: the feature — see ``_try_rust_download``.
@@ -1756,6 +1926,14 @@ def _try_rust_download(
         lines ride along because they are the only place the *reason* for a
         failure exists (see :func:`_download_failure_detail`).
         """
+        # The pool was created long before this (prepare_terrain /
+        # ensure_pool_tiles) and the scratch job file long before that;
+        # re-make both here, a statement away from the launch, because the
+        # converter writes its output .abt straight into `output_dir` and a
+        # directory that went missing in between is what "os error 3" is.
+        ensure_engine_dirs(os.path.abspath(cache_dir),
+                           os.path.dirname(os.path.abspath(job_file)),
+                           os.path.abspath(pbf_dir) if pbf_dir else None)
         job = {
             "url_template": url_template,
             "encoding": encoding,
@@ -1935,11 +2113,12 @@ def _download_zoom_group(
                 _set_rebuild_flags(cache_dir, all_names)
                 return DownloadOutcome(True)
 
-            if ok == 0:
+            if ok == 0 and no_data == 0:
                 # TOTAL failure, which is a different animal from the partial
                 # one warned about further down: not one source tile arrived
-                # and the misses are NOT all no-data answers (that case
-                # returned as complete above — the converter said which), so
+                # and none of the misses is a no-data answer (all-404 returned
+                # as complete above; a 404-plus-real-failure mix takes the
+                # retry path below, where only the real failures retry), so
                 # the network died, the key is wrong, or the engine predates
                 # the no-data tally and cannot say. Retrying at half the
                 # connections cannot fix any of those, so say what it is,
@@ -1993,6 +2172,13 @@ def _download_zoom_group(
                 return DownloadOutcome(True)
 
             if attempt >= max_passes or conn <= _MIN_DOWNLOAD_CONNECTIONS:
+                if no_data > 0:
+                    # Part of the remaining gaps is the service answering 404
+                    # — permanent sea, not a retryable failure. The user must
+                    # hear the sea-level contract even though the run also had
+                    # real failures (the all-404 case warned and returned
+                    # complete above).
+                    _warn_no_data_tiles(zoom, no_data, total)
                 _log(f"  WARNING: {missing} source tile(s) still failed after "
                      f"{attempt} pass(es); {len(affected)} output tile(s) left "
                      f"with gaps — using partial terrain and flagging just "
@@ -3000,6 +3186,9 @@ def prepare_terrain(
                 if line.strip():
                     _log(f"  WARNING: {line.strip()}")
         _record_route("terrain_dir")
+        # An early return, but still a usable terrain directory handed to the
+        # engine — the recorder covers every path, not just the built ones.
+        _record_view_dir(terrain_dir)
         return terrain_dir
 
     bbox = _compute_sector_bbox(tx_lat, tx_lon, max_range_km, az_start, az_end)
@@ -3032,11 +3221,12 @@ def prepare_terrain(
     buildings_id = buildings_identity(buildings_file, osm_buildings)
 
     # The pool holds tiles for this source; the view is what the engine reads.
+    # Both identities are computed ONCE here and reused for the rest of the
+    # run — never recomputed at the launch site, where a changed cache-dir
+    # setting would move them out from under the directories already made.
     pool_dir = _pool_dir(source, buildings_id)
-    view_dir = os.path.join(get_cache_dir(), _VIEW_DIRNAME,
-                            _cache_key(source, subtiles, resolution_m,
-                                       buildings_id))
-    os.makedirs(pool_dir, exist_ok=True)
+    view_dir = _view_dir(source, subtiles, resolution_m, buildings_id)
+    ensure_engine_dirs(pool_dir, view_dir)
     # Log the resolved paths so the user can inspect the .abt tiles directly
     # (e.g. to check for missing tiles that show up as empty stripes through a
     # line-of-sight). Set QgsSettings "waveshed/cache_dir" to relocate.
@@ -3056,6 +3246,7 @@ def prepare_terrain(
             # as that route — a warm run must not read as "acquired nothing".
             _record_route("sources" if terrain_dir
                           else _source_route(source, dem_layer))
+            _record_view_dir(view_dir)
             return view_dir
         _log(f"  {len(gone)} pooled tile(s) vanished between check and link; "
              f"rebuilding those")
@@ -3186,6 +3377,7 @@ def prepare_terrain(
                      "flagged for rebuild so the next run retries them")
             _finish_view(pool_dir, view_dir, expected, t0)
             _record_route("download")
+            _record_view_dir(view_dir)
             return view_dir
         # NO render fallback for an XYZ elevation service: the router
         # contract says XYZ goes through the shared Rust downloader, and
@@ -3295,10 +3487,18 @@ def prepare_terrain(
                 job["buildings_pbf_dir"] = os.path.abspath(pbf_dir)
             jobs.append(job)
 
+        # Immediately before the write and the launch, not only at the top of
+        # this function: the pool has been observed to disappear between the
+        # two on Windows, and the converter writes every output .abt into it.
         job_file = os.path.join(view_dir, "batch_job.json")
-        os.makedirs(view_dir, exist_ok=True)
+        ensure_engine_dirs(pool_dir, view_dir,
+                           os.path.dirname(os.path.abspath(job_file)))
         with open(job_file, "w") as fh:
             json.dump(jobs, fh)
+
+        # Name whatever is missing instead of letting the converter die with
+        # a pathless "os error 3".
+        preflight_ingest_jobs(jobs)
 
         t2 = time.perf_counter()
         exe = binary_manager.find_binary("aether_converter")
@@ -3346,4 +3546,5 @@ def prepare_terrain(
                 os.remove(tf)
 
     _finish_view(pool_dir, view_dir, expected, t0)
+    _record_view_dir(view_dir)
     return view_dir

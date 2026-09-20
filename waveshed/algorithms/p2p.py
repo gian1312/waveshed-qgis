@@ -32,6 +32,7 @@ from ..core.job_builder import (
     MIN_ANTENNA_AGL_M,
     VALID_RESOLUTIONS,
     P2PParams,
+    batch_max_range_km,
     build_p2p_job,
     height_floor_error,
     write_job_file,
@@ -295,7 +296,8 @@ class P2PAlgorithm(QgsProcessingAlgorithm):
         feedback.setProgress(5)
 
         entries = self._parse_csv(batch_file)
-        centre_lat, centre_lon, max_range_km = self._compute_terrain_extent(entries)
+        (centre_lat, centre_lon,
+         terrain_radius_km) = self._compute_terrain_extent(entries)
 
         if feedback.isCanceled():
             return {}
@@ -308,7 +310,7 @@ class P2PAlgorithm(QgsProcessingAlgorithm):
             dem_layer=dem_layer,
             tx_lat=centre_lat,
             tx_lon=centre_lon,
-            max_range_km=max_range_km,
+            max_range_km=terrain_radius_km,
             resolution_m=resolution_m,
             binary_manager=bm,
             feedback=feedback,
@@ -346,7 +348,10 @@ class P2PAlgorithm(QgsProcessingAlgorithm):
             rx_mode="AGL",
             model=model,
             resolution_m=resolution_m,
-            max_range_km=int(math.ceil(max_range_km)),
+            # NOT the terrain radius: aether_core reads max_range_km as the
+            # per-link distance CAP and answers 0/0 for anything longer, so
+            # it is sized on the longest link in the batch.
+            max_range_km=batch_max_range_km(entries, terrain_radius_km),
             backend=backend,
             output_name=output_name,
         )

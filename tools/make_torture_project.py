@@ -2756,8 +2756,14 @@ def start_tile_server():
         def log_message(self, fmt, *args):
             pass          # do not spam the QGIS log with one line per tile
 
+    class Backlogged(http.server.ThreadingHTTPServer):
+        # The Rust downloader opens up to 256 connections at once; the
+        # TCPServer default backlog of 5 refuses the burst and the refusals
+        # count as real connect errors against the no-data contract.
+        request_queue_size = 512
+
     try:
-        server = http.server.ThreadingHTTPServer(
+        server = Backlogged(
             ("127.0.0.1", TILE_PORT),
             functools.partial(Handler, directory=root))
     except OSError as exc:

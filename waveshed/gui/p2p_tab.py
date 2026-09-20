@@ -66,6 +66,7 @@ from ..core.job_builder import (
     INVALID,
     VALID_RESOLUTIONS,
     P2PParams,
+    batch_max_range_km,
     build_p2p_job,
     format_model_warnings,
     height_floor_error,
@@ -230,12 +231,16 @@ def _compute_bbox_for_entries(
 
 
 def _terrain_extent_for_batch(batch_file: str) -> Tuple[float, float, float]:
-    """Return ``(centre_lat, centre_lon, max_range_km)`` for a batch CSV.
+    """Return ``(centre_lat, centre_lon, terrain_radius_km)`` for a batch CSV.
 
-    The centroid and a range covering the full extent (plus margin) are what
+    The centroid and a radius covering the full extent (plus margin) are what
     ``prepare_terrain`` is called with.  Shared by the worker and the pre-run
     size estimate so the two can never disagree about how much data a run
     will pull.
+
+    This radius is a TERRAIN figure only. It is not the job's
+    ``analysis.max_range_km``, which aether_core reads as the per-link
+    distance cap — see :func:`job_range_for_batch`.
     """
     entries = _parse_batch_csv(batch_file)
     min_lat, max_lat, min_lon, max_lon = _compute_bbox_for_entries(entries)
@@ -250,6 +255,19 @@ def _terrain_extent_for_batch(batch_file: str) -> Tuple[float, float, float]:
     lon_span_km = (max_lon - min_lon) * 111.0 * cos_lat
     half_diag_km = math.sqrt(lat_span_km**2 + lon_span_km**2) / 2.0
     return centre_lat, centre_lon, max(half_diag_km + 5.0, 10.0)
+
+
+def job_range_for_batch(batch_file: str, terrain_radius_km: float) -> int:
+    """``analysis.max_range_km`` for a BATCH_P2P run over *batch_file*.
+
+    The terrain radius from :func:`_terrain_extent_for_batch` used to be
+    written straight into the job, which made it the engine's per-link
+    distance cap: every link longer than the radius of the terrain disc was
+    silently answered 0 dB / 0 m instead of being computed (Bern -> Thun,
+    25.2 km, against an 18 km radius). ``job_builder.batch_max_range_km``
+    sizes the cap on the longest link in the batch instead.
+    """
+    return batch_max_range_km(_parse_batch_csv(batch_file), terrain_radius_km)
 
 
 def _write_temp_batch_csv(
@@ -562,8 +580,8 @@ class _P2PWorker(QThread):
             self.status.emit("Computing terrain extents...")
             self.progress.emit(5)
 
-            centre_lat, centre_lon, max_range_km = _terrain_extent_for_batch(
-                self.batch_file)
+            (centre_lat, centre_lon,
+             terrain_radius_km) = _terrain_extent_for_batch(self.batch_file)
 
             if self._canceled:
                 return
@@ -579,7 +597,7 @@ class _P2PWorker(QThread):
                 dem_layer=self.dem_layer,
                 tx_lat=centre_lat,
                 tx_lon=centre_lon,
-                max_range_km=max_range_km,
+                max_range_km=terrain_radius_km,
                 resolution_m=params.resolution_m,
                 binary_manager=bm,
             )
@@ -591,7 +609,16 @@ class _P2PWorker(QThread):
             self.status.emit("Building job configuration...")
             self.progress.emit(20)
 
-            params.max_range_km = int(math.ceil(max_range_km))
+            # The terrain radius above sized the tile disc. The JOB's
+            # max_range_km is a different number: aether_core uses it as the
+            # per-link distance CAP, so writing the terrain radius here
+            # answered 0/0 for every link longer than it.
+            params.max_range_km = job_range_for_batch(
+                self.batch_file, terrain_radius_km)
+            QgsMessageLog.logMessage(
+                f"P2P batch: terrain radius {terrain_radius_km:.1f} km, "
+                f"job max_range_km={params.max_range_km} (link cap)",
+                TAG, Qgis.MessageLevel.Info)
 
             job_config = build_p2p_job(
                 params, abt_dir, output_dir, batch_file=self.batch_file,

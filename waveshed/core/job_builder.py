@@ -5,8 +5,9 @@ Produces JSON matching the schema defined in rust/aether_core/src/config.rs.
 
 import dataclasses
 import json
+import math
 import os
-from typing import Optional
+from typing import Optional, Sequence, Tuple
 
 # Resolution values (metres) the plugin offers throughout the UI. aether_core
 # takes resolution_m as a plain f32 (clamped to >= 0.1 m) with no fixed set, so
@@ -15,6 +16,83 @@ from typing import Optional
 # Keep this in sync with terrain_adapter.ABT_EXTENT_DEG (every value offered
 # here needs a per-resolution .abt tile extent).
 VALID_RESOLUTIONS = [2, 5, 10, 30, 90, 250]
+
+# Mean Earth radius (m) — the value aether_core's P2P engine uses for the
+# great-circle distance it measures every link with (engines/p2p.rs). Kept
+# identical here so the plugin can never compute a shorter link than the
+# engine does and cap a link the engine considers in range.
+EARTH_RADIUS_M = 6_371_000.0
+
+#: Safety margin (km) added on top of the longest link in a batch when the
+#: job's ``analysis.max_range_km`` is derived from it. ``max_range_km`` is the
+#: per-link distance CAP in aether_core: engines/p2p.rs builds every link with
+#: ``max_dist_m = max_range_km * 1000`` and its trivial-link guard writes a
+#: 0/0 result for any link whose measured distance exceeds it. An integer
+#: ceiling alone would leave a link sitting exactly on the cap at the mercy of
+#: the f32 rounding the engine does, so round up and add a kilometre.
+MAX_RANGE_MARGIN_KM = 1
+
+#: One batch-CSV row as the two P2P parsers produce it:
+#: ``(type, id, lat, lon, altitude, mode)`` with type ``"S"`` (source/TX) or
+#: ``"R"`` (receiver/RX).
+BatchEntry = Tuple[str, str, float, float, float, str]
+
+
+def haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    """Great-circle distance in km between two WGS84 points.
+
+    Same formula and same Earth radius as aether_core's P2P engine, so the
+    distance the plugin uses to size ``analysis.max_range_km`` is the one the
+    engine will compare against that cap.
+    """
+    p1 = math.radians(lat1)
+    p2 = math.radians(lat2)
+    dp = p2 - p1
+    dl = math.radians(lon2 - lon1)
+    a = (math.sin(dp / 2.0) ** 2
+         + math.cos(p1) * math.cos(p2) * math.sin(dl / 2.0) ** 2)
+    return (EARTH_RADIUS_M * 2.0
+            * math.atan2(math.sqrt(a), math.sqrt(1.0 - a))) / 1000.0
+
+
+def longest_link_km(entries: Sequence[BatchEntry]) -> float:
+    """Longest TX-RX great-circle distance (km) over a batch CSV's links.
+
+    aether_core pairs a BATCH_P2P run as the full cross product of the ``S``
+    rows with the ``R`` rows (engines/p2p.rs), so every such pair is a link
+    that will be computed. Returns 0.0 when one of the two sides is empty —
+    there is then no link to size anything from.
+    """
+    tx = [e for e in entries if e[0].strip().upper() == "S"]
+    rx = [e for e in entries if e[0].strip().upper() == "R"]
+    if not tx or not rx:
+        return 0.0
+    return max(haversine_km(s[2], s[3], r[2], r[3]) for s in tx for r in rx)
+
+
+def batch_max_range_km(entries: Sequence[BatchEntry],
+                       terrain_radius_km: float) -> int:
+    """The ``analysis.max_range_km`` a BATCH_P2P job over *entries* needs.
+
+    *terrain_radius_km* is what terrain preparation was asked for — the radius
+    of the disc around the batch centroid that had to be tiled. It is NOT a
+    valid distance cap: a batch whose endpoints span the full bounding box has
+    links up to twice that radius long, and aether_core silently writes a 0/0
+    result for every link longer than the cap (see ``MAX_RANGE_MARGIN_KM``).
+    A 25.2 km Bern-Thun link under an 18 km terrain radius is exactly that
+    case.
+
+    So take whichever is larger: the terrain radius (kept so the two numbers
+    never disagree for a small batch, and so a single-site job still covers
+    its own disc) or the longest link plus ``MAX_RANGE_MARGIN_KM``.
+
+    Raising the cap costs nothing in terrain: the engine selects the tiles a
+    link needs by walking that link's own great-circle path, not by the cap,
+    and the terrain the batch's bounding box produced already covers every
+    path between two of its own endpoints.
+    """
+    needed = math.ceil(longest_link_km(entries)) + MAX_RANGE_MARGIN_KM
+    return int(max(math.ceil(terrain_radius_km), needed))
 
 
 def _processing_setting(key: str, default: int) -> int:

@@ -1272,16 +1272,23 @@ class TestCleanCancelDuringConvert(unittest.TestCase):
         The runner may read ``fake_runner.worker`` (set before run) to flip
         the cancel flag mid-"run", simulating cancel() winning the race.
         """
-        entry = _LayerEntry(layer_type="raster", source_path="/a.tif",
-                            extent=dict(self.RAW), target_resolutions=[30])
-        info = {"path": "/a.tif", "crs": None, "crs_authid": "EPSG:4326",
-                "native_bounds": {"west": 0, "east": 20, "south": 40,
-                                  "north": 50},
-                "wgs84_bounds": {"west": 0, "east": 20, "south": 40,
-                                 "north": 50},
-                "halo_deg": 0.001}
         with tempfile.TemporaryDirectory() as out_dir:
-            worker = _MapConverterWorker([entry], out_dir, [30], ["/a.tif"])
+            # A source that really exists: the worker's launch preflight
+            # refuses to start the converter on a path that is not there
+            # (that is the whole point of naming it instead of letting the
+            # engine die with a pathless "os error 3").
+            src = os.path.join(out_dir, "a.tif")
+            open(src, "w").close()
+            entry = _LayerEntry(layer_type="raster", source_path=src,
+                                extent=dict(self.RAW),
+                                target_resolutions=[30])
+            info = {"path": src, "crs": None, "crs_authid": "EPSG:4326",
+                    "native_bounds": {"west": 0, "east": 20, "south": 40,
+                                      "north": 50},
+                    "wgs84_bounds": {"west": 0, "east": 20, "south": 40,
+                                     "north": 50},
+                    "halo_deg": 0.001}
+            worker = _MapConverterWorker([entry], out_dir, [30], [src])
             fake_runner.worker = worker
             rec = _worker_signals(worker)
             with mock.patch.object(

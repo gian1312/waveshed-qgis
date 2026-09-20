@@ -1194,15 +1194,32 @@ class _MapConverterWorker(QThread):
             job_file = os.path.join(
                 tempfile.gettempdir(), f"aether_conv_{os.getpid()}.json"
             )
+            # Re-made a statement before the write: the output directory and
+            # the scratch temp dir were created in an earlier phase, and a
+            # directory that vanished in between is what the converter
+            # reports as the pathless "os error 3".
+            terrain_adapter.ensure_engine_dirs(
+                self._output_dir, os.path.dirname(os.path.abspath(job_file)))
             with open(job_file, "w") as fh:
                 json.dump(jobs, fh)
 
+            # Fail with the offending PATH rather than letting the converter
+            # die on a missing source or output directory with no name in it.
+            terrain_adapter.preflight_ingest_jobs(jobs)
+
             self._log(f"Launching: {converter_exe} ingest")
+
+            no_data_batch = []
 
             def on_line(line: str) -> None:
                 if self._canceled:
                     raise terrain_adapter.ConverterCancelled()
                 self._log(line)
+                # CONTRACT item 18: a batch no source covers exits 0 with
+                # this marker instead of failing — catch it so the success
+                # path below can say what the output actually holds.
+                if "[Warn] NO-DATA batch:" in line:
+                    no_data_batch.append(line)
                 prog = self._parse_progress(line)
                 if prog:
                     curr, tot = prog
@@ -1243,6 +1260,13 @@ class _MapConverterWorker(QThread):
 
             self.progress.emit(100)
             self.status.emit("Done.")
+            if no_data_batch:
+                self._log(
+                    "WARNING: no source covered any pixel of this area — "
+                    "every output tile is no-data (VOID). The Map Converter "
+                    "keeps voids by contract; Site Analysis reads such "
+                    "ground as 0 m (sea level). Check the sources' extent "
+                    "and CRS if you expected terrain here.")
             self._log(f"Conversion complete: {total} tiles.")
             self.finished_ok.emit(self._output_dir)
 

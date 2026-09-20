@@ -121,6 +121,12 @@ class _Run:
         self.binaries.append(name)
         return f"/nonexistent/{name}"
 
+    def _write_job_file(self, *_args, **_kwargs):
+        path = os.path.join(self.output_dir, "job.json")
+        with open(path, "w") as fh:
+            fh.write("{}")
+        return path
+
     def __enter__(self):
         fixed_dt = mock.Mock()
         fixed_dt.now.return_value.strftime.return_value = "20260101_000000"
@@ -130,9 +136,10 @@ class _Run:
             mock.patch.object(alg, "prepare_terrain",
                               return_value=self.output_dir),
             mock.patch.object(alg, "build_p2p_job", return_value={}),
+            # A real file on disk: run_converter_streaming refuses to
+            # launch on a job file that is not there (the os error 3 guard).
             mock.patch.object(alg, "write_job_file",
-                              return_value=os.path.join(self.output_dir,
-                                                        "job.json")),
+                              side_effect=self._write_job_file),
             mock.patch.object(alg.api_key, "apply_license_env"),
             # p2p.py no longer imports subprocess at all — every engine run
             # goes through terrain_adapter.run_converter_streaming, so the

@@ -10,6 +10,7 @@ exactly how it got there.
 from __future__ import annotations
 
 import importlib.util
+import shutil
 import sys
 from pathlib import Path
 
@@ -1021,3 +1022,285 @@ def test_excess_loss_refuses_a_csv_without_the_frozen_column(tmp_path):
     excess, detail = tr._excess_loss_db(str(csv_path), (46.9, 7.4), (46.8, 7.6))
     assert excess is None
     assert "Path_Loss_dB" in detail
+
+
+def _p2p_csv(tmp_path, loss):
+    csv_path = tmp_path / f"p2p_{loss}.csv"
+    csv_path.write_text("Source_ID,Target_ID,Signal_dBm,Path_Loss_dB\n"
+                        f"Site_0,WP_0,-70.00,{loss}\n", encoding="utf-8")
+    return str(csv_path)
+
+
+BERN, THUN = (46.9481, 7.4474), (46.7580, 7.6280)
+
+
+def test_excess_loss_refuses_the_engines_no_result_sentinel(tmp_path):
+    """9999 is "I have no answer", not a 9,999 dB path.
+
+    Subtracted from free space it produced a confident +9,880 dB "excess",
+    and through the clear/obstructed subtraction a nonsense negative margin —
+    row 5.3, 2026-09-20.
+    """
+    excess, detail = tr._excess_loss_db(_p2p_csv(tmp_path, "9999.00"), BERN, THUN)
+    assert excess is None
+    assert "9999" in detail and "no result" in detail
+
+
+def test_excess_loss_refuses_a_loss_below_free_space(tmp_path):
+    # Free space over Bern->Thun at 900 MHz is ~119 dB. 50 dB is not a
+    # propagation result; reporting it as a large negative "excess" accuses
+    # the engine of physics instead of naming the bad value.
+    excess, detail = tr._excess_loss_db(_p2p_csv(tmp_path, "50.00"), BERN, THUN)
+    assert excess is None
+    assert "below free space" in detail and "50.0" in detail
+
+
+def test_excess_loss_keeps_a_value_just_under_free_space(tmp_path):
+    # Two-ray constructive interference can legitimately beat free space by a
+    # few dB, so the guard has a tolerance and does not eat honest results.
+    excess, detail = tr._excess_loss_db(_p2p_csv(tmp_path, "115.00"), BERN, THUN)
+    assert excess is not None and -6.0 < excess < 0.0, detail
+
+
+# ---------------------------------------------------------------------------
+# Complaints: the engine's reason must survive the truncation
+# ---------------------------------------------------------------------------
+
+def test_a_complaint_keeps_the_cause_and_drops_the_progress_chatter():
+    """Rows 1.1/1.3b reported an anonymous failure for a named refusal.
+
+    The tail kept the last 15 log lines and the download's own progress
+    counter filled all 15, so the engine's "Caused by:" line — the only part
+    worth reading — never reached the report.
+    """
+    log = ["Caused by: unsupported codec ZSTD in /data/cog_zstd.tif"]
+    log += [f"Downloading terrain (z12): {i}/63 source tiles" for i in range(50, 64)]
+    log += ["Terrain download: 7/7 tiles ready", "Converting tile 3/62",
+            "Resolved layer 2/2"]
+    said = tr._worker_complaint({"err": "Converter failed (exit code 1). See log.",
+                                 "log": log})
+    assert "ZSTD" in said
+    assert "Downloading terrain" not in said and "Converting tile" not in said
+    # The worker's verdict goes LAST, because every caller truncates with
+    # _tail, which keeps the end.
+    assert said.endswith("Converter failed (exit code 1). See log.")
+    assert "ZSTD" in tr._tail(said, 120)
+
+
+def test_a_progress_line_that_names_a_problem_is_not_progress():
+    assert tr._is_progress_line("[Download] 42% (12/63) - 3.1 MB/s, 0 errors")
+    assert tr._is_progress_line("Converting tile 7/62")
+    assert not tr._is_progress_line("[Stats] NO-DATA (HTTP 404): 3/63 tiles")
+    assert not tr._is_progress_line("Caused by: 2/3 sources failed to open")
+
+
+# ---------------------------------------------------------------------------
+# A row that bails out owes its declared checks a verdict, not a hole
+# ---------------------------------------------------------------------------
+
+def test_an_early_return_fails_the_rest_of_the_row_by_name():
+    results = tr.Results()
+    for check_id in ("pipeline", "pipeline.sa", "pipeline.both_tabs",
+                     "pipeline.cov.grid"):
+        results.plan("2.1", check_id)
+    results.add("2.1", "pipeline", "terrain out of this layer", tr.FAIL, "boom")
+    assert tr._fail_rest("2.1", {"row": "2.1"}, results,
+                         "the Map Converter run failed") == 3
+    results.finish()
+    assert results.count(tr.NOTRUN) == 0
+    assert results.count(tr.FAIL) == 4
+    filed = {e["id"]: e["detail"] for e in results.entries}
+    assert "not reached: the Map Converter run failed" in filed["pipeline.sa"]
+
+
+def test_the_boundary_scenarios_are_not_failed_by_a_row_bailing_out():
+    """``overrun:`` checks run AFTER the row driver returns, in their own loop.
+
+    Failing them from inside the row would report a scenario that has not
+    been attempted yet.
+    """
+    results = tr.Results()
+    results.plan("1.1", "pipeline.sa")
+    results.plan("1.1", "overrun:east-edge.run")
+    tr._fail_rest("1.1", {"row": "1.1"}, results, "the run failed")
+    assert ("1.1", "overrun:east-edge.run") not in results.executed
+    assert ("1.1", "pipeline.sa") in results.executed
+
+
+def test_one_scenarios_checks_can_be_failed_without_touching_another():
+    results = tr.Results()
+    for check_id in ("overrun:a.run", "overrun:a.sea", "overrun:b.run"):
+        results.plan("1.1", check_id)
+    results.add("1.1", "overrun:a.run", "run", tr.FAIL, "no layer")
+    assert tr._fail_rest("1.1", None, results, "the layer is not in the project",
+                         only=tr._overrun_checks_of("a")) == 1
+    assert ("1.1", "overrun:a.sea") in results.executed
+    assert ("1.1", "overrun:b.run") not in results.executed
+
+
+# ---------------------------------------------------------------------------
+# The Site Analysis view: asked of the plugin, not recomputed
+# ---------------------------------------------------------------------------
+
+class _Adapter:
+    """Only what _pop_view_dirs looks for."""
+
+    def __init__(self, recorded=None, has_recorder=True):
+        self._recorded = recorded
+        if has_recorder:
+            self.pop_prepared_view_dirs = self._pop
+
+    def _pop(self):
+        out, self._recorded = list(self._recorded or []), []
+        return out
+
+
+def test_the_runner_reads_the_view_the_plugin_recorded():
+    plugin = {"adapter": _Adapter(["/cache/views/aaa", "/cache/views/bbb"])}
+    recorded = tr._pop_view_dirs(plugin)
+    assert recorded == ["/cache/views/aaa", "/cache/views/bbb"]
+    # Popping clears, exactly like pop_acquisition_routes.
+    assert tr._pop_view_dirs(plugin) == []
+    view, caveat = tr._sa_view_from_run(recorded, "src", 46.9, 7.4, 3.0, 30, plugin)
+    assert view == "/cache/views/bbb" and caveat == ""
+
+
+def test_an_empty_recording_is_not_the_same_as_a_moved_cache_identity():
+    view, caveat = tr._sa_view_from_run([], "src", 46.9, 7.4, 3.0, 30, None)
+    assert view == ""
+    assert caveat == "prepare_terrain returned no view directory"
+
+
+def test_an_older_plugin_falls_back_to_the_recompute_and_says_so(monkeypatch):
+    plugin = {"adapter": _Adapter(has_recorder=False)}
+    assert tr._pop_view_dirs(plugin) is None
+    monkeypatch.setattr(tr, "_sa_view_dir",
+                        lambda *a, **k: "/cache/views/guessed")
+    view, caveat = tr._sa_view_from_run(None, "src", 46.9, 7.4, 3.0, 30, plugin)
+    assert view == "/cache/views/guessed"
+    assert "pop_prepared_view_dirs" in caveat and "RUNNER" in caveat
+
+
+# ---------------------------------------------------------------------------
+# The reference terrain has to still be there to be compared against
+# ---------------------------------------------------------------------------
+
+def test_an_unreadable_tile_fails_identical_terrain_by_name_instead_of_raising():
+    """Row 1.10, 2026-09-20: ``.size`` on a None grid took the check down.
+
+    It also re-read 2x62 MB of tiles that the loop above had already read.
+    """
+    class _Abt(_TwoDirAbt):
+        @classmethod
+        def list_tiles(cls, d):
+            return [f"{d}/t.abt"]
+
+    import numpy as np
+    _TwoDirAbt.grids = {"/x/a": np.array([[100, 200]], dtype="int16"),
+                        "/x/broken": None}
+    ok, why = tr._identical_terrain("/x/a", "/x/broken", {"abt": _Abt})
+    assert not ok
+    assert "unreadable" in why and "/x/broken/t.abt" in why
+
+
+def test_the_reference_notices_its_own_tiles_going_missing(tmp_path):
+    ref_dir = tmp_path / "reference_terrain"
+    ref_dir.mkdir()
+    for name in ("a.abt", "b.abt"):
+        (ref_dir / name).write_bytes(b"AETH" + b"\0" * 60)
+
+    class _Abt:
+        @staticmethod
+        def read_header(path):
+            return object()
+
+    plugin = {"abt": _Abt}
+    reference = tr._Reference(ref_dir, [str(ref_dir / "a.abt"),
+                                        str(ref_dir / "b.abt")])
+    assert tr._reference_missing(reference, plugin) == []
+    (ref_dir / "b.abt").unlink()
+    assert tr._reference_missing(reference, plugin) == ["b.abt"]
+
+    class _Unreadable:
+        @staticmethod
+        def read_header(path):
+            return None
+
+    assert tr._reference_missing(reference, {"abt": _Unreadable}) == \
+        ["a.abt", "b.abt"]
+
+
+def test_a_vanished_reference_is_reported_as_such_not_as_a_wrong_row(tmp_path):
+    """Rows 2.13-2.26, 2026-09-20: nine rows accused of terrain that disagreed.
+
+    The reference had disappeared. "No shared real sample" is what the suite
+    said; "the thing I compare you against is gone" is what happened, and the
+    first row at which it happened has to be recorded once.
+    """
+    ref_dir = tmp_path / "reference_terrain"
+    ref_dir.mkdir()
+    reference = tr._Reference(ref_dir, [str(ref_dir / "a.abt")])
+    shutil.rmtree(ref_dir)
+
+    class _Abt:
+        ELEV_STEP_M = _abt.ELEV_STEP_M
+
+        @staticmethod
+        def list_tiles(d):
+            return []
+
+        @staticmethod
+        def read_header(path):
+            return None
+
+    results = tr.Results()
+    results.plan("2.13", "pipeline.agrees")
+    tr._check_agrees("2.13", {"row": "2.13"}, [], reference, 25.0, results,
+                     {"abt": _Abt})
+    entry = results.entries[-1]
+    assert entry["status"] == tr.FAIL
+    assert "the reference terrain vanished during the run" in entry["detail"]
+    assert str(ref_dir) in entry["detail"]
+    assert reference.vanished_at == "2.13"
+    assert any("first noticed at row 2.13" in note for note in results.notes)
+    # Recorded ONCE, however many rows hit it afterwards.
+    results.plan("2.14", "pipeline.agrees")
+    tr._check_agrees("2.14", {"row": "2.14"}, [], reference, 25.0, results,
+                     {"abt": _Abt})
+    assert len(results.notes) == 1
+    assert "first noticed at row 2.13" in results.entries[-1]["detail"]
+
+
+def test_an_empty_comparison_says_which_of_the_three_reasons_it_was(tmp_path):
+    """len(ref), the name overlap and the per-tile reason, or the message is
+    the same sentence for three different defects."""
+    import numpy as np
+    ref_dir = tmp_path / "reference_terrain"
+    ref_dir.mkdir()
+    (ref_dir / "N46E007_30m.abt").write_bytes(b"AETH" + b"\0" * 60)
+    reference = tr._Reference(ref_dir, [str(ref_dir / "N46E007_30m.abt")])
+
+    class _Abt:
+        ELEV_STEP_M = _abt.ELEV_STEP_M
+        MIN_VALID_ELEV_M = _abt.MIN_VALID_ELEV_M
+
+        @staticmethod
+        def list_tiles(d):
+            return [str(ref_dir / "N46E007_30m.abt")]
+
+        @staticmethod
+        def read_header(path):
+            return path
+
+        @staticmethod
+        def read_tile(header):
+            return np.array([[1120, 1120]], dtype="int16")
+
+    results = tr.Results()
+    results.plan("2.13", "pipeline.agrees")
+    tr._check_agrees("2.13", {"row": "2.13"}, ["/row/N48E010_30m.abt"],
+                     reference, 25.0, results, {"abt": _Abt})
+    detail = results.entries[-1]["detail"]
+    assert "the reference holds 1 tile(s)" in detail.lower()
+    assert "0 name(s) in common" in detail
+    assert "no tile of that name in the reference" in detail
