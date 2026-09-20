@@ -3042,7 +3042,7 @@ def _export_via_qgis(dem_layer: Any, dest: str, bbox: Dict[str, float], resoluti
     w.setOutputFormat("GTiff")
     err = w.writeRaster(pipe, nc, nr, extent, wgs84, QgsProject.instance().transformContext())
     _log(f"    writeRaster: {time.perf_counter() - t:.1f}s (err={err})")
-    if err != QgsRasterFileWriter.NoError:
+    if err != QgsRasterFileWriter.WriterError.NoError:
         raise RuntimeError(f"writeRaster failed (code {err})")
 
 

@@ -151,7 +151,7 @@ class SettingsDialog(QDialog):
 
         # --- OK / Cancel -----------------------------------------------------
         self._button_box = QDialogButtonBox(
-            QDialogButtonBox.Ok | QDialogButtonBox.Cancel
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
         )
         self._button_box.accepted.connect(self._on_accept)
         self._button_box.rejected.connect(self.reject)
@@ -212,7 +212,7 @@ class SettingsDialog(QDialog):
         row = QHBoxLayout()
         row.addWidget(QLabel("API key:"))
         self._api_key_edit = QLineEdit()
-        self._api_key_edit.setEchoMode(QLineEdit.Password)
+        self._api_key_edit.setEchoMode(QLineEdit.EchoMode.Password)
         self._api_key_edit.setPlaceholderText("Paste your Waveshed API key")
         row.addWidget(self._api_key_edit)
 
@@ -401,7 +401,7 @@ class SettingsDialog(QDialog):
     def _on_accept(self) -> None:
         """Save and close (standalone dialog mode)."""
         self.save_settings()
-        if self.windowFlags() & Qt.Dialog:
+        if self.windowFlags() & Qt.WindowType.Dialog:
             self.accept()
 
     # ------------------------------------------------------ binary helpers
@@ -489,23 +489,23 @@ class SettingsDialog(QDialog):
             f"you agree to that EULA."
         )
         msg.setWordWrap(True)
-        msg.setTextFormat(Qt.RichText)
+        msg.setTextFormat(Qt.TextFormat.RichText)
         vbox.addWidget(msg)
 
         if eula_url:
             link = QLabel(f'<a href="{eula_url}">Read the Aether engine EULA</a>')
-            link.setTextFormat(Qt.RichText)
+            link.setTextFormat(Qt.TextFormat.RichText)
             link.setOpenExternalLinks(True)
             vbox.addWidget(link)
 
         buttons = QDialogButtonBox()
-        buttons.addButton("Accept && Download", QDialogButtonBox.AcceptRole)
-        buttons.addButton("Cancel", QDialogButtonBox.RejectRole)
+        buttons.addButton("Accept && Download", QDialogButtonBox.ButtonRole.AcceptRole)
+        buttons.addButton("Cancel", QDialogButtonBox.ButtonRole.RejectRole)
         buttons.accepted.connect(dlg.accept)
         buttons.rejected.connect(dlg.reject)
         vbox.addWidget(buttons)
 
-        return dlg.exec_() == QDialog.Accepted
+        return dlg.exec() == QDialog.DialogCode.Accepted
 
     def _on_download_ok(self, result_dir: str) -> None:
         self._download_progress.setVisible(False)
@@ -556,10 +556,10 @@ class SettingsDialog(QDialog):
     # ------------------------------------------------------- API key helpers
     def _toggle_key_visibility(self, checked: bool) -> None:
         if checked:
-            self._api_key_edit.setEchoMode(QLineEdit.Normal)
+            self._api_key_edit.setEchoMode(QLineEdit.EchoMode.Normal)
             self._btn_show_key.setText("Hide")
         else:
-            self._api_key_edit.setEchoMode(QLineEdit.Password)
+            self._api_key_edit.setEchoMode(QLineEdit.EchoMode.Password)
             self._btn_show_key.setText("Show")
 
     def _validate_api_key(self) -> None:
@@ -634,7 +634,7 @@ class SettingsDialog(QDialog):
             self,
             "Machine fingerprint",
             "Send this fingerprint to get a machine-locked license key:",
-            QLineEdit.Normal,
+            QLineEdit.EchoMode.Normal,
             fingerprint,
         )
 
@@ -703,9 +703,10 @@ class SettingsDialog(QDialog):
             f"Delete {len(entries)} cached terrain set(s), freeing "
             f"{size_mb:,.0f} MB?\n\n{terrain_adapter.get_cache_dir()}\n\n"
             "Terrain will be re-downloaded or rebuilt on the next run.",
-            QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
         )
-        if answer != QMessageBox.Yes:
+        if answer != QMessageBox.StandardButton.Yes:
             return
 
         removed, freed = terrain_adapter.clear_cache()

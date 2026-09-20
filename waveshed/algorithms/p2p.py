@@ -115,7 +115,7 @@ class P2PAlgorithm(QgsProcessingAlgorithm):
             QgsProcessingParameterFile(
                 self.BATCH_FILE,
                 "Batch CSV File",
-                behavior=QgsProcessingParameterFile.File,
+                behavior=QgsProcessingParameterFile.Behavior.File,
                 fileFilter="CSV Files (*.csv)",
                 optional=True,
             )
@@ -126,7 +126,7 @@ class P2PAlgorithm(QgsProcessingAlgorithm):
             QgsProcessingParameterNumber(
                 self.TX_LAT,
                 "TX Latitude",
-                type=QgsProcessingParameterNumber.Double,
+                type=QgsProcessingParameterNumber.Type.Double,
                 defaultValue=0.0,
                 minValue=-90.0,
                 maxValue=90.0,
@@ -137,7 +137,7 @@ class P2PAlgorithm(QgsProcessingAlgorithm):
             QgsProcessingParameterNumber(
                 self.TX_LON,
                 "TX Longitude",
-                type=QgsProcessingParameterNumber.Double,
+                type=QgsProcessingParameterNumber.Type.Double,
                 defaultValue=0.0,
                 minValue=-180.0,
                 maxValue=180.0,
@@ -155,7 +155,7 @@ class P2PAlgorithm(QgsProcessingAlgorithm):
             QgsProcessingParameterNumber(
                 self.TX_HEIGHT,
                 "TX Height (m AGL)",
-                type=QgsProcessingParameterNumber.Double,
+                type=QgsProcessingParameterNumber.Type.Double,
                 defaultValue=30.0,
                 minValue=MIN_ANTENNA_AGL_M,
                 maxValue=10000.0,
@@ -168,7 +168,7 @@ class P2PAlgorithm(QgsProcessingAlgorithm):
             QgsProcessingParameterNumber(
                 self.RX_LAT,
                 "RX Latitude",
-                type=QgsProcessingParameterNumber.Double,
+                type=QgsProcessingParameterNumber.Type.Double,
                 defaultValue=0.0,
                 minValue=-90.0,
                 maxValue=90.0,
@@ -179,7 +179,7 @@ class P2PAlgorithm(QgsProcessingAlgorithm):
             QgsProcessingParameterNumber(
                 self.RX_LON,
                 "RX Longitude",
-                type=QgsProcessingParameterNumber.Double,
+                type=QgsProcessingParameterNumber.Type.Double,
                 defaultValue=0.0,
                 minValue=-180.0,
                 maxValue=180.0,
@@ -191,7 +191,7 @@ class P2PAlgorithm(QgsProcessingAlgorithm):
             QgsProcessingParameterNumber(
                 self.RX_HEIGHT,
                 "RX Height (m AGL)",
-                type=QgsProcessingParameterNumber.Double,
+                type=QgsProcessingParameterNumber.Type.Double,
                 defaultValue=1.5,
                 minValue=MIN_ANTENNA_AGL_M,
                 maxValue=10000.0,

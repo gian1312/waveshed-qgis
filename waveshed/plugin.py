@@ -2,8 +2,12 @@
 
 import os
 from qgis.PyQt.QtGui import QIcon
-from qgis.PyQt.QtWidgets import QAction
 from qgis.core import QgsApplication
+
+try:  # Qt6 (QGIS 4) moved QAction from QtWidgets to QtGui.
+    from qgis.PyQt.QtGui import QAction
+except ImportError:  # Qt5 (QGIS 3.x)
+    from qgis.PyQt.QtWidgets import QAction
 
 
 class AetherPlugin:

@@ -450,7 +450,7 @@ def fetch_manifest(url: str = MANIFEST_URL) -> dict:
 
     request = QgsBlockingNetworkRequest()
     err = request.get(QNetworkRequest(QUrl(url)))
-    if err != QgsBlockingNetworkRequest.NoError:
+    if err != QgsBlockingNetworkRequest.ErrorCode.NoError:
         raise RuntimeError(
             f"Failed to fetch the release manifest from {url}: "
             f"{request.errorMessage()}"
@@ -525,7 +525,7 @@ def _download_to_file(
             lambda received, total: progress_cb(int(received), int(total))
         )
     err = request.get(QNetworkRequest(QUrl(url)))
-    if err != QgsBlockingNetworkRequest.NoError:
+    if err != QgsBlockingNetworkRequest.ErrorCode.NoError:
         raise RuntimeError(
             f"Failed to download the Aether engine from {url}: "
             f"{request.errorMessage()}"

@@ -133,7 +133,8 @@ def _set_layer_filters(combo) -> None:
     except (AttributeError, TypeError):
         pass
     combo.setFilters(
-        QgsMapLayerProxyModel.RasterLayer | QgsMapLayerProxyModel.VectorLayer
+        QgsMapLayerProxyModel.Filter.RasterLayer
+        | QgsMapLayerProxyModel.Filter.VectorLayer
     )
 
 
@@ -867,7 +868,7 @@ def resolve_sources_with_progress(layers, parent=None, render_jobs=None,
 
     dlg = QProgressDialog("Preparing layers…", "Cancel", 0, total, parent)
     dlg.setWindowTitle("Map Converter")
-    dlg.setWindowModality(Qt.WindowModal)
+    dlg.setWindowModality(Qt.WindowModality.WindowModal)
     # Show at once: the first layer is often the slowest, and a dialog that
     # only appears after the default 4 s delay is the freeze all over again.
     dlg.setMinimumDuration(0)
@@ -1446,15 +1447,15 @@ class _RectangleDrawTool:
         self._first_point_wgs84 = None    # in WGS84 (for callback)
 
         # Rubber band — visible orange rectangle.
-        self._rb = QgsRubberBand(self._canvas, QgsWkbTypes.PolygonGeometry)
+        self._rb = QgsRubberBand(self._canvas, QgsWkbTypes.GeometryType.PolygonGeometry)
         self._rb.setColor(QColor(255, 120, 0, 100))
         self._rb.setWidth(2)
-        self._rb.setLineStyle(Qt.DashLine)
+        self._rb.setLineStyle(Qt.PenStyle.DashLine)
 
         # We subclass QgsMapToolEmitPoint inline by monkey-patching
         # canvasMoveEvent and canvasReleaseEvent.
         self._tool = QgsMapToolEmitPoint(self._canvas)
-        self._tool.setCursor(Qt.CrossCursor)
+        self._tool.setCursor(Qt.CursorShape.CrossCursor)
         self._tool.canvasReleaseEvent = self._on_release
         self._tool.canvasMoveEvent = self._on_move
         self._tool.keyPressEvent = self._on_key
@@ -1475,10 +1476,10 @@ class _RectangleDrawTool:
     # -- Events ------------------------------------------------------------
 
     def _on_release(self, event):
-        if event.button() == Qt.RightButton:
+        if event.button() == Qt.MouseButton.RightButton:
             self._cancel()
             return
-        if event.button() != Qt.LeftButton:
+        if event.button() != Qt.MouseButton.LeftButton:
             return
 
         point = self._tool.toMapCoordinates(event.pos())
@@ -1497,7 +1498,7 @@ class _RectangleDrawTool:
             # Clear the preview once the rectangle is committed — the extent
             # now lives in the layer entry and is shown there, so leaving the
             # band on the canvas only accumulates stale outlines across draws.
-            self._rb.reset(QgsWkbTypes.PolygonGeometry)
+            self._rb.reset(QgsWkbTypes.GeometryType.PolygonGeometry)
             self._restore()
             self._callback(s, n, w, e)
 
@@ -1509,14 +1510,14 @@ class _RectangleDrawTool:
         self._draw_rect(self._first_point_canvas, current)
 
     def _on_key(self, event):
-        if event.key() == Qt.Key_Escape:
+        if event.key() == Qt.Key.Key_Escape:
             self._cancel()
 
     # -- Rubber band -------------------------------------------------------
 
     def _draw_rect(self, p1, p2):
         """Draw a rectangle from two opposite corners (canvas CRS)."""
-        self._rb.reset(QgsWkbTypes.PolygonGeometry)
+        self._rb.reset(QgsWkbTypes.GeometryType.PolygonGeometry)
         self._rb.addPoint(QgsPointXY(p1.x(), p1.y()), False)
         self._rb.addPoint(QgsPointXY(p2.x(), p1.y()), False)
         self._rb.addPoint(QgsPointXY(p2.x(), p2.y()), False)
@@ -1625,10 +1626,10 @@ class MapConverterTab(QWidget):
         # Table
         self._table = QTableWidget(0, len(_LAYER_COLS))
         self._table.setHorizontalHeaderLabels(_LAYER_COLS)
-        self._table.setSelectionBehavior(QAbstractItemView.SelectRows)
-        self._table.setSelectionMode(QAbstractItemView.SingleSelection)
+        self._table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self._table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self._table.horizontalHeader().setSectionResizeMode(
-            _COL_SOURCE, QHeaderView.Stretch
+            _COL_SOURCE, QHeaderView.ResizeMode.Stretch
         )
         self._table.verticalHeader().setVisible(False)
         self._table.setMinimumHeight(130)
@@ -1772,9 +1773,10 @@ class MapConverterTab(QWidget):
                 self, "Possible Imagery",
                 f"'{layer.name()}' looks like imagery (RGB), not a DEM.\n"
                 f"Elevation data needs single-band Float32/Int16.\n\nAdd anyway?",
-                QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
             )
-            if r != QMessageBox.Yes:
+            if r != QMessageBox.StandardButton.Yes:
                 return
 
         is_buildings = isinstance(layer, QgsVectorLayer)
@@ -1847,10 +1849,10 @@ class MapConverterTab(QWidget):
             "File: single vector file (FGB, SHP, GPKG, GeoJSON)\n"
             "Folder: directory of .fgb parts, or an ESRI .gdb"
         )
-        btn_file = msg.addButton("Select File...", QMessageBox.AcceptRole)
-        btn_folder = msg.addButton("Select Folder...", QMessageBox.AcceptRole)
-        msg.addButton("Cancel", QMessageBox.RejectRole)
-        msg.exec_()
+        btn_file = msg.addButton("Select File...", QMessageBox.ButtonRole.AcceptRole)
+        btn_folder = msg.addButton("Select Folder...", QMessageBox.ButtonRole.AcceptRole)
+        msg.addButton("Cancel", QMessageBox.ButtonRole.RejectRole)
+        msg.exec()
 
         clicked = msg.clickedButton()
         if clicked == btn_file:
@@ -2071,7 +2073,7 @@ class MapConverterTab(QWidget):
 
     def _set_cell(self, row, col, text, tooltip=None):
         item = QTableWidgetItem(text)
-        item.setFlags(item.flags() & ~Qt.ItemIsEditable)
+        item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
         if tooltip:
             item.setToolTip(tooltip)
         self._table.setItem(row, col, item)
@@ -2236,9 +2238,10 @@ class MapConverterTab(QWidget):
                     f"resolution (~{entry.native_res_m:.1f}m).\n\n"
                     f"The output will be upsampled (interpolated) — "
                     f"no additional detail will be gained.\n\nProceed?",
-                    QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                    QMessageBox.StandardButton.No,
                 )
-                if r != QMessageBox.Yes:
+                if r != QMessageBox.StandardButton.Yes:
                     return
 
         entry.target_resolutions = new_res
@@ -2386,9 +2389,10 @@ class MapConverterTab(QWidget):
                     f"the finest input (~{finest_input:.1f}m).\n\n"
                     f"The output will be interpolated — no additional "
                     f"detail will be gained.\n\nProceed?",
-                    QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                    QMessageBox.StandardButton.No,
                 )
-                if r != QMessageBox.Yes:
+                if r != QMessageBox.StandardButton.Yes:
                     return
 
         # Building Z validation.
@@ -2401,9 +2405,10 @@ class MapConverterTab(QWidget):
                         self, "Buildings Without 3D",
                         f"'{entry.qgis_layer.name()}' has no Z coordinates.\n"
                         f"2D buildings will be silently ignored.\nContinue?",
-                        QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+                        QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                        QMessageBox.StandardButton.No,
                     )
-                    if r != QMessageBox.Yes:
+                    if r != QMessageBox.StandardButton.Yes:
                         return
 
         output_dir = self._get_output_dir()

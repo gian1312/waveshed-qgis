@@ -66,7 +66,7 @@ def _apply_los_style(layer: QgsRasterLayer) -> None:
     Value 1 is rendered as green indicating line-of-sight visibility.
     """
     color_ramp = QgsColorRampShader()
-    color_ramp.setColorRampType(QgsColorRampShader.Exact)
+    color_ramp.setColorRampType(QgsColorRampShader.Type.Exact)
 
     visible_color = QColor("#00CC00")
     visible_color.setAlphaF(0.7)
@@ -93,7 +93,7 @@ def _apply_signal_strength_style(layer: QgsRasterLayer) -> None:
     (green).  Used for both SIMPLE_LOSS and ITM outputs.
     """
     color_ramp = QgsColorRampShader()
-    color_ramp.setColorRampType(QgsColorRampShader.Interpolated)
+    color_ramp.setColorRampType(QgsColorRampShader.Type.Interpolated)
 
     color_ramp.setColorRampItemList([
         QgsColorRampShader.ColorRampItem(-140, QColor("#FF0000"), "-140 dBm"),
@@ -132,7 +132,7 @@ def estimate_altitude_range_m(
     try:
         provider = layer.dataProvider()
         stats = provider.bandStatistics(
-            band, QgsRasterBandStats.Min | QgsRasterBandStats.Max,
+            band, QgsRasterBandStats.Stats.Min | QgsRasterBandStats.Stats.Max,
         )
         max_raw = stats.maximumValue
         min_raw = stats.minimumValue
@@ -195,7 +195,7 @@ def build_min_alt_renderer(
     classifies on the unscaled band value (see :mod:`.min_alt`).
     """
     ramp = QgsColorRampShader()
-    ramp.setColorRampType(QgsColorRampShader.Interpolated)
+    ramp.setColorRampType(QgsColorRampShader.Type.Interpolated)
 
     if max_ramp_m is None:
         max_ramp_m = threshold_m if threshold_m else _ma.DEFAULT_RAMP_MAX_M
@@ -275,7 +275,7 @@ def build_band_renderer(
     can I get to at these altitudes" without a legend lookup.
     """
     ramp = QgsColorRampShader()
-    ramp.setColorRampType(QgsColorRampShader.Discrete)
+    ramp.setColorRampType(QgsColorRampShader.Type.Discrete)
 
     items = []
     for stop in _ma.band_stops(bands, reference):

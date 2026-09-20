@@ -324,7 +324,7 @@ class _P2PResultViewer(QDialog):
         super().__init__(parent)
         self.setWindowTitle("P2P Link Analysis Plots")
         self.setMinimumSize(800, 550)
-        self.setAttribute(Qt.WA_DeleteOnClose)
+        self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
 
         self._output_dir = output_dir
         self._output_name = output_name
@@ -731,15 +731,15 @@ class P2PTab(QWidget):
 
         # Rubber bands for map visualisation
         canvas = self.iface.mapCanvas()
-        self._site_a_rb = QgsRubberBand(canvas, QgsWkbTypes.PointGeometry)
+        self._site_a_rb = QgsRubberBand(canvas, QgsWkbTypes.GeometryType.PointGeometry)
         self._site_a_rb.setColor(QColor(255, 0, 0, 200))  # Red
         self._site_a_rb.setIconSize(12)
 
-        self._site_b_rb = QgsRubberBand(canvas, QgsWkbTypes.PointGeometry)
+        self._site_b_rb = QgsRubberBand(canvas, QgsWkbTypes.GeometryType.PointGeometry)
         self._site_b_rb.setColor(QColor(0, 0, 255, 200))  # Blue
         self._site_b_rb.setIconSize(12)
 
-        self._link_line_rb = QgsRubberBand(canvas, QgsWkbTypes.LineGeometry)
+        self._link_line_rb = QgsRubberBand(canvas, QgsWkbTypes.GeometryType.LineGeometry)
         self._link_line_rb.setColor(QColor(255, 255, 0, 255))  # Yellow
         self._link_line_rb.setWidth(3)
 
@@ -897,7 +897,7 @@ class P2PTab(QWidget):
             self._site_a_rb.setToGeometry(QgsGeometry.fromPointXY(pt_a), None)
             self._site_a_rb.show()
         else:
-            self._site_a_rb.reset(QgsWkbTypes.PointGeometry)
+            self._site_a_rb.reset(QgsWkbTypes.GeometryType.PointGeometry)
 
         # Site B marker
         if has_b:
@@ -905,7 +905,7 @@ class P2PTab(QWidget):
             self._site_b_rb.setToGeometry(QgsGeometry.fromPointXY(pt_b), None)
             self._site_b_rb.show()
         else:
-            self._site_b_rb.reset(QgsWkbTypes.PointGeometry)
+            self._site_b_rb.reset(QgsWkbTypes.GeometryType.PointGeometry)
 
         # Link line between the two sites
         if has_a and has_b:
@@ -916,13 +916,13 @@ class P2PTab(QWidget):
             )
             self._link_line_rb.show()
         else:
-            self._link_line_rb.reset(QgsWkbTypes.LineGeometry)
+            self._link_line_rb.reset(QgsWkbTypes.GeometryType.LineGeometry)
 
     def _reset_rubber_bands(self) -> None:
         """Clear all rubber bands from the map canvas."""
-        self._site_a_rb.reset(QgsWkbTypes.PointGeometry)
-        self._site_b_rb.reset(QgsWkbTypes.PointGeometry)
-        self._link_line_rb.reset(QgsWkbTypes.LineGeometry)
+        self._site_a_rb.reset(QgsWkbTypes.GeometryType.PointGeometry)
+        self._site_b_rb.reset(QgsWkbTypes.GeometryType.PointGeometry)
+        self._link_line_rb.reset(QgsWkbTypes.GeometryType.LineGeometry)
 
     # ------------------------------------------------------------------
     # UI construction
@@ -1469,8 +1469,9 @@ class P2PTab(QWidget):
         warn = dem_layer_warning(dem_layer)
         if warn and QMessageBox.warning(
             self, "Not a DEM?", warn + "\n\nUse it anyway?",
-            QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
-        ) != QMessageBox.Yes:
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        ) != QMessageBox.StandardButton.Yes:
             return
 
         output_dir = self.line_output_dir.text().strip()
@@ -1501,8 +1502,9 @@ class P2PTab(QWidget):
                 "are probably invalid.\n\n"
                 + format_model_warnings(model_issues)
                 + "\n\nRun anyway?",
-                QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
-            ) != QMessageBox.Yes:
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            ) != QMessageBox.StandardButton.Yes:
                 return
 
         # ---- Confirm an unreasonably large terrain download ----
@@ -1526,11 +1528,14 @@ class P2PTab(QWidget):
         warn = terrain_size_warning(disk_mb, cached_mb)
         if warn is not None:
             msg, strong = warn
-            default = QMessageBox.No if strong else QMessageBox.Yes
+            default = (
+                QMessageBox.StandardButton.No if strong
+                else QMessageBox.StandardButton.Yes
+            )
             if QMessageBox.warning(
                 self, "Large terrain download", msg,
-                QMessageBox.Yes | QMessageBox.No, default,
-            ) != QMessageBox.Yes:
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No, default,
+            ) != QMessageBox.StandardButton.Yes:
                 return
 
         # Switch to running state.

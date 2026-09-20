@@ -2821,7 +2821,7 @@ def check_coordinate_transforms():
         key = "Projections/promptWhenMultipleTransformsExist"
         settings.setValue(key, False)
         try:
-            settings.setValue(key, False, QgsSettings.App)
+            settings.setValue(key, False, QgsSettings.Section.App)
         except Exception:
             pass
         settings.sync()
@@ -3105,7 +3105,7 @@ def repair_renderers():
             renderer = QgsSingleBandGrayRenderer(provider, 1)
             enhancement = QgsContrastEnhancement(provider.dataType(1))
             enhancement.setContrastEnhancementAlgorithm(
-                QgsContrastEnhancement.StretchToMinimumMaximum)
+                QgsContrastEnhancement.ContrastEnhancementAlgorithm.StretchToMinimumMaximum)
             enhancement.setMinimumValue(DEM_STRETCH[0])
             enhancement.setMaximumValue(DEM_STRETCH[1])
             renderer.setContrastEnhancement(enhancement)

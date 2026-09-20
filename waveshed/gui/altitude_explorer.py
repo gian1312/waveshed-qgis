@@ -92,7 +92,7 @@ from ..core.result_loader import (
 
 TAG = "Waveshed"
 
-_LAYER_ID_ROLE = Qt.UserRole
+_LAYER_ID_ROLE = Qt.ItemDataRole.UserRole
 
 #: More bands than this stop being readable — the legend turns into a wall and
 #: neighbouring colours stop being tellable apart on the map.
@@ -141,7 +141,7 @@ def _uint16_data_type():
     if data_type is not None and hasattr(data_type, "UInt16"):
         return data_type.UInt16
     if hasattr(Qgis, "UInt16"):
-        return Qgis.UInt16
+        return Qgis.DataType.UInt16
     from qgis.core import QgsRaster
     return QgsRaster.UInt16
 
@@ -221,7 +221,7 @@ class _TerrainSourceDialog(QDialog):
             self.combo.setFilters(Qgis.LayerFilter.RasterLayer)
         except (AttributeError, TypeError):
             from qgis.core import QgsMapLayerProxyModel
-            self.combo.setFilters(QgsMapLayerProxyModel.RasterLayer)
+            self.combo.setFilters(QgsMapLayerProxyModel.Filter.RasterLayer)
         self.combo.setAllowEmptyLayer(True)
         # Our own coverage results are never terrain; offering them invites a
         # nonsense answer that would look plausible on the map.
@@ -242,7 +242,10 @@ class _TerrainSourceDialog(QDialog):
         layout.addLayout(file_row)
 
         buttons = QDialogButtonBox(
-            QDialogButtonBox.Ok | QDialogButtonBox.Cancel, Qt.Horizontal, self,
+            QDialogButtonBox.StandardButton.Ok
+            | QDialogButtonBox.StandardButton.Cancel,
+            Qt.Orientation.Horizontal,
+            self,
         )
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
@@ -667,7 +670,7 @@ class AltitudeExplorerDock(QgsDockWidget):
         ag_layout.addLayout(band_row)
 
         slider_row = QHBoxLayout()
-        self.slider = QSlider(Qt.Horizontal)
+        self.slider = QSlider(Qt.Orientation.Horizontal)
         self.slider.setMinimum(0)
         self.slider.setMaximum(int(DEFAULT_RAMP_MAX_M))
         self.spin = QSpinBox()
@@ -779,13 +782,13 @@ class AltitudeExplorerDock(QgsDockWidget):
         for layer in candidates:
             item = QListWidgetItem(layer.name())
             item.setData(_LAYER_ID_ROLE, layer.id())
-            item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
+            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
             # New layers default to checked (so a fresh run is driven at once);
             # keep prior choices on refresh.
             if not had_any or layer.id() in previously_checked:
-                item.setCheckState(Qt.Checked)
+                item.setCheckState(Qt.CheckState.Checked)
             else:
-                item.setCheckState(Qt.Unchecked)
+                item.setCheckState(Qt.CheckState.Unchecked)
             self.layer_list.addItem(item)
         self.layer_list.blockSignals(False)
 
@@ -808,7 +811,7 @@ class AltitudeExplorerDock(QgsDockWidget):
         out: List[QgsRasterLayer] = []
         for i in range(self.layer_list.count()):
             item = self.layer_list.item(i)
-            if item.checkState() == Qt.Checked:
+            if item.checkState() == Qt.CheckState.Checked:
                 layer = proj.mapLayer(item.data(_LAYER_ID_ROLE))
                 if isinstance(layer, QgsRasterLayer) and layer.isValid():
                     out.append(layer)
@@ -819,7 +822,7 @@ class AltitudeExplorerDock(QgsDockWidget):
 
     def _set_all_checked(self, checked: bool) -> None:
         self.layer_list.blockSignals(True)
-        state = Qt.Checked if checked else Qt.Unchecked
+        state = Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked
         for i in range(self.layer_list.count()):
             self.layer_list.item(i).setCheckState(state)
         self.layer_list.blockSignals(False)
@@ -975,7 +978,7 @@ class AltitudeExplorerDock(QgsDockWidget):
             dialog = _TerrainSourceDialog(
                 self, [job[3] for job in without_terrain],
             )
-            if dialog.exec_() != QDialog.Accepted:
+            if dialog.exec() != QDialog.DialogCode.Accepted:
                 # Anything already queued belongs to *this* attempt — carrying
                 # it forward would attach it to an unrelated one later.
                 self._report_amsl_errors()
@@ -1005,7 +1008,7 @@ class AltitudeExplorerDock(QgsDockWidget):
             "Building the sea-level view…", "Cancel", 0, 100, self,
         )
         progress.setWindowTitle("Sea-level altitudes")
-        progress.setWindowModality(Qt.WindowModal)
+        progress.setWindowModality(Qt.WindowModality.WindowModal)
         progress.setMinimumDuration(0)
         progress.setAutoClose(False)
         progress.setAutoReset(False)
@@ -1206,8 +1209,11 @@ class AltitudeExplorerDock(QgsDockWidget):
         for band in bands:
             item = QListWidgetItem(f"{band.altitude_m:g}{suffix}")
             item.setIcon(_swatch(band.color, band.visible))
-            item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
-            item.setCheckState(Qt.Checked if band.visible else Qt.Unchecked)
+            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            item.setCheckState(
+                Qt.CheckState.Checked if band.visible
+                else Qt.CheckState.Unchecked
+            )
             self.band_list.addItem(item)
         if target is not None:
             self.band_list.setCurrentRow(bands.index(target))
@@ -1337,7 +1343,7 @@ class AltitudeExplorerDock(QgsDockWidget):
         bands = self._bands
         if not (0 <= row < len(bands)):
             return
-        bands[row].visible = item.checkState() == Qt.Checked
+        bands[row].visible = item.checkState() == Qt.CheckState.Checked
         self.band_list.blockSignals(True)
         item.setIcon(_swatch(bands[row].color, bands[row].visible))
         self.band_list.blockSignals(False)
@@ -1608,7 +1614,7 @@ class AltitudeExplorerDock(QgsDockWidget):
             0, 0, self,
         )
         progress.setWindowTitle("Best-site merge")
-        progress.setWindowModality(Qt.WindowModal)
+        progress.setWindowModality(Qt.WindowModality.WindowModal)
         progress.setMinimumDuration(0)
         progress.setAutoClose(False)
         progress.setAutoReset(False)
@@ -1724,7 +1730,7 @@ class AltitudeExplorerDock(QgsDockWidget):
             "Generating iso-altitude contours…", "Cancel", 0, 100, self,
         )
         progress.setWindowTitle("Iso-altitude contours")
-        progress.setWindowModality(Qt.WindowModal)
+        progress.setWindowModality(Qt.WindowModality.WindowModal)
         progress.setMinimumDuration(0)
         progress.setAutoClose(False)
         progress.setAutoReset(False)
@@ -1880,7 +1886,7 @@ def show_altitude_explorer(iface) -> "AltitudeExplorerDock":
         _INSTANCE = None
 
     _INSTANCE = AltitudeExplorerDock(iface, iface.mainWindow())
-    iface.addDockWidget(Qt.RightDockWidgetArea, _INSTANCE)
+    iface.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, _INSTANCE)
     _INSTANCE.show()
     _INSTANCE.raise_()
     return _INSTANCE

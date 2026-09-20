@@ -468,10 +468,10 @@ def start_qgis():
     QCoreApplication.setOrganizationName("QGIS")
     QCoreApplication.setOrganizationDomain("qgis.org")
     QCoreApplication.setApplicationName("QGIS3")
-    QSettings.setDefaultFormat(QSettings.IniFormat)
+    QSettings.setDefaultFormat(QSettings.Format.IniFormat)
     profile = _default_profile_folder()
     if profile:
-        QSettings.setPath(QSettings.IniFormat, QSettings.UserScope, profile)
+        QSettings.setPath(QSettings.Format.IniFormat, QSettings.Scope.UserScope, profile)
     # GUI enabled: tier C drives the tabs' own main-thread resolve, whose
     # progress dialog is a real widget. Offscreen, it draws to nowhere —
     # but it must be constructible, exactly as in the GUI.
@@ -1954,11 +1954,11 @@ def _run_worker(worker, timeout: int) -> Dict[str, Any]:
     def _failed(message):
         state["err"] = str(message)
 
-    worker.finished_ok.connect(_took, Qt.DirectConnection)
-    worker.finished_err.connect(_failed, Qt.DirectConnection)
+    worker.finished_ok.connect(_took, Qt.ConnectionType.DirectConnection)
+    worker.finished_err.connect(_failed, Qt.ConnectionType.DirectConnection)
     if hasattr(worker, "log_line"):
-        worker.log_line.connect(state["log"].append, Qt.DirectConnection)
-    worker.status.connect(state["log"].append, Qt.DirectConnection)
+        worker.log_line.connect(state["log"].append, Qt.ConnectionType.DirectConnection)
+    worker.status.connect(state["log"].append, Qt.ConnectionType.DirectConnection)
     worker.start()
     if not worker.wait(int(timeout) * 1000):
         try:
@@ -2001,7 +2001,7 @@ class _MessageLogTap:
         # adapter logs from worker threads, and a queued delivery would need
         # an event loop this runner never spins — the tap read empty.
         QgsApplication.messageLog().messageReceived.connect(
-            _collect, Qt.DirectConnection)
+            _collect, Qt.ConnectionType.DirectConnection)
         return self
 
     def __exit__(self, *exc) -> None:

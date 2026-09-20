@@ -133,7 +133,7 @@ class _PatternGeneratorDialog(QDialog):
 
         # Dialog buttons.
         btn_box = QDialogButtonBox(
-            QDialogButtonBox.Ok | QDialogButtonBox.Cancel
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
         )
         btn_box.accepted.connect(self._on_accept)
         btn_box.rejected.connect(self.reject)
@@ -794,12 +794,12 @@ class AssetManagerTab(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
 
         self.asset_list = QListWidget()
-        self.asset_list.setFlow(QListWidget.LeftToRight)
+        self.asset_list.setFlow(QListWidget.Flow.LeftToRight)
         self.asset_list.setWrapping(False)
         self.asset_list.setMaximumHeight(60)
-        self.asset_list.setSelectionMode(QListWidget.SingleSelection)
-        self.asset_list.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
-        self.asset_list.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.asset_list.setSelectionMode(QListWidget.SelectionMode.SingleSelection)
+        self.asset_list.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.asset_list.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         layout.addWidget(self.asset_list)
 
         btn_row = QHBoxLayout()
@@ -826,7 +826,7 @@ class AssetManagerTab(QWidget):
     def _build_parameters_tab(self) -> QWidget:
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
-        scroll.setFrameShape(QScrollArea.NoFrame)
+        scroll.setFrameShape(QScrollArea.Shape.NoFrame)
 
         panel = QWidget()
         layout = QVBoxLayout(panel)
@@ -928,7 +928,7 @@ class AssetManagerTab(QWidget):
     def _build_patterns_tab(self) -> QWidget:
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
-        scroll.setFrameShape(QScrollArea.NoFrame)
+        scroll.setFrameShape(QScrollArea.Shape.NoFrame)
 
         panel = QWidget()
         layout = QVBoxLayout(panel)
@@ -942,9 +942,9 @@ class AssetManagerTab(QWidget):
         self.az_table.setHorizontalHeaderLabels(["Angle (deg)", "Gain (0-1)"])
         self.az_table.horizontalHeader().setStretchLastSection(True)
         self.az_table.horizontalHeader().setSectionResizeMode(
-            0, QHeaderView.Stretch
+            0, QHeaderView.ResizeMode.Stretch
         )
-        self.az_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.az_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.az_table.setMinimumHeight(160)
         az_layout.addWidget(self.az_table)
 
@@ -977,9 +977,9 @@ class AssetManagerTab(QWidget):
         self.el_table.setHorizontalHeaderLabels(["Angle (deg)", "Gain (0-1)"])
         self.el_table.horizontalHeader().setStretchLastSection(True)
         self.el_table.horizontalHeader().setSectionResizeMode(
-            0, QHeaderView.Stretch
+            0, QHeaderView.ResizeMode.Stretch
         )
-        self.el_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.el_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.el_table.setMinimumHeight(160)
         el_layout.addWidget(self.el_table)
 
@@ -1261,7 +1261,7 @@ class AssetManagerTab(QWidget):
     ) -> None:
         """Open the pattern generator dialog and populate the table."""
         dlg = _PatternGeneratorDialog(pattern_type, parent=self)
-        if dlg.exec_() == QDialog.Accepted:
+        if dlg.exec() == QDialog.DialogCode.Accepted:
             data = dlg.get_generated_pattern()
             if data:
                 self._set_pattern_data(table, data)
@@ -1279,7 +1279,7 @@ class AssetManagerTab(QWidget):
         name = self.edit_name.text().strip() or "Unnamed"
         dlg = _PatternVisualizerDialog(parent=self)
         dlg.plot(data, pattern_type, name)
-        dlg.exec_()
+        dlg.exec()
 
     # ------------------------------------------------------------------
     # Public API
@@ -1437,13 +1437,15 @@ class AssetManagerTab(QWidget):
             "Unsaved Changes",
             "The current asset has unsaved changes.\n"
             "Save before continuing?",
-            QMessageBox.Save | QMessageBox.Discard | QMessageBox.Cancel,
-            QMessageBox.Cancel,
+            QMessageBox.StandardButton.Save
+            | QMessageBox.StandardButton.Discard
+            | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Cancel,
         )
-        if answer == QMessageBox.Save:
+        if answer == QMessageBox.StandardButton.Save:
             self._on_save()
             return True
-        if answer == QMessageBox.Discard:
+        if answer == QMessageBox.StandardButton.Discard:
             self._dirty = False
             return True
         return False
@@ -1558,10 +1560,10 @@ class AssetManagerTab(QWidget):
             self,
             "Delete Asset",
             f'Are you sure you want to delete "{name}"?',
-            QMessageBox.Yes | QMessageBox.No,
-            QMessageBox.No,
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
         )
-        if answer != QMessageBox.Yes:
+        if answer != QMessageBox.StandardButton.Yes:
             return
 
         path = asset.get("_path")
@@ -1588,10 +1590,10 @@ class AssetManagerTab(QWidget):
                 self,
                 "Reload Assets",
                 "Reloading will discard any unsaved changes.\nContinue?",
-                QMessageBox.Yes | QMessageBox.No,
-                QMessageBox.No,
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
             )
-            if answer != QMessageBox.Yes:
+            if answer != QMessageBox.StandardButton.Yes:
                 return
 
         self._dirty = False

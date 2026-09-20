@@ -76,6 +76,24 @@ class _MockSignalDescriptor:
 
 
 # ---------------------------------------------------------------------------
+# 2b. Scoped enum stubs
+# ---------------------------------------------------------------------------
+#
+# Qt6 / PyQt6 (QGIS 4) removed the unscoped spelling of every enum member: the
+# bare ``Checked`` on ``Qt`` is gone, only ``Qt.CheckState.Checked`` resolves.
+# (Spelling the dead form out here would trip the static guard.)  The stubs
+# below therefore expose the **scoped** name only.  That is deliberate: an
+# unscoped member left anywhere in the plugin raises AttributeError here and
+# fails the test that touches it, instead of passing under Qt5 and breaking on
+# a user's QGIS 4.  ``tests/test_qt6_compat.py`` is the static twin of this
+# rule and catches the lines no test happens to execute.
+
+def _enum_scope(name: str, **members: int) -> type:
+    """Build a stand-in for a scoped Qt/QGIS enum (``Qt.CheckState`` …)."""
+    return type(name, (), dict(members))
+
+
+# ---------------------------------------------------------------------------
 # 3. Lightweight Qt widget stubs
 # ---------------------------------------------------------------------------
 
@@ -105,8 +123,9 @@ class _MockQWidget:
 
 
 class _MockQDialog(_MockQWidget):
-    Accepted = 1
-    Rejected = 0
+    class DialogCode:
+        Accepted = 1
+        Rejected = 0
 
 
 class _MockQThread:
@@ -160,9 +179,10 @@ class _FakeMessageLog:
 # ---------------------------------------------------------------------------
 
 class _FakeWkbTypes:
-    PointGeometry = 0
-    LineGeometry = 1
-    PolygonGeometry = 2
+    class GeometryType:
+        PointGeometry = 0
+        LineGeometry = 1
+        PolygonGeometry = 2
 
     @staticmethod
     def hasZ(wkb_type):
@@ -194,7 +214,9 @@ _core.QgsMessageLog = _FakeMessageLog
 _core.QgsSettings = _MockQSettings
 _core.QgsCoordinateReferenceSystem = _FakeCRS
 _core.QgsCoordinateTransform = mock.MagicMock()
-_core.QgsMapLayerProxyModel = type("Proxy", (), {"RasterLayer": 1, "VectorLayer": 2})
+_core.QgsMapLayerProxyModel = type("Proxy", (), {
+    "Filter": _enum_scope("Filter", RasterLayer=1, VectorLayer=2),
+})
 _core.QgsPointXY = type("PT", (), {"__init__": lambda self, *a: None, "x": lambda self: 0, "y": lambda self: 0})
 _core.QgsProject = type("Proj", (), {"instance": staticmethod(lambda: mock.MagicMock())})
 _core.QgsRasterLayer = type("RL", (), {"__init__": lambda self, *a, **kw: None})
@@ -206,11 +228,14 @@ _core.QgsGeometry = mock.MagicMock()
 # Raster styling classes — enough for core.result_loader to import.
 _core.QgsColorRampShader = type("QgsColorRampShader", (), {
     "__init__": lambda self, *a, **kw: None,
-    "Exact": 0, "Interpolated": 1,
+    "Type": _enum_scope("Type", Interpolated=0, Discrete=1, Exact=2),
     "ColorRampItem": type("ColorRampItem", (), {"__init__": lambda self, *a: None}),
 })
 _core.QgsRasterShader = type("QgsRasterShader", (), {"__init__": lambda self, *a, **kw: None})
-_core.QgsRasterBandStats = type("QgsRasterBandStats", (), {"Max": 4})
+# Stats is an IntFlag in QGIS; result_loader ORs Min with Max.
+_core.QgsRasterBandStats = type("QgsRasterBandStats", (), {
+    "Stats": _enum_scope("Stats", Min=1, Max=2),
+})
 _core.QgsSingleBandPseudoColorRenderer = type(
     "QgsSingleBandPseudoColorRenderer", (), {"__init__": lambda self, *a, **kw: None},
 )
@@ -250,7 +275,8 @@ for _param_name in (
 ):
     setattr(_core, _param_name, type(_param_name, (), {
         "__init__": lambda self, *a, **kw: None,
-        "Double": 1, "Integer": 0, "File": 0, "Folder": 1,
+        "Type": _enum_scope("Type", Integer=0, Double=1),
+        "Behavior": _enum_scope("Behavior", File=0, Folder=1),
     }))
 
 # GUI classes
@@ -258,11 +284,33 @@ _gui.QgsMapLayerComboBox = type("MLCB", (), {"__init__": lambda self, *a, **kw: 
 _gui.QgsRubberBand = type("RB", (), {"__init__": lambda self, *a, **kw: None, "reset": lambda self, *a: None, "addPoint": lambda self, *a: None, "setColor": lambda self, *a: None, "setWidth": lambda self, *a: None})
 _gui.QgsMapToolEmitPoint = type("MTEP", (), {"__init__": lambda self, *a: None})
 
-# Qt Core
+# Qt Core — scoped exactly as PyQt6 spells them (see section 2b).
 _qtcore.Qt = type("Qt", (), {
-    "ItemIsEditable": 2, "CrossCursor": 24, "LeftButton": 1,
-    "Key_Escape": 0x01000000, "WA_DeleteOnClose": 55, "Window": 1,
-    "Widget": 0,
+    "CheckState": _enum_scope(
+        "CheckState", Unchecked=0, PartiallyChecked=1, Checked=2,
+    ),
+    "CursorShape": _enum_scope("CursorShape", CrossCursor=2, WaitCursor=3),
+    "DockWidgetArea": _enum_scope(
+        "DockWidgetArea", LeftDockWidgetArea=1, RightDockWidgetArea=2,
+    ),
+    "ItemDataRole": _enum_scope("ItemDataRole", DisplayRole=0, UserRole=0x0100),
+    "ItemFlag": _enum_scope(
+        "ItemFlag", ItemIsEditable=2, ItemIsEnabled=32, ItemIsUserCheckable=16,
+    ),
+    "Key": _enum_scope("Key", Key_Escape=0x01000000),
+    "MouseButton": _enum_scope("MouseButton", LeftButton=1, RightButton=2),
+    "Orientation": _enum_scope("Orientation", Horizontal=1, Vertical=2),
+    "PenStyle": _enum_scope("PenStyle", SolidLine=1, DashLine=2),
+    "ScrollBarPolicy": _enum_scope(
+        "ScrollBarPolicy",
+        ScrollBarAsNeeded=0, ScrollBarAlwaysOff=1, ScrollBarAlwaysOn=2,
+    ),
+    "TextFormat": _enum_scope("TextFormat", PlainText=0, RichText=1),
+    "WidgetAttribute": _enum_scope("WidgetAttribute", WA_DeleteOnClose=55),
+    "WindowModality": _enum_scope(
+        "WindowModality", NonModal=0, WindowModal=1, ApplicationModal=2,
+    ),
+    "WindowType": _enum_scope("WindowType", Widget=0, Window=1, Dialog=3),
 })
 _qtcore.QThread = _MockQThread
 _qtcore.pyqtSignal = _MockSignalDescriptor
@@ -290,7 +338,17 @@ for name in _widget_names:
     elif name == "QMessageBox":
         mb = type("QMessageBox", (), {
             "__init__": lambda self, *a, **kw: None,
-            "Yes": 0x4000, "No": 0x10000, "Ok": 0x400,
+            "StandardButton": _enum_scope(
+                "StandardButton",
+                Ok=0x400, Save=0x800, Discard=0x800000,
+                Cancel=0x400000, Yes=0x4000, No=0x10000,
+            ),
+            "ButtonRole": _enum_scope(
+                "ButtonRole", AcceptRole=0, RejectRole=1, ActionRole=3,
+            ),
+            "Icon": _enum_scope(
+                "Icon", NoIcon=0, Information=1, Warning=2, Critical=3, Question=4,
+            ),
             "warning": staticmethod(lambda *a, **kw: 0x4000),
             "critical": staticmethod(lambda *a, **kw: 0x400),
             "information": staticmethod(lambda *a, **kw: 0x400),
@@ -302,8 +360,28 @@ for name in _widget_names:
 
 # Extra widget attributes some dialogs reference at call time.
 _qtwidgets.QInputDialog.getText = staticmethod(lambda *a, **kw: ("", False))
-_qtwidgets.QLineEdit.Normal = 0
-_qtwidgets.QLineEdit.Password = 2
+_qtwidgets.QLineEdit.EchoMode = _enum_scope("EchoMode", Normal=0, Password=2)
+_qtwidgets.QAbstractItemView.SelectionBehavior = _enum_scope(
+    "SelectionBehavior", SelectItems=0, SelectRows=1, SelectColumns=2,
+)
+_qtwidgets.QAbstractItemView.SelectionMode = _enum_scope(
+    "SelectionMode", NoSelection=0, SingleSelection=1, ExtendedSelection=3,
+)
+_qtwidgets.QTableWidget.SelectionBehavior = _qtwidgets.QAbstractItemView.SelectionBehavior
+_qtwidgets.QTableWidget.SelectionMode = _qtwidgets.QAbstractItemView.SelectionMode
+_qtwidgets.QListWidget.SelectionMode = _qtwidgets.QAbstractItemView.SelectionMode
+_qtwidgets.QListWidget.Flow = _enum_scope("Flow", LeftToRight=0, TopToBottom=1)
+_qtwidgets.QHeaderView.ResizeMode = _enum_scope(
+    "ResizeMode", Interactive=0, Stretch=1, Fixed=2, ResizeToContents=3,
+)
+_qtwidgets.QScrollArea.Shape = _enum_scope("Shape", NoFrame=0, Box=1, Panel=2)
+_qtwidgets.QDialogButtonBox.StandardButton = _enum_scope(
+    "StandardButton", Ok=0x400, Cancel=0x400000, Close=0x200000,
+)
+_qtwidgets.QDialogButtonBox.ButtonRole = _enum_scope(
+    "ButtonRole", AcceptRole=0, RejectRole=1, ActionRole=3,
+)
+_qtwidgets.QFileDialog.Option = _enum_scope("Option", ShowDirsOnly=1)
 
 # Qt GUI
 _qtgui.QColor = type("QColor", (), {"__init__": lambda self, *a: None})

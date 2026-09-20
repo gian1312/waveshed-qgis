@@ -1,6 +1,7 @@
 [general]
 name=Waveshed
 qgisMinimumVersion=3.28
+supportsQt6=True
 version=0.2.0
 author=Gian-Andrea Heinrich
 email=info@waveshed.io
@@ -14,6 +15,9 @@ tags=rf,propagation,radio,coverage,p2p,gpu,terrain,ITM,LOS,waveshed
 category=Analysis
 icon=resources/icon.png
 changelog=0.2.0
+    - Runs on QGIS 4 (Qt6/PyQt6) as well as QGIS 3.28+ (Qt5): every Qt and
+      QGIS enum is now spelled with its scope, QAction is imported from
+      whichever module the binding keeps it in, and exec_() became exec().
     - Terrain tiles are pooled and reused across sites, so overlapping runs no
       longer re-download shared tiles. Existing caches are rebuilt once.
     - Building tiles (OpenFreeMap) pool alongside terrain and are reused too.

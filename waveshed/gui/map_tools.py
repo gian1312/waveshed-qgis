@@ -31,7 +31,7 @@ class PointCaptureTool(QgsMapToolEmitPoint):
         super().__init__(canvas)
         self._canvas = canvas
         self._previous_tool = previous_tool
-        self.setCursor(Qt.CrossCursor)
+        self.setCursor(Qt.CursorShape.CrossCursor)
 
     def canvasReleaseEvent(self, event):
         """Handle mouse release: capture point, transform, emit, restore."""
@@ -51,7 +51,7 @@ class PointCaptureTool(QgsMapToolEmitPoint):
 
     def keyPressEvent(self, event):
         """Allow cancellation with Escape."""
-        if event.key() == Qt.Key_Escape:
+        if event.key() == Qt.Key.Key_Escape:
             self._restore_tool()
 
     def _restore_tool(self):

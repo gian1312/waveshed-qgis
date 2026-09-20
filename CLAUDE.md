@@ -11,7 +11,7 @@ waveshed/             Plugin package (installed into QGIS plugins dir)
   plugin.py            Menu/toolbar integration, init/unload lifecycle
   provider.py          QgsProcessingProvider registration
   algorithms/          QgsProcessingAlgorithm implementations
-  gui/                 PyQt5 dialogs (.py + .ui files)
+  gui/                 Qt dialogs, hand-built in Python (no .ui files)
   core/                Business logic (no GUI imports)
   resources/           Icons, color ramps
 tests/                 pytest unit + integration tests
@@ -115,14 +115,25 @@ These are covered by `.gitignore`. The plugin only embeds the **public** verific
 ## Code Conventions
 
 - snake_case everywhere (Python, JSON keys, file names)
-- PyQt5 for all GUI (QGIS bundles it)
+- Qt for all GUI, imported through `qgis.PyQt` only — never `PyQt5`/`PyQt6`
+  directly. The plugin runs on QGIS 3.28+ (Qt5) **and** QGIS 4 (Qt6), so every
+  Qt/QGIS enum is spelled with its scope (`Qt.CheckState.Checked`,
+  `QMessageBox.StandardButton.Yes`, `QgsWkbTypes.GeometryType.PointGeometry`),
+  `.exec()` not `.exec_()`, and `QAction`/`QActionGroup`/`QShortcut` are
+  imported with a `try: from qgis.PyQt.QtGui` / `except ImportError:
+  from qgis.PyQt.QtWidgets` pair (Qt6 moved them). Scoped names work on the
+  PyQt5 QGIS 3.28 ships, so this costs nothing on Qt5.
+  `tests/test_qt6_compat.py` enforces all of it; `tests/conftest.py` mirrors it
+  by stubbing scoped enums only.
 - GDAL access via `osgeo` (QGIS bundles it) — never add GDAL as a pip dependency
 - Use `QgsSettings("waveshed/...")` for persistent plugin settings (the engine env var `AETHER_BIN_DIR` keeps its `AETHER` name)
 - Use `QgsMessageLog` for debug logging, `QgsMessageBar` for user-facing messages
 - Type hints on all public functions
 - No external pip dependencies beyond what QGIS provides (PyQt5, osgeo/GDAL, numpy).
-  There are no exceptions — `core/api_key.py` verifies Ed25519 signatures with
-  the standard library alone, so nothing imports `nacl`. Keep it that way: a
+  There are no exceptions — `core/api_key.py` validates keys structurally
+  (Base58 charset + payload length) with the standard library alone; the
+  Ed25519 signature is verified by the engine binary, so nothing imports
+  `nacl`. Keep it that way: a
   pip dependency is a support burden in a QGIS plugin, which cannot install one.
 
 ## Testing

@@ -406,7 +406,9 @@ class SiteAnalysisTab(QWidget):
         self._asset_cache: Dict[str, dict] = {}
 
         # Rubber band for showing site positions on the map.
-        self._sites_rb = QgsRubberBand(self.iface.mapCanvas(), QgsWkbTypes.PointGeometry)
+        self._sites_rb = QgsRubberBand(
+            self.iface.mapCanvas(), QgsWkbTypes.GeometryType.PointGeometry,
+        )
         self._sites_rb.setColor(QColor(0, 200, 255, 200))
         self._sites_rb.setWidth(3)
         self._sites_rb.setIconSize(12)
@@ -548,8 +550,8 @@ class SiteAnalysisTab(QWidget):
 
         # Sites table.
         self.sites_table = QTableWidget()
-        self.sites_table.setSelectionBehavior(QTableWidget.SelectRows)
-        self.sites_table.setSelectionMode(QTableWidget.SingleSelection)
+        self.sites_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.sites_table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
         self.sites_table.verticalHeader().setVisible(False)
         self.sites_table.verticalHeader().setDefaultSectionSize(36)
         self._setup_sites_columns()
@@ -568,11 +570,11 @@ class SiteAnalysisTab(QWidget):
         # have, so it collapses them to near-nothing — which is why Asset and
         # AZ Rotation were unusable the moment Propagation Loss unhid them.
         # Size them explicitly and let Location absorb the slack instead.
-        header.setSectionResizeMode(QHeaderView.Interactive)
+        header.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
         header.setMinimumSectionSize(_COL_MIN_WIDTH)
         for col, width in _COL_WIDTHS.items():
             self.sites_table.setColumnWidth(col, width)
-        header.setSectionResizeMode(_COL_LOCATION, QHeaderView.Stretch)
+        header.setSectionResizeMode(_COL_LOCATION, QHeaderView.ResizeMode.Stretch)
 
     # -- Altitudes section -------------------------------------------------
 
@@ -594,10 +596,10 @@ class SiteAnalysisTab(QWidget):
         self.alt_table.setColumnCount(len(_ALT_COLUMNS))
         self.alt_table.setHorizontalHeaderLabels(_ALT_COLUMNS)
         self.alt_table.horizontalHeader().setSectionResizeMode(
-            QHeaderView.Stretch,
+            QHeaderView.ResizeMode.Stretch,
         )
-        self.alt_table.setSelectionBehavior(QTableWidget.SelectRows)
-        self.alt_table.setSelectionMode(QTableWidget.SingleSelection)
+        self.alt_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.alt_table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
         self.alt_table.verticalHeader().setVisible(False)
         layout.addWidget(self.alt_table)
 
@@ -1035,7 +1037,7 @@ class SiteAnalysisTab(QWidget):
 
     def _update_rubber_band(self) -> None:
         """Redraw site position markers on the map canvas."""
-        self._sites_rb.reset(QgsWkbTypes.PointGeometry)
+        self._sites_rb.reset(QgsWkbTypes.GeometryType.PointGeometry)
         canvas = self.iface.mapCanvas()
         canvas_crs = canvas.mapSettings().destinationCrs()
         wgs84 = QgsCoordinateReferenceSystem("EPSG:4326")
@@ -1494,8 +1496,9 @@ class SiteAnalysisTab(QWidget):
             warn = dem_layer_warning(dem_layer)
             if warn and QMessageBox.warning(
                 self, "Not a DEM?", warn + "\n\nUse it anyway?",
-                QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
-            ) != QMessageBox.Yes:
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            ) != QMessageBox.StandardButton.Yes:
                 return
 
         output_dir = self.line_output_dir.text().strip()
@@ -1559,8 +1562,9 @@ class SiteAnalysisTab(QWidget):
                 "are probably invalid.\n\n"
                 + format_model_warnings(model_issues)
                 + "\n\nRun anyway?",
-                QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
-            ) != QMessageBox.Yes:
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            ) != QMessageBox.StandardButton.Yes:
                 return
 
         # ---- Confirm an unreasonably large terrain download ----
@@ -1618,19 +1622,23 @@ class SiteAnalysisTab(QWidget):
             )
             if cov and QMessageBox.warning(
                 self, "Incomplete terrain coverage", cov + "\n\nRun anyway?",
-                QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
-            ) != QMessageBox.Yes:
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            ) != QMessageBox.StandardButton.Yes:
                 return
 
         _log_terrain_plan(tiles_cached, tiles_missing, total_mb, cached_mb)
         warn = terrain_size_warning(total_mb, cached_mb)
         if warn is not None:
             msg, strong = warn
-            default = QMessageBox.No if strong else QMessageBox.Yes
+            default = (
+                QMessageBox.StandardButton.No if strong
+                else QMessageBox.StandardButton.Yes
+            )
             if QMessageBox.warning(
                 self, "Large terrain download", msg,
-                QMessageBox.Yes | QMessageBox.No, default,
-            ) != QMessageBox.Yes:
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No, default,
+            ) != QMessageBox.StandardButton.Yes:
                 return
 
         # ---- Launch worker ----
@@ -1705,9 +1713,10 @@ class SiteAnalysisTab(QWidget):
                 f"{loaded_count} result(s) loaded into QGIS.\n\n"
                 "Open the Altitude Explorer to pick a preferred altitude and "
                 "see the reachable area live?",
-                QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes,
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.Yes,
             )
-            if reply == QMessageBox.Yes:
+            if reply == QMessageBox.StandardButton.Yes:
                 try:
                     from .altitude_explorer import show_altitude_explorer
                     show_altitude_explorer(self.iface)

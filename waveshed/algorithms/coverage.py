@@ -110,7 +110,7 @@ class CoverageAlgorithm(QgsProcessingAlgorithm):
             QgsProcessingParameterNumber(
                 self.TX_LAT,
                 "TX Latitude",
-                type=QgsProcessingParameterNumber.Double,
+                type=QgsProcessingParameterNumber.Type.Double,
                 minValue=-90.0,
                 maxValue=90.0,
                 defaultValue=0.0,
@@ -121,7 +121,7 @@ class CoverageAlgorithm(QgsProcessingAlgorithm):
             QgsProcessingParameterNumber(
                 self.TX_LON,
                 "TX Longitude",
-                type=QgsProcessingParameterNumber.Double,
+                type=QgsProcessingParameterNumber.Type.Double,
                 minValue=-180.0,
                 maxValue=180.0,
                 defaultValue=0.0,
@@ -137,7 +137,7 @@ class CoverageAlgorithm(QgsProcessingAlgorithm):
             QgsProcessingParameterNumber(
                 self.TX_HEIGHT,
                 "TX Height (m AGL)",
-                type=QgsProcessingParameterNumber.Double,
+                type=QgsProcessingParameterNumber.Type.Double,
                 minValue=MIN_ANTENNA_AGL_M,
                 maxValue=10000.0,
                 defaultValue=30.0,
@@ -148,7 +148,7 @@ class CoverageAlgorithm(QgsProcessingAlgorithm):
             QgsProcessingParameterNumber(
                 self.FREQ_MHZ,
                 "Frequency (MHz)",
-                type=QgsProcessingParameterNumber.Double,
+                type=QgsProcessingParameterNumber.Type.Double,
                 minValue=1.0,
                 maxValue=3000.0,
                 defaultValue=433.0,
@@ -159,7 +159,7 @@ class CoverageAlgorithm(QgsProcessingAlgorithm):
             QgsProcessingParameterNumber(
                 self.ERP_WATTS,
                 "ERP (Watts)",
-                type=QgsProcessingParameterNumber.Double,
+                type=QgsProcessingParameterNumber.Type.Double,
                 minValue=0.001,
                 maxValue=1000000.0,
                 defaultValue=10.0,
@@ -188,7 +188,7 @@ class CoverageAlgorithm(QgsProcessingAlgorithm):
             QgsProcessingParameterNumber(
                 self.MAX_RANGE,
                 "Max Range (km)",
-                type=QgsProcessingParameterNumber.Integer,
+                type=QgsProcessingParameterNumber.Type.Integer,
                 minValue=1,
                 maxValue=500,
                 defaultValue=50,

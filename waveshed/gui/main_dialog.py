@@ -60,8 +60,8 @@ class AetherMainDialog(QDialog):
         self.setMinimumSize(900, 600)
 
         # Non-modal: clean up on close and float as a proper window
-        self.setAttribute(Qt.WA_DeleteOnClose)
-        self.setWindowFlags(self.windowFlags() | Qt.Window)
+        self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+        self.setWindowFlags(self.windowFlags() | Qt.WindowType.Window)
 
         self._build_ui()
         self._connect_signals()
@@ -175,7 +175,7 @@ class AetherMainDialog(QDialog):
         self._settings_widget = SettingsDialog(parent=wrapper)
         # Replace OK/Cancel with a single "Save Settings" button.
         self._settings_widget._button_box.setVisible(False)
-        self._settings_widget.setWindowFlags(Qt.Widget)
+        self._settings_widget.setWindowFlags(Qt.WindowType.Widget)
         layout.addWidget(self._settings_widget)
 
         from qgis.PyQt.QtWidgets import QPushButton, QHBoxLayout as _HL
