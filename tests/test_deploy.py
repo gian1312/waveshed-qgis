@@ -239,3 +239,126 @@ def test_flags_control_kill_and_launch(tmp_path, monkeypatch, flags, expect_kill
     assert deploy.main(flags) == 0
     assert kill.called is expect_kill
     assert launch.called is expect_launch
+
+
+# ---------------------------------------------------------------------------
+# --qgis 3 / 4 / both — QGIS 4 keeps its own profile folder and executable
+# ---------------------------------------------------------------------------
+
+_TAIL4 = ("QGIS", "QGIS4", "profiles", "default", "python", "plugins")
+
+
+def test_resolve_plugin_dir_qgis4_uses_its_own_profile(tmp_path, monkeypatch):
+    monkeypatch.setattr(sys, "platform", "win32")
+    appdata = tmp_path / "AppData" / "Roaming"
+    monkeypatch.setenv("APPDATA", str(appdata))
+
+    assert deploy.resolve_plugin_dir("", major="4") == appdata.joinpath(*_TAIL4)
+    assert deploy.resolve_plugin_dir("", major="3") == appdata.joinpath(*_TAIL)
+    assert deploy.resolve_plugin_dir("") == appdata.joinpath(*_TAIL)
+
+
+def test_read_config_exposes_the_qgis4_section(tmp_path, monkeypatch):
+    ini = tmp_path / "deploy.local.ini"
+    ini.write_text(
+        "[paths]\nqgis_exe = C:/q3/qgis-bin.exe\nplugin_dir =\naether_bin_dir =\n"
+        "[qgis4]\nqgis_exe = C:/q4/qgis-qt6-bin.exe\nplugin_dir = C:/q4/plugins\n"
+    )
+    monkeypatch.setattr(deploy, "CONFIG_FILE", ini)
+    cfg = deploy.read_config()
+    assert cfg["qgis_exe"] == "C:/q3/qgis-bin.exe"
+    assert cfg["qgis4_exe"] == "C:/q4/qgis-qt6-bin.exe"
+    assert cfg["qgis4_plugin_dir"] == "C:/q4/plugins"
+
+
+def test_read_config_without_qgis4_section_is_blank_not_missing(tmp_path, monkeypatch):
+    ini = tmp_path / "deploy.local.ini"
+    ini.write_text("[paths]\nqgis_exe = C:/q3/qgis-bin.exe\n")
+    monkeypatch.setattr(deploy, "CONFIG_FILE", ini)
+    cfg = deploy.read_config()
+    assert cfg["qgis4_exe"] == ""
+    assert cfg["qgis4_plugin_dir"] == ""
+
+
+def _two_installs(tmp_path, monkeypatch):
+    q3 = tmp_path / "q3" / "plugins"
+    q4 = tmp_path / "q4" / "plugins"
+    q3.mkdir(parents=True)
+    q4.mkdir(parents=True)
+    exe3 = tmp_path / "qgis-bin.exe"
+    exe4 = tmp_path / "qgis-qt6-bin.exe"
+    exe3.write_text("")
+    exe4.write_text("")
+    monkeypatch.setattr(deploy, "read_config", lambda required=True: {
+        "qgis_exe": str(exe3), "plugin_dir": str(q3), "aether_bin_dir": "",
+        "qgis4_exe": str(exe4), "qgis4_plugin_dir": str(q4),
+    })
+    return q3, q4, exe3, exe4
+
+
+def test_install_both_targets_both_profiles_and_launches_each(tmp_path, monkeypatch):
+    q3, q4, exe3, exe4 = _two_installs(tmp_path, monkeypatch)
+    launch = mock.Mock()
+    monkeypatch.setattr(deploy, "kill_qgis", mock.Mock(return_value=False))
+    monkeypatch.setattr(deploy, "launch_qgis", launch)
+    copied = []
+    monkeypatch.setattr(deploy, "copy_plugin",
+                        lambda src, dst: copied.append(dst) or 0)
+
+    assert deploy.main(["--qgis", "both"]) == 0
+    assert copied == [q3 / "waveshed", q4 / "waveshed"]
+    assert [c.args[0] for c in launch.call_args_list] == [str(exe3), str(exe4)]
+
+
+def test_install_qgis4_only_touches_the_qgis4_profile(tmp_path, monkeypatch):
+    q3, q4, exe3, exe4 = _two_installs(tmp_path, monkeypatch)
+    launch = mock.Mock()
+    monkeypatch.setattr(deploy, "kill_qgis", mock.Mock(return_value=False))
+    monkeypatch.setattr(deploy, "launch_qgis", launch)
+    copied = []
+    monkeypatch.setattr(deploy, "copy_plugin",
+                        lambda src, dst: copied.append(dst) or 0)
+
+    assert deploy.main(["--qgis", "4"]) == 0
+    assert copied == [q4 / "waveshed"]
+    launch.assert_called_once_with(str(exe4))
+
+
+def test_install_qgis4_without_its_exe_fails_loudly_unless_no_launch(tmp_path, monkeypatch, capsys):
+    q3, q4, exe3, exe4 = _two_installs(tmp_path, monkeypatch)
+    exe4.unlink()
+    monkeypatch.setattr(deploy, "kill_qgis", mock.Mock(return_value=False))
+    monkeypatch.setattr(deploy, "launch_qgis", mock.Mock())
+    monkeypatch.setattr(deploy, "copy_plugin", mock.Mock(return_value=0))
+
+    assert deploy.main(["--qgis", "4"]) == 1
+    assert "[qgis4] qgis_exe" in capsys.readouterr().out
+
+    assert deploy.main(["--qgis", "4", "--no-launch"]) == 0
+
+
+def test_plugin_dir_override_refused_with_both(tmp_path, monkeypatch, capsys):
+    _two_installs(tmp_path, monkeypatch)
+    monkeypatch.setattr(deploy, "kill_qgis", mock.Mock(return_value=False))
+    monkeypatch.setattr(deploy, "launch_qgis", mock.Mock())
+    monkeypatch.setattr(deploy, "copy_plugin", mock.Mock(return_value=0))
+
+    assert deploy.main(["--qgis", "both", "--plugin-dir", str(tmp_path)]) == 1
+    assert "--qgis both" in capsys.readouterr().out
+    assert deploy.main(["--status", "--qgis", "both", "--plugin-dir", str(tmp_path)]) == 1
+
+
+def test_status_and_remove_cover_both_majors(tmp_path, monkeypatch, capsys):
+    q3, q4, _, _ = _two_installs(tmp_path, monkeypatch)
+    _stage_fake_plugin(q3, version="3.3.3")
+    _stage_fake_plugin(q4, version="4.4.4")
+
+    assert deploy.main(["--status", "--qgis", "both"]) == 0
+    out = capsys.readouterr().out
+    assert "qgis3.version=3.3.3" in out
+    assert "qgis4.version=4.4.4" in out
+
+    assert deploy.main(["--remove", "--qgis", "both"]) == 0
+    assert not (q3 / "waveshed").exists()
+    assert not (q4 / "waveshed").exists()
+
