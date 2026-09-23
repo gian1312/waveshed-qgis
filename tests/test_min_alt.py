@@ -128,9 +128,10 @@ class TestResolutions(unittest.TestCase):
 
 
 class TestFeatureRename(unittest.TestCase):
-    """The MIN_ALT feature is shown to users as 'Minimum LOS Altitude', but the
-    engine wire value must stay 'MIN_ALT'. Assert on source (the GUI modules
-    pull in Qt classes the lightweight stubs do not provide)."""
+    """The MIN_ALT feature is shown to users as 'LOS Floor' (renamed from
+    'Minimum LOS Altitude' on 2026-09-21), but the engine wire value must stay
+    'MIN_ALT'. Assert on source (the GUI modules pull in Qt classes the
+    lightweight stubs do not provide)."""
 
     def _read(self, *parts):
         import os
@@ -142,8 +143,15 @@ class TestFeatureRename(unittest.TestCase):
 
     def test_mode_radio_uses_new_display_name(self):
         src = self._read("gui", "main_dialog.py")
-        self.assertIn('QRadioButton("Minimum LOS Altitude")', src)
+        self.assertIn('QRadioButton("LOS Floor")', src)
+        self.assertNotIn('Minimum LOS Altitude', src)
         self.assertNotIn('QRadioButton("Min Altitude")', src)
+
+    def test_no_user_facing_module_keeps_the_old_name(self):
+        for parts in (("gui", "site_analysis_tab.py"),
+                      ("gui", "altitude_explorer.py"),
+                      ("plugin.py",)):
+            self.assertNotIn("Minimum LOS Altitude", self._read(*parts), parts)
 
     def test_engine_wire_value_unchanged(self):
         src = self._read("gui", "main_dialog.py")
@@ -503,6 +511,148 @@ class TestBandStops(unittest.TestCase):
     def test_labels_follow_the_reference(self):
         stops = ma.band_stops([self._band(1500.0)], ma.REF_AMSL)
         self.assertEqual(stops[0].label, "≤ 1500 m AMSL")
+
+
+class TestBandReference(unittest.TestCase):
+    """Each band says what its own metres are measured from.
+
+    The Altitude Explorer shows several at once ("100 m AGL" beside "2500 m
+    AMSL"), and the two are drawn on different rasters, so the reference has to
+    travel with the band rather than sit in one switch over the whole set.
+    """
+
+    def test_a_band_defaults_to_above_ground(self):
+        # What the solver emits, and what a band saved before references
+        # existed means.
+        band = ma.AltitudeBand(100.0, (1, 2, 3))
+        self.assertEqual(band.reference, ma.REF_AGL)
+
+    def test_a_band_carries_its_own_reference(self):
+        band = ma.AltitudeBand(2500.0, (1, 2, 3), True, ma.REF_AMSL)
+        self.assertEqual(band.reference, ma.REF_AMSL)
+
+    def test_label_names_the_reference(self):
+        self.assertEqual(ma.band_label(100.0, ma.REF_AGL), "100 m AGL")
+        self.assertEqual(ma.band_label(2500.0, ma.REF_AMSL), "2500 m AMSL")
+
+    def test_label_drops_a_trailing_zero(self):
+        # The slider hands over floats; "100 m AGL" is what a person says.
+        self.assertEqual(ma.band_label(100.0, ma.REF_AGL), "100 m AGL")
+        self.assertEqual(ma.band_label(12.5, ma.REF_AGL), "12.5 m AGL")
+
+    def test_label_of_an_unlabelled_band_reads_as_above_ground(self):
+        self.assertEqual(ma.band_label(50.0, None), "50 m AGL")
+        self.assertEqual(ma.band_label(50.0, "nonsense"), "50 m AGL")
+
+
+class TestSplitBandsByReference(unittest.TestCase):
+    """The split that decides which raster each band is drawn on."""
+
+    @staticmethod
+    def _band(altitude_m, reference=ma.REF_AGL):
+        return ma.AltitudeBand(altitude_m, (1, 2, 3), True, reference)
+
+    def test_every_reference_is_present_even_when_unused(self):
+        # Callers ask for one without guarding, so both keys always exist.
+        grouped = ma.split_bands_by_reference([self._band(100.0)])
+        self.assertEqual(set(grouped), set(ma.REFERENCES))
+        self.assertEqual(grouped[ma.REF_AMSL], [])
+
+    def test_mixed_bands_land_on_their_own_reference(self):
+        agl_low = self._band(100.0)
+        amsl = self._band(2500.0, ma.REF_AMSL)
+        agl_high = self._band(300.0)
+        grouped = ma.split_bands_by_reference([agl_low, amsl, agl_high])
+        self.assertEqual(grouped[ma.REF_AGL], [agl_low, agl_high])
+        self.assertEqual(grouped[ma.REF_AMSL], [amsl])
+
+    def test_each_group_comes_back_in_altitude_order(self):
+        # band_stops nests in altitude order; the split is what hands it one.
+        grouped = ma.split_bands_by_reference([
+            self._band(300.0), self._band(100.0), self._band(200.0),
+            self._band(3000.0, ma.REF_AMSL), self._band(2500.0, ma.REF_AMSL),
+        ])
+        self.assertEqual([b.altitude_m for b in grouped[ma.REF_AGL]],
+                         [100.0, 200.0, 300.0])
+        self.assertEqual([b.altitude_m for b in grouped[ma.REF_AMSL]],
+                         [2500.0, 3000.0])
+
+    def test_an_unknown_reference_reads_as_above_ground(self):
+        band = self._band(100.0, "sea-ish")
+        grouped = ma.split_bands_by_reference([band])
+        self.assertEqual(grouped[ma.REF_AGL], [band])
+
+    def test_anything_with_the_two_attributes_can_be_split(self):
+        # The Altitude Explorer's own mutable band object is not an
+        # AltitudeBand; the split must take it as it is.
+        class _Mutable:
+            def __init__(self, altitude_m, reference):
+                self.altitude_m = altitude_m
+                self.reference = reference
+
+        high = _Mutable(2500.0, ma.REF_AMSL)
+        low = _Mutable(100.0, ma.REF_AGL)
+        grouped = ma.split_bands_by_reference([high, low])
+        self.assertEqual(grouped[ma.REF_AGL], [low])
+        self.assertEqual(grouped[ma.REF_AMSL], [high])
+
+    def test_the_caller_s_list_is_left_alone(self):
+        bands = [self._band(300.0), self._band(100.0)]
+        ma.split_bands_by_reference(bands)
+        self.assertEqual([b.altitude_m for b in bands], [300.0, 100.0])
+
+
+class TestBandStopsOnASubset(unittest.TestCase):
+    """A renderer is built per layer from only that layer's bands, so the
+    stops have to nest within the subset — not carry on the ladder of the
+    bands that went to the *other* layer."""
+
+    @staticmethod
+    def _band(altitude_m, reference=ma.REF_AGL, color=(1, 2, 3)):
+        return ma.AltitudeBand(altitude_m, color, True, reference)
+
+    def setUp(self):
+        self.mixed = [
+            self._band(100.0), self._band(300.0),
+            self._band(2500.0, ma.REF_AMSL),
+        ]
+        self.grouped = ma.split_bands_by_reference(self.mixed)
+
+    def test_the_lone_band_of_its_group_owns_everything_below_it(self):
+        # 2500 m AMSL is the *first* ring on the sea-level twin, so it reads
+        # "<= 2500", never "300 - 2500": the 300 went to the other raster.
+        stops = ma.band_stops(self.grouped[ma.REF_AMSL], ma.REF_AMSL)
+        self.assertEqual([s.label for s in stops[:-1]], ["≤ 2500 m AMSL"])
+        self.assertEqual(stops[0].raw, ma.altitude_to_raw(2500.0))
+
+    def test_the_other_group_keeps_its_own_nesting(self):
+        stops = ma.band_stops(self.grouped[ma.REF_AGL], ma.REF_AGL)
+        self.assertEqual([s.raw for s in stops[:-1]],
+                         [ma.altitude_to_raw(100.0), ma.altitude_to_raw(300.0)])
+        self.assertEqual([s.label for s in stops[:-1]],
+                         ["≤ 100 m AGL", "100 – 300 m AGL"])
+
+    def test_no_stop_of_the_other_reference_leaks_in(self):
+        # The altitudes are not comparable: raw 5000 (2500 m) on the
+        # above-ground raster would paint a ring nothing asked for.
+        for reference in ma.REFERENCES:
+            with self.subTest(reference=reference):
+                stops = ma.band_stops(self.grouped[reference], reference)
+                mine = {ma.altitude_to_raw(b.altitude_m)
+                        for b in self.grouped[reference]}
+                self.assertEqual(
+                    {s.raw for s in stops[:-1]}, mine,
+                )
+
+    def test_each_subset_still_ends_transparent_and_ascends(self):
+        for reference in ma.REFERENCES:
+            with self.subTest(reference=reference):
+                stops = ma.band_stops(self.grouped[reference], reference)
+                raws = [s.raw for s in stops]
+                self.assertEqual(raws, sorted(raws))
+                self.assertEqual(len(set(raws)), len(raws))
+                self.assertEqual(stops[-1].raw, ma.MIN_ALT_SENTINEL)
+                self.assertIsNone(stops[-1].color)
 
 
 class TestBandPalette(unittest.TestCase):

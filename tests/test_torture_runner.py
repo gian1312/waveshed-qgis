@@ -1304,3 +1304,71 @@ def test_an_empty_comparison_says_which_of_the_three_reasons_it_was(tmp_path):
     assert "the reference holds 1 tile(s)" in detail.lower()
     assert "0 name(s) in common" in detail
     assert "no tile of that name in the reference" in detail
+
+
+# ---------------------------------------------------------------------------
+# A hung worker must report WHERE it hung (row 4.3, 2026-09-22: "no answer
+# within 540s" carried nothing to act on).
+# ---------------------------------------------------------------------------
+
+class _Signal:
+    def __init__(self):
+        self._fns = []
+
+    def connect(self, fn, *_args):
+        self._fns.append(fn)
+
+    def emit(self, *args):
+        for fn in self._fns:
+            fn(*args)
+
+
+class _HungWorker:
+    """Emits two status lines, then never answers."""
+    def __init__(self):
+        self.finished_ok = _Signal()
+        self.finished_err = _Signal()
+        self.status = _Signal()
+        self.cancelled = False
+
+    def start(self):
+        self.status.emit("[1/1] torture 4.3: Downloading terrain...")
+        self.status.emit("[1/1] torture 4.3: Running aether_core...")
+
+    def wait(self, _ms):
+        return False
+
+    def cancel(self):
+        self.cancelled = True
+
+
+def test_timed_out_worker_names_its_last_status():
+    state = tr._run_worker(_HungWorker(), timeout=7)
+    assert state["ok"] is None
+    assert state["err"].startswith("no answer within 7s")
+    assert "Running aether_core" in state["err"]
+    assert "Downloading terrain" not in state["err"], "only the LAST status"
+    assert state["elapsed"] >= 0.0
+
+
+def test_timed_out_worker_cancels_through_its_own_cancel():
+    worker = _HungWorker()
+    tr._run_worker(worker, timeout=1)
+    assert worker.cancelled
+
+
+def test_stall_report_quotes_the_plugin_log_line():
+    text = tr._stall_report(
+        ["Preparing terrain"],
+        ["    writeRaster 1852x1852 (3.4M px)...", ""])
+    assert "last status: 'Preparing terrain'" in text
+    assert "writeRaster 1852x1852" in text
+
+
+def test_stall_report_says_when_nothing_was_said():
+    assert "no status and no log line" in tr._stall_report([], [])
+
+
+def test_synthesized_timeout_still_never_counts_as_a_refusal():
+    state = tr._run_worker(_HungWorker(), timeout=3)
+    assert any(state["err"].startswith(c) for c in tr._SYNTHESIZED_COMPLAINTS)

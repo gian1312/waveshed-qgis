@@ -57,7 +57,7 @@ from qgis.PyQt.QtGui import QColor
 
 from ..core.asset_manager import compute_erp, list_assets, load_asset
 from ..core.attribution import source_credit
-from ..core.binary_manager import find_binary
+from ..core.binary_manager import engine_error_hint, find_binary
 from ..core import api_key
 from ..core import terrain_adapter
 
@@ -227,6 +227,11 @@ class _SiteAnalysisWorker(QThread):
             # single time rather than once per site/height.
             reset_terrain_warnings()
 
+            # Pre-flight: every job shares one resolution, so one probe
+            # decides the run — before any terrain is fetched.
+            from ..core import binary_manager as _bm
+            _bm.check_engine_for_job(self.jobs[0][0].resolution_m)
+
             for job_idx, (params, display_name) in enumerate(self.jobs):
                 if self._canceled:
                     return
@@ -323,6 +328,7 @@ class _SiteAnalysisWorker(QThread):
                     raise RuntimeError(
                         f"aether_core exited with code {rc}"
                         f" for {display_name}:\n{tail}"
+                        + engine_error_hint(tail)
                     )
 
                 if self._canceled:
@@ -606,7 +612,7 @@ class SiteAnalysisTab(QWidget):
         # Shown instead of the table in MIN_ALT mode, where a single run already
         # covers every altitude so per-altitude rows would only duplicate work.
         self.lbl_alt_min_alt_note = QLabel(
-            "Minimum LOS Altitude mode computes the lowest line-of-sight "
+            "LOS Floor mode computes the lowest line-of-sight "
             "altitude for every location in one pass — receiver altitudes are "
             "not needed here. Use the Altitude Explorer to view any altitude "
             "afterwards."
@@ -1407,7 +1413,7 @@ class SiteAnalysisTab(QWidget):
                     display_name = (
                         f"Site {site_idx + 1} "
                         f"({tx_lat:.4f}, {tx_lon:.4f}) "
-                        f"— Minimum LOS Altitude"
+                        f"— LOS Floor"
                     )
                 else:
                     display_name = (
@@ -1709,7 +1715,7 @@ class SiteAnalysisTab(QWidget):
         if has_min_alt:
             reply = QMessageBox.question(
                 self, "Analysis Complete",
-                f"Completed {len(results)} Minimum LOS Altitude job(s).\n"
+                f"Completed {len(results)} LOS Floor job(s).\n"
                 f"{loaded_count} result(s) loaded into QGIS.\n\n"
                 "Open the Altitude Explorer to pick a preferred altitude and "
                 "see the reachable area live?",

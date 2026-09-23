@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import platform
 import shutil
 import stat
@@ -248,6 +249,30 @@ def _fingerprint_error_message(returncode: int, stdout: str, stderr: str) -> str
         f"aether_core --fingerprint exited with code {returncode}"
         + (f": {detail}" if detail else ".")
     )
+
+
+def engine_error_hint(output: str) -> str:
+    """Return an actionable hint for a known ``aether_core`` failure, or ``""``.
+
+    Pure (no subprocess or IO) so it can be unit-tested directly. Appended to
+    the engine's own ``[E:...]`` tail by every caller that runs a job, so the
+    user learns *what to do* rather than only what the engine refused.
+
+    Known case — ``[E:Unsupported resolution 90m. Allowed: [2.0, 5.0, 10.0,
+    30.0]]``: engines up to v0.4.2 carried a hardcoded resolution list on the
+    native GPU path that contradicted the engine contract (any positive value)
+    and the plugin's own offer of 90 m / 250 m. The list is gone in newer
+    builds, so the fix is an engine update, not a plugin setting.
+    """
+    if "unsupported resolution" in (output or "").lower():
+        return (
+            "\n\nThe installed Aether engine build only accepts 2, 5, 10 and "
+            "30 m on the GPU path (a hardcoded list removed in engine "
+            f"{COARSE_RESOLUTION_MIN_ENGINE}). Update the engine via Settings "
+            "\u2192 Download binaries, or pick one of those resolutions for "
+            "this run."
+        )
+    return ""
 
 
 def read_machine_fingerprint(timeout: float = 10.0) -> str:
@@ -722,6 +747,102 @@ def _clear_quarantine(target_dir: str, files: list) -> None:
                 pass
 
     # Linux: nothing to do — the executable bit set after extraction suffices.
+
+
+#: First aether_core that solves resolutions outside the legacy GPU list.
+#: Engines up to 0.4.2 carried a hardcoded ``[2, 5, 10, 30]`` on the native
+#: GPU path (aether-tools docs/CONTRACT.md §1.5, capability gates).
+COARSE_RESOLUTION_MIN_ENGINE = "0.4.3"
+
+#: What an engine older than :data:`COARSE_RESOLUTION_MIN_ENGINE` accepts.
+LEGACY_ENGINE_RESOLUTIONS = (2, 5, 10, 30)
+
+
+class EngineTooOldError(RuntimeError):
+    """The installed engine cannot run this job; the message says what to do."""
+
+
+def parse_engine_version(output: str) -> Optional[str]:
+    """Extract the semver from ``aether_core --version`` output, else ``None``.
+
+    The contract line is ``aether_core <semver>``. Anything else — clap's
+    "unexpected argument" from a build too old to know the flag, an empty
+    stdout, a crash banner — reads as *unknown*, which callers must treat as
+    the oldest known engine, never as the newest.
+    """
+    for line in (output or "").splitlines():
+        parts = line.strip().split()
+        if len(parts) == 2 and parts[0] == "aether_core":
+            candidate = parts[1].lstrip("v")
+            if re.fullmatch(r"\d+(\.\d+)+", candidate):
+                return candidate
+    return None
+
+
+def read_engine_version(timeout: float = 5.0) -> Optional[str]:
+    """Return the installed ``aether_core`` version, or ``None`` if unknown.
+
+    Runs ``aether_core --version`` (no license, no GPU). Never raises: a
+    missing binary or an engine too old for the flag both yield ``None``.
+    """
+    try:
+        exe = find_binary("aether_core")
+        result = subprocess.run(
+            [exe, "--version"],
+            capture_output=True, text=True, timeout=timeout, check=False,
+        )
+    except Exception:  # noqa: BLE001 — a probe must never take the run down
+        return None
+    if result.returncode != 0:
+        return None
+    return parse_engine_version(result.stdout)
+
+
+def engine_supports_resolution(
+    engine_version: Optional[str], resolution_m: float,
+) -> bool:
+    """True if an engine of *engine_version* solves *resolution_m*.
+
+    ``None`` (unknown / pre-``--version`` build) is the oldest known engine.
+    """
+    if engine_version and compare_versions(
+        engine_version, COARSE_RESOLUTION_MIN_ENGINE,
+    ) >= 0:
+        return True
+    return float(resolution_m) in {float(r) for r in LEGACY_ENGINE_RESOLUTIONS}
+
+
+def check_engine_for_job(resolution_m: float) -> str:
+    """Pre-flight before any terrain is fetched: log the engine, gate the job.
+
+    Logs the engine path and version on every run (so a stale local deploy
+    is visible in the Log Messages panel), and raises
+    :class:`EngineTooOldError` when the installed engine cannot solve
+    *resolution_m* — BEFORE the terrain download, which for a 90 m / 250 m
+    run is the expensive part of a job the engine would then refuse anyway.
+
+    Returns the version string that was logged (``"unknown"`` if the engine
+    predates ``--version``), for callers that want to show it.
+    """
+    try:
+        exe = find_binary("aether_core")
+    except Exception:  # noqa: BLE001 — the run's own find_binary reports it
+        exe = "aether_core"
+    version = read_engine_version()
+    shown = version or "unknown (build predates --version)"
+    QgsMessageLog.logMessage(
+        f"Engine: {exe} — aether_core {shown}", TAG, Qgis.MessageLevel.Info,
+    )
+    if not engine_supports_resolution(version, resolution_m):
+        allowed = ", ".join(str(r) for r in LEGACY_ENGINE_RESOLUTIONS)
+        raise EngineTooOldError(
+            f"The installed Aether engine (aether_core {shown}) cannot run a "
+            f"{resolution_m:g} m analysis: it accepts only {allowed} m on the "
+            f"GPU path. Engine {COARSE_RESOLUTION_MIN_ENGINE} or newer is "
+            "required. Update it via Settings \u2192 Download binaries, or pick "
+            "one of those resolutions. Nothing was downloaded."
+        )
+    return shown
 
 
 def _version_handshake(binary_dir: str) -> None:

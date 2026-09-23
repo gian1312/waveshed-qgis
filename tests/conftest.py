@@ -294,6 +294,8 @@ _qtcore.Qt = type("Qt", (), {
         "DockWidgetArea", LeftDockWidgetArea=1, RightDockWidgetArea=2,
     ),
     "ItemDataRole": _enum_scope("ItemDataRole", DisplayRole=0, UserRole=0x0100),
+    "ConnectionType": _enum_scope(
+        "ConnectionType", AutoConnection=0, DirectConnection=1, QueuedConnection=2),
     "ItemFlag": _enum_scope(
         "ItemFlag", ItemIsEditable=2, ItemIsEnabled=32, ItemIsUserCheckable=16,
     ),
@@ -327,7 +329,8 @@ _widget_names = [
     "QRadioButton", "QSizePolicy", "QSpinBox", "QSplitter",
     "QTableWidget", "QTableWidgetItem", "QTabWidget", "QToolButton",
     "QVBoxLayout", "QWidget", "QInputDialog", "QDialogButtonBox",
-    "QTextEdit", "QProgressDialog", "QApplication", "QListWidget",
+    "QTextBrowser", "QTextEdit", "QProgressDialog", "QApplication",
+    "QListWidget",
     "QListWidgetItem", "QScrollArea", "QStackedWidget", "QSlider",
 ]
 for name in _widget_names:

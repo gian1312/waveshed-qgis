@@ -32,6 +32,13 @@ All adaptation happens in this plugin. Communication with binaries is exclusivel
 | `aether_converter` | `ingest --job-file <job.json>` | Ingest job JSON, GeoTIFF | .abt terrain tiles |
 | `aether_export` | `-i <.bit/.tiles> -j <.json> -o <.tif>` | .bit/.tiles + .json sidecar | Cloud-Optimized BigTIFF |
 
+Every binary answers `--version` with `<name> <semver>` (toolkit binaries since
+converter 0.2.5 / export 1.0.1). `binary_manager.check_engine_for_job` runs
+`aether_core --version` at the start of every run, logs the engine path and
+version, and refuses 90 m / 250 m on engines older than
+`COARSE_RESOLUTION_MIN_ENGINE` (0.4.3) before any terrain is fetched; an engine
+that does not know the flag counts as the oldest known build.
+
 ## Job Config JSON Structure (aether_core)
 
 Defined in `rust/aether_core/src/config.rs`. Sections: tx, rx, analysis, output, processing, propagation.

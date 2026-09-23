@@ -58,7 +58,11 @@ from qgis.core import (
 )
 from qgis.gui import QgsRubberBand
 
-from ..core.binary_manager import binaries_warning, find_binary
+from ..core.binary_manager import (
+    binaries_warning,
+    engine_error_hint,
+    find_binary,
+)
 from ..core import api_key
 from ..core import terrain_adapter
 from ..core.asset_manager import compute_erp, list_assets
@@ -593,6 +597,7 @@ class _P2PWorker(QThread):
             from ..core import binary_manager as bm
             from ..core.terrain_adapter import prepare_terrain
 
+            bm.check_engine_for_job(params.resolution_m)
             abt_dir = prepare_terrain(
                 dem_layer=self.dem_layer,
                 tx_lat=centre_lat,
@@ -673,6 +678,7 @@ class _P2PWorker(QThread):
                 tail = "\n".join(output_lines[-20:])
                 raise RuntimeError(
                     f"aether_core exited with code {rc}:\n{tail}"
+                    + engine_error_hint(tail)
                 )
 
             if self._canceled:

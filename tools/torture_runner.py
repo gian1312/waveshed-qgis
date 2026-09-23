@@ -1959,19 +1959,56 @@ def _run_worker(worker, timeout: int) -> Dict[str, Any]:
     if hasattr(worker, "log_line"):
         worker.log_line.connect(state["log"].append, Qt.ConnectionType.DirectConnection)
     worker.status.connect(state["log"].append, Qt.ConnectionType.DirectConnection)
-    worker.start()
-    if not worker.wait(int(timeout) * 1000):
-        try:
-            worker.cancel()
-        except Exception:
-            pass
-        worker.wait(15000)
+    # The plugin narrates the slow parts (writeRaster sizes and timings, pool
+    # hits, the engine's own lines) through QgsMessageLog, not through worker
+    # signals. Keep them: a timeout that only says "no answer" cannot be told
+    # apart from a hang, a slow server or a slow engine — which is exactly
+    # what row 4.3 (live WCS) reported on 2026-09-22.
+    started = time.perf_counter()
+    with _MessageLogTap() as tap:
+        worker.start()
+        finished = worker.wait(int(timeout) * 1000)
+        if not finished:
+            try:
+                worker.cancel()
+            except Exception:
+                pass
+            worker.wait(15000)
+    state["elapsed"] = time.perf_counter() - started
+    state["plugin_log"] = list(tap.lines)
+    if not finished:
         state["err"] = (state["err"]
-                        or f"no answer within {timeout}s — the worker was cancelled")
+                        or f"no answer within {timeout}s — the worker was cancelled"
+                        + _stall_report(state["log"], tap.lines))
     if state["ok"] is None and state["err"] is None:
         state["err"] = ("the worker finished without emitting a verdict "
                         "(cancelled mid-run?)")
     return state
+
+
+def _stall_report(statuses: List[str], plugin_log: List[str]) -> str:
+    """Where a worker stood when it was cancelled — the last thing it said.
+
+    Pure, so the timeout wording can be unit-tested. The status line names
+    the pipeline stage (terrain / job / engine / export); the plugin log line
+    names the operation inside it (``writeRaster 1852x1852 …``). Both are
+    quoted so the finding carries the evidence, not just the verdict.
+    """
+    def _last(lines: List[str]) -> str:
+        for line in reversed(lines):
+            text = " ".join(str(line).split())
+            if text:
+                return _shorten(text, 110)
+        return ""
+    status, logged = _last(statuses), _last(plugin_log)
+    if not status and not logged:
+        return "; it emitted no status and no log line at all"
+    parts = []
+    if status:
+        parts.append(f"last status: {status!r}")
+    if logged:
+        parts.append(f"last log line: {logged!r}")
+    return "; " + "; ".join(parts)
 
 
 class _MessageLogTap:
@@ -1989,9 +2026,6 @@ class _MessageLogTap:
         self._tag_prefix = tag_prefix
 
     def __enter__(self) -> "_MessageLogTap":
-        from qgis.core import QgsApplication
-        from qgis.PyQt.QtCore import Qt
-
         def _collect(message, tag, _level):
             if str(tag or "").startswith(self._tag_prefix):
                 self.lines.append(str(message))
@@ -2000,11 +2034,18 @@ class _MessageLogTap:
         # Direct, for the same reason _run_worker collects directly: the
         # adapter logs from worker threads, and a queued delivery would need
         # an event loop this runner never spins — the tap read empty.
-        QgsApplication.messageLog().messageReceived.connect(
-            _collect, Qt.ConnectionType.DirectConnection)
+        try:
+            from qgis.core import QgsApplication
+            from qgis.PyQt.QtCore import Qt
+            QgsApplication.messageLog().messageReceived.connect(
+                _collect, Qt.ConnectionType.DirectConnection)
+        except Exception:  # noqa: BLE001 — no message log (unit-test stubs)
+            self._collect = None
         return self
 
     def __exit__(self, *exc) -> None:
+        if self._collect is None:
+            return
         from qgis.core import QgsApplication
         try:
             QgsApplication.messageLog().messageReceived.disconnect(self._collect)
@@ -3475,7 +3516,8 @@ def _pipeline_row(row, layer, plugin, pipe: "Pipeline", manifest, results,
     terrain_ok = _abt_asserts(rid, row, tiles, plugin, lat, lon, results,
                               "pipeline",
                               "terrain out of this layer, through the real Map Converter",
-                              f"{len(tiles)} tile(s) via the Map Converter worker")
+                              f"{len(tiles)} tile(s) via the Map Converter worker "
+                              f"in {state.get('elapsed', 0.0):.0f}s")
 
     # ---- the catalogue's independent reference -------------------------
     if _agrees_applies(row, manifest, plugin):
@@ -3494,11 +3536,12 @@ def _pipeline_row(row, layer, plugin, pipe: "Pipeline", manifest, results,
     sa_views = _pop_view_dirs(plugin)
     if sa_state["ok"] is not None:
         results.add(rid, "pipeline.sa", "a real Site Analysis run, end to end",
-                    PASS, f"{len(sa_state['ok'])} result(s) out of the worker",
+                    PASS, f"{len(sa_state['ok'])} result(s) out of the worker "
+                          f"in {sa_state.get('elapsed', 0.0):.0f}s",
                     known_fail_for(row, "pipeline.sa"))
     else:
         results.add(rid, "pipeline.sa", "a real Site Analysis run, end to end",
-                    FAIL, _tail(" ".join((sa_state["err"] or "").split()), 200),
+                    FAIL, _tail(" ".join((sa_state["err"] or "").split()), 320),
                     known_fail_for(row, "pipeline.sa"))
     _check_route(rid, row, mc_routes, sa_routes, results)
 

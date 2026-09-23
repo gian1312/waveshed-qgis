@@ -30,7 +30,7 @@ pure Python that both the loader and the Altitude Explorer dock share.
 
 from __future__ import annotations
 
-from typing import List, NamedTuple, Optional, Sequence, Tuple
+from typing import Dict, List, NamedTuple, Optional, Sequence, Tuple, TypeVar
 
 # ---------------------------------------------------------------------------
 # Quantization contract (mirrors solver.rs — do not change independently)
@@ -106,6 +106,16 @@ def reference_phrase(reference: Optional[str]) -> str:
     """Plain-language name of *reference*, for prose in the UI."""
     return ("above sea level" if normalize_reference(reference) == REF_AMSL
             else "above ground")
+
+
+def band_label(altitude_m: float, reference: Optional[str]) -> str:
+    """How one altitude is written wherever it is listed: ``"100 m AGL"``.
+
+    The reference is part of the label because a set of altitudes may now mix
+    them — ``100`` on its own is a sensible drone height above ground and
+    underground for most of the Alps above sea level.
+    """
+    return f"{altitude_m:g}{reference_suffix(reference)}"
 
 
 # ---------------------------------------------------------------------------
@@ -249,13 +259,47 @@ def next_band_color(used: Sequence[Tuple[int, int, int]]) -> Tuple[int, int, int
 class AltitudeBand(NamedTuple):
     """One altitude the explorer draws, with the colour it draws it in."""
 
-    #: Upper bound of the band, in metres of whichever reference is in force.
+    #: Upper bound of the band, in metres of its own :attr:`reference`.
     altitude_m: float
     #: Fill colour ``(r, g, b)``.
     color: Tuple[int, int, int]
     #: When False the band still splits the ones above it but is not drawn —
     #: hiding "≤ 100 m" leaves a hole rather than handing its area to "≤ 200 m".
     visible: bool = True
+    #: What this band's metres are measured from.  Bands of different
+    #: references are drawn on different rasters (the original and its
+    #: sea-level twin), so this is what :func:`split_bands_by_reference` sorts
+    #: them by.  Defaults to AGL — what the solver emits, and what a band
+    #: restored from state written before references existed means.
+    reference: str = REF_AGL
+
+
+#: Anything with ``altitude_m`` and ``reference`` — an :class:`AltitudeBand` or
+#: the Altitude Explorer's own mutable band object.
+_BandLike = TypeVar("_BandLike")
+
+
+def split_bands_by_reference(
+    bands: Sequence[_BandLike],
+) -> Dict[str, List[_BandLike]]:
+    """Group *bands* by what their altitudes are measured from.
+
+    Altitudes of different references live on different rasters — AGL on the
+    result the solver wrote, AMSL on its sea-level twin — so a mixed set of
+    bands has to be split before any of it reaches a renderer: nesting 100 m
+    AGL inside 2500 m AMSL would paint one surface with the other's rings.
+
+    Every reference is present in the result, with an empty list when no band
+    uses it, so a caller can ask for one without guarding.  Each list comes
+    back in altitude order, which is the order :func:`band_stops` needs.  A
+    band with no (or an unknown) reference reads as AGL.
+    """
+    grouped: Dict[str, List[_BandLike]] = {ref: [] for ref in REFERENCES}
+    for band in bands:
+        grouped[normalize_reference(getattr(band, "reference", None))].append(band)
+    for group in grouped.values():
+        group.sort(key=lambda band: band.altitude_m)
+    return grouped
 
 
 class BandStop(NamedTuple):

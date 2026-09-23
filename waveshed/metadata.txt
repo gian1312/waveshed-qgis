@@ -2,7 +2,7 @@
 name=Waveshed
 qgisMinimumVersion=3.28
 supportsQt6=True
-version=0.2.0
+version=0.3.0
 author=Gian-Andrea Heinrich
 email=info@waveshed.io
 description=RF propagation analysis (coverage, point-to-point) powered by the Aether GPU engine.
@@ -14,7 +14,24 @@ license=GPL-2.0-or-later
 tags=rf,propagation,radio,coverage,p2p,gpu,terrain,ITM,LOS,waveshed
 category=Analysis
 icon=resources/icon.png
-changelog=0.2.0
+changelog=0.3.0
+    - "Minimum LOS Altitude" is now "LOS Floor" everywhere in the UI. The
+      Processing wire value stays MIN_ALT, so saved models keep working.
+    - Built-in Help: a searchable Help tab (last tab of the dialog), a
+      "Waveshed Help" menu entry and a "?" next to the model choice. Covers
+      every control, terrain sources and the no-data contract, LOS Floor and
+      the Altitude Explorer, the Processing algorithms, earth-curvature and
+      ITM notes, troubleshooting and a glossary.
+    - Altitude Explorer: each altitude band has its own AGL/AMSL reference,
+      so "100 m AGL" and "2500 m AMSL" can be shown together. "Measured
+      from" applies to the selected band and the next one added; sea-level
+      bands render on the cached terrain twin, built on first use.
+    - Engine failures now carry an actionable hint. An engine that rejects
+      90 m / 250 m ("Unsupported resolution ... Allowed: [2, 5, 10, 30]")
+      is an older build: update it via Settings, or pick 2/5/10/30 m.
+    - Requires Aether engine 0.4.3 or newer for 90 m and 250 m coverage and
+      for correct ITM results with AMSL antenna heights on the GPU.
+    0.2.0
     - Runs on QGIS 4 (Qt6/PyQt6) as well as QGIS 3.28+ (Qt5): every Qt and
       QGIS enum is now spelled with its scope, QAction is imported from
       whichever module the binding keeps it in, and exec_() became exec().

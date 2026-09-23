@@ -11,13 +11,20 @@ so "reachable by 100 m" and "needs 200 m" are legible in one picture rather
 than one slider position at a time.  It drives one *or several* layers at once
 (e.g. multiple transmitter sites), so their reachable areas union on the canvas.
 
-Altitudes can be read two ways.  **AGL** is what the solver emits — height above
-the ground directly below, which is what a mast or a terrain-following drone
-holds.  **AMSL** is the sea-level altitude a pilot actually flies; getting there
-means adding the terrain under each pixel, so the first switch to it builds a
-sea-level twin of each layer (``raster_tools.build_amsl_raster``) using the very
-terrain the run was computed over.  Twins are cached on disk and re-used, so the
-switch is instant after the first time.
+Altitudes can be read two ways, **per altitude**.  **AGL** is what the solver
+emits — height above the ground directly below, which is what a mast or a
+terrain-following drone holds.  **AMSL** is the sea-level altitude a pilot
+actually flies; getting there means adding the terrain under each pixel, so the
+first sea-level altitude builds a sea-level twin of each layer
+(``raster_tools.build_amsl_raster``) using the very terrain the run was computed
+over.  Twins are cached on disk and re-used, so the next one is instant.
+
+Each altitude carries its own reference, so "100 m AGL" and "2500 m AMSL" are on
+the map together, each in its own colour: the above-ground altitudes are painted
+on the layer the solver wrote, the sea-level ones on its twin, and both rasters
+are on at once.  The continuous ramp ("Colour by: Required altitude", and the
+full range after *Reset*) is one surface by nature, so it — like the contour
+tool — follows the reference of the *selected* altitude alone.
 
 The heavy lifting (renderer construction, quantization, raster maths) lives in
 ``core.result_loader`` / ``core.min_alt`` / ``core.raster_tools``; this module
@@ -29,7 +36,7 @@ from __future__ import annotations
 import os
 import tempfile
 from datetime import datetime
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 from qgis.core import Qgis, QgsMessageLog, QgsProject, QgsRasterLayer
 from qgis.gui import QgsColorButton, QgsDockWidget, QgsMapLayerComboBox
@@ -69,12 +76,16 @@ from ..core.min_alt import (
     DEFAULT_RAMP_MAX_M,
     REF_AGL,
     REF_AMSL,
+    REFERENCES,
     AltitudeBand,
     band_color,
+    band_label,
     next_band_color,
     nice_ceiling,
+    normalize_reference,
     reference_phrase,
     reference_suffix,
+    split_bands_by_reference,
 )
 from ..core.result_loader import (
     GROUP_AMSL,
@@ -162,14 +173,25 @@ class _Band:
     Mutable on purpose: the slider edits the selected band in place while it is
     being dragged, and identity (not list position) is what the editor strip
     tracks, so removing a band cannot make the strip edit a different one.
+
+    Each band owns its :attr:`reference`, so a set of altitudes may mix them:
+    the above-ground ones are drawn on the layer the solver wrote, the
+    sea-level ones on its twin, at the same time.
     """
 
-    __slots__ = ("altitude_m", "color", "visible")
+    __slots__ = ("altitude_m", "color", "visible", "reference")
 
-    def __init__(self, altitude_m: float, color: QColor, visible: bool = True):
+    def __init__(self, altitude_m: float, color: QColor, visible: bool = True,
+                 reference: str = REF_AGL):
         self.altitude_m = float(altitude_m)
         self.color = QColor(color)
         self.visible = visible
+        self.reference = normalize_reference(reference)
+
+    @property
+    def label(self) -> str:
+        """How this band is written in the band list — ``"100 m AGL"``."""
+        return band_label(self.altitude_m, self.reference)
 
     def as_altitude_band(self) -> AltitudeBand:
         """The GUI-free view of this band, for the renderer."""
@@ -177,6 +199,7 @@ class _Band:
             self.altitude_m,
             (self.color.red(), self.color.green(), self.color.blue()),
             self.visible,
+            self.reference,
         )
 
 
@@ -185,6 +208,79 @@ def _swatch(color: QColor, visible: bool) -> QIcon:
     pixmap = QPixmap(_SWATCH_PX, _SWATCH_PX)
     pixmap.fill(color if visible else QColor(0, 0, 0, 0))
     return QIcon(pixmap)
+
+
+def _readout_text(
+    layer_count: int,
+    bands: Sequence[_Band],
+    use_bands: bool,
+    nested: bool,
+    reference: str,
+    undriven: int = 0,
+) -> str:
+    """One line saying exactly what is on the canvas right now.
+
+    Pure — everything it says comes from its arguments — because this is the
+    sentence that has to stay true as the rules get subtler.  *layer_count* is
+    how many rasters were painted (a site showing both an above-ground and a
+    sea-level altitude contributes two), *nested* says the bands own the
+    colours, and *reference* is the selected altitude's, which is what the
+    single-surface styles follow.
+    """
+    if not layer_count:
+        if undriven:
+            return ("No sea-level view for the selected layers yet — "
+                    "re-tick them to build it, or measure from the ground.")
+        return "No layers selected."
+
+    plural = "s" if layer_count != 1 else ""
+    waiting = (f" {undriven} more await{'s' if undriven == 1 else ''} a "
+               f"sea-level view." if undriven else "")
+    reference = normalize_reference(reference)
+    # One ramp is one surface, so it can only speak one reference — the
+    # selected altitude's. Saying which one is the whole documentation of that
+    # rule the user ever sees.
+    full_ramp = (f"Showing the full LOS Floor ramp, measured "
+                 f"{reference_phrase(reference)}, on {layer_count} "
+                 f"layer{plural}.{waiting}")
+
+    grouped = split_bands_by_reference(bands)
+    ordered = [band for ref in REFERENCES for band in grouped[ref]]
+    if not use_bands or not ordered:
+        return full_ramp
+
+    if not nested:
+        # One ramp clipped at the highest altitude of that same reference: the
+        # per-band colours and the hidden/shown ticks play no part, so do not
+        # claim they do.
+        mine = grouped[reference]
+        if not mine:
+            return full_ramp
+        return (f"Reachable at ≤ {band_label(mine[-1].altitude_m, reference)}, "
+                f"coloured by the altitude each point needs, on {layer_count} "
+                f"layer{plural}.{waiting}")
+
+    shown = [band for band in ordered if band.visible]
+    if not shown:
+        return f"All {len(ordered)} altitudes are hidden — tick one to draw it."
+
+    references = {normalize_reference(band.reference) for band in shown}
+    if len(references) > 1:
+        # Mixed references have no common suffix to factor out, so every
+        # altitude carries its own — and they are not one nested set either.
+        listed = ", ".join(
+            band_label(band.altitude_m, band.reference) for band in shown
+        )
+        return (f"{len(shown)} altitudes on {layer_count} layer{plural}: "
+                f"{listed}.{waiting}")
+
+    only = references.pop()
+    if len(shown) == 1:
+        return (f"Reachable at ≤ {band_label(shown[0].altitude_m, only)} on "
+                f"{layer_count} layer{plural}.{waiting}")
+    listed = ", ".join(f"{band.altitude_m:g}" for band in shown)
+    return (f"Reachable at {listed}{reference_suffix(only)} — nested bands on "
+            f"{layer_count} layer{plural}.{waiting}")
 
 
 class _TerrainSourceDialog(QDialog):
@@ -529,15 +625,23 @@ class AltitudeExplorerDock(QgsDockWidget):
         self.iface = iface
         self._updating = False  # guard against slider<->spin feedback loops
 
-        # The altitudes on show, per reference. Kept apart because the numbers
-        # are not interchangeable: 100 m AGL is a sensible drone height, while
-        # 100 m AMSL is underground for most of the Alps.
-        self._band_sets: Dict[str, List[_Band]] = {REF_AGL: [], REF_AMSL: []}
+        # The altitudes on show. Each carries its own reference: the numbers
+        # are not interchangeable (100 m AGL is a sensible drone height, 100 m
+        # AMSL is underground for most of the Alps), so they are told apart per
+        # band rather than by one switch over the whole set.
+        self._bands: List[_Band] = []
+        #: What the selected altitude is measured from — what the "Measured
+        #: from" radios show, and what the next added band inherits.
         self._reference = REF_AGL
         self._selected_band: Optional[_Band] = None
-        #: Tidy (lowest, highest) altitude the sliders span, for the current
-        #: reference and selection.
+        #: Tidy (lowest, highest) altitude the sliders span, for the selected
+        #: band's reference.
         self._range: Tuple[float, float] = (0.0, DEFAULT_RAMP_MAX_M)
+        #: The same span per reference, refreshed from the layers on the
+        #: canvas; None while that reference has no layer yet.
+        self._ranges: Dict[str, Optional[Tuple[float, float]]] = {
+            ref: None for ref in REFERENCES
+        }
 
         # Background sea-level (AMSL) twin building state.
         self._amsl_worker: Optional[_AmslWorker] = None
@@ -587,9 +691,11 @@ class AltitudeExplorerDock(QgsDockWidget):
         layout.setContentsMargins(8, 8, 8, 8)
 
         intro = QLabel(
-            "Pick the altitudes you care about — every selected Minimum LOS "
-            "Altitude layer shows where it reaches the transmitter at each of "
-            "them, one colour per altitude. No recomputation needed."
+            "Pick the altitudes you care about — every selected LOS Floor "
+            "layer shows where it reaches the transmitter at each of them, "
+            "one colour per altitude. Each altitude is measured from the "
+            "ground or from sea level, as you choose, and they can be on the "
+            "map together. No recomputation needed."
         )
         intro.setWordWrap(True)
         intro.setStyleSheet("color: gray; font-size: 11px;")
@@ -619,13 +725,16 @@ class AltitudeExplorerDock(QgsDockWidget):
         self.radio_amsl = QRadioButton("Sea level (AMSL)")
         self.radio_agl.setChecked(True)
         self.radio_agl.setToolTip(
-            "Height above the ground directly below — what a mast or a "
-            "terrain-following drone holds."
+            "Measure the selected altitude from the ground directly below — "
+            "what a mast or a terrain-following drone holds. Applies to the "
+            "altitude selected below, and to the next one you add."
         )
         self.radio_amsl.setToolTip(
-            "Altitude above sea level — what a pilot flies. Waveshed adds the "
-            "terrain the analysis was run over to each layer the first time you "
-            "switch; after that it is instant."
+            "Measure the selected altitude from sea level — what a pilot "
+            "flies. Waveshed adds the terrain the analysis was run over to "
+            "each layer the first time an altitude needs it; after that it is "
+            "instant. Altitudes measured from the ground stay on show "
+            "alongside it."
         )
         self._ref_group = QButtonGroup(self)
         self._ref_group.addButton(self.radio_agl)
@@ -651,7 +760,8 @@ class AltitudeExplorerDock(QgsDockWidget):
         self.band_list.setMaximumHeight(110)
         self.band_list.setToolTip(
             "Untick an altitude to hide its band without losing it — the bands "
-            "above keep their own areas."
+            "above keep their own areas. Each row is labelled with what it is "
+            "measured from; select one to change that above."
         )
         ag_layout.addWidget(self.band_list)
 
@@ -693,7 +803,9 @@ class AltitudeExplorerDock(QgsDockWidget):
         )
         self.radio_shade.setToolTip(
             "One continuous ramp up to the highest altitude, colouring pixels "
-            "by the altitude they actually need (blue = low, red = high)."
+            "by the altitude they actually need (blue = low, red = high). One "
+            "ramp covers one reference: the one the selected altitude is "
+            "measured from."
         )
         self._style_group = QButtonGroup(self)
         self._style_group.addButton(self.radio_bands)
@@ -714,8 +826,10 @@ class AltitudeExplorerDock(QgsDockWidget):
         action_row.addStretch()
         self.btn_reset = QPushButton("Reset to full range")
         self.btn_reset.setToolTip(
-            "Restore the continuous Minimum LOS Altitude colour ramp on the "
-            "selected layers."
+            "Restore the continuous LOS Floor colour ramp on the selected "
+            "layers. One ramp is one surface, so it is drawn on whichever "
+            "reference the selected altitude uses — above ground or above sea "
+            "level."
         )
         action_row.addWidget(self.btn_reset)
         layout.addLayout(action_row)
@@ -727,12 +841,17 @@ class AltitudeExplorerDock(QgsDockWidget):
         self.btn_merge.setToolTip(
             "Across the selected sites, compute the lowest required altitude at "
             "each location and which site provides it. Produces a combined "
-            "Minimum LOS Altitude layer (drivable by the slider) plus a best-site map."
+            "LOS Floor layer (drivable by the slider) plus a best-site map. "
+            "Always merged from the above-ground surfaces — taking the lowest "
+            "of several and adding the terrain afterwards give the same "
+            "answer — so the result is a new above-ground site layer."
         )
         self.btn_contours = QPushButton("Iso-altitude contours…")
         self.btn_contours.setToolTip(
             "Draw labelled contour lines of equal required altitude on each "
-            "selected layer (e.g. the 50 m / 100 m 'reach' lines)."
+            "selected layer (e.g. the 50 m / 100 m 'reach' lines). A contour "
+            "set has one reference: the one the selected altitude is measured "
+            "from."
         )
         tg_layout.addWidget(self.btn_merge)
         tg_layout.addWidget(self.btn_contours)
@@ -745,7 +864,7 @@ class AltitudeExplorerDock(QgsDockWidget):
         self.slider.valueChanged.connect(self._on_slider)
         self.spin.valueChanged.connect(self._on_spin)
         self.chk_threshold.toggled.connect(self._on_threshold_toggled)
-        self.radio_shade.toggled.connect(lambda _: self._apply())
+        self.radio_shade.toggled.connect(lambda _: self._refresh_canvas())
         self.radio_amsl.toggled.connect(self._on_reference_toggled)
         self.btn_reset.clicked.connect(self._on_reset)
         self.btn_all.clicked.connect(lambda: self._set_all_checked(True))
@@ -794,8 +913,8 @@ class AltitudeExplorerDock(QgsDockWidget):
 
         if not candidates:
             self.lbl_readout.setText(
-                "No Minimum LOS Altitude layers found. "
-                "Run a Minimum LOS Altitude analysis first."
+                "No LOS Floor layers found. "
+                "Run a LOS Floor analysis first."
             )
             self._sync_band_editor()  # nothing to edit — grey the strip out
             return
@@ -803,7 +922,7 @@ class AltitudeExplorerDock(QgsDockWidget):
         self._sync_range_to_layers()
         if not self._bands:
             self._seed_bands()
-        self._apply()
+        self._refresh_canvas()
 
     def _checked_layers(self) -> List[QgsRasterLayer]:
         """The MIN_ALT source layers the user ticked, above-ground originals."""
@@ -843,18 +962,38 @@ class AltitudeExplorerDock(QgsDockWidget):
                 return candidate
         return None
 
-    def _driven_layers(self) -> List[QgsRasterLayer]:
-        """The layers the current reference actually paints.
+    def _layers_for_reference(self, reference: str) -> List[QgsRasterLayer]:
+        """The ticked layers that carry altitudes of *reference*.
 
         Above ground that is the ticked layers themselves; above sea level it is
         their twins, and a layer whose twin does not exist yet is simply left
         out — :meth:`_ensure_twins` is what creates them, and it reports what it
         could not do rather than silently drawing the wrong surface.
         """
-        if self._reference == REF_AGL:
+        if normalize_reference(reference) == REF_AGL:
             return self._checked_layers()
         twins = [self._twin_of(lyr) for lyr in self._checked_layers()]
         return [twin for twin in twins if twin is not None]
+
+    def _active_references(self) -> List[str]:
+        """The references the canvas is painting right now, above-ground first.
+
+        With the nested bands on show that is every reference a band uses — the
+        whole point of a per-band reference, and what lets a site's original and
+        its sea-level twin be drawn at the same time.
+
+        A continuous ramp ("Colour by: Required altitude", and the full range
+        after *Reset*) is one surface by nature and cannot mean two
+        measurements at once, so it follows the *selected* altitude's reference
+        alone.  The same goes for a band set that is empty: there is nothing to
+        take a reference from but the selection.
+        """
+        if self.chk_threshold.isChecked() and self.radio_bands.isChecked():
+            grouped = split_bands_by_reference(self._bands)
+            active = [ref for ref in REFERENCES if grouped[ref]]
+            if active:
+                return active
+        return [normalize_reference(self._reference)]
 
     def _set_layer_visible(self, layer, visible: bool) -> None:
         """Tick/untick *layer* in the Layers panel (canvas visibility)."""
@@ -865,27 +1004,26 @@ class AltitudeExplorerDock(QgsDockWidget):
         except Exception:  # noqa: BLE001 — cosmetic; never worth an error
             pass
 
-    def _sync_twin_visibility(self) -> None:
-        """Show whichever surface of each pair the current reference means.
+    def _sync_layer_visibility(self) -> None:
+        """Show each ticked layer on the references it is actually painting.
 
-        Both rasters cover the same ground, so leaving a pair on together would
-        paint one over the other and make the altitudes on screen mean nothing.
-        Flipping the switch back restores what it hid.
+        A site with both an above-ground and a sea-level altitude now has both
+        of its rasters on: each is handed only its own bands and is transparent
+        everywhere else, so they compose rather than hide one another.  A
+        raster whose reference no band uses has nothing to say and is unticked
+        in the Layers panel — left on, it would paint the previous answer under
+        the current one, and the altitudes on screen would mean nothing.
 
-        Every pair is swapped, not just the ticked ones: unticking a layer means
-        "stop driving it", not "hide it", so its raster stays on the canvas —
-        and it has to be the raster the reference says it is.  Layers with no
-        twin are left exactly as the user had them.
+        Only ticked layers are touched: unticking a layer means "stop driving
+        it", not "hide it", so a pair the user has unticked stays exactly as
+        they left it.
         """
-        amsl = self._reference == REF_AMSL
-        for layer in QgsProject.instance().mapLayers().values():
-            if not _is_site_layer(layer):
-                continue
+        active = self._active_references()
+        for layer in self._checked_layers():
+            self._set_layer_visible(layer, REF_AGL in active)
             twin = self._twin_of(layer)
-            if twin is None:
-                continue  # nothing to swap with — leave the user's tree alone
-            self._set_layer_visible(layer, not amsl)
-            self._set_layer_visible(twin, amsl)
+            if twin is not None:
+                self._set_layer_visible(twin, REF_AMSL in active)
 
     def _twin_path(self, layer) -> Optional[str]:
         """Where *layer*'s sea-level twin lives on disk.
@@ -940,9 +1078,11 @@ class AltitudeExplorerDock(QgsDockWidget):
     def _ensure_twins(self) -> bool:
         """Make sure every ticked layer has a sea-level twin.
 
-        Returns True when a background build was started (the caller should stop
-        and let :meth:`_on_amsl_finished` pick up), False when there was nothing
-        to do or nothing could be done.
+        Called the moment the *first* sea-level altitude appears — a band
+        switched to AMSL, one added while the radios say sea level, or a layer
+        ticked while one is on show.  Returns True when a background build was
+        started (the caller should stop and let :meth:`_on_amsl_finished` pick
+        up), False when there was nothing to do or nothing could be done.
         """
         if self._amsl_worker is not None:
             # Already building. The running worker's job list is fixed, so a
@@ -1096,27 +1236,27 @@ class AltitudeExplorerDock(QgsDockWidget):
 
         self._report_amsl_errors()
         self._report_amsl_gaps()
-        if not self._driven_layers():
-            # Nothing to drive above sea level — fall back rather than leave the
-            # dock showing AMSL numbers over an AGL map.
-            self._set_reference(REF_AGL)
+        if (REF_AMSL in self._active_references()
+                and not self._layers_for_reference(REF_AMSL)):
+            # Nothing to draw the sea-level altitudes on — bring them back down
+            # rather than leave the dock showing AMSL numbers over an AGL map.
+            self._revert_amsl_bands()
             return
         self._finish_reference_change()
 
     def _finish_reference_change(self) -> None:
-        """Bring the whole dock into line with the reference now in force.
+        """Bring the whole dock into line with the references now in force.
 
         Shared by the immediate switch and the one that had to wait for a
-        background build: the band *list* has to be rebuilt too, or it keeps
-        showing the previous reference's rows while the canvas is painted from
-        this one's — and the slider then edits a band that is not in the list.
+        background build: the band *list* has to be rebuilt too, or a row keeps
+        the reference it was labelled with while the canvas is painted from the
+        new one — and the slider then spans the wrong altitudes for it.
         """
         self._sync_range_to_layers()
         if not self._bands:
             self._seed_bands()
         self._rebuild_band_list()
-        self._sync_twin_visibility()
-        self._apply()
+        self._refresh_canvas()
 
     def _report_amsl_errors(self) -> None:
         errors = self._amsl_errors
@@ -1165,11 +1305,6 @@ class AltitudeExplorerDock(QgsDockWidget):
     # Altitude bands
     # ------------------------------------------------------------------
 
-    @property
-    def _bands(self) -> List[_Band]:
-        """The bands for the reference in force."""
-        return self._band_sets[self._reference]
-
     def _seed_bands(self) -> None:
         """Start a reference off with one altitude in a useful place.
 
@@ -1177,7 +1312,10 @@ class AltitudeExplorerDock(QgsDockWidget):
         coverage on the first paint, low enough that dragging up is interesting.
         """
         low, high = self._range
-        band = _Band(self._snap(low + (high - low) / 3.0), QColor(*band_color(0)))
+        band = _Band(
+            self._snap(low + (high - low) / 3.0), QColor(*band_color(0)),
+            reference=self._reference,
+        )
         self._bands.append(band)
         self._rebuild_band_list(select=band)
 
@@ -1191,23 +1329,30 @@ class AltitudeExplorerDock(QgsDockWidget):
         return int(round(value_m / 5.0) * 5)
 
     def _rebuild_band_list(self, select: Optional[_Band] = None) -> None:
-        """Redraw the band list from :attr:`_bands`, in altitude order.
+        """Redraw the band list from :attr:`_bands`, grouped by reference and
+        in altitude order within each group.
+
+        Grouped rather than one ladder because metres of different references
+        are not comparable: 2500 m AMSL slotted between 100 and 300 m AGL would
+        invite reading the three as one sequence.  Each row says what it is
+        measured from, so "100 m AGL" and "2500 m AMSL" are told apart at a
+        glance.
 
         *select* is a band rather than a row on purpose: the list re-sorts here,
         so a row index taken before the rebuild would point at whichever band
         happened to land there.  Defaults to keeping the current selection.
         """
-        bands = sorted(self._bands, key=lambda b: b.altitude_m)
-        self._band_sets[self._reference] = bands
+        grouped = split_bands_by_reference(self._bands)
+        bands = [band for ref in REFERENCES for band in grouped[ref]]
+        self._bands = bands
         target = select if select in bands else self._selected_band
         if target not in bands:
             target = bands[0] if bands else None
 
-        suffix = reference_suffix(self._reference)
         self.band_list.blockSignals(True)
         self.band_list.clear()
         for band in bands:
-            item = QListWidgetItem(f"{band.altitude_m:g}{suffix}")
+            item = QListWidgetItem(band.label)
             item.setIcon(_swatch(band.color, band.visible))
             item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
             item.setCheckState(
@@ -1220,6 +1365,10 @@ class AltitudeExplorerDock(QgsDockWidget):
         self.band_list.blockSignals(False)
 
         self._selected_band = target
+        if target is not None:
+            # The radios and the slider follow the selection, so the dock's
+            # idea of "the reference" is whatever the selected band says.
+            self._reference = target.reference
         self._sync_band_editor()
 
     def _sync_band_editor(self) -> None:
@@ -1241,39 +1390,77 @@ class AltitudeExplorerDock(QgsDockWidget):
         if band is None:
             return
         self._updating = True
-        self.spin.setSuffix(reference_suffix(self._reference))
+        # The "Measured from" radios are the selected band's own reference, and
+        # the slider has to span *that* reference's altitudes — 2500 m AMSL is
+        # off the end of an above-ground slider.
+        self.radio_agl.setChecked(band.reference == REF_AGL)
+        self.radio_amsl.setChecked(band.reference == REF_AMSL)
+        self.spin.setSuffix(reference_suffix(band.reference))
+        self._apply_slider_range(band.reference)
         self.slider.setValue(int(round(band.altitude_m)))
         self.spin.setValue(int(round(band.altitude_m)))
         self.btn_band_color.setColor(band.color)
         self._updating = False
 
-    def _sync_range_to_layers(self) -> None:
-        """Span the sliders over the altitudes the driven layers actually hold.
-
-        Above ground that is 0 to a tidy ceiling; above sea level the floor is
-        the valley, so the slider does not spend most of its travel underground.
-        """
-        layers = self._driven_layers()
+    def _range_for(self, reference: str) -> Optional[Tuple[float, float]]:
+        """Tidy ``(lowest, highest)`` altitude the layers of *reference* hold,
+        or None while that reference has no layer on the canvas yet."""
+        layers = self._layers_for_reference(reference)
         if not layers:
-            return
+            return None
         ranges = [estimate_altitude_range_m(lyr) for lyr in layers]
         low = min(lo for lo, _ in ranges)
         high = nice_ceiling(max(hi for _, hi in ranges))
         if low >= high:
             low = 0.0
-        self._range = (low, high)
+        return (low, high)
 
-        self._updating = True
+    def _span_for(self, reference: str) -> Tuple[float, float]:
+        """The slider span for *reference*, falling back to the last known one
+        while that reference has no layer yet (a sea-level twin still
+        building, say) so the slider is never left with an empty range."""
+        return self._ranges.get(normalize_reference(reference)) or self._range
+
+    def _apply_slider_range(self, reference: str) -> None:
+        """Point the slider and spin box at *reference*'s span.
+
+        Callers hold ``_updating`` — this moves the widgets, and the change
+        must not read back as the user dragging the selected band.
+        """
+        low, high = self._span_for(reference)
         self.slider.setMinimum(int(low))
         self.slider.setMaximum(int(high))
         self.spin.setRange(int(low), int(high))
+
+    def _sync_range_to_layers(self) -> None:
+        """Span the sliders over the altitudes the driven layers actually hold.
+
+        Above ground that is 0 to a tidy ceiling; above sea level the floor is
+        the valley, so the slider does not spend most of its travel
+        underground.  The two spans are different numbers of the same slider,
+        so it follows the *selected* band's reference while every band is held
+        inside the span of its own — a 100 m altitude switched to sea level
+        lands on the valley floor rather than under it.
+        """
+        spans = {ref: self._range_for(ref) for ref in REFERENCES}
+        if not any(spans.values()):
+            return  # no layer on the canvas yet; leave the widgets alone
+        self._ranges = spans
+        self._range = self._span_for(self._reference)
+
+        self._updating = True
+        self._apply_slider_range(self._reference)
         self._updating = False
 
-        # Bands from a previous, smaller layer set would otherwise sit outside
-        # the range and quietly draw nothing.
+        # Bands from a previous, smaller layer set — or one that has just
+        # changed reference — would otherwise sit outside their span and
+        # quietly draw nothing.
         clamped = False
         for band in self._bands:
-            bounded = min(max(band.altitude_m, low), high)
+            span = spans.get(band.reference)
+            if span is None:
+                continue
+            bounded = min(max(band.altitude_m, span[0]), span[1])
             if bounded != band.altitude_m:
                 band.altitude_m = bounded
                 clamped = True
@@ -1293,26 +1480,45 @@ class AltitudeExplorerDock(QgsDockWidget):
         if self._amsl_pending():
             return
         self._sync_range_to_layers()
-        self._sync_twin_visibility()
-        self._apply()
+        self._refresh_canvas()
+
+    def _needs_twins(self) -> bool:
+        """True when a sea-level altitude is on show over a layer without a
+        sea-level twin — the one condition that calls for a build."""
+        if REF_AMSL not in self._active_references():
+            return False
+        return any(self._twin_of(lyr) is None for lyr in self._checked_layers())
 
     def _amsl_pending(self) -> bool:
-        """True when the caller should stand down and let the reference settle.
+        """True when the caller should stand down and let sea level settle.
 
-        Either a background build is running (its completion re-applies), or
-        nothing could be built and we have dropped back to above-ground — in
-        which case the fallback has already redrawn everything.
+        Either a background build is running (its completion re-applies
+        everything), or nothing could be built and the sea-level altitudes have
+        been brought back down to ground — in which case that fallback has
+        already redrawn.
         """
-        if self._reference != REF_AMSL:
+        if not self._needs_twins():
             return False
         if self._ensure_twins():
             return True
-        if self._checked_layers() and not self._driven_layers():
-            # The user has already been told why; sitting on AMSL with an empty
-            # canvas would just look like the map had gone.
-            self._set_reference(REF_AGL)
-            return True
-        return False
+        # Nothing could be built, and the user has been told why. An altitude
+        # measured from a sea level we cannot produce would sit in the list
+        # drawing nothing, so bring it down to the ground instead.
+        self._revert_amsl_bands()
+        return True
+
+    def _revert_amsl_bands(self) -> None:
+        """Measure every sea-level altitude from the ground again, and redraw.
+
+        The last resort when no twin could be built: the numbers stay, but they
+        now mean what the surface on the canvas actually holds.  They are
+        clamped into the above-ground span on the way (a 2500 m sea-level
+        altitude is not a 2500 m above-ground one).
+        """
+        for band in self._bands:
+            band.reference = REF_AGL
+        self._reference = REF_AGL
+        self._finish_reference_change()
 
     def _on_reference_toggled(self, amsl: bool) -> None:
         if self._updating:
@@ -1320,8 +1526,13 @@ class AltitudeExplorerDock(QgsDockWidget):
         self._set_reference(REF_AMSL if amsl else REF_AGL)
 
     def _set_reference(self, reference: str) -> None:
-        """Switch what the altitudes are measured from, building twins if the
-        sea-level view needs them."""
+        """Measure the *selected* altitude from *reference* (and the next one
+        added), building sea-level twins if that is what it now needs.
+
+        Only the selected band moves — the others keep what they were measured
+        from, which is the point of a per-band reference.
+        """
+        reference = normalize_reference(reference)
         self._reference = reference
         self._updating = True
         self.radio_agl.setChecked(reference == REF_AGL)
@@ -1329,14 +1540,25 @@ class AltitudeExplorerDock(QgsDockWidget):
         self.spin.setSuffix(reference_suffix(reference))
         self._updating = False
 
+        band = self._selected_band
+        if band is not None:
+            band.reference = reference
+
         if self._amsl_pending():
-            return  # a build is running, or we fell back to above-ground
+            return  # a build is running, or we fell back to above ground
         self._finish_reference_change()
 
     def _on_band_selected(self, row: int) -> None:
         bands = self._bands
-        self._selected_band = bands[row] if 0 <= row < len(bands) else None
+        band = bands[row] if 0 <= row < len(bands) else None
+        self._selected_band = band
+        if band is not None:
+            self._reference = band.reference
         self._sync_band_editor()
+        if not (self.chk_threshold.isChecked() and self.radio_bands.isChecked()):
+            # The continuous ramp follows the selected altitude's reference, so
+            # picking a different row can move it to the other surface.
+            self._refresh_canvas()
 
     def _on_band_toggled(self, item) -> None:
         row = self.band_list.row(item)
@@ -1357,16 +1579,19 @@ class AltitudeExplorerDock(QgsDockWidget):
         if altitude is None:
             self.iface.messageBar().pushInfo(
                 "Waveshed",
-                "Every altitude in this layer's range already has a band.",
+                "Every altitude in this layer's range already has a band "
+                f"measured {reference_phrase(self._reference)}.",
             )
             return
         color = next_band_color([
             (b.color.red(), b.color.green(), b.color.blue()) for b in bands
         ])
-        band = _Band(altitude, QColor(*color))
+        band = _Band(altitude, QColor(*color), reference=self._reference)
         bands.append(band)
         self._rebuild_band_list(select=band)
-        self._apply()
+        if self._amsl_pending():
+            return  # the first sea-level altitude has a twin to build first
+        self._refresh_canvas()
 
     def _next_altitude(self) -> Optional[int]:
         """Where a newly added band goes, or None if the range is full.
@@ -1379,7 +1604,10 @@ class AltitudeExplorerDock(QgsDockWidget):
         any existing band.
         """
         low, high = self._range
-        used = sorted(int(round(band.altitude_m)) for band in self._bands)
+        # Only bands of the same reference can collide: 100 m AGL and 100 m
+        # AMSL are different altitudes drawn on different rasters.
+        used = sorted(int(round(band.altitude_m)) for band in self._bands
+                      if band.reference == self._reference)
         if not used:
             return self._snap(low + (high - low) / 3.0)
         taken = set(used)
@@ -1408,7 +1636,9 @@ class AltitudeExplorerDock(QgsDockWidget):
         del bands[row]
         self._selected_band = None
         self._rebuild_band_list(select=bands[min(row, len(bands) - 1)])
-        self._apply()
+        # Removing the last altitude of a reference takes that surface off the
+        # canvas, so visibility is settled again here, not only the renderers.
+        self._refresh_canvas()
 
     def _on_band_color(self, color) -> None:
         band = self._selected_band
@@ -1454,7 +1684,7 @@ class AltitudeExplorerDock(QgsDockWidget):
         item = self.band_list.item(row)
         if item is not None:
             self.band_list.blockSignals(True)
-            item.setText(f"{band.altitude_m:g}{reference_suffix(self._reference)}")
+            item.setText(band.label)
             self.band_list.blockSignals(False)
         self._apply()
 
@@ -1466,92 +1696,92 @@ class AltitudeExplorerDock(QgsDockWidget):
     def _on_threshold_toggled(self, on: bool) -> None:
         self.band_list.setEnabled(on)
         self._sync_band_editor()  # owns every other control's enabled state
-        self._apply()
+        self._refresh_canvas()
 
     def _on_reset(self) -> None:
         self.chk_threshold.setChecked(False)
-        self._apply()
+        self._refresh_canvas()
 
     # ------------------------------------------------------------------
     # Rendering
     # ------------------------------------------------------------------
 
+    def _refresh_canvas(self) -> None:
+        """Settle which rasters are on, then repaint them.
+
+        The two belong together: a reference that has just lost its last
+        altitude needs its raster unticked *and* the remaining ones
+        re-rendered, and doing one without the other leaves the previous
+        answer on the map.
+        """
+        self._sync_layer_visibility()
+        self._apply()
+
     def _apply(self) -> None:
-        """Re-render every driven layer for the current altitudes and style."""
-        layers = self._driven_layers()
+        """Re-render every driven layer for the current altitudes and style.
+
+        The bands are split by reference first: an above-ground altitude is a
+        fact about the raster the solver wrote and a sea-level one about its
+        twin, so each layer is handed only the bands measured the way it is.
+        Nesting survives the split — coverage is still cumulative *within* one
+        reference, which is all :func:`min_alt.band_stops` ever needed.
+        """
         use_bands = self.chk_threshold.isChecked()
-        bands = sorted(self._bands, key=lambda b: b.altitude_m)
+        nested = use_bands and self.radio_bands.isChecked()
+        grouped = split_bands_by_reference(self._bands)
+        active = self._active_references()
 
-        # A shared ramp spanning every driven layer keeps colours comparable
-        # across sites — one site's "must climb high" red means what the next
-        # one's does.
-        ranges = [estimate_altitude_range_m(lyr) for lyr in layers]
-        min_ramp_m = min((lo for lo, _ in ranges), default=0.0)
-        max_ramp_m = max((hi for _, hi in ranges), default=DEFAULT_RAMP_MAX_M)
+        painted = 0
+        for reference in active:
+            layers = self._layers_for_reference(reference)
+            bands = grouped[reference]
+            # A shared ramp spanning every layer of this reference keeps
+            # colours comparable across sites — one site's "must climb high"
+            # red means what the next one's does. Across references it would
+            # not: their metres are not the same measurement.
+            ranges = [estimate_altitude_range_m(lyr) for lyr in layers]
+            min_ramp_m = min((lo for lo, _ in ranges), default=0.0)
+            max_ramp_m = max((hi for _, hi in ranges), default=DEFAULT_RAMP_MAX_M)
 
-        for layer in layers:
-            if use_bands and bands and self.radio_bands.isChecked():
-                renderer = build_band_renderer(
-                    layer.dataProvider(), 1,
-                    [band.as_altitude_band() for band in bands],
-                    reference=self._reference,
-                )
-            else:
-                renderer = build_min_alt_renderer(
-                    layer.dataProvider(), 1,
-                    threshold_m=bands[-1].altitude_m if (use_bands and bands)
-                    else None,
-                    shade=self.radio_shade.isChecked() or not use_bands,
-                    max_ramp_m=max_ramp_m,
-                    min_ramp_m=min_ramp_m,
-                    reference=self._reference,
-                )
-            layer.setRenderer(renderer)
-            layer.triggerRepaint()
+            for layer in layers:
+                if nested and bands:
+                    renderer = build_band_renderer(
+                        layer.dataProvider(), 1,
+                        [band.as_altitude_band() for band in bands],
+                        reference=reference,
+                    )
+                else:
+                    renderer = build_min_alt_renderer(
+                        layer.dataProvider(), 1,
+                        threshold_m=bands[-1].altitude_m if (use_bands and bands)
+                        else None,
+                        shade=self.radio_shade.isChecked() or not use_bands,
+                        max_ramp_m=max_ramp_m,
+                        min_ramp_m=min_ramp_m,
+                        reference=reference,
+                    )
+                layer.setRenderer(renderer)
+                layer.triggerRepaint()
+                painted += 1
 
-        # Above sea level a ticked layer is only drawn once its twin exists, so
-        # say how many are waiting rather than quietly reporting a lower count.
-        undriven = (len(self._checked_layers()) - len(layers)
-                    if self._reference == REF_AMSL else 0)
+        # A sea-level altitude only paints once its layer's twin exists, so say
+        # how many are waiting rather than quietly reporting a lower count.
+        undriven = (len(self._checked_layers())
+                    - len(self._layers_for_reference(REF_AMSL))
+                    if REF_AMSL in active else 0)
         self.lbl_readout.setText(
-            self._readout(len(layers), bands, use_bands, undriven)
+            self._readout(painted, self._bands, use_bands, undriven)
         )
 
     def _readout(self, layer_count: int, bands, use_bands: bool,
                  undriven: int = 0) -> str:
         """One line saying exactly what is on the canvas right now."""
-        if not layer_count:
-            if undriven:
-                return ("No sea-level view for the selected layers yet — "
-                        "re-tick them to build it, or switch back to AGL.")
-            return "No layers selected."
-
-        plural = "s" if layer_count != 1 else ""
-        waiting = (f" {undriven} more await{'s' if undriven == 1 else ''} a "
-                   f"sea-level view." if undriven else "")
-
-        if not use_bands or not bands:
-            return (f"Showing the full Minimum LOS Altitude ramp on "
-                    f"{layer_count} layer{plural}.{waiting}")
-
-        suffix = reference_suffix(self._reference)
-        if not self.radio_bands.isChecked():
-            # One ramp clipped at the highest altitude: the per-band colours and
-            # the hidden/shown ticks play no part, so do not claim they do.
-            return (f"Reachable at ≤ {bands[-1].altitude_m:g}{suffix}, coloured "
-                    f"by the altitude each point needs, on {layer_count} "
-                    f"layer{plural}.{waiting}")
-
-        shown = [band for band in bands if band.visible]
-        if not shown:
-            return (f"All {len(bands)} altitudes are hidden — tick one to draw "
-                    f"it.")
-        if len(shown) == 1:
-            return (f"Reachable at ≤ {shown[0].altitude_m:g}{suffix} on "
-                    f"{layer_count} layer{plural}.{waiting}")
-        listed = ", ".join(f"{band.altitude_m:g}" for band in shown)
-        return (f"Reachable at {listed}{suffix} — nested bands on "
-                f"{layer_count} layer{plural}.{waiting}")
+        return _readout_text(
+            layer_count, bands, use_bands,
+            nested=self.radio_bands.isChecked(),
+            reference=self._reference,
+            undriven=undriven,
+        )
 
     # ------------------------------------------------------------------
     # Tools: best-site merge (Option E) and iso-altitude contours (Option D)
@@ -1590,7 +1820,7 @@ class AltitudeExplorerDock(QgsDockWidget):
         if len(self._checked_layers()) < 2:
             QMessageBox.information(
                 self, "Best-site merge",
-                "Tick at least two Minimum LOS Altitude layers to merge.",
+                "Tick at least two LOS Floor layers to merge.",
             )
             return
         # Deliberately the above-ground originals, whatever reference is on
@@ -1691,13 +1921,17 @@ class AltitudeExplorerDock(QgsDockWidget):
                 "or cancel it first.",
             )
             return
-        # Contours trace what is on the canvas, so above sea level they follow
-        # the twins — "hold this altitude to clear that ridge" lines.
-        layers = self._driven_layers()
+        # A contour set is one ladder of altitudes, so it has one reference:
+        # the selected altitude's. Above sea level that means the twins —
+        # "hold this altitude to clear that ridge" lines.
+        layers = self._layers_for_reference(self._reference)
         if not layers:
             QMessageBox.information(
                 self, "Contours",
-                "Tick at least one Minimum LOS Altitude layer.",
+                "Tick at least one LOS Floor layer. Contours follow the "
+                "reference of the altitude selected above "
+                f"({self._reference}), so a sea-level one needs its sea-level "
+                "view built first.",
             )
             return
         inputs = self._file_inputs(layers)

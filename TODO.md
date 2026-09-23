@@ -107,8 +107,10 @@ Running list of follow-up work. Keep items short; link to the code site.
   colour ramp is built (`core/result_loader.py`) — and a decision on whether
   the floor is display-only or also passed to the engine.
 
-- [ ] **Help system.** No Help action or bundled help exists, and only ~19
-  widgets have tooltips. Deferred until the rest of the release work is done.
+- [x] **Help system.** Done 2026-09-21: `waveshed/help/` (18 topics) rendered
+  by `gui/help_tab.py` as the last dialog tab, plus a "Waveshed Help" menu
+  action and a "?" beside the model radios. Tests scrape control labels and
+  the resolution table from the source and require each to appear.
 
 - [x] **P2P had no asset or azimuth controls at all.** Fixed 2026-08-05. The
   original report ("we cannot select the assets and azimuths in propagation
@@ -284,13 +286,19 @@ distributed while the QGIS plugin still runs a months-old engine — with no
 signal from either side. Confirmed by inspection: both distribute targets
 carried the buildings marker, the plugin's copy did not.
 
-- [ ] **Make the mismatch visible.** Options, cheapest first: have the plugin
+- [x] **Make the mismatch visible.** Done 2026-09-22:
+  `binary_manager.check_engine_for_job` logs `Engine: <path> — aether_core
+  <version>` at the start of every Site Analysis, P2P and Processing run. Options, cheapest first: have the plugin
   log the engine path + build identity on every run (path is logged now, build
   identity is not); add a version/date line to `Settings → Download` showing
   what is staged versus what the manifest offers; or have the pipeline's
   Distribute action also refresh `~/.aether/bin` when a local deploy is
   already present.
-- [ ] **Give the engine a queryable version.** `aether_converter --version`
+- [x] **Give the engine a queryable version.** Done 2026-09-22: `aether_core`
+  already had `--version`; `aether_converter`/`aether_export`/`aether_aggregate`
+  gained it in aether-tools (0.2.5 / 1.0.1 / 1.0.1, CONTRACT §1.5 with a
+  capability-gate table). The plugin now probes `aether_core --version`
+  before terrain and refuses 90/250 m on engines < 0.4.3. `aether_converter --version`
   would turn every "is this the new binary?" question into one command, and
   would let the plugin's capability check read a version instead of scanning
   the executable for a marker string.
@@ -943,7 +951,9 @@ a long download — or gets a misleading error from the engine. Needed:
 > `_sync_twin_visibility`, the `_next_altitude` materialisation; (3) layout and
 > sizing; (4) polish — theming, number formatting, mnemonics, message bar.
 
-- [ ] **AMSL and AGL cannot be shown together.** `_sync_twin_visibility`
+- [x] **AMSL and AGL cannot be shown together.** Done 2026-09-21: each band
+  carries its own reference; AGL bands paint the original, AMSL bands the
+  twin, both visible at once. Original finding: `_sync_twin_visibility`
   (`gui/altitude_explorer.py:865-885`) explicitly hides whichever surface is not
   selected, and `_driven_layers()` (`:843-854`) returns originals **or** twins.
   Everything needed for "both" already exists: `_band_sets` is already keyed by
@@ -1023,7 +1033,9 @@ a long download — or gets a misleading error from the engine. Needed:
   in a `QGroupBox`, and there are three different button alignments in one panel
   (`:717` right-aligned lone Reset, `:734-735` full-width stacked).
 
-- [ ] **No test imports `altitude_explorer`.** A redesign breaks no tests and
+- [x] **No test imports `altitude_explorer`.** Done 2026-09-21:
+  `tests/test_altitude_explorer.py` drives the real dock methods (41 tests).
+  Original finding: A redesign breaks no tests and
   gets no safety net. The contract to preserve is `band_stops` +
   `build_band_renderer` (covered by `tests/test_min_alt.py`).
 
@@ -1066,7 +1078,11 @@ a long download — or gets a misleading error from the engine. Needed:
 
 ## Repository hygiene
 
-- [ ] **No `.gitattributes` in any repo, and CRLF churn hides real diffs.**
+- [x] **No `.gitattributes` in any repo, and CRLF churn hides real diffs.**
+  Done: checked 2026-09-22, `.gitattributes` is committed in QGIS_Plugin,
+  AETHER, aether-tools, AETHER_Web and MPT_SIGMA and every index holds zero
+  CRLF files (`git ls-files --eol | grep i/crlf` is empty in all five), so
+  the remaining renormalise runs were no-ops.
   *Partly done:* `.gitattributes` (`* text=auto`, `eol=lf`/`eol=crlf` for
   scripts, `binary` for images and the `.abt`/`.bit`/`.pbf`/`.fgb`/`.tif`
   formats) added to all five repos, and `core.filemode=false` set here — this

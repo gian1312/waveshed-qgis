@@ -36,7 +36,7 @@ class AetherPlugin:
         self.toolbar.addAction(self.action_main)
         self.actions.append(self.action_main)
 
-        # Altitude Explorer dock toggle — drives Minimum LOS Altitude result layers.
+        # Altitude Explorer dock toggle — drives LOS Floor result layers.
         self.action_explorer = QAction(
             icon, "Altitude Explorer", self.iface.mainWindow(),
         )
@@ -44,6 +44,14 @@ class AetherPlugin:
         self.iface.addPluginToMenu(self.menu_name, self.action_explorer)
         self.toolbar.addAction(self.action_explorer)
         self.actions.append(self.action_explorer)
+
+        # Built-in documentation — opens the main dialog on its Help tab.
+        self.action_help = QAction(icon, "Waveshed Help", self.iface.mainWindow())
+        # Wrapped: QAction.triggered hands the slot a `checked` bool, which
+        # would otherwise land in the anchor argument.
+        self.action_help.triggered.connect(lambda: self._open_help())
+        self.iface.addPluginToMenu(self.menu_name, self.action_help)
+        self.actions.append(self.action_help)
 
         # Register processing provider
         from .provider import AetherProvider
@@ -66,6 +74,18 @@ class AetherPlugin:
             return True
         except RuntimeError:
             return False
+
+    def _open_help(self, anchor: str = "") -> None:
+        """Open the main dialog and show its Help tab.
+
+        Reuses the dialog when one is already open (``_open_main_dialog``
+        raises it), so the menu entry never spawns a second window.
+        """
+        self._open_main_dialog()
+        dialog = self._main_dialog
+        show_help = getattr(dialog, "show_help", None)
+        if callable(show_help):
+            show_help(anchor)
 
     def _open_altitude_explorer(self):
         from .gui.altitude_explorer import show_altitude_explorer

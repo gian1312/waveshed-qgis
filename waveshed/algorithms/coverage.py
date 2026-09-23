@@ -241,6 +241,11 @@ class CoverageAlgorithm(QgsProcessingAlgorithm):
         feedback.setProgress(5)
 
         try:
+            bm.check_engine_for_job(resolution_m)
+        except bm.EngineTooOldError as exc:
+            raise QgsProcessingException(str(exc)) from exc
+
+        try:
             abt_dir = prepare_terrain(
                 dem_layer=dem_layer,
                 tx_lat=tx_lat,
@@ -332,6 +337,7 @@ class CoverageAlgorithm(QgsProcessingAlgorithm):
             tail = "\n".join(output_lines[-20:])
             raise QgsProcessingException(
                 f"aether_core failed (exit {rc}):\n{tail}"
+                + bm.engine_error_hint(tail)
             )
 
         if feedback.isCanceled():

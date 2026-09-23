@@ -17,11 +17,13 @@ from qgis.PyQt.QtWidgets import (
     QLabel,
     QRadioButton,
     QTabWidget,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
 from qgis.core import QgsSettings
 
+from .help_tab import HelpTab
 from .site_analysis_tab import SiteAnalysisTab
 from .p2p_tab import P2PTab
 from .asset_manager_tab import AssetManagerTab
@@ -38,7 +40,7 @@ _GEOMETRY_KEY = "waveshed/main_dialog_geometry"
 _DEFAULT_SIZE = (980, 780)
 
 _MIN_ALT_TOOLTIP = (
-    "Minimum-LOS-altitude map: for every location, the lowest altitude "
+    "LOS Floor map: for every location, the lowest altitude "
     "(AGL) at which it first gains line-of-sight to the transmitter.\n"
     "One run answers coverage at *any* altitude — explore it live with "
     "the Altitude Explorer."
@@ -103,6 +105,17 @@ class AetherMainDialog(QDialog):
         """
         return self.combo_loss_model.currentText()
 
+    def show_help(self, anchor: str = "") -> None:
+        """Bring the Help tab to the front, at *anchor* when one is given.
+
+        The single entry point every caller uses — the plugin menu's
+        "Waveshed Help" action and the "?" button beside the mode radios —
+        so a topic name is resolved in one place (an unknown one falls back to
+        the overview rather than showing a blank page).
+        """
+        self.tabs.setCurrentWidget(self.help_tab)
+        self.help_tab.show_topic(anchor)
+
     # ------------------------------------------------------------------
     # UI construction
     # ------------------------------------------------------------------
@@ -116,7 +129,7 @@ class AetherMainDialog(QDialog):
 
         self.radio_los = QRadioButton("Line of Sight (LOS)")
         self.radio_loss = QRadioButton("Propagation Loss")
-        self.radio_min_alt = QRadioButton("Minimum LOS Altitude")
+        self.radio_min_alt = QRadioButton("LOS Floor")
         self.radio_min_alt.setToolTip(_MIN_ALT_TOOLTIP)
         self.radio_los.setChecked(True)
 
@@ -145,6 +158,14 @@ class AetherMainDialog(QDialog):
         self.lbl_loss_model.setVisible(False)
         self.combo_loss_model.setVisible(False)
 
+        # One click from the choice to the page explaining it.
+        self.btn_mode_help = QToolButton()
+        self.btn_mode_help.setText("?")
+        self.btn_mode_help.setToolTip(
+            "What do these modes compute? Opens the Help tab.")
+        self.btn_mode_help.clicked.connect(lambda: self.show_help("models"))
+        mode_row.addWidget(self.btn_mode_help)
+
         mode_row.addStretch()
         layout.addLayout(mode_row)
 
@@ -156,12 +177,15 @@ class AetherMainDialog(QDialog):
         self.asset_tab = AssetManagerTab()
         self.converter_tab = MapConverterTab(self)
         self.settings_tab = self._build_settings_tab()
+        self.help_tab = HelpTab(self)
 
         self.tabs.addTab(self.site_tab, "360\u00B0")
         self.tabs.addTab(self.p2p_tab, "P2P Link")
         self.tabs.addTab(self.asset_tab, "Assets")
         self.tabs.addTab(self.converter_tab, "Map Converter")
         self.tabs.addTab(self.settings_tab, "Settings")
+        # Always last: Help is a reference, not a step in the workflow.
+        self.tabs.addTab(self.help_tab, "Help")
 
         layout.addWidget(self.tabs)
 

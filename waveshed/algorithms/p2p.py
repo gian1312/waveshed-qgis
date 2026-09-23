@@ -306,6 +306,11 @@ class P2PAlgorithm(QgsProcessingAlgorithm):
         feedback.setProgressText("Preparing terrain tiles...")
         feedback.setProgress(10)
 
+        try:
+            bm.check_engine_for_job(resolution_m)
+        except bm.EngineTooOldError as exc:
+            raise QgsProcessingException(str(exc)) from exc
+
         abt_dir = prepare_terrain(
             dem_layer=dem_layer,
             tx_lat=centre_lat,
@@ -396,6 +401,7 @@ class P2PAlgorithm(QgsProcessingAlgorithm):
             tail = "\n".join(output_lines[-20:])
             raise QgsProcessingException(
                 f"aether_core exited with code {rc}:\n{tail}"
+                + bm.engine_error_hint(tail)
             )
 
         if feedback.isCanceled():
