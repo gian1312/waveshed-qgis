@@ -15,8 +15,8 @@ tags=rf,propagation,radio,coverage,p2p,gpu,terrain,ITM,LOS,waveshed
 category=Analysis
 icon=resources/icon.png
 changelog=0.3.1
-    - automatic deployment.
-changelog=0.3.0
+    - Automatic release deployment.
+    0.3.0
     - Engine downloads are verified end to end: the release manifest must
       carry a valid signature from the Waveshed release key (releases up to
       engine 0.4.7 predate signing and are still accepted), and engine
