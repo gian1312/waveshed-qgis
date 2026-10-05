@@ -21,6 +21,7 @@ class AetherPlugin:
         self.toolbar = None
         self.provider = None
         self._main_dialog = None
+        self._engine_notices = None
 
     def initGui(self):
         self.toolbar = self.iface.addToolBar("Waveshed")
@@ -58,6 +59,19 @@ class AetherPlugin:
         self.provider = AetherProvider()
         QgsApplication.processingRegistry().addProvider(self.provider)
 
+        # First-run prompt / update notice — deferred, never blocks start-up,
+        # never downloads anything by itself.
+        from .gui.engine_notices import EngineNotices
+        self._engine_notices = EngineNotices(self.iface, self.open_engine_settings)
+        self._engine_notices.start()
+
+    def open_engine_settings(self, start_download: bool = False) -> None:
+        """Open the main dialog on its Settings tab (optionally starting the download)."""
+        self._open_main_dialog()
+        show = getattr(self._main_dialog, "show_engine_settings", None)
+        if callable(show):
+            show(start_download=start_download)
+
     def _is_dialog_alive(self) -> bool:
         """Check if the dialog reference is still valid (not deleted by Qt)."""
         if self._main_dialog is None:
@@ -92,6 +106,9 @@ class AetherPlugin:
         show_altitude_explorer(self.iface)
 
     def unload(self):
+        if self._engine_notices is not None:
+            self._engine_notices.stop()
+            self._engine_notices = None
         if self._is_dialog_alive():
             try:
                 self._main_dialog.close()

@@ -1,0 +1,135 @@
+name: Release Waveshed plugin
+
+# Publishes the QGIS plugin ZIP to the Waveshed custom plugin repository.
+# Triggered by pushing a v* tag equal to waveshed/metadata.txt's version; a manual
+# workflow_dispatch runs everything up to the upload as a DRY RUN (no R2 writes).
+#
+# What ends up where (R2 bucket waveshed-releases, public at releases.waveshed.io):
+#   qgis/waveshed.<V>.zip   immutable; an existing object is never overwritten
+#   qgis/latest.json        downloads page record   (cache max-age=60)
+#   qgis/plugins.xml        QGIS repository listing (cache max-age=60)
+# waveshed.io relays the two listings at /qgis/latest.json and /qgis/plugins.xml;
+# users add https://waveshed.io/qgis/plugins.xml to QGIS once. Upload order is
+# zip -> latest.json -> plugins.xml, so no listing ever names a missing ZIP.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      # The distro Python with the distro GDAL/numpy: the torture-runner tests use
+      # real GDAL, so nothing is skipped for want of osgeo (QGIS ships GDAL; pip
+      # cannot provide matching bindings).
+      - name: Install test dependencies
+        run: |
+          set -euo pipefail
+          sudo apt-get update -q
+          sudo apt-get install -y -q python3-gdal python3-numpy python3-pytest
+
+      - name: Version
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION=$(/usr/bin/python3 -c "import package; print(package.read_version('waveshed/metadata.txt'))")
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            TAG="${GITHUB_REF#refs/tags/}"
+            if [ "${TAG}" != "v${VERSION}" ]; then
+              echo "::error::tag ${TAG} does not match waveshed/metadata.txt version ${VERSION}"
+              exit 1
+            fi
+          fi
+          echo "Plugin version ${VERSION}"
+
+      - name: Unit tests
+        run: /usr/bin/python3 -m pytest -q -p no:cacheprovider tests
+
+      # --release: metadata URLs must answer 200 anonymously (public repository) and
+      # waveshed/core/release_keys.py must list a trusted manifest-signing key.
+      - name: Build ZIP
+        run: /usr/bin/python3 package.py --release dist
+
+      - name: Repository listings
+        run: |
+          /usr/bin/python3 tools/make_plugin_repo.py \
+            "dist/waveshed.${{ steps.version.outputs.version }}.zip" --out-dir dist/repo
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: waveshed-plugin-${{ steps.version.outputs.version }}
+          path: |
+            dist/waveshed.*.zip
+            dist/repo/
+          retention-days: 90
+
+      - name: Upload to R2
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: bash
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          ENDPOINT: ${{ secrets.R2_S3_ENDPOINT }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          ZIP="waveshed.${VERSION}.zip"
+          if aws s3api head-object --bucket waveshed-releases --key "qgis/${ZIP}" \
+               --endpoint-url "${ENDPOINT}" >/dev/null 2>&1; then
+            echo "::error::qgis/${ZIP} already exists in R2; published ZIPs are immutable. Bump the version."
+            exit 1
+          fi
+          aws s3 cp "dist/${ZIP}" "s3://waveshed-releases/qgis/${ZIP}" \
+            --endpoint-url "${ENDPOINT}" --content-type application/zip \
+            --cache-control "public, max-age=31536000, immutable"
+          aws s3 cp dist/repo/latest.json "s3://waveshed-releases/qgis/latest.json" \
+            --endpoint-url "${ENDPOINT}" --content-type application/json \
+            --cache-control "public, max-age=60"
+          aws s3 cp dist/repo/plugins.xml "s3://waveshed-releases/qgis/plugins.xml" \
+            --endpoint-url "${ENDPOINT}" --content-type application/xml \
+            --cache-control "public, max-age=60"
+
+      # What QGIS users actually see: the waveshed.io relays must serve this version,
+      # and the ZIP behind them must hash to what latest.json says.
+      - name: Verify publication
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: bash
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          /usr/bin/python3 - <<'PY'
+          import hashlib, json, os, sys, time, urllib.request
+          import xml.etree.ElementTree as ET
+          version = os.environ["VERSION"]
+          def get(url):
+              req = urllib.request.Request(url, headers={"User-Agent": "waveshed-release-check", "Cache-Control": "no-cache"})
+              with urllib.request.urlopen(req, timeout=60) as r:
+                  return r.read()
+          deadline = time.time() + 600
+          while True:
+              try:
+                  latest = json.loads(get("https://waveshed.io/qgis/latest.json"))
+                  listed = ET.fromstring(get("https://waveshed.io/qgis/plugins.xml")).find("pyqgis_plugin").get("version")
+                  if latest.get("version") == version and listed == version:
+                      break
+                  print(f"relay serves latest.json {latest.get('version')} / plugins.xml {listed}; waiting for {version}")
+              except Exception as exc:
+                  print(f"relay not ready: {exc}")
+              if time.time() > deadline:
+                  sys.exit(f"waveshed.io did not serve plugin {version} within 10 minutes")
+              time.sleep(15)
+          body = get(latest["url"])
+          digest = hashlib.sha256(body).hexdigest()
+          if digest != latest["sha256"] or len(body) != latest["size_bytes"]:
+              sys.exit(f"published ZIP does not match latest.json: sha256 {digest}, size {len(body)}")
+          print(f"published: {latest['url']} sha256 {digest}")
+          PY

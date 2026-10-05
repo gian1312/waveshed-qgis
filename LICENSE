@@ -16,7 +16,27 @@ Street, Fifth Floor, Boston, MA 02110-1301 USA.
 
 The Aether engine binaries are NOT part of this program.  They are separate
 proprietary software, not bundled with this plugin, downloaded on demand and
-licensed under their own EULA.  The GPL does not apply to them.
+licensed under their own EULA.  The GPL does not apply to them.  The engine
+EULA permits non-commercial use only; commercial, governmental and
+organisational use of the engine requires the author's prior written
+permission (info@waveshed.io).  That condition applies to the engine, not to
+this program.
+
+----------------------------------------------------------------------------
+NOTICE — MODEL OUTPUT, NO LIABILITY
+(Informational notice.  It does not add any restriction to, and does not
+modify, the GNU General Public License below; where they differ, the GPL
+governs your rights in this program.)
+
+Results displayed or produced with this program are outputs of a radio
+propagation MODEL.  They are approximations, not measurements, and are not a
+guarantee of coverage, signal strength or any other real-world outcome.  They
+should not be relied on for safety-of-life, regulatory, planning or financial
+decisions without independent verification.  To the maximum extent permitted
+by applicable law, the author accepts no liability for anything arising from
+the use of this program or its results (see also sections 11 and 12 of the
+GPL below).
+----------------------------------------------------------------------------
 
 The full text of the GNU General Public License version 2 follows.
 

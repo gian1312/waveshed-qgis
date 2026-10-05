@@ -7,6 +7,8 @@ GUI code; progress feedback is delivered through plain callbacks.
 
 from __future__ import annotations
 
+import base64
+import binascii
 import hashlib
 import json
 import os
@@ -17,6 +19,7 @@ import stat
 import subprocess
 import tempfile
 import zipfile
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, List, Optional, Sequence
 
@@ -38,6 +41,26 @@ _EXE_SUFFIX = ".exe" if platform.system() == "Windows" else ""
 
 #: URL of the release manifest served by waveshed.io.
 MANIFEST_URL = "https://waveshed.io/releases/latest.json"
+
+#: Every engine archive must be served from here. The manifest is signed, but
+#: pinning the host as well means even a manifest accepted under the
+#: pre-signing grace rule (:data:`LAST_UNSIGNED_ENGINE`) cannot point the
+#: download anywhere else.
+RELEASES_URL_PREFIX = "https://releases.waveshed.io/"
+
+#: Detached signature of the manifest for one engine version. Versioned (and
+#: immutable) rather than ``manifests/latest.json.sig`` so a manifest and its
+#: signature can never be fetched from two different releases mid-upload.
+MANIFEST_SIG_URL = "https://releases.waveshed.io/manifests/v{version}/latest.json.sig"
+
+#: Domain-separation prefix of the manifest signature: the signed message is
+#: this prefix followed by the exact manifest bytes as served.
+MANIFEST_SIG_CONTEXT = b"waveshed-manifest-v1\0"
+
+#: Newest engine release published before manifests were signed. A manifest
+#: for this version or older may come without a signature (HTTP 404 on the
+#: .sig); anything newer must carry a valid one. Never raise this value.
+LAST_UNSIGNED_ENGINE = "0.4.7"
 
 #: Maps (platform.system(), platform.machine()) to the engine
 #: (platform, arch) pair used in the manifest's asset entries. Intel macOS
@@ -272,7 +295,54 @@ def engine_error_hint(output: str) -> str:
             "\u2192 Download binaries, or pick one of those resolutions for "
             "this run."
         )
-    return ""
+    return macos_launch_hint(output)
+
+
+#: Output fragments of a macOS launch that Gatekeeper (quarantine) blocked or
+#: killed: the shell's "Killed: 9", the system dialog text, a SIGKILL'd child.
+_MACOS_BLOCKED_SIGNS = (
+    "killed: 9", "sigkill", "signal 9", "cannot be opened",
+    "operation not permitted", "cannot be verified", "not verified",
+    "malicious software", "quarantine",
+)
+
+
+def macos_launch_hint(output: str, binary_dir: Optional[str] = None,
+                      force: bool = False) -> str:
+    """The manual quarantine fix, when a macOS engine launch looks blocked.
+
+    Waveshed ships no notarized engine (by decision); quarantine clearing is
+    what makes it run (:func:`prepare_engine_dir`). Should that not have
+    worked, the user gets the one command that fixes it. *force* skips the
+    output match (a launch killed by a signal has no output to match).
+    Returns ``""`` off macOS or when nothing points at Gatekeeper.
+    """
+    if platform.system() != "Darwin":
+        return ""
+    text = (output or "").lower()
+    if not force and not any(sign in text for sign in _MACOS_BLOCKED_SIGNS):
+        return ""
+    directory = binary_dir or discover_binary_dir() or DEFAULT_INSTALL_DIR
+    return (
+        "\n\nmacOS may have blocked the Aether engine (download quarantine). "
+        "Open Terminal and run:\n"
+        f'    xattr -cr "{directory}"\n'
+        "then try again."
+    )
+
+
+def engine_message_action(message: str) -> Optional[str]:
+    """What a user-facing engine message asks the user to do, for a button.
+
+    ``"update"`` when it tells them to update the engine (too old, unsupported
+    resolution, no ``--fingerprint``), ``"install"`` when the engine is missing,
+    else ``None``. Every such message names the Settings "Download binaries"
+    step, which is what this keys on.
+    """
+    text = (message or "").lower()
+    if "download binaries" not in text:
+        return None
+    return "update" if "update" in text else "install"
 
 
 def read_machine_fingerprint(timeout: float = 10.0) -> str:
@@ -454,40 +524,168 @@ def select_asset(
     )
 
 
-def fetch_manifest(url: str = MANIFEST_URL) -> dict:
-    """Fetch and validate the release manifest from waveshed.io.
+#: Callable[[str], tuple[Optional[int], bytes, str]] — (HTTP status or None,
+#: body, error message or "") — the seam the signature check fetches through.
+HttpGet = Callable[[str], "tuple[Optional[int], bytes, str]"]
 
-    Uses :class:`QgsBlockingNetworkRequest` so the QGIS network stack (and the
-    user's proxy configuration) is honoured. Safe to call from a worker thread.
 
-    Raises
-    ------
-    RuntimeError
-        On network error or a malformed manifest.
+def _http_get(url: str) -> tuple[Optional[int], bytes, str]:
+    """GET *url* through the QGIS network stack (proxy settings honoured).
+
+    Returns ``(status, body, error)``: *status* is the HTTP status code (None
+    when no response arrived), *error* is empty on success. Never raises for
+    network or HTTP failures — callers decide what a 404 means.
     """
     from qgis.core import QgsBlockingNetworkRequest
     from qgis.PyQt.QtCore import QUrl
     from qgis.PyQt.QtNetwork import QNetworkRequest
 
-    QgsMessageLog.logMessage(
-        f"Fetching engine manifest {url}", TAG, Qgis.MessageLevel.Info
-    )
-
     request = QgsBlockingNetworkRequest()
     err = request.get(QNetworkRequest(QUrl(url)))
+    reply = request.reply()
+    status = None
+    try:
+        code = reply.attribute(QNetworkRequest.Attribute.HttpStatusCodeAttribute)
+        status = int(code) if code is not None else None
+    except (TypeError, ValueError, AttributeError):
+        status = None
+    body = bytes(reply.content())
     if err != QgsBlockingNetworkRequest.ErrorCode.NoError:
+        return status, body, request.errorMessage() or f"HTTP {status}"
+    return status, body, ""
+
+
+_SEMVER_RE = re.compile(r"\d+\.\d+\.\d+")
+
+
+def verify_manifest_signature(
+    raw: bytes,
+    manifest: dict,
+    trusted_keys: Optional[Sequence[str]] = None,
+    fetch: Optional[HttpGet] = None,
+) -> str:
+    """Check the detached Ed25519 signature of the manifest bytes *raw*.
+
+    The signature lives at :data:`MANIFEST_SIG_URL` for the manifest's own
+    version and covers ``MANIFEST_SIG_CONTEXT + raw``. Rules:
+
+    * valid signature by a key in *trusted_keys* (default
+      :data:`release_keys.MANIFEST_PUBLIC_KEYS`) → accepted;
+    * bad signature, untrusted key or malformed signature file → refused;
+    * no signature (HTTP 404) → accepted only for a manifest version up to
+      :data:`LAST_UNSIGNED_ENGINE` (releases published before signing), with
+      a warning; refused for anything newer;
+    * any other failure to fetch the signature → refused ("try again").
+
+    Returns ``"signed"`` or ``"unsigned-legacy"``. Raises
+    :class:`RuntimeError` when the manifest must not be used.
+    """
+    from . import ed25519, release_keys
+
+    if trusted_keys is None:
+        trusted_keys = release_keys.MANIFEST_PUBLIC_KEYS
+    fetch = fetch or _http_get
+
+    version = str(manifest.get("version", "")).strip()
+    if not _SEMVER_RE.fullmatch(version):
         raise RuntimeError(
-            f"Failed to fetch the release manifest from {url}: "
-            f"{request.errorMessage()}"
+            f"Refusing the release manifest: version {version!r} is not a "
+            "plain X.Y.Z version."
+        )
+    sig_url = MANIFEST_SIG_URL.format(version=version)
+    status, body, error = fetch(sig_url)
+
+    if status == 404:
+        if compare_versions(version, LAST_UNSIGNED_ENGINE) <= 0:
+            QgsMessageLog.logMessage(
+                f"Release manifest {version} is unsigned (published before "
+                f"manifest signing); accepted under the pre-signing rule "
+                f"(<= {LAST_UNSIGNED_ENGINE}). SHA-256 still protects every archive.",
+                TAG, Qgis.MessageLevel.Warning,
+            )
+            return "unsigned-legacy"
+        raise RuntimeError(
+            f"Refusing the release manifest for engine {version}: it has no "
+            "signature. Every release after "
+            f"{LAST_UNSIGNED_ENGINE} must be signed. If a release is being "
+            "published right now, try again in a few minutes."
+        )
+    if error:
+        raise RuntimeError(
+            f"Could not fetch the release manifest signature ({sig_url}): "
+            f"{error}. The manifest was not used; please try again later."
         )
 
-    raw = bytes(request.reply().content())
+    try:
+        doc = json.loads(body.decode("utf-8"))
+        if not isinstance(doc, dict):
+            raise ValueError("not a JSON object")
+        if doc.get("alg") != "ed25519" or doc.get("context") != "waveshed-manifest-v1":
+            raise ValueError("unsupported algorithm or context")
+        public_key = bytes.fromhex(str(doc.get("public_key", "")))
+        signature = base64.b64decode(str(doc.get("signature", "")), validate=True)
+        if len(public_key) != 32 or len(signature) != 64:
+            raise ValueError("wrong key or signature length")
+    except (ValueError, UnicodeDecodeError, binascii.Error) as exc:
+        raise RuntimeError(
+            f"Refusing the release manifest: its signature file is malformed ({exc})."
+        ) from exc
+
+    trusted = {k.strip().lower() for k in trusted_keys}
+    if public_key.hex() not in trusted:
+        raise RuntimeError(
+            "Refusing the release manifest: it is signed by a key this plugin "
+            "does not trust. Update the Waveshed plugin, or contact "
+            "info@waveshed.io if this persists."
+        )
+    if not ed25519.verify(public_key, MANIFEST_SIG_CONTEXT + raw, signature):
+        raise RuntimeError(
+            "Refusing the release manifest: its signature does not match. The "
+            "manifest may have been altered in transit; nothing was downloaded."
+        )
+    QgsMessageLog.logMessage(
+        f"Release manifest {version} signature verified (key {public_key.hex()[:16]}…).",
+        TAG, Qgis.MessageLevel.Info,
+    )
+    return "signed"
+
+
+def parse_manifest_bytes(raw: bytes) -> dict:
+    """Parse and structurally validate manifest bytes (no signature check)."""
     try:
         data = json.loads(raw.decode("utf-8"))
     except (ValueError, UnicodeDecodeError) as exc:
         raise RuntimeError(f"Release manifest is not valid JSON: {exc}") from exc
-
     return validate_manifest(data)
+
+
+def fetch_manifest(url: str = MANIFEST_URL, fetch: Optional[HttpGet] = None) -> dict:
+    """Fetch, validate and signature-check the release manifest from waveshed.io.
+
+    The single entry point for every manifest consumer (Download, the startup
+    update check, Settings → Check for updates), so none of them can use an
+    unverified manifest. Uses :class:`QgsBlockingNetworkRequest` so the QGIS
+    network stack (and the user's proxy configuration) is honoured. Safe to
+    call from a worker thread.
+
+    Raises
+    ------
+    RuntimeError
+        On network error, a malformed manifest, or a failed signature check
+        (see :func:`verify_manifest_signature`).
+    """
+    fetch = fetch or _http_get
+    QgsMessageLog.logMessage(
+        f"Fetching engine manifest {url}", TAG, Qgis.MessageLevel.Info
+    )
+    status, raw, error = fetch(url)
+    if error:
+        raise RuntimeError(
+            f"Failed to fetch the release manifest from {url}: {error}"
+        )
+    data = parse_manifest_bytes(raw)
+    verify_manifest_signature(raw, data, fetch=fetch)
+    return data
 
 
 # ---------------------------------------------------------------------------
@@ -568,27 +766,40 @@ def download_engine(
     """Download, verify, and install the Aether engine described by *asset*.
 
     This performs the download only. Callers MUST obtain the user's consent to
-    the engine EULA first (handled by the Settings dialog).
+    the engine EULA first (handled by the Settings dialog), and must pass a
+    manifest that came through :func:`fetch_manifest` (signature-checked).
 
-    Pipeline: download -> size check (warn-only) -> SHA-256 (fail-closed) ->
-    extract -> chmod +x (non-Windows) -> clear OS download quarantine ->
-    persist settings -> check prerequisites -> best-effort
-    ``aether_core --version`` handshake.
+    Pipeline: host pin -> download -> size check (warn-only) -> SHA-256
+    (fail-closed) -> extract into a staging dir inside *target_dir* -> all
+    binaries present -> chmod +x -> clear OS download quarantine ->
+    ``revocation.bin`` (fail-soft) -> ``aether_core --version`` must report the
+    manifest's version -> swap the staged files into place -> persist settings
+    -> prerequisites (logged).
+
+    The swap is all-or-nothing (:func:`_install_staged`): a failure at any
+    step leaves the previous install exactly as it was, so an update can never
+    leave a mix of old and new binaries behind.
 
     Returns the install directory. Raises :class:`RuntimeError` on any hard
-    failure (the partially-downloaded archive is always removed).
+    failure (the downloaded archive and the staging dir are always removed).
     """
     target_dir = os.path.expanduser(target_dir)
     os.makedirs(target_dir, exist_ok=True)
+    _cleanup_stale_backups(target_dir)
 
     url = asset.get("url")
     if not url:
         raise RuntimeError("Selected manifest asset has no download URL.")
+    if not str(url).startswith(RELEASES_URL_PREFIX):
+        raise RuntimeError(
+            f"Refusing to download the engine from {url}: engine archives are "
+            f"only accepted from {RELEASES_URL_PREFIX}."
+        )
     version = manifest.get("version", "?")
 
-    # The manifest is not signed — only TLS to waveshed.io stands between it
-    # and an attacker — so nothing in it is allowed to choose a filesystem
-    # path. Joining asset["filename"] onto the temp dir let a value like
+    # Nothing in the manifest is allowed to choose a filesystem path (it was
+    # unsigned for releases up to LAST_UNSIGNED_ENGINE, and defence in depth
+    # after). Joining asset["filename"] onto the temp dir let a value like
     # "../../home/<user>/.bashrc" resolve outside it, and the response body is
     # written there BEFORE verify_sha256 runs, with the `finally` below then
     # deleting it: an arbitrary file clobber-and-delete driven by a network
@@ -613,80 +824,347 @@ def download_engine(
             os.remove(zip_path)
         raise
 
-    extracted_files: list[str] = []
+    # Staged inside the target so the final moves stay on one filesystem
+    # (os.replace is then a rename, never a copy) and need no write access to
+    # the target's parent.
+    staging = tempfile.mkdtemp(prefix=STAGING_PREFIX, dir=target_dir)
     try:
-        # 2. Size check (warn-only)
-        expected_size = asset.get("size_bytes")
-        if isinstance(expected_size, int) and expected_size > 0:
-            actual_size = os.path.getsize(zip_path)
-            if actual_size != expected_size:
-                QgsMessageLog.logMessage(
-                    f"Downloaded size {actual_size} != manifest size_bytes "
-                    f"{expected_size} (continuing).",
-                    TAG, Qgis.MessageLevel.Warning,
-                )
-
-        # 3. SHA-256 (mandatory, fail-closed)
-        verify_sha256(zip_path, asset.get("sha256"))
-
-        # Windows: clear any Mark-of-the-Web on the downloaded zip *before*
-        # extracting, so the extracted files cannot inherit it (covers a zip a
-        # user fetched via a browser and pointed the plugin at). No-op
-        # elsewhere and when the stream is absent.
-        if platform.system() == "Windows":
-            _clear_quarantine(target_dir, [zip_path])
-
-        # 4. Extract
         try:
-            with zipfile.ZipFile(zip_path, "r") as zf:
-                zf.extractall(target_dir)
-                extracted_files = [
-                    os.path.join(target_dir, name)
-                    for name in zf.namelist()
-                    if not name.endswith("/")
-                ]
-        except zipfile.BadZipFile as exc:
+            # 2. Size check (warn-only)
+            expected_size = asset.get("size_bytes")
+            if isinstance(expected_size, int) and expected_size > 0:
+                actual_size = os.path.getsize(zip_path)
+                if actual_size != expected_size:
+                    QgsMessageLog.logMessage(
+                        f"Downloaded size {actual_size} != manifest size_bytes "
+                        f"{expected_size} (continuing).",
+                        TAG, Qgis.MessageLevel.Warning,
+                    )
+
+            # 3. SHA-256 (mandatory, fail-closed)
+            verify_sha256(zip_path, asset.get("sha256"))
+
+            # Windows: clear any Mark-of-the-Web on the downloaded zip *before*
+            # extracting, so the extracted files cannot inherit it. No-op
+            # elsewhere and when the stream is absent.
+            if platform.system() == "Windows":
+                _clear_quarantine(staging, [zip_path])
+
+            # 4. Extract into the staging dir
+            try:
+                with zipfile.ZipFile(zip_path, "r") as zf:
+                    zf.extractall(staging)
+                    extracted_files = [
+                        os.path.join(staging, name)
+                        for name in zf.namelist()
+                        if not name.endswith("/")
+                    ]
+            except zipfile.BadZipFile as exc:
+                raise RuntimeError(
+                    f"Downloaded file is not a valid ZIP archive: {exc}"
+                ) from exc
+        finally:
+            if os.path.exists(zip_path):
+                os.remove(zip_path)
+
+        # 5. The archive must hold the whole engine
+        missing = [b for b in REQUIRED_BINARIES if not _dir_has_binary(staging, b)]
+        if missing:
             raise RuntimeError(
-                f"Downloaded file is not a valid ZIP archive: {exc}"
-            ) from exc
+                "The downloaded engine archive is incomplete (missing: "
+                f"{', '.join(missing)}). Nothing was installed."
+            )
+
+        # 6. Executable bit + OS download quarantine (macOS xattr / Windows
+        #    Mark-of-the-Web; a no-op on Linux).
+        _make_executable(staging)
+        _clear_quarantine(staging, extracted_files)
+
+        # 7. Signed licence revocation list from the manifest -> revocation.bin
+        #    (fail-soft: absent/malformed is logged, never fatal). Written into
+        #    the staging dir so it is swapped in together with the binaries.
+        write_revocation_file(manifest, staging)
+
+        # 8. The staged engine must run and be the version we were promised.
+        _verify_staged_version(staging, str(version))
+
+        # 9. Swap into place (all-or-nothing)
+        _install_staged(staging, target_dir)
     finally:
-        if os.path.exists(zip_path):
-            os.remove(zip_path)
+        shutil.rmtree(staging, ignore_errors=True)
 
-    # 5. Executable permissions (Linux / macOS)
-    if platform.system() != "Windows":
-        for name in REQUIRED_BINARIES:
-            path = os.path.join(target_dir, name)
-            if os.path.exists(path):
-                current = os.stat(path).st_mode
-                os.chmod(path, current | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
-
-    # 6. Clear the OS download quarantine so the fresh binaries launch without
-    #    friction (macOS xattr / Windows Mark-of-the-Web; a no-op on Linux).
-    _clear_quarantine(target_dir, extracted_files)
-
-    # 7. Persist install location and engine version
+    # 10. Persist install location and engine version
     settings = QgsSettings()
     settings.setValue("waveshed/binary_dir", target_dir)
     settings.setValue("waveshed/installed_engine_version", version)
 
     QgsMessageLog.logMessage(
-        f"Aether engine {version} extracted to {target_dir}",
+        f"Aether engine {version} installed to {target_dir}",
         TAG, Qgis.MessageLevel.Info,
     )
 
-    # 8. Verify prerequisites
-    issues = check_prerequisites(target_dir)
-    missing = [i for i in issues if "not found" in i.lower()]
-    if missing:
-        raise RuntimeError(
-            "Download succeeded but verification failed:\n" + "\n".join(missing)
-        )
-
-    # 9. Best-effort version handshake (never fails the install)
-    _version_handshake(target_dir)
+    # 11. Prerequisites (GPU drivers etc.) — reported, the install stands.
+    check_prerequisites(target_dir)
 
     return target_dir
+
+
+#: Prefix of the staging dir an engine archive is extracted into.
+STAGING_PREFIX = ".waveshed-staging-"
+
+#: Infix of the backup name a replaced file gets during the swap.
+BACKUP_INFIX = ".waveshed-old-"
+
+
+def _make_executable(directory: str) -> None:
+    """Set the executable bit on every required binary in *directory* (POSIX).
+
+    Archives that went through a browser or a non-POSIX unzip can lose the
+    bit; MPT_SIGMA's KADAS plugin does the same on every load.
+    """
+    if platform.system() == "Windows":
+        return
+    for name in REQUIRED_BINARIES:
+        path = os.path.join(directory, name)
+        try:
+            if os.path.isfile(path):
+                current = os.stat(path).st_mode
+                os.chmod(path, current | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+        except OSError as exc:
+            QgsMessageLog.logMessage(
+                f"Could not make {path} executable: {exc}",
+                TAG, Qgis.MessageLevel.Warning,
+            )
+
+
+def prepare_engine_dir(binary_dir: Optional[str]) -> None:
+    """Make an engine directory runnable on macOS: ``chmod +x`` + clear quarantine.
+
+    Waveshed ships the engine ad-hoc signed and NOT notarized (a deliberate
+    decision), so a copy that reached the disk through a browser carries the
+    ``com.apple.quarantine`` attribute and Gatekeeper refuses to launch it.
+    Our own download clears it, but a user who unzipped a browser download and
+    pointed Settings at it (Browse, Auto-detect, ``AETHER_BIN_DIR``) would be
+    stuck — so, like MPT_SIGMA, this runs at plugin load, after Browse /
+    Auto-detect, and before every ``--version`` probe. Best effort, never
+    raises; a no-op on Windows and Linux (Linux needs only the executable bit,
+    which a ZIP extract by us already sets).
+    """
+    if not binary_dir or platform.system() != "Darwin":
+        return
+    try:
+        if not os.path.isdir(binary_dir):
+            return
+        _make_executable(binary_dir)
+        _clear_quarantine(binary_dir, [])
+    except Exception as exc:  # noqa: BLE001 — must never break a caller
+        QgsMessageLog.logMessage(
+            f"Could not prepare the engine directory {binary_dir}: {exc}",
+            TAG, Qgis.MessageLevel.Warning,
+        )
+
+
+def _verify_staged_version(staging: str, expected: str) -> None:
+    """``aether_core --version`` from *staging* must name *expected*.
+
+    A staged engine that cannot run at all, or reports another version than
+    the manifest promised, is never swapped in.
+    """
+    exe = os.path.join(staging, _binary_name("aether_core"))
+    try:
+        result = subprocess.run(
+            [exe, "--version"], capture_output=True, text=True,
+            timeout=15, check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise RuntimeError(
+            f"The downloaded engine could not be started ({exc}). Nothing was "
+            "installed." + macos_launch_hint(str(exc), staging, force=True)
+        ) from exc
+    found = parse_engine_version(result.stdout) if result.returncode == 0 else None
+    if found is None:
+        detail = (result.stderr or result.stdout or "").strip()
+        raise RuntimeError(
+            f"The downloaded engine did not answer --version (exit "
+            f"{result.returncode}{': ' + detail if detail else ''}). Nothing "
+            "was installed." + macos_launch_hint(
+                detail, staging, force=result.returncode < 0)
+        )
+    if _SEMVER_RE.fullmatch(expected) and compare_versions(found, expected) != 0:
+        raise RuntimeError(
+            f"The downloaded engine reports version {found}, but the release "
+            f"manifest promised {expected}. Nothing was installed."
+        )
+    QgsMessageLog.logMessage(
+        f"Staged engine answers aether_core {found}", TAG, Qgis.MessageLevel.Info,
+    )
+
+
+def _staged_files(staging: str) -> list[str]:
+    """Every file below *staging*, as paths relative to it."""
+    out = []
+    for root, _dirs, files in os.walk(staging):
+        for name in files:
+            out.append(os.path.relpath(os.path.join(root, name), staging))
+    return sorted(out)
+
+
+def _assert_not_in_use(target_dir: str, rel_files: Sequence[str]) -> None:
+    """Windows: refuse up front when a file to be replaced is locked.
+
+    A running ``aether_core.exe`` (or a DLL it loaded) cannot be opened for
+    writing, so it is detected here before anything is touched. POSIX can
+    replace a running binary safely, so this is Windows-only.
+    """
+    if platform.system() != "Windows":
+        return
+    for rel in rel_files:
+        path = os.path.join(target_dir, rel)
+        if not os.path.isfile(path):
+            continue
+        try:
+            with open(path, "r+b"):
+                pass
+        except OSError as exc:
+            raise RuntimeError(
+                f"Cannot update the engine: {path} is in use or read-only "
+                f"({exc}). Wait for running analyses to finish (or close "
+                "them), then try again. The current engine was left as it was."
+            ) from exc
+
+
+def _install_staged(staging: str, target_dir: str) -> None:
+    """Move every staged file into *target_dir*, all-or-nothing.
+
+    Phase 1 renames each file that will be replaced to a backup name, phase 2
+    moves the staged files in. Any failure rolls both phases back, so the
+    previous install is left exactly as it was. Files in *target_dir* the
+    archive does not contain (a ``license.key`` next to ``aether_core``, a
+    previous ``revocation.bin``) are never touched. Backups are deleted at the
+    end; one that cannot be deleted yet (Windows keeps a renamed running
+    binary locked) is removed by the next install (:func:`_cleanup_stale_backups`).
+    """
+    rel_files = _staged_files(staging)
+    _assert_not_in_use(target_dir, rel_files)
+
+    token = os.urandom(4).hex()
+    backups: list[tuple[str, str]] = []
+    moved: list[str] = []
+    try:
+        for rel in rel_files:
+            dst = os.path.join(target_dir, rel)
+            if os.path.lexists(dst):
+                bak = dst + BACKUP_INFIX + token
+                os.rename(dst, bak)
+                backups.append((dst, bak))
+        for rel in rel_files:
+            dst = os.path.join(target_dir, rel)
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            os.replace(os.path.join(staging, rel), dst)
+            moved.append(dst)
+    except OSError as exc:
+        for dst in moved:
+            try:
+                os.remove(dst)
+            except OSError:
+                pass
+        for dst, bak in reversed(backups):
+            try:
+                os.replace(bak, dst)
+            except OSError as restore_exc:
+                QgsMessageLog.logMessage(
+                    f"Could not restore {dst} from {bak}: {restore_exc}",
+                    TAG, Qgis.MessageLevel.Critical,
+                )
+        raise RuntimeError(
+            f"Installing the engine into {target_dir} failed ({exc}). The "
+            "previous engine was restored. If an analysis is running, wait for "
+            "it to finish and try again."
+        ) from exc
+
+    for _dst, bak in backups:
+        try:
+            os.remove(bak)
+        except OSError:
+            QgsMessageLog.logMessage(
+                f"Old engine file {bak} is still in use; it is removed by the "
+                "next install.", TAG, Qgis.MessageLevel.Info,
+            )
+
+
+def _cleanup_stale_backups(target_dir: str) -> None:
+    """Remove leftovers of earlier installs: backups and staging dirs."""
+    try:
+        for root, dirs, files in os.walk(target_dir):
+            for name in list(dirs):
+                if name.startswith(STAGING_PREFIX):
+                    shutil.rmtree(os.path.join(root, name), ignore_errors=True)
+                    dirs.remove(name)
+            for name in files:
+                if BACKUP_INFIX in name:
+                    try:
+                        os.remove(os.path.join(root, name))
+                    except OSError:
+                        pass
+    except OSError:
+        pass
+
+
+#: File the engine reads the signed licence revocation list from (next to
+#: ``aether_core``; licence format v3, AETHER ``Design Documents/License-v3.md``).
+REVOCATION_FILE = "revocation.bin"
+
+
+def write_revocation_file(manifest: dict, target_dir: str) -> Optional[str]:
+    """Write the manifest's signed ``revocation`` list as ``revocation.bin``.
+
+    The manifest carries ``"revocation": {"key_id", "seq", "blob"}`` with
+    ``blob`` = base64 of ``key_id u8 || seq u32 || count u16 ||
+    licence_id[16 * count] || Ed25519 signature``. Only the layout is checked
+    here -- the engine verifies the signature and ignores a list older than
+    one it has already seen -- so writing it cannot weaken anything.
+
+    Fail-soft: an absent or malformed field is logged and the install goes on
+    (any existing ``revocation.bin`` is left alone). Returns the written path,
+    or ``None``.
+    """
+    rev = manifest.get("revocation") if isinstance(manifest, dict) else None
+    if rev is None:
+        QgsMessageLog.logMessage(
+            "Release manifest has no licence revocation list (nothing to write).",
+            TAG, Qgis.MessageLevel.Info,
+        )
+        return None
+    try:
+        if not isinstance(rev, dict) or not isinstance(rev.get("blob"), str):
+            raise ValueError("no base64 'blob' string")
+        blob = base64.b64decode(rev["blob"], validate=True)
+        if len(blob) < 71:
+            raise ValueError(f"{len(blob)} bytes is too short")
+        seq = int.from_bytes(blob[1:5], "big")
+        count = int.from_bytes(blob[5:7], "big")
+        if len(blob) != 7 + 16 * count + 64:
+            raise ValueError("length does not match its entry count")
+        if rev.get("key_id") is not None and rev.get("key_id") != blob[0]:
+            raise ValueError("key_id does not match the blob")
+        if rev.get("seq") is not None and rev.get("seq") != seq:
+            raise ValueError("seq does not match the blob")
+        path = os.path.join(target_dir, REVOCATION_FILE)
+        tmp = path + ".tmp"
+        with open(tmp, "wb") as fh:
+            fh.write(blob)
+        os.replace(tmp, path)
+    except (ValueError, binascii.Error, OSError) as exc:
+        QgsMessageLog.logMessage(
+            f"Skipping the licence revocation list from the manifest: {exc}",
+            TAG, Qgis.MessageLevel.Warning,
+        )
+        return None
+    QgsMessageLog.logMessage(
+        f"Wrote licence revocation list (seq {seq}, {count} entries) to {path}",
+        TAG, Qgis.MessageLevel.Info,
+    )
+    return path
 
 
 def _clear_quarantine(target_dir: str, files: list) -> None:
@@ -787,6 +1265,20 @@ def read_engine_version(timeout: float = 5.0) -> Optional[str]:
     """
     try:
         exe = find_binary("aether_core")
+    except Exception:  # noqa: BLE001 — a probe must never take the run down
+        return None
+    return probe_engine_version(os.path.dirname(exe), timeout=timeout)
+
+
+def probe_engine_version(binary_dir: str, timeout: float = 5.0) -> Optional[str]:
+    """``aether_core --version`` of the engine in *binary_dir*, or ``None``.
+
+    Prepares the directory first on macOS (:func:`prepare_engine_dir`), so a
+    quarantined copy is fixed before it is launched. Never raises.
+    """
+    prepare_engine_dir(binary_dir)
+    exe = os.path.join(binary_dir, _binary_name("aether_core"))
+    try:
         result = subprocess.run(
             [exe, "--version"],
             capture_output=True, text=True, timeout=timeout, check=False,
@@ -794,6 +1286,13 @@ def read_engine_version(timeout: float = 5.0) -> Optional[str]:
     except Exception:  # noqa: BLE001 — a probe must never take the run down
         return None
     if result.returncode != 0:
+        hint = macos_launch_hint(result.stderr or "", binary_dir,
+                                 force=result.returncode < 0)
+        if hint:
+            QgsMessageLog.logMessage(
+                f"aether_core --version failed (exit {result.returncode}).{hint}",
+                TAG, Qgis.MessageLevel.Warning,
+            )
         return None
     return parse_engine_version(result.stdout)
 
@@ -845,28 +1344,69 @@ def check_engine_for_job(resolution_m: float) -> str:
     return shown
 
 
-def _version_handshake(binary_dir: str) -> None:
-    """Best-effort ``aether_core --version`` probe; logs, never raises.
+# ---------------------------------------------------------------------------
+# Engine update check
+# ---------------------------------------------------------------------------
 
-    Older engine builds may not support ``--version`` — a failure here must
-    never fail the install.
+#: QgsSettings switch for the once-per-session startup update check (default on).
+UPDATE_CHECK_KEY = "waveshed/engine_update_check"
+
+#: QgsSettings: the engine version the user was last told about, so each new
+#: release produces exactly one startup notice.
+UPDATE_NOTIFIED_KEY = "waveshed/engine_update_notified_version"
+
+
+def auto_update_check_enabled() -> bool:
+    """True unless the user switched the startup update check off."""
+    value = QgsSettings().value(UPDATE_CHECK_KEY, True)
+    if isinstance(value, str):
+        return value.strip().lower() not in ("false", "0", "no", "off", "")
+    return bool(value)
+
+
+@dataclass
+class EngineUpdateInfo:
+    """Installed vs. published engine version."""
+
+    installed: Optional[str]
+    available: str
+    update_available: bool
+    manifest: dict
+
+
+def check_for_engine_update(fetch: Optional[HttpGet] = None) -> Optional[EngineUpdateInfo]:
+    """Compare the installed engine with the (signature-checked) manifest.
+
+    Returns ``None`` when no engine is installed (the first-run notice covers
+    that case). The installed version is what the engine itself answers to
+    ``--version`` — the directory may have been replaced since our last
+    download — falling back to the version recorded at download time. An
+    engine whose version cannot be determined predates ``--version`` and is
+    reported as updatable. Raises :class:`RuntimeError` on a network or
+    signature failure; safe to call from a worker thread.
     """
-    exe = os.path.join(binary_dir, _binary_name("aether_core"))
-    try:
-        result = subprocess.run(
-            [exe, "--version"],
-            capture_output=True, text=True, timeout=5, check=False,
-        )
-        out = (result.stdout or result.stderr or "").strip()
-        QgsMessageLog.logMessage(
-            f"aether_core --version -> {out or '(no output)'}",
-            TAG, Qgis.MessageLevel.Info,
-        )
-    except Exception as exc:  # noqa: BLE001 - handshake must never fail install
-        QgsMessageLog.logMessage(
-            f"aether_core --version handshake skipped: {exc}",
-            TAG, Qgis.MessageLevel.Info,
-        )
+    binary_dir = discover_binary_dir()
+    if binary_dir is None:
+        return None
+    installed = probe_engine_version(binary_dir) or (
+        str(QgsSettings().value("waveshed/installed_engine_version", "") or "") or None
+    )
+    manifest = fetch_manifest(fetch=fetch)
+    available = str(manifest["version"])
+    newer = installed is None or compare_versions(available, installed) > 0
+    return EngineUpdateInfo(installed, available, newer, manifest)
+
+
+def should_notify_update(info: Optional[EngineUpdateInfo]) -> bool:
+    """True when *info* is an update the user has not been told about yet."""
+    if info is None or not info.update_available:
+        return False
+    return str(QgsSettings().value(UPDATE_NOTIFIED_KEY, "") or "") != info.available
+
+
+def mark_update_notified(version: str) -> None:
+    """Remember that the notice for *version* was shown."""
+    QgsSettings().setValue(UPDATE_NOTIFIED_KEY, version)
 
 
 # ---------------------------------------------------------------------------

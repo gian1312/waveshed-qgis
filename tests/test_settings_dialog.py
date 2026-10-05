@@ -24,7 +24,7 @@ from waveshed.core import api_key as ak
 from waveshed.core import binary_manager as bm
 from waveshed.gui.settings_dialog import SettingsDialog
 
-from test_api_key import _b58encode, _v1_raw
+from test_api_key import _b58encode, _v3_raw
 
 
 class _FakeLineEdit:
@@ -74,7 +74,7 @@ class TestSaveButtonPersists(unittest.TestCase):
         ak.store_key("")
 
     def test_valid_key_is_persisted_normalized(self):
-        key = _b58encode(_v1_raw())
+        key = _b58encode(_v3_raw())
         wrapped = f"{key[:40]} {key[40:]}"   # internal space (copy artefact)
         dlg = _new_dialog()
         dlg._api_key_edit = _FakeLineEdit(wrapped)

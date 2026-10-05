@@ -12,6 +12,7 @@ from pathlib import Path
 from qgis.PyQt.QtCore import Qt, QThread, QUrl, pyqtSignal
 from qgis.PyQt.QtGui import QDesktopServices
 from qgis.PyQt.QtWidgets import (
+    QCheckBox,
     QDialog,
     QDialogButtonBox,
     QFileDialog,
@@ -24,12 +25,13 @@ from qgis.PyQt.QtWidgets import (
     QProgressBar,
     QPushButton,
     QSpinBox,
+    QTextBrowser,
     QVBoxLayout,
     QWidget,
 )
-from qgis.core import QgsSettings
+from qgis.core import Qgis, QgsMessageLog, QgsSettings
 
-from ..core import api_key, binary_manager
+from ..core import api_key, binary_manager, eula
 from ..core.attribution import attribution_lines
 
 
@@ -38,18 +40,37 @@ from ..core.attribution import attribution_lines
 # ---------------------------------------------------------------------------
 
 class _ManifestThread(QThread):
-    """Fetch the release manifest and select the platform asset off-thread."""
+    """Fetch the (signature-checked) release manifest and select the platform
+    asset off-thread. ``fetch_eula=False`` skips the EULA text (update check)."""
 
-    ready = pyqtSignal(object, object)   # (manifest dict, asset dict)
-    error = pyqtSignal(str)              # error message on failure
+    ready = pyqtSignal(object, object, str)  # (manifest, asset, EULA text or "")
+    error = pyqtSignal(str)                   # error message on failure
+
+    def __init__(self, parent: QWidget | None = None, fetch_eula: bool = True) -> None:
+        super().__init__(parent)
+        self._fetch_eula = fetch_eula
 
     def run(self) -> None:  # noqa: D401 – Qt override
         try:
             manifest = binary_manager.fetch_manifest()
             asset = binary_manager.select_asset(manifest)
-            self.ready.emit(manifest, asset)
         except Exception as exc:
             self.error.emit(str(exc))
+            return
+        if not self._fetch_eula:
+            self.ready.emit(manifest, asset, "")
+            return
+        # The canonical EULA text is shown in the consent dialog. A failed
+        # fetch is not fatal: the dialog falls back to the key points + link.
+        try:
+            eula_text = eula.fetch_eula_text(manifest.get("eula_url") or eula.EULA_URL)
+        except Exception as exc:  # noqa: BLE001 – fall back to the link
+            QgsMessageLog.logMessage(
+                f"Could not load the engine EULA text: {exc}",
+                binary_manager.TAG, Qgis.MessageLevel.Warning,
+            )
+            eula_text = ""
+        self.ready.emit(manifest, asset, eula_text)
 
 
 class _DownloadThread(QThread):
@@ -120,6 +141,7 @@ _WATCHED_KEYS = (
     "waveshed/max_vram_gb",
     "waveshed/max_ram_gb",
     "waveshed/download_connections",
+    binary_manager.UPDATE_CHECK_KEY,
 )
 
 
@@ -138,6 +160,9 @@ class SettingsDialog(QDialog):
         self.setMinimumWidth(560)
 
         self._manifest_thread: _ManifestThread | None = None
+        self._update_thread: _ManifestThread | None = None
+        #: Engine version published in the last manifest seen, for the label.
+        self._available_version: str | None = None
         self._download_thread: _DownloadThread | None = None
         self._fingerprint_thread: _FingerprintThread | None = None
         self._settings = QgsSettings()
@@ -185,8 +210,30 @@ class SettingsDialog(QDialog):
         self._btn_download = QPushButton("Download Binaries")
         self._btn_download.clicked.connect(self._download_binaries)
         row2.addWidget(self._btn_download)
+
+        self._btn_check_update = QPushButton("Check for updates")
+        self._btn_check_update.setToolTip(
+            "Compare the installed Aether engine with the latest release "
+            "(nothing is downloaded)."
+        )
+        self._btn_check_update.clicked.connect(self._check_for_updates)
+        row2.addWidget(self._btn_check_update)
         row2.addStretch()
         vbox.addLayout(row2)
+
+        # Installed vs. published engine version
+        self._engine_version_label = QLabel()
+        vbox.addWidget(self._engine_version_label)
+
+        self._update_check_box = QCheckBox(
+            "Check for engine updates when QGIS starts"
+        )
+        self._update_check_box.setToolTip(
+            "Once per QGIS session, compare the installed engine with the "
+            "latest release and show a notice when a newer one exists. "
+            "Nothing is downloaded without your confirmation."
+        )
+        vbox.addWidget(self._update_check_box)
 
         # Progress bar (hidden by default)
         self._download_progress = QProgressBar()
@@ -349,6 +396,7 @@ class SettingsDialog(QDialog):
 
         # Binaries
         self._binary_dir_edit.setText(s.value("waveshed/binary_dir", ""))
+        self._update_check_box.setChecked(binary_manager.auto_update_check_enabled())
         self._refresh_binary_status()
 
         # API key
@@ -389,6 +437,7 @@ class SettingsDialog(QDialog):
         s.setValue("waveshed/max_vram_gb", self._vram_spin.value())
         s.setValue("waveshed/max_ram_gb", self._ram_spin.value())
         s.setValue("waveshed/download_connections", self._conn_spin.value())
+        s.setValue(binary_manager.UPDATE_CHECK_KEY, bool(self._update_check_box.isChecked()))
         api_key.store_key(self._api_key_edit.text().strip())
 
         # The saved binary dir is what runs use from now on — re-validate it
@@ -410,17 +459,68 @@ class SettingsDialog(QDialog):
             self, "Select Binary Directory", self._binary_dir_edit.text()
         )
         if path:
+            # macOS: a browser-downloaded copy is quarantined — fix it now.
+            binary_manager.prepare_engine_dir(path)
             self._binary_dir_edit.setText(path)
             self._refresh_binary_status()
 
     def _auto_detect_binaries(self) -> None:
         detected = binary_manager.discover_binary_dir()
         if detected:
+            binary_manager.prepare_engine_dir(detected)
             self._binary_dir_edit.setText(detected)
             self._refresh_binary_status()
         else:
             self._binary_status_label.setText("Binaries: Not found")
             self._binary_status_label.setStyleSheet("color: red;")
+
+    def start_engine_download(self) -> None:
+        """Start the download flow (manifest -> EULA consent -> download).
+
+        Public entry point for the startup update notice and the "Update
+        engine" button on run errors.
+        """
+        self._download_binaries()
+
+    def _check_for_updates(self) -> None:
+        """Fetch the signed manifest and show the published engine version."""
+        if self._update_thread is not None and self._update_thread.isRunning():
+            return
+        self._btn_check_update.setEnabled(False)
+        self._engine_version_label.setText("Checking waveshed.io for engine updates...")
+        self._engine_version_label.setStyleSheet("color: gray;")
+        self._update_thread = _ManifestThread(parent=self, fetch_eula=False)
+        self._update_thread.ready.connect(self._on_update_info)
+        self._update_thread.error.connect(self._on_update_err)
+        self._update_thread.start()
+
+    def _on_update_info(self, manifest: dict, _asset: dict, _eula: str = "") -> None:
+        self._btn_check_update.setEnabled(True)
+        self._available_version = str(manifest.get("version", "")) or None
+        self._refresh_engine_version()
+
+    def _on_update_err(self, error: str) -> None:
+        self._btn_check_update.setEnabled(True)
+        self._refresh_engine_version()
+        QMessageBox.warning(self, "Update check failed", error)
+
+    def _refresh_engine_version(self) -> None:
+        """Show "installed X / available Y" for the configured engine dir."""
+        binary_dir = self._binary_dir_edit.text().strip()
+        installed = None
+        if binary_dir and os.path.isdir(binary_dir) and binary_manager._dir_has_binary(
+                binary_dir, "aether_core"):
+            installed = binary_manager.probe_engine_version(binary_dir)
+        available = self._available_version
+        text = (f"Installed engine: {installed or 'unknown'}"
+                f"  /  Latest release: {available or 'not checked'}")
+        style = "color: gray;"
+        if available and (installed is None
+                          or binary_manager.compare_versions(available, installed) > 0):
+            text += "  \u2014 update available (Download Binaries)"
+            style = "color: #b35900;"
+        self._engine_version_label.setText(text)
+        self._engine_version_label.setStyleSheet(style)
 
     def _download_binaries(self) -> None:
         if self._manifest_thread is not None and self._manifest_thread.isRunning():
@@ -441,9 +541,10 @@ class SettingsDialog(QDialog):
         self._manifest_thread.error.connect(self._on_download_err)
         self._manifest_thread.start()
 
-    def _on_manifest_ready(self, manifest: dict, asset: dict) -> None:
+    def _on_manifest_ready(self, manifest: dict, asset: dict, eula_text: str = "") -> None:
         version = manifest.get("version", "?")
-        eula_url = manifest.get("eula_url", "")
+        self._available_version = str(manifest.get("version", "")) or None
+        eula_url = manifest.get("eula_url", "") or eula.EULA_URL
 
         # Advisory: the engine release may want a newer plugin. Allow proceeding.
         if binary_manager.is_plugin_outdated(manifest.get("min_plugin_version")):
@@ -456,7 +557,7 @@ class SettingsDialog(QDialog):
             )
 
         # Mandatory consent to the proprietary engine EULA before any download.
-        if not self._confirm_engine_download(version, eula_url):
+        if not self._confirm_engine_download(version, eula_url, eula_text):
             self._btn_download.setEnabled(True)
             self._refresh_binary_status()
             return
@@ -471,13 +572,21 @@ class SettingsDialog(QDialog):
         self._download_thread.finished_err.connect(self._on_download_err)
         self._download_thread.start()
 
-    def _confirm_engine_download(self, version: str, eula_url: str) -> bool:
+    def _confirm_engine_download(
+        self, version: str, eula_url: str, eula_text: str = ""
+    ) -> bool:
         """Modal consent dialog for the proprietary Aether engine download.
 
-        Nothing about the consent is persisted — it is requested every time.
+        Shows a highlighted key-points summary (``core.eula.KEY_POINTS``) and
+        below it the canonical EULA text fetched from *eula_url*, which
+        governs. Consent is requested every time; the accepted EULA version is
+        recorded in settings.
         """
+        text_version = eula.parse_eula_version(eula_text) if eula_text else None
+
         dlg = QDialog(self)
         dlg.setWindowTitle("Download Aether engine")
+        dlg.resize(680, 640)
         vbox = QVBoxLayout(dlg)
 
         msg = QLabel(
@@ -486,14 +595,52 @@ class SettingsDialog(QDialog):
             f"The Aether engine is closed-source software, separate from this "
             f"GPL-licensed plugin, and is provided under its own End User "
             f"License Agreement (EULA). By choosing <b>Accept &amp; Download</b> "
-            f"you agree to that EULA."
+            f"you agree to that EULA"
+            + (f" (version {text_version})." if text_version else ".")
         )
         msg.setWordWrap(True)
         msg.setTextFormat(Qt.TextFormat.RichText)
         vbox.addWidget(msg)
 
+        points = QLabel(eula.key_points_html())
+        points.setWordWrap(True)
+        points.setTextFormat(Qt.TextFormat.RichText)
+        points.setStyleSheet(
+            "QLabel { background-color: #fff4ce; color: #1f1f1f; "
+            "border: 1px solid #d9a400; border-radius: 4px; padding: 8px; }"
+        )
+        vbox.addWidget(points)
+
+        if text_version and text_version != eula.SUMMARY_EULA_VERSION:
+            note = QLabel(
+                f"Note: this summary was written for EULA version "
+                f"{eula.SUMMARY_EULA_VERSION}; the full text below is version "
+                f"{text_version} and governs."
+            )
+            note.setWordWrap(True)
+            note.setStyleSheet("color: #b35900;")
+            vbox.addWidget(note)
+
+        if eula_text:
+            full = QTextBrowser()
+            full.setOpenExternalLinks(True)
+            if hasattr(full, "setMarkdown"):
+                full.setMarkdown(eula_text)
+            else:
+                full.setPlainText(eula_text)
+            full.setMinimumHeight(260)
+            vbox.addWidget(full, 1)
+        else:
+            missing = QLabel(
+                "The full EULA text could not be loaded here. Please read it "
+                "using the link below before accepting — the full text governs."
+            )
+            missing.setWordWrap(True)
+            missing.setStyleSheet("color: #b35900;")
+            vbox.addWidget(missing)
+
         if eula_url:
-            link = QLabel(f'<a href="{eula_url}">Read the Aether engine EULA</a>')
+            link = QLabel(f'<a href="{eula_url}">Open the Aether engine EULA in your browser</a>')
             link.setTextFormat(Qt.TextFormat.RichText)
             link.setOpenExternalLinks(True)
             vbox.addWidget(link)
@@ -505,7 +652,13 @@ class SettingsDialog(QDialog):
         buttons.rejected.connect(dlg.reject)
         vbox.addWidget(buttons)
 
-        return dlg.exec() == QDialog.DialogCode.Accepted
+        accepted = dlg.exec() == QDialog.DialogCode.Accepted
+        if accepted:
+            eula.record_acceptance(
+                text_version
+                or f"{eula.SUMMARY_EULA_VERSION} (summary shown; full text not loaded)"
+            )
+        return accepted
 
     def _on_download_ok(self, result_dir: str) -> None:
         self._download_progress.setVisible(False)
@@ -526,6 +679,9 @@ class SettingsDialog(QDialog):
     def _refresh_binary_status(self) -> None:
         """Update the binary-status and prerequisites labels."""
         binary_dir = self._binary_dir_edit.text().strip()
+
+        if hasattr(self, "_engine_version_label"):
+            self._refresh_engine_version()
 
         if not binary_dir or not os.path.isdir(binary_dir):
             self._binary_status_label.setText("Binaries: Missing")

@@ -116,6 +116,18 @@ class AetherMainDialog(QDialog):
         self.tabs.setCurrentWidget(self.help_tab)
         self.help_tab.show_topic(anchor)
 
+    def show_engine_settings(self, start_download: bool = False) -> None:
+        """Bring the Settings tab (engine section) to the front.
+
+        With *start_download* the engine download flow starts at once — it
+        still fetches the signed manifest and asks for EULA consent first.
+        Used by the startup notices and the "Update engine" button on run
+        errors (``gui.engine_notices``).
+        """
+        self.tabs.setCurrentWidget(self.settings_tab)
+        if start_download:
+            self._settings_widget.start_engine_download()
+
     # ------------------------------------------------------------------
     # UI construction
     # ------------------------------------------------------------------

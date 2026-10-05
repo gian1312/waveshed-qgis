@@ -1,7 +1,8 @@
 """The Waveshed help text — one HTML fragment per topic.
 
-Plain data: no Qt, no QGIS, no imports from the rest of the plugin, so the
-whole document can be checked by the test suite. Every control is quoted with
+Plain data: no Qt, no QGIS, and no imports from the rest of the plugin except
+the stdlib-only ``core.site_links`` (page URLs), so the whole document can be
+checked by the test suite. Every control is quoted with
 the exact label the code gives it, so a reader can find it in the dialog.
 
 Keep this in step with the code. The tests in ``tests/test_help_content.py``
@@ -14,6 +15,10 @@ the help wrong.
 from __future__ import annotations
 
 from typing import List, NamedTuple, Tuple
+
+# The one pure-stdlib module this file uses: page links carry the site's
+# preview flag, and that must stay in a single place (core/site_links.py).
+from ..core.site_links import GET_KEY_URL
 
 
 class Topic(NamedTuple):
@@ -125,21 +130,41 @@ GeoTIFF.</td><td>No</td></tr>
 
 <h3>Installing</h3>
 <ol>
-<li>Open the <b>Settings</b> tab and press <b>Download Binaries</b>.</li>
+<li>Open the <b>Settings</b> tab and press <b>Download Binaries</b>. On a QGIS
+start without an engine, a notice in the message bar has an <b>Open
+Settings</b> button that takes you there; nothing is ever downloaded without
+this step.</li>
 <li>The plugin fetches the release manifest from
-<a href="https://waveshed.io/releases/latest.json">waveshed.io/releases/latest.json</a>,
-picks the asset for your platform, and shows the <b>Download Aether engine</b>
-consent dialog naming the version, with a link to the EULA. Nothing is
-downloaded before you press <b>Accept &amp; Download</b>, and the consent is
-asked again every time (it is never remembered).</li>
+<a href="https://waveshed.io/releases/latest.json">waveshed.io/releases/latest.json</a>
+and checks its <b>signature</b> against the Waveshed release key built into
+the plugin. A manifest with a bad or unknown signature is refused; only
+releases up to engine 0.4.7, published before signing, may come unsigned.
+It then picks the asset for your platform (archives are accepted only from
+<code>releases.waveshed.io</code>) and shows the <b>Download Aether engine</b>
+consent dialog naming the version. It shows a highlighted <b>Key points</b>
+summary (non-commercial use only; commercial, governmental and organisational
+use needs written permission; model output, no warranty, no liability) and
+below it the full EULA text, which governs — the summary is not exhaustive.
+Nothing is downloaded before you press <b>Accept &amp; Download</b>, and the
+consent is asked again every time; the plugin only records which EULA version
+you accepted.</li>
 <li>The archive is verified against the manifest's <b>SHA-256</b> before it is
 extracted. A missing, placeholder or mismatched digest aborts the install —
 this is fail-closed by design.</li>
-<li>Binaries are extracted to the <b>Binary directory:</b> you set, or to
-<code>~/.aether/bin</code>. On Linux/macOS they are made executable; on macOS
-the Gatekeeper quarantine attribute is cleared, on Windows the
-Mark-of-the-Web.</li>
+<li>The archive is unpacked into a staging folder inside the <b>Binary
+directory:</b> you set (or <code>~/.aether/bin</code>). There all three
+binaries must be present, are made executable (Linux/macOS), have the macOS
+Gatekeeper quarantine attribute or the Windows Mark-of-the-Web cleared, and
+<code>aether_core --version</code> must report the version the manifest
+promised. Only then are the files swapped into place — all or nothing, so a
+failed install leaves the previous engine untouched. Other files in that
+folder (for example a <code>license.key</code>) are never touched.</li>
 </ol>
+<p><b>macOS:</b> the engine is ad-hoc signed and not notarized. The plugin
+clears the download quarantine on every start and whenever you pick a folder
+with <b>Browse...</b> or <b>Auto-detect</b>, so a copy you unzipped from a
+browser download works too. If macOS still refuses to run it, the error shows
+the fix: <code>xattr -cr "&lt;engine folder&gt;"</code> in Terminal.</p>
 <p>Supported platforms: <b>Windows x64</b>, <b>Linux x64</b>,
 <b>macOS arm64</b> (Apple Silicon). Intel macOS is not supported.</p>
 
@@ -160,15 +185,18 @@ in. A partially populated directory is skipped, not half-used.</p>
 <p><code>aether_core</code> needs a key; the converter and the exporter do not.
 Paste it into <b>API key:</b> in Settings and press <b>Save</b> — the status
 line turns into <b>&check; Key saved</b>. <b>Get API Key</b> opens
-<a href="https://waveshed.io/downloads">waveshed.io/downloads</a>. The key is
+<a href="{GET_KEY_URL}">waveshed.io/get-key</a>, the page that issues free
+keys for non-commercial use. The key is
 stored in QGIS settings under <code>waveshed/api_key</code> and passed to the
 engine as the <code>AETHER_LICENSE</code> environment variable at launch.</p>
 <p>The plugin checks the key <i>structurally</i> only: valid Base58 (Bitcoin
-alphabet) text whose payload decodes to 84 bytes (v1) or 116 bytes (v2,
-machine-locked) — roughly 115&ndash;160 characters. Whitespace picked up from a
-wrapped terminal copy is stripped automatically. The Ed25519 signature itself is
-verified inside the engine, so a structurally valid but unsigned key fails at
-run time, not in the dialog.</p>
+alphabet) text whose payload decodes to a 188-byte licence of format v3
+(about 257 characters), with a known licence type and a sane expiry. Keys of
+the retired v1/v2 formats are recognised and rejected with a clear message.
+Whitespace picked up from a wrapped terminal copy is stripped automatically.
+The Ed25519 signature, the machine lock and revocation are verified inside the
+engine, so a structurally valid but unsigned key fails at run time, not in the
+dialog.</p>
 
 <h3>Machine fingerprint</h3>
 <p>A machine-locked (node-locked) key is issued against this computer's
@@ -180,15 +208,24 @@ Send that value when requesting a locked key. Engine builds older than
 the engine.</p>
 
 <h3>Engine updates</h3>
-<p>Press <b>Download Binaries</b> again: the manifest always describes the
-latest release, and the new files overwrite the old ones in the same
-directory. The installed version is remembered under
+<p>Once per QGIS session the plugin compares the installed engine with the
+signed manifest in the background; when a newer release exists it shows one
+notice per release with an <b>Update</b> button. Switch this off with
+<b>Check for engine updates when QGIS starts</b> in Settings; offline it stays
+silent. <b>Check for updates</b> in Settings does the same on demand and shows
+<b>Installed engine</b> / <b>Latest release</b>. <b>Update</b> (or <b>Download
+Binaries</b>) runs the normal install — EULA consent included — and swaps the
+new engine in only after it has been verified (see above). On Windows, close
+running analyses first: an engine that is still running is detected and the
+update is refused, leaving the old engine in place. An analysis that fails
+because the engine is too old offers <b>Update engine</b> in its error
+message. The installed version is remembered under
 <code>waveshed/installed_engine_version</code>. If the manifest declares a
 <code>min_plugin_version</code> newer than the installed plugin you get an
 advisory <b>Plugin update recommended</b> warning and can still continue.
 Some engine defects are fixed only by updating — see
 <a href="#troubleshooting">Troubleshooting</a>.</p>
-"""
+""".replace("{GET_KEY_URL}", GET_KEY_URL)
 
 # ---------------------------------------------------------------------------
 # Modes / models
@@ -956,6 +993,11 @@ binaries live.</li>
 <a href="#install">Installing the engine</a> and fill the field in.</li>
 <li><b>Download Binaries</b> — fetch and install the latest engine after EULA
 consent.</li>
+<li><b>Check for updates</b> — compare the installed engine with the latest
+release; the line below shows <b>Installed engine</b> / <b>Latest
+release</b>.</li>
+<li><b>Check for engine updates when QGIS starts</b> — the once-per-session
+background check (on by default).</li>
 <li>The status line reads <b>Binaries: Found (3/3)</b> in green or
 <b>Binaries: Missing</b> in red, and an orange line below reports platform
 prerequisites (for example missing Vulkan drivers on Linux).</li>
@@ -1548,6 +1590,20 @@ proprietary, closed-source software distributed by Waveshed under their own End
 User License Agreement, shown for acceptance before every download. The GPL
 does not apply to them, and running them needs an API key from
 <a href="https://waveshed.io">waveshed.io</a>.</p>
+<p>The engine EULA grants <b>non-commercial use only</b> (private/personal,
+hobby, and education or research by individuals). <b>Commercial, governmental
+and organisational use</b> — companies, public bodies, NGOs, associations and
+other organisations — requires the author's prior written permission
+(info@waveshed.io).</p>
+
+<h3>Model output, no liability</h3>
+<p>Results are outputs of a radio propagation <b>model</b>: approximations, not
+measurements, and not a guarantee of real-world coverage or link performance.
+Do not rely on them for safety-of-life, regulatory, planning or financial
+decisions without independent verification. To the maximum extent permitted by
+law, the author accepts no liability for anything arising from their use. (For
+the plugin itself this is an informational notice; it adds no restriction to
+the GPL.)</p>
 
 <h3>Data the plugin downloads on your behalf</h3>
 <p>These datasets keep their own licences; several require attribution wherever

@@ -6,7 +6,7 @@ version=0.3.0
 author=Gian-Andrea Heinrich
 email=info@waveshed.io
 description=RF propagation analysis (coverage, point-to-point) powered by the Aether GPU engine.
-about=Waveshed provides RF propagation analysis for QGIS - area coverage (Site Analysis) and point-to-point link budgets - using LOS and ITM (Longley-Rice) models. All computation is performed by the proprietary Aether engine, a separate closed-source GPU binary that is NOT bundled with this plugin. The engine is downloaded on demand from https://waveshed.io through the plugin's Download dialog (an explicit, user-initiated action) and is licensed under its own EULA, shown for acceptance before download. Running analyses additionally requires an API key obtained from https://waveshed.io. Supported engine platforms: Windows x64, Linux x64, and macOS arm64.
+about=Waveshed provides RF propagation analysis for QGIS - area coverage (Site Analysis) and point-to-point link budgets - using LOS and ITM (Longley-Rice) models. All computation is performed by the proprietary Aether engine, a separate closed-source GPU binary that is NOT bundled with this plugin. The engine is downloaded on demand from https://waveshed.io through the plugin's Download dialog (an explicit, user-initiated action) and is licensed under its own EULA, shown for acceptance before download; the engine EULA permits non-commercial use only (commercial, governmental and organisational use requires prior written permission). Results are outputs of a propagation model - approximations, not measurements - and must not be relied on for safety-of-life, regulatory, planning or financial decisions without independent verification; no liability is accepted to the maximum extent permitted by law. Running analyses additionally requires an API key obtained from https://waveshed.io. Supported engine platforms: Windows x64, Linux x64, and macOS arm64.
 tracker=https://github.com/gian1312/waveshed-qgis/issues
 repository=https://github.com/gian1312/waveshed-qgis
 homepage=https://waveshed.io
@@ -15,6 +15,26 @@ tags=rf,propagation,radio,coverage,p2p,gpu,terrain,ITM,LOS,waveshed
 category=Analysis
 icon=resources/icon.png
 changelog=0.3.0
+    - Engine downloads are verified end to end: the release manifest must
+      carry a valid signature from the Waveshed release key (releases up to
+      engine 0.4.7 predate signing and are still accepted), and engine
+      archives are only accepted from releases.waveshed.io.
+    - Engine updates are all-or-nothing: the new engine is unpacked and
+      test-started next to the old one and only then swapped in. A failed or
+      interrupted update leaves the previous engine working; on Windows an
+      engine that is still running is detected and the update is refused.
+    - First start without an engine shows a notice with a button to Settings.
+      Once per QGIS session the plugin checks for a newer engine and shows a
+      notice (once per release) with an "Update" button; the check can be
+      switched off in Settings. Settings shows the installed and the latest
+      engine version and has a "Check for updates" button.
+    - An analysis that fails because the engine is too old or missing now
+      offers "Update engine" / "Open Settings" right in the error message.
+    - macOS: engine folders chosen with Browse or Auto-detect (for example a
+      browser download) are made executable and cleared of the download
+      quarantine, as on every plugin start; if macOS still blocks the engine,
+      the error names the one Terminal command that fixes it.
+    - The plugin is no longer marked experimental.
     - "Minimum LOS Altitude" is now "LOS Floor" everywhere in the UI. The
       Processing wire value stays MIN_ALT, so saved models keep working.
     - Built-in Help: a searchable Help tab (last tab of the dialog), a
@@ -50,6 +70,6 @@ changelog=0.3.0
       complete, which produced coverage with silent gaps.
     0.1.0
     - Initial experimental release.
-experimental=True
+experimental=False
 deprecated=False
 hasProcessingProvider=yes

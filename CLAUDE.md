@@ -124,7 +124,11 @@ Defined in `aether_converter/src/ingest.rs` (contract v2.0):
 - `api_key.txt` - User API keys
 - Any `*.key` files
 
-These are covered by `.gitignore`. The plugin only embeds the **public** verification key.
+These are covered by `.gitignore`. The plugin embeds no licence key at all —
+licence signatures, node-lock and revocation are verified by the engine. The
+only key it carries is the **public** release-manifest key in
+`waveshed/core/release_keys.py` (see Engine distribution); the matching private
+key lives in the AETHER vendor keys / CI secrets, never here.
 
 ## Code Conventions
 
@@ -147,7 +151,8 @@ These are covered by `.gitignore`. The plugin only embeds the **public** verific
   There are no exceptions — `core/api_key.py` validates keys structurally
   (Base58 charset + payload length) with the standard library alone; the
   Ed25519 signature is verified by the engine binary, so nothing imports
-  `nacl`. Keep it that way: a
+  `nacl`; the one signature the plugin checks itself (the release manifest)
+  goes through the pure-Python verifier `core/ed25519.py`. Keep it that way: a
   pip dependency is a support burden in a QGIS plugin, which cannot install one.
 
 ## Testing
@@ -158,6 +163,63 @@ pytest tests/ -v --tb=short
 
 Unit tests mock QGIS APIs. Integration tests require QGIS environment.
 
-## Build / Package
+## Engine distribution (binary_manager)
 
-Plugin is distributed as a ZIP for QGIS Plugin Manager (build with `python3 package.py` → `dist/waveshed.<version>.zip`). The Aether engine binaries are distributed separately via the waveshed.io release manifest (`https://waveshed.io/releases/latest.json`) and downloaded on demand by the plugin's Settings dialog.
+The engine is never bundled; Settings → Download Binaries fetches it on demand
+after EULA consent (asked every time). Rules, all in `core/binary_manager.py`:
+
+- **Signed manifest.** `fetch_manifest` is the only way any code gets a
+  manifest (Download, the startup update check, Check for updates). It checks
+  `https://releases.waveshed.io/manifests/v<version>/latest.json.sig`
+  (JSON `{alg: ed25519, context: waveshed-manifest-v1, public_key, signature}`)
+  over `b"waveshed-manifest-v1\0" + the exact manifest bytes` — the
+  waveshed.io relay serves them verbatim. Valid + trusted key → ok; bad /
+  untrusted / malformed → refuse; HTTP 404 → allowed only for versions
+  `<= LAST_UNSIGNED_ENGINE` (0.4.7, published before signing; never raise it);
+  any other fetch error → refuse. The version must be X.Y.Z before it is put
+  in the URL.
+- **Trusted keys** live in `core/release_keys.py` (`MANIFEST_PUBLIC_KEYS`,
+  64-hex strings). That file is rewritten by the AETHER release GUI — keep the
+  documented tuple format. Empty tuple = every signed manifest refused;
+  `package.py --release` refuses to build then. Rotation = ship the new key
+  next to the old one first.
+- **Host pin.** Asset URLs must start with `https://releases.waveshed.io/`.
+- **Staged, all-or-nothing install.** The archive is SHA-256-checked
+  (fail-closed), extracted into `<target>/.waveshed-staging-*`, must contain
+  all three binaries, gets `chmod +x` + quarantine clearing + `revocation.bin`,
+  and `aether_core --version` must report the manifest version. Only then
+  `_install_staged` swaps files in (backup-rename, move, roll back on any
+  error; Windows refuses up front when a binary is locked by a running job).
+  Files the archive does not contain (`license.key`) are never touched;
+  leftovers are removed by the next install.
+- **macOS: no notarization, by decision.** The ad-hoc-signed engine runs once
+  the download quarantine is cleared. Like MPT_SIGMA, `prepare_engine_dir`
+  (`chmod +x` + `xattr -cr`) runs at plugin load, after Browse/Auto-detect,
+  and before every `--version` probe; a Gatekeeper-looking failure gets the
+  `xattr -cr "<dir>"` hint (`macos_launch_hint`).
+- **Notices** (`gui/engine_notices.py`): first start without an engine →
+  message bar with "Open Settings"; once per session (switch
+  `waveshed/engine_update_check`, default on; silent offline) a newer release
+  → one notice per version (`waveshed/engine_update_notified_version`) with
+  "Update" → Settings download flow. Run errors that say "Settings →
+  Download binaries" get an "Update engine" / "Open Settings" button
+  (`show_run_error`). Nothing ever downloads without the consent dialog.
+
+## Build / Package / Release
+
+Plugin is distributed as a ZIP (build with `python3 package.py` →
+`dist/waveshed.<version>.zip`; `--release` additionally requires public
+metadata URLs and a trusted manifest key).
+
+Release = push tag `v<metadata version>`. `.github/workflows/release.yml` runs
+the full test suite (distro Python + python3-gdal, so nothing is skipped for
+want of GDAL), `package.py --release`, `tools/make_plugin_repo.py` (writes
+`plugins.xml` + `latest.json` from the metadata *inside* the ZIP), uploads to
+R2 `waveshed-releases` — `qgis/waveshed.<V>.zip` (immutable, never
+overwritten), then `qgis/latest.json`, then `qgis/plugins.xml` — and waits
+until `https://waveshed.io/qgis/latest.json` / `plugins.xml` (AETHER_Web
+relays) serve the new version, then re-downloads the ZIP and checks its
+SHA-256. Secrets: `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY`, `R2_S3_ENDPOINT`.
+`workflow_dispatch` is a dry run (no upload). QGIS users add
+`https://waveshed.io/qgis/plugins.xml` as a plugin repository; plugins.qgis.org
+is the later, separate channel.

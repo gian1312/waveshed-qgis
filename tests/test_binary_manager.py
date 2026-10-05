@@ -462,7 +462,7 @@ class TestManifestCannotChooseAPath(unittest.TestCase):
                 with self.assertRaises(RuntimeError):
                     bm.download_engine(
                         {"version": "0.4.2"},
-                        {"url": "https://waveshed.io/a.zip",
+                        {"url": "https://releases.waveshed.io/a.zip",
                          "filename": filename},
                         target_dir=target,
                     )
@@ -495,6 +495,58 @@ class TestManifestCannotChooseAPath(unittest.TestCase):
         self.assertEqual(os.path.dirname(captured["dest"]),
                          tempfile.gettempdir())
 
+
+def _revocation_blob(key_id: int = 0, seq: int = 3, ids=(b"\x11" * 16,)) -> bytes:
+    body = seq.to_bytes(4, "big") + len(ids).to_bytes(2, "big") + b"".join(ids)
+    return bytes([key_id]) + body + b"\x5a" * 64
+
+
+class TestWriteRevocationFile(unittest.TestCase):
+    """manifest["revocation"] -> revocation.bin next to aether_core, fail-soft."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.dir = self._tmp.name
+        self.path = os.path.join(self.dir, bm.REVOCATION_FILE)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _manifest(self, rev):
+        m = dict(MANIFEST)
+        if rev is not None:
+            m["revocation"] = rev
+        return m
+
+    def test_writes_decoded_blob(self):
+        import base64
+        blob = _revocation_blob()
+        rev = {"key_id": 0, "seq": 3, "blob": base64.b64encode(blob).decode()}
+        self.assertEqual(bm.write_revocation_file(self._manifest(rev), self.dir), self.path)
+        with open(self.path, "rb") as fh:
+            self.assertEqual(fh.read(), blob)
+
+    def test_absent_field_is_a_noop(self):
+        self.assertIsNone(bm.write_revocation_file(self._manifest(None), self.dir))
+        self.assertFalse(os.path.exists(self.path))
+
+    def test_malformed_values_never_raise_and_keep_existing_file(self):
+        import base64
+        with open(self.path, "wb") as fh:
+            fh.write(b"old")
+        good = base64.b64encode(_revocation_blob()).decode()
+        for rev in (
+            "not a dict",
+            {"seq": 3},                                       # no blob
+            {"blob": "***not base64***"},
+            {"blob": base64.b64encode(b"short").decode()},
+            {"blob": base64.b64encode(_revocation_blob() + b"x").decode()},  # bad length
+            {"key_id": 4, "seq": 3, "blob": good},            # key_id mismatch
+            {"key_id": 0, "seq": 9, "blob": good},            # seq mismatch
+        ):
+            self.assertIsNone(bm.write_revocation_file(self._manifest(rev), self.dir), rev)
+        with open(self.path, "rb") as fh:
+            self.assertEqual(fh.read(), b"old")
 
 if __name__ == "__main__":
     unittest.main()

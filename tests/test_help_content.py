@@ -260,6 +260,7 @@ class TestCoversTheUI:
         "Inspect .abt...", "Download Buildings...",
         # Settings
         "Download Binaries", "Auto-detect", "Show machine fingerprint",
+        "Check for updates", "Check for engine updates when QGIS starts",
         "Max VRAM budget (GB):", "Max RAM budget (GB):",
         "Download connections:", "Local terrain dir:", "Terrain cache:",
         # Altitude Explorer

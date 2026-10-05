@@ -71,6 +71,32 @@ Running list of follow-up work. Keep items short; link to the code site.
 
 ## Publishing (plugins.qgis.org)
 
+Interim channel (2026-10-05): the custom repository
+`https://waveshed.io/qgis/plugins.xml` + the ZIP on `/downloads`, published by
+`.github/workflows/release.yml` on a `v*` tag (see CLAUDE.md "Build / Package
+/ Release"). plugins.qgis.org stays the target.
+
+- [x] **Release workflow + custom repository listing.** Done 2026-10-05:
+  `tools/make_plugin_repo.py` (plugins.xml + latest.json from the metadata in
+  the ZIP), R2 `qgis/` upload, live check through the waveshed.io relays.
+  `experimental=False`.
+- [ ] **First tag needs owner action:** make `github.com/gian1312/waveshed-qgis`
+  public (and point the `qgis_plugin` remote there — `package.py --release`
+  checks the metadata URLs answer 200), add the three `R2_*` secrets to this
+  repository, and put the release manifest public key into
+  `waveshed/core/release_keys.py` (the AETHER release GUI writes it;
+  `--release` refuses an empty key list).
+
+- [ ] **TODO(release): remove `?prv` before publication.** Every link to a
+  preview-gated waveshed.io page (`/get-key` behind **Get API Key**, the
+  `/get-key` link in Help → Installing, and anything built with
+  `site_page_url`) carries `?prv` from ONE place:
+  `PREVIEW_QUERY` in `waveshed/core/site_links.py`. Set it to `""` once
+  `/downloads` and `/get-key` are public, and flip the pins in
+  `tests/test_site_links.py`. `package.py` prints a loud `WARNING` block (the ZIP
+  is still built) while any packaged text file contains `?prv`. The machine
+  URLs (release manifest, EULA text) are not gated and never carry the flag.
+
 - [x] **Runtime data attribution.** Done. `core/attribution.py` is the single
   source of credit for every dataset the plugin fetches (Mapzen/Terrarium,
   OpenFreeMap, Copernicus, swisstopo), shown in Settings under "Data sources"
@@ -291,7 +317,9 @@ carried the buildings marker, the plugin's copy did not.
   <version>` at the start of every Site Analysis, P2P and Processing run. Options, cheapest first: have the plugin
   log the engine path + build identity on every run (path is logged now, build
   identity is not); add a version/date line to `Settings → Download` showing
-  what is staged versus what the manifest offers; or have the pipeline's
+  what is staged versus what the manifest offers (done 2026-10-05: Settings
+  shows "Installed engine / Latest release", plus a startup update notice);
+  or have the pipeline's
   Distribute action also refresh `~/.aether/bin` when a local deploy is
   already present.
 - [x] **Give the engine a queryable version.** Done 2026-09-22: `aether_core`

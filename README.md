@@ -14,17 +14,20 @@ configurations, invokes the engine, and loads results back into QGIS.
 
 ## Installation
 
-### From the QGIS Plugin Manager (recommended)
+### From the Waveshed plugin repository (recommended)
 
-1. In QGIS, open **Plugins → Manage and Install Plugins…**
-2. Search for **Waveshed** and click **Install Plugin**.
+1. In QGIS, open **Plugins → Manage and Install Plugins… → Settings**.
+2. Under **Plugin Repositories** click **Add…**, name it `Waveshed` and enter
+   the URL `https://waveshed.io/qgis/plugins.xml`.
+3. Go to **All**, search for **Waveshed** and click **Install Plugin**.
+   QGIS offers updates from the same repository from then on.
 
-Because this is an experimental release, enable
-**Settings → Show also experimental plugins** in the Plugin Manager first.
+(Publication on plugins.qgis.org follows; until then the plugin is not in the
+default QGIS repository.)
 
 ### From a ZIP
 
-1. Download the latest `waveshed.<version>.zip`.
+1. Download the latest `waveshed.<version>.zip` (https://waveshed.io/downloads).
 2. In QGIS, open **Plugins → Manage and Install Plugins… → Install from ZIP**.
 3. Select the downloaded ZIP and click **Install Plugin**.
 
@@ -62,7 +65,16 @@ PARTICULAR PURPOSE. See the [`LICENSE`](LICENSE) file for the full GPL-2.0 text.
 **The Aether engine binaries are not part of this program.** They are separate,
 proprietary software distributed by Waveshed under their own End User License
 Agreement, downloaded from [waveshed.io](https://waveshed.io). The GPL does not
-apply to the Aether engine.
+apply to the Aether engine. The engine EULA permits **non-commercial use only**;
+commercial, governmental and organisational use requires prior written
+permission (info@waveshed.io).
+
+**Model output, no liability.** Results are outputs of a radio propagation
+model — approximations, not measurements or guarantees. Do not rely on them for
+safety-of-life, regulatory, planning or financial decisions without independent
+verification. To the maximum extent permitted by law, the author accepts no
+liability for anything arising from their use. (This notice adds no restriction
+to the GPL.)
 
 ## Links
 

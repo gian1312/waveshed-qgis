@@ -93,6 +93,7 @@ from ..core.terrain_adapter import (
     terrain_plan,
     terrain_size_warning,
 )
+from .engine_notices import show_run_error
 from .height_inputs import MIN_AMSL_M, bind_height_mode
 from .map_tools import activate_point_capture
 
@@ -1522,7 +1523,7 @@ class SiteAnalysisTab(QWidget):
         # error. Blocking, not advisory — the run cannot succeed.
         engine_warning = binaries_warning()
         if engine_warning:
-            QMessageBox.critical(self, "Aether engine not found", engine_warning)
+            show_run_error(self, "Aether engine not found", engine_warning)
             return
 
         # Refresh asset cache before building jobs so latest data is used.
@@ -1740,7 +1741,7 @@ class SiteAnalysisTab(QWidget):
 
     def _on_finished_err(self, message: str) -> None:
         self._reset_run_ui()
-        QMessageBox.critical(self, "Analysis Failed", message)
+        show_run_error(self, "Analysis Failed", message)
 
     # ==================================================================
     # Cancel (called by parent dialog if needed)

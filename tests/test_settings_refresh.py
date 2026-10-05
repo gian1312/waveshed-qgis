@@ -100,6 +100,17 @@ class _FakeCombo(QtWidgets.QComboBox):
         self.current = self.items[idx] if 0 <= idx < len(self.items) else ""
 
 
+class _FakeCheck:
+    def __init__(self, checked=True):
+        self.checked = checked
+
+    def isChecked(self):
+        return self.checked
+
+    def setChecked(self, v):
+        self.checked = v
+
+
 def _settings_dialog(binary_dir="", cache_dir="/c", terrain_dir=""):
     dlg = SettingsDialog.__new__(SettingsDialog)
     dlg._settings = QgsSettings()
@@ -112,6 +123,9 @@ def _settings_dialog(binary_dir="", cache_dir="/c", terrain_dir=""):
     dlg._api_key_edit = _FakeLineEdit("")
     dlg._binary_status_label = _FakeLabel()
     dlg._prereq_label = _FakeLabel()
+    dlg._update_check_box = _FakeCheck(True)
+    dlg._engine_version_label = _FakeLabel()
+    dlg._available_version = None
     return dlg
 
 
