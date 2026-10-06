@@ -83,9 +83,66 @@ jobs:
         run: |
           set -euo pipefail
           ZIP="waveshed.${VERSION}.zip"
-          if aws s3api head-object --bucket waveshed-releases --key "qgis/${ZIP}" \
-               --endpoint-url "${ENDPOINT}" >/dev/null 2>&1; then
+
+          # Diagnostics first: a wrong secret must fail here with its real cause,
+          # never as a bare NoSuchBucket from the first upload. Only shapes and
+          # lengths are printed -- no secret value, no account id.
+          /usr/bin/python3 - <<'PY'
+          import os, re, sys
+          from urllib.parse import urlsplit
+          ep = os.environ.get("ENDPOINT", "")
+          kid = os.environ.get("AWS_ACCESS_KEY_ID", "")
+          sec = os.environ.get("AWS_SECRET_ACCESS_KEY", "")
+          problems = []
+          u = urlsplit(ep.strip())
+          host = u.hostname or ""
+          if not ep:
+              problems.append("R2_S3_ENDPOINT is empty (aws would silently fall back to Amazon S3)")
+          if ep != ep.strip():
+              problems.append("R2_S3_ENDPOINT has leading/trailing whitespace or a newline")
+          if u.scheme != "https":
+              problems.append(f"R2_S3_ENDPOINT scheme is {u.scheme or '(none)'!r}, expected https")
+          if not host.endswith(".r2.cloudflarestorage.com"):
+              problems.append("R2_S3_ENDPOINT host is not *.r2.cloudflarestorage.com")
+          if u.path not in ("", "/"):
+              problems.append("R2_S3_ENDPOINT has a path -- remove the bucket name after .com")
+          jurisdiction = "eu" if ".eu.r2." in host else ("fedramp" if ".fedramp.r2." in host else "default")
+          account = host.split(".")[0] if host else ""
+          print(f"endpoint: scheme={u.scheme or '(none)'}, jurisdiction={jurisdiction}, account id {len(account)} chars "
+                f"({'32 hex' if re.fullmatch(r'[0-9a-f]{32}', account) else 'NOT 32 lowercase hex'}), "
+                f"path={'none' if u.path in ('', '/') else 'PRESENT'}")
+          print(f"access key id: {len(kid)} chars ({'32 hex, R2 shape' if re.fullmatch(r'[0-9a-f]{32}', kid) else 'not the 32-hex R2 shape'})"
+                f"; secret: {len(sec)} chars ({'64 hex, R2 shape' if re.fullmatch(r'[0-9a-f]{64}', sec) else 'not the 64-hex R2 shape'})")
+          if kid != kid.strip() or sec != sec.strip():
+              problems.append("an R2 key secret has leading/trailing whitespace or a newline")
+          for p in problems:
+              print(f"::error::{p}")
+          sys.exit(1 if problems else 0)
+          PY
+
+          # Can these credentials see the bucket at all? List one key under qgis/
+          # (Object Read is enough). Print R2's own error instead of hiding it.
+          if ! out=$(aws s3api list-objects-v2 --bucket waveshed-releases --prefix qgis/ --max-keys 1 \
+                 --endpoint-url "${ENDPOINT}" 2>&1); then
+            echo "${out}"
+            case "${out}" in
+              *NoSuchBucket*) echo "::error::R2 says bucket waveshed-releases does not exist for this endpoint + key pair. The bucket is in the EU jurisdiction: the endpoint must be https://<account-id>.eu.r2.cloudflarestorage.com, and the token must belong to the same account and cover that bucket." ;;
+              *AccessDenied*|*Unauthorized*|*InvalidAccessKeyId*|*SignatureDoesNotMatch*) echo "::error::R2 rejected the key pair (wrong/rotated token, or a token from another account)." ;;
+              *) echo "::error::Could not list waveshed-releases/qgis/ (see the R2 error above)." ;;
+            esac
+            exit 1
+          fi
+          echo "bucket reachable: listed waveshed-releases/qgis/ OK"
+
+          # Published ZIPs are immutable. Only a real 404 means "not there yet";
+          # any other error stops here with its message.
+          if out=$(aws s3api head-object --bucket waveshed-releases --key "qgis/${ZIP}" \
+                 --endpoint-url "${ENDPOINT}" 2>&1); then
             echo "::error::qgis/${ZIP} already exists in R2; published ZIPs are immutable. Bump the version."
+            exit 1
+          elif ! grep -qE '\(404\)|Not Found' <<<"${out}"; then
+            echo "${out}"
+            echo "::error::Could not check whether qgis/${ZIP} exists (see the R2 error above)."
             exit 1
           fi
           aws s3 cp "dist/${ZIP}" "s3://waveshed-releases/qgis/${ZIP}" \
