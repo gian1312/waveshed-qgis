@@ -1283,18 +1283,65 @@ def probe_engine_version(binary_dir: str, timeout: float = 5.0) -> Optional[str]
             [exe, "--version"],
             capture_output=True, text=True, timeout=timeout, check=False,
         )
-    except Exception:  # noqa: BLE001 — a probe must never take the run down
+    except subprocess.TimeoutExpired:
+        # A fresh .exe is often still being scanned by antivirus on its first
+        # launches; say so instead of silently reporting "unknown".
+        QgsMessageLog.logMessage(
+            f"aether_core --version did not answer within {timeout:g} s ({exe}); "
+            "the engine version is reported as unknown for now.",
+            TAG, Qgis.MessageLevel.Warning,
+        )
+        return None
+    except Exception as exc:  # noqa: BLE001 — a probe must never take the run down
+        QgsMessageLog.logMessage(
+            f"aether_core --version could not be started ({exe}): {exc}",
+            TAG, Qgis.MessageLevel.Warning,
+        )
         return None
     if result.returncode != 0:
         hint = macos_launch_hint(result.stderr or "", binary_dir,
                                  force=result.returncode < 0)
-        if hint:
-            QgsMessageLog.logMessage(
-                f"aether_core --version failed (exit {result.returncode}).{hint}",
-                TAG, Qgis.MessageLevel.Warning,
-            )
+        detail = (result.stderr or result.stdout or "").strip()[:300]
+        QgsMessageLog.logMessage(
+            f"aether_core --version failed (exit {result.returncode})"
+            f"{': ' + detail if detail else ''}.{hint}",
+            TAG, Qgis.MessageLevel.Warning,
+        )
         return None
-    return parse_engine_version(result.stdout)
+    version = parse_engine_version(result.stdout)
+    if version is None:
+        QgsMessageLog.logMessage(
+            f"aether_core --version gave no version line: {(result.stdout or '').strip()[:200]!r}",
+            TAG, Qgis.MessageLevel.Warning,
+        )
+    return version
+
+
+def installed_engine_version(binary_dir: Optional[str]) -> Optional[str]:
+    """Version of the engine in *binary_dir*: its own ``--version`` answer,
+    else the version recorded when Waveshed installed it into that same dir.
+
+    The recorded value is only trusted for the directory it was recorded for
+    (a hand-picked other directory may hold anything). It covers a probe that
+    timed out -- a freshly downloaded .exe being scanned by antivirus -- right
+    after an install whose version was already verified in staging.
+    """
+    if not binary_dir:
+        return None
+    probed = probe_engine_version(binary_dir)
+    if probed:
+        return probed
+    settings = QgsSettings()
+    recorded_dir = str(settings.value("waveshed/binary_dir", "") or "")
+    recorded = str(settings.value("waveshed/installed_engine_version", "") or "") or None
+    if recorded and recorded_dir and _same_dir(recorded_dir, binary_dir):
+        return recorded
+    return None
+
+
+def _same_dir(a: str, b: str) -> bool:
+    norm = lambda p: os.path.normcase(os.path.realpath(os.path.expanduser(p)))  # noqa: E731
+    return norm(a) == norm(b)
 
 
 def engine_supports_resolution(
@@ -1388,9 +1435,7 @@ def check_for_engine_update(fetch: Optional[HttpGet] = None) -> Optional[EngineU
     binary_dir = discover_binary_dir()
     if binary_dir is None:
         return None
-    installed = probe_engine_version(binary_dir) or (
-        str(QgsSettings().value("waveshed/installed_engine_version", "") or "") or None
-    )
+    installed = installed_engine_version(binary_dir)
     manifest = fetch_manifest(fetch=fetch)
     available = str(manifest["version"])
     newer = installed is None or compare_versions(available, installed) > 0

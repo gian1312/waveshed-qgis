@@ -510,7 +510,7 @@ class SettingsDialog(QDialog):
         installed = None
         if binary_dir and os.path.isdir(binary_dir) and binary_manager._dir_has_binary(
                 binary_dir, "aether_core"):
-            installed = binary_manager.probe_engine_version(binary_dir)
+            installed = binary_manager.installed_engine_version(binary_dir)
         available = self._available_version
         text = (f"Installed engine: {installed or 'unknown'}"
                 f"  /  Latest release: {available or 'not checked'}")

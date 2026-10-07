@@ -120,6 +120,11 @@ Interim channel (2026-10-05): the custom repository
 
 ## UI / UX
 
+- [ ] **Better P2P plots.** Requested 2026-10-06. The point-to-point profile
+  and link plots in `gui/p2p_tab.py` need a quality pass; capture what is
+  wanted (layout, labels/units, Fresnel and earth-curvature display,
+  readability, export) before changing them.
+
 - [ ] **Fix the layer legend.** Reported 2026-08-05. The legend QGIS shows for
   a loaded result does not read correctly — capture what it currently shows
   versus what it should (band values vs dB, ramp stops, units, the

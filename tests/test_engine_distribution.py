@@ -15,6 +15,7 @@ import json
 import os
 import shutil
 import stat
+import subprocess
 import tempfile
 import unittest
 import zipfile
@@ -412,6 +413,23 @@ class TestMacosPreparation(unittest.TestCase):
             self.assertEqual(bm.probe_engine_version("/x"), "0.4.8")
         self.assertEqual(order, ["prep", "run"])
 
+    def test_probe_failures_are_logged_not_silent(self):
+        cases = [
+            (subprocess.TimeoutExpired(["aether_core"], 5), "did not answer within 5 s"),
+            (OSError("Access is denied"), "could not be started"),
+            (mock.Mock(returncode=3, stdout="", stderr="licence trouble"), "exit 3): licence trouble"),
+            (mock.Mock(returncode=0, stdout="banner only\n", stderr=""), "no version line"),
+        ]
+        for outcome, needle in cases:
+            logged = []
+            run = {"side_effect": outcome} if isinstance(outcome, BaseException) else {"return_value": outcome}
+            with mock.patch.object(bm, "prepare_engine_dir"), \
+                    mock.patch.object(bm.subprocess, "run", **run), \
+                    mock.patch.object(bm.QgsMessageLog, "logMessage",
+                                      side_effect=lambda m, *a, **k: logged.append(m)):
+                self.assertIsNone(bm.probe_engine_version("/x"))
+            self.assertTrue(any(needle in m for m in logged), (needle, logged))
+
     def test_gatekeeper_kill_gets_the_xattr_command(self):
         with mock.patch.object(bm.platform, "system", return_value="Darwin"):
             hint = bm.engine_error_hint("zsh: killed: 9  aether_core")
@@ -466,6 +484,10 @@ class TestUpdateCheck(unittest.TestCase):
 
     def test_unknown_installed_version_falls_back_then_counts_as_old(self):
         QgsSettings().setValue("waveshed/installed_engine_version", "0.4.8")
+        QgsSettings().setValue("waveshed/binary_dir", "/elsewhere")
+        # Recorded for another directory: not evidence about /e.
+        self.assertTrue(self._check(None).update_available)
+        QgsSettings().setValue("waveshed/binary_dir", "/e")
         self.assertFalse(self._check(None).update_available)
         QgsSettings._store.clear()
         info = self._check(None)
@@ -701,6 +723,29 @@ class TestSettingsDialogEngineVersion(unittest.TestCase):
                 dlg._available_version = "0.4.7"
                 dlg._refresh_engine_version()
                 self.assertNotIn("update available", dlg._engine_version_label.text_value)
+
+    def test_just_installed_engine_is_not_unknown_when_its_probe_times_out(self):
+        """2026-10-06 (Windows): right after Download Binaries the label read
+        "Installed engine: unknown / Latest release: 0.4.8 -- update available"."""
+        with tempfile.TemporaryDirectory() as d, \
+                mock.patch.object(QgsSettings, "_store", {}):
+            open(os.path.join(d, "aether_core" + bm._EXE_SUFFIX), "w").close()
+            QgsSettings().setValue("waveshed/binary_dir", d)
+            QgsSettings().setValue("waveshed/installed_engine_version", "0.4.8")
+            dlg = self._dlg(d)
+            dlg._available_version = "0.4.8"
+            timeout = subprocess.TimeoutExpired(["aether_core", "--version"], 5)
+            with mock.patch.object(bm.subprocess, "run", side_effect=timeout):
+                dlg._refresh_engine_version()
+            self.assertIn("Installed engine: 0.4.8", dlg._engine_version_label.text_value)
+            self.assertNotIn("update available", dlg._engine_version_label.text_value)
+            # A directory Waveshed did not install into stays honest.
+            with tempfile.TemporaryDirectory() as other:
+                open(os.path.join(other, "aether_core" + bm._EXE_SUFFIX), "w").close()
+                dlg._binary_dir_edit = _Edit(other)
+                with mock.patch.object(bm.subprocess, "run", side_effect=timeout):
+                    dlg._refresh_engine_version()
+                self.assertIn("Installed engine: unknown", dlg._engine_version_label.text_value)
 
     def test_start_engine_download_runs_the_consent_flow(self):
         dlg = self._dlg("")

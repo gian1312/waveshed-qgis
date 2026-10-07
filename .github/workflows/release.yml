@@ -126,7 +126,15 @@ jobs:
                  --endpoint-url "${ENDPOINT}" 2>&1); then
             echo "${out}"
             case "${out}" in
-              *NoSuchBucket*) echo "::error::R2 says bucket waveshed-releases does not exist for this endpoint + key pair. The bucket is in the EU jurisdiction: the endpoint must be https://<account-id>.eu.r2.cloudflarestorage.com, and the token must belong to the same account and cover that bucket." ;;
+              *NoSuchBucket*)
+                # A jurisdiction is part of the bucket's address: an EU-jurisdiction bucket
+                # exists only behind <account>.eu.r2..., a default one only behind <account>.r2...
+                # A "Location: Western Europe" hint is NOT a jurisdiction (default endpoint).
+                case "${ENDPOINT}" in
+                  *.eu.r2.*) other="https://<account-id>.r2.cloudflarestorage.com (default jurisdiction -- also right for a bucket that merely has a European location hint)" ;;
+                  *) other="https://<account-id>.eu.r2.cloudflarestorage.com (only if the bucket's Settings show Jurisdiction: European Union)" ;;
+                esac
+                echo "::error::R2 says bucket waveshed-releases does not exist behind this endpoint. The bucket lives in the other jurisdiction or another account: try R2_S3_ENDPOINT = ${other}, and use a token from the account that owns the bucket." ;;
               *AccessDenied*|*Unauthorized*|*InvalidAccessKeyId*|*SignatureDoesNotMatch*) echo "::error::R2 rejected the key pair (wrong/rotated token, or a token from another account)." ;;
               *) echo "::error::Could not list waveshed-releases/qgis/ (see the R2 error above)." ;;
             esac
