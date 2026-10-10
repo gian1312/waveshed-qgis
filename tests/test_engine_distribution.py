@@ -436,6 +436,25 @@ class TestMacosPreparation(unittest.TestCase):
             self.assertIn('xattr -cr "', hint)
             self.assertEqual(bm.macos_launch_hint("ordinary failure", "/b"), "")
             self.assertIn('xattr -cr "/b"', bm.macos_launch_hint("", "/b", force=True))
+    def test_sigkill_after_output_is_memory_not_gatekeeper(self):
+        ran = "[Core] tile grid\n[P:40] Wedge 3/8"
+        with mock.patch.object(bm.platform, "system", return_value="Darwin"):
+            for rc in (-9, 137):
+                hint = bm.engine_error_hint(ran, rc)
+                self.assertIn("out of memory", hint)
+                self.assertIn("Activity Monitor", hint)
+                self.assertNotIn("xattr", hint)
+            # killed at launch, no engine output -> still Gatekeeper
+            self.assertIn("xattr", bm.engine_error_hint("zsh: killed: 9  aether_core", -9))
+            self.assertIn("xattr", bm.engine_error_hint("", -9))
+            # quarantine text wins even after output
+            self.assertIn("xattr", bm.engine_error_hint(ran + "\nquarantine", -9))
+            # an ordinary failure is neither
+            self.assertEqual(bm.engine_error_hint(ran, 1), "")
+        with mock.patch.object(bm.platform, "system", return_value="Linux"):
+            self.assertEqual(bm.engine_error_hint(ran, -9), "")
+
+    def test_gatekeeper_kill_linux_is_silent(self):
         with mock.patch.object(bm.platform, "system", return_value="Linux"):
             self.assertEqual(bm.macos_launch_hint("killed: 9", "/b", force=True), "")
 

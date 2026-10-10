@@ -1019,12 +1019,16 @@ analysis tabs' DEM dropdown as <b>Local: &lt;path&gt;</b>. Selected, it is the
 <tr><td><b>Terrain cache:</b></td><td><code>~/.aether/cache</code></td>
 <td>Where the tile pool and the per-run views live. <b>Clear...</b> reports how
 many entries and how many megabytes would go, then deletes them.</td></tr>
-<tr><td><b>Max VRAM budget (GB):</b></td><td>8 (range 1&ndash;64)</td>
-<td>Sent with every job as <code>processing.max_vram_usage_gb</code>. It does
-<i>not</i> raise the engine's ~3.86 GB single-allocation ceiling for the terrain
-atlas.</td></tr>
-<tr><td><b>Max RAM budget (GB):</b></td><td>16 (range 1&ndash;256)</td>
-<td>Sent as <code>processing.max_ram_usage_gb</code>.</td></tr>
+<tr><td><b>Max VRAM budget (GB):</b></td><td>Auto (range 1&ndash;256)</td>
+<td>Auto sends nothing and the engine sizes the budget itself (on Apple Silicon
+that is the GPU memory macOS allows). A number is sent with coverage jobs as
+<code>processing.max_vram_usage_gb</code>. It does <i>not</i> raise the engine's
+~3.86 GB single-allocation ceiling for the terrain atlas.</td></tr>
+<tr><td><b>Max RAM budget (GB):</b></td><td>Auto (range 1&ndash;256)</td>
+<td>Auto sends nothing and the engine chooses. A number is sent with coverage
+jobs as <code>processing.max_ram_usage_gb</code>. Values saved by an earlier
+version stay as they are; set the box back to Auto to hand the choice to the
+engine.</td></tr>
 <tr><td><b>Download connections:</b></td><td>256 (range 16&ndash;1024)</td>
 <td>Parallel HTTP connections the terrain downloader uses. Lower it on a
 connection that objects to the rate; retries automatically use half.</td></tr>

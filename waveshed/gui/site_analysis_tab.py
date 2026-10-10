@@ -329,7 +329,7 @@ class _SiteAnalysisWorker(QThread):
                     raise RuntimeError(
                         f"aether_core exited with code {rc}"
                         f" for {display_name}:\n{tail}"
-                        + engine_error_hint(tail)
+                        + engine_error_hint(tail, rc)
                     )
 
                 if self._canceled:

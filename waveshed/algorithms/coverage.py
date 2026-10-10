@@ -337,7 +337,7 @@ class CoverageAlgorithm(QgsProcessingAlgorithm):
             tail = "\n".join(output_lines[-20:])
             raise QgsProcessingException(
                 f"aether_core failed (exit {rc}):\n{tail}"
-                + bm.engine_error_hint(tail)
+                + bm.engine_error_hint(tail, rc)
             )
 
         if feedback.isCanceled():

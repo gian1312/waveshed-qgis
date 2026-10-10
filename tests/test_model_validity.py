@@ -316,3 +316,22 @@ class TestJobBuilderRejection(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestMemoryBudgetAuto(unittest.TestCase):
+    """Auto (0) omits the coverage job's memory budgets; a number is sent."""
+
+    def test_auto_omits_both_fields(self):
+        p = build_coverage_job(
+            CoverageParams(max_ram_gb=0, max_vram_gb=0), "/abt", "/out")["processing"]
+        self.assertEqual({"terrain_dir": "/abt"}, p)
+
+    def test_explicit_values_are_sent(self):
+        p = build_coverage_job(
+            CoverageParams(max_ram_gb=32, max_vram_gb=12), "/abt", "/out")["processing"]
+        self.assertEqual(32, p["max_ram_usage_gb"])
+        self.assertEqual(12, p["max_vram_usage_gb"])
+
+    def test_unset_settings_default_to_auto(self):
+        params = CoverageParams()
+        self.assertEqual((0, 0), (params.max_ram_gb, params.max_vram_gb))

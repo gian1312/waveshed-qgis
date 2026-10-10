@@ -104,20 +104,24 @@ def _processing_setting(key: str, default: int) -> int:
     construction site ever read them back, so both controls were dead and
     every job shipped the hardcoded defaults. Defaulting here means a new
     construction site cannot forget them.
+
+    ``0`` means Auto (the default): the coverage job then omits the field and
+    the engine picks its own budget. Any stored value is an explicit choice
+    and is kept as is.
     """
     try:
         from qgis.core import QgsSettings
-        return max(1, int(QgsSettings().value(f"waveshed/{key}", default)))
+        return max(0, int(QgsSettings().value(f"waveshed/{key}", default)))
     except Exception:  # noqa: BLE001 — no QGIS (unit tests), or a junk value
         return default
 
 
 def _default_max_ram_gb() -> int:
-    return _processing_setting("max_ram_gb", 16)
+    return _processing_setting("max_ram_gb", 0)
 
 
 def _default_max_vram_gb() -> int:
-    return _processing_setting("max_vram_gb", 8)
+    return _processing_setting("max_vram_gb", 0)
 
 
 @dataclasses.dataclass
@@ -565,6 +569,13 @@ def build_coverage_job(
     _validate_antenna_heights(params)
     log_model_warnings(params)
 
+    processing: dict = {"terrain_dir": abt_dir}
+    # Auto (0): leave the budgets out so the engine sizes them itself.
+    if params.max_ram_gb:
+        processing["max_ram_usage_gb"] = params.max_ram_gb
+    if params.max_vram_gb:
+        processing["max_vram_usage_gb"] = params.max_vram_gb
+
     return {
         "tx": _build_tx(params),
         "rx": {
@@ -584,11 +595,7 @@ def build_coverage_job(
             "directory": output_dir,
             "filename": params.output_name,
         },
-        "processing": {
-            "terrain_dir": abt_dir,
-            "max_ram_usage_gb": params.max_ram_gb or 16,
-            "max_vram_usage_gb": params.max_vram_gb or 8,
-        },
+        "processing": processing,
         "propagation": _build_propagation(params),
     }
 

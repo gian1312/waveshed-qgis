@@ -38,8 +38,11 @@ class AetherPlugin:
         self.actions.append(self.action_main)
 
         # Altitude Explorer dock toggle — drives LOS Floor result layers.
+        # Own icon (main icon + altitude bars) so the two toolbar buttons differ.
+        explorer_icon_path = os.path.join(self.plugin_dir, "resources", "icon_explorer.png")
+        explorer_icon = QIcon(explorer_icon_path) if os.path.exists(explorer_icon_path) else icon
         self.action_explorer = QAction(
-            icon, "Altitude Explorer", self.iface.mainWindow(),
+            explorer_icon, "Altitude Explorer", self.iface.mainWindow(),
         )
         self.action_explorer.triggered.connect(self._open_altitude_explorer)
         self.iface.addPluginToMenu(self.menu_name, self.action_explorer)

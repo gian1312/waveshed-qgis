@@ -274,7 +274,7 @@ def _fingerprint_error_message(returncode: int, stdout: str, stderr: str) -> str
     )
 
 
-def engine_error_hint(output: str) -> str:
+def engine_error_hint(output: str, returncode: Optional[int] = None) -> str:
     """Return an actionable hint for a known ``aether_core`` failure, or ``""``.
 
     Pure (no subprocess or IO) so it can be unit-tested directly. Appended to
@@ -295,7 +295,42 @@ def engine_error_hint(output: str) -> str:
             "\u2192 Download binaries, or pick one of those resolutions for "
             "this run."
         )
-    return macos_launch_hint(output)
+    if macos_oom_kill(output, returncode):
+        return (
+            "\n\nmacOS most likely stopped the engine because the run ran out "
+            "of memory (the engine was already running when it was killed). "
+            "Reduce the range or use a coarser resolution, or lower the "
+            "memory budget in Settings; Activity Monitor (Memory tab) shows "
+            "the pressure."
+        )
+    return macos_launch_hint(output, force=returncode in _SIGKILL_CODES)
+
+
+#: Exit codes of a SIGKILL'd child: -9 from ``subprocess``, 137 via a shell.
+_SIGKILL_CODES = (-9, 137)
+
+#: Fragments only Gatekeeper/quarantine produces (not a bare SIGKILL).
+_MACOS_QUARANTINE_SIGNS = (
+    "cannot be opened", "cannot be verified", "not verified",
+    "malicious software", "quarantine", "operation not permitted",
+)
+
+
+def macos_oom_kill(output: str, returncode: Optional[int]) -> bool:
+    """True when a macOS engine SIGKILL looks like memory pressure (jetsam).
+
+    Gatekeeper kills at launch, before the engine prints anything; an engine
+    that produced output was already running, so a SIGKILL is most likely the
+    system reclaiming memory. A quarantine-specific message overrides this.
+    """
+    if platform.system() != "Darwin" or returncode not in _SIGKILL_CODES:
+        return False
+    text = (output or "").lower()
+    if any(sign in text for sign in _MACOS_QUARANTINE_SIGNS):
+        return False
+    return any(
+        line.strip() and "killed" not in line for line in text.splitlines()
+    )
 
 
 #: Output fragments of a macOS launch that Gatekeeper (quarantine) blocked or
