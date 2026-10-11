@@ -349,6 +349,7 @@ class TestRenderSplit(_PatchMixin, unittest.TestCase):
             self.band_calls.append({
                 "provider": provider, "bands": list(bands),
                 "reference": reference,
+                "gaps": kwargs.get("hidden_leave_gaps"),
             })
             return ("bands", provider)
 
@@ -362,12 +363,12 @@ class TestRenderSplit(_PatchMixin, unittest.TestCase):
         self.site = _Layer("site")
         self.twin = _Layer("site (AMSL)")
 
-    def _dock_with(self, bands, *, twin=True, limiting=True, nested=True,
-                   reference=ma.REF_AGL):
+    def _dock_with(self, bands, *, twin=True, nested=True,
+                   reference=ma.REF_AGL, gaps=False):
         dock = _dock(
             _bands=list(bands),
             _reference=reference,
-            chk_threshold=_Toggle(limiting),
+            chk_gaps=_Toggle(gaps),
             radio_bands=_Toggle(nested),
             radio_shade=_Toggle(not nested),
             lbl_readout=_Label(),
@@ -403,6 +404,15 @@ class TestRenderSplit(_PatchMixin, unittest.TestCase):
             with self.subTest(reference=call["reference"]):
                 self.assertTrue(all(band.reference == call["reference"]
                                     for band in call["bands"]))
+
+    def test_the_gap_option_reaches_the_renderer(self):
+        for gaps in (False, True):
+            with self.subTest(gaps=gaps):
+                self.band_calls.clear()
+                dock = self._dock_with(_bands((100.0, ma.REF_AGL)),
+                                       twin=False, gaps=gaps)
+                dock._apply()
+                self.assertEqual([c["gaps"] for c in self.band_calls], [gaps])
 
     def test_a_reference_with_no_band_is_not_painted(self):
         dock = self._dock_with(_bands((100.0, ma.REF_AGL)))
@@ -440,10 +450,9 @@ class TestRenderSplit(_PatchMixin, unittest.TestCase):
         self.assertEqual(self.ramp_calls[0]["threshold_m"], 2500.0)
         self.assertEqual(self.ramp_calls[0]["reference"], ma.REF_AMSL)
 
-    def test_the_full_range_ramp_follows_the_selected_reference_too(self):
+    def test_the_ramp_without_a_band_of_its_reference_is_the_full_range(self):
         dock = self._dock_with(
-            _bands((100.0, ma.REF_AGL), (2500.0, ma.REF_AMSL)),
-            limiting=False, reference=ma.REF_AGL,
+            _bands((2500.0, ma.REF_AMSL)), nested=False, reference=ma.REF_AGL,
         )
         dock._apply()
         self.assertEqual([call["provider"] for call in self.ramp_calls],
@@ -483,12 +492,11 @@ class TestLayerVisibility(_PatchMixin, unittest.TestCase):
         self.twin = _Layer("site (AMSL)")
         self.visible = {}
 
-    def _sync(self, bands, *, nested=True, limiting=True,
+    def _sync(self, bands, *, nested=True,
               reference=ma.REF_AGL, twin=True):
         dock = _dock(
             _bands=list(bands),
             _reference=reference,
-            chk_threshold=_Toggle(limiting),
             radio_bands=_Toggle(nested),
         )
         dock._checked_layers = lambda: [self.site]
@@ -534,7 +542,6 @@ class TestNeedsTwins(_PatchMixin, unittest.TestCase):
         dock = _dock(
             _bands=list(bands),
             _reference=reference,
-            chk_threshold=_Toggle(True),
             radio_bands=_Toggle(True),
         )
         dock._checked_layers = lambda: [self.site]
@@ -787,6 +794,116 @@ class TestSubsetRenderer(_PatchMixin, unittest.TestCase):
         first = renderer.shader.function.items[0]
         self.assertEqual((first.color.red(), first.color.green(),
                           first.color.blue()), (40, 50, 60))
+
+
+
+class _Spin:
+    def __init__(self, value):
+        self._value = value
+
+    def value(self):
+        return self._value
+
+
+class TestAutoPick(_PatchMixin, unittest.TestCase):
+    def setUp(self):
+        self.patch(ae, "QColor", _Color)
+        self.refreshed = 0
+
+    def _dock_with(self, bands, reference=ma.REF_AGL, count=4):
+        dock = _dock(
+            _bands=list(bands),
+            _reference=reference,
+            _selected_band=None,
+            _ranges={ma.REF_AGL: (0.0, 5000.0), ma.REF_AMSL: (400.0, 3000.0)},
+            _range=(0.0, 5000.0),
+            spin_auto=_Spin(count),
+        )
+        dock._rebuild_band_list = lambda select=None: None
+        dock._amsl_pending = lambda: False
+
+        def refresh():
+            self.refreshed += 1
+        dock._refresh_canvas = refresh
+        return dock
+
+    def test_replaces_only_the_selected_reference(self):
+        kept = _bands((2500.0, ma.REF_AMSL))
+        dock = self._dock_with(_bands((100.0, ma.REF_AGL)) + kept)
+        dock._on_auto_pick()
+        agl = [b.altitude_m for b in dock._bands if b.reference == ma.REF_AGL]
+        self.assertEqual(agl, [1250.0, 2500.0, 3750.0, 5000.0])
+        self.assertIn(kept[0], dock._bands)
+        self.assertEqual(self.refreshed, 1)
+
+    def test_new_bands_get_distinct_colours(self):
+        dock = self._dock_with([])
+        dock._on_auto_pick()
+        colours = [(b.color.red(), b.color.green(), b.color.blue())
+                   for b in dock._bands]
+        self.assertEqual(len(set(colours)), len(colours))
+
+    def test_never_exceeds_the_band_cap(self):
+        others = _bands(*[(1000.0 + i, ma.REF_AMSL) for i in range(6)])
+        dock = self._dock_with(others, count=8)
+        dock._on_auto_pick()
+        self.assertLessEqual(len(dock._bands), ae.MAX_BANDS)
+
+
+
+class _RangeWidget:
+    """Slider / spin box stand-in that records its range."""
+
+    def __init__(self):
+        self.low = self.high = None
+
+    def setMinimum(self, value):
+        self.low = value
+
+    def setMaximum(self, value):
+        self.high = value
+
+    def setRange(self, low, high):
+        self.low, self.high = low, high
+
+
+class TestAltitudeRange(_PatchMixin, unittest.TestCase):
+    """The slider spans the data; the box takes any altitude the encoding can
+    hold, and a typed altitude above the data is never cut back."""
+
+    def setUp(self):
+        self.patch(ae, "QColor", _Color)
+
+    def _dock_with(self, bands, span=(0.0, 5000.0)):
+        dock = _dock(
+            _bands=list(bands), _reference=ma.REF_AGL, _range=span,
+            _ranges={ma.REF_AGL: span, ma.REF_AMSL: None},
+            slider=_RangeWidget(), spin=_RangeWidget(),
+        )
+        dock._range_for = lambda ref: span if ref == ma.REF_AGL else None
+        dock._rebuild_band_list = lambda select=None: None
+        dock._sync_band_editor = lambda: None
+        return dock
+
+    def test_the_box_reaches_the_encoding_limit_the_slider_the_data(self):
+        dock = self._dock_with([])
+        dock._apply_slider_range(ma.REF_AGL)
+        self.assertEqual((dock.slider.low, dock.slider.high), (0, 5000))
+        self.assertEqual((dock.spin.low, dock.spin.high),
+                         (0, ma.MIN_ALT_MAX_ALTITUDE_M))
+        self.assertEqual(ma.MIN_ALT_MAX_ALTITUDE_M, 32767)
+
+    def test_an_altitude_above_the_data_is_kept(self):
+        band = _bands((8000.0, ma.REF_AGL))[0]
+        dock = self._dock_with([band])
+        dock._sync_range_to_layers()
+        self.assertEqual(band.altitude_m, 8000.0)
+
+    def test_an_altitude_below_the_floor_is_lifted_to_it(self):
+        band = _bands((100.0, ma.REF_AGL))[0]
+        dock = self._dock_with([band], span=(1200.0, 3000.0))
+        dock._sync_range_to_layers()
+        self.assertEqual(band.altitude_m, 1200.0)
 
 
 if __name__ == "__main__":

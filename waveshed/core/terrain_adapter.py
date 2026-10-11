@@ -335,7 +335,7 @@ def _compute_sector_bbox(
 # a snapshot date: OpenFreeMap republishes periodically, and pinning that here
 # would invalidate every cached tile on each republish. Clear the terrain cache
 # to pick up newer building data.
-_OSM_BUILDINGS_TOKEN = "openfreemap:z14"
+_OSM_BUILDINGS_SOURCE_ID = "openfreemap:z14"
 
 
 def source_fingerprint(buildings: str) -> str:
@@ -1260,7 +1260,7 @@ def buildings_identity(buildings_file: Optional[str] = None,
     if buildings_file:
         parts.append(source_fingerprint(buildings_file))
     if osm_buildings:
-        parts.append(_OSM_BUILDINGS_TOKEN)
+        parts.append(_OSM_BUILDINGS_SOURCE_ID)
     return "+".join(parts) if parts else None
 
 

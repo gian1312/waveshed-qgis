@@ -497,16 +497,39 @@ class TestBandStops(unittest.TestCase):
         stops = ma.band_stops([self._band(100.0), self._band(100.2)])
         self.assertEqual(len(stops), 2)
 
-    def test_a_hidden_band_still_bounds_the_one_above_it(self):
-        # Hiding "<= 100 m" must leave a hole, not hand its area to "<= 200 m".
+    def test_a_hidden_band_hands_its_area_to_the_next_shown_one(self):
+        # Default: 3000 m covering everything must not leave 5000 m empty once
+        # 3000 m is unticked — 5000 m shows everything it reaches.
+        stops = ma.band_stops([
+            self._band(3000.0, (1, 1, 1), visible=False),
+            self._band(5000.0, (2, 2, 2)),
+        ])
+        self.assertEqual(len(stops), 2)
+        self.assertEqual(stops[0].raw, ma.altitude_to_raw(5000.0))
+        self.assertEqual(stops[0].color, (2, 2, 2))
+        self.assertEqual(stops[0].label, "≤ 5000 m AGL")
+
+    def test_every_band_hidden_draws_nothing(self):
+        stops = ma.band_stops([self._band(100.0, visible=False)])
+        self.assertEqual(len(stops), 1)
+        self.assertIsNone(stops[0].color)
+        self.assertEqual(stops[0].raw, ma.MIN_ALT_SENTINEL)
+
+    def test_gap_mode_hidden_band_still_bounds_the_one_above_it(self):
+        # Optional: hiding "<= 100 m" leaves a hole, not its area to "<= 200 m".
         stops = ma.band_stops([
             self._band(100.0, (1, 1, 1), visible=False),
             self._band(200.0, (2, 2, 2)),
-        ])
+        ], hidden_leave_gaps=True)
         self.assertEqual(stops[0].raw, ma.altitude_to_raw(100.0))
         self.assertIsNone(stops[0].color)
         self.assertEqual(stops[1].color, (2, 2, 2))
         self.assertEqual(stops[1].label, "100 – 200 m AGL")
+
+    def test_shown_bands_are_unaffected_by_the_gap_option(self):
+        bands = [self._band(100.0, (1, 1, 1)), self._band(200.0, (2, 2, 2))]
+        self.assertEqual(ma.band_stops(bands),
+                         ma.band_stops(bands, hidden_leave_gaps=True))
 
     def test_labels_follow_the_reference(self):
         stops = ma.band_stops([self._band(1500.0)], ma.REF_AMSL)
@@ -847,6 +870,29 @@ class TestAmslArithmetic(unittest.TestCase):
             nodata_raw=1000,
         )
         self.assertEqual(out.tolist(), [[1100, ma.MIN_ALT_SENTINEL]])
+
+
+
+class TestAutoAltitudes(unittest.TestCase):
+    def test_even_rounded_steps_ending_on_the_ceiling(self):
+        self.assertEqual(ma.auto_altitudes(0, 5000, 4), [1250, 2500, 3750, 5000])
+        self.assertEqual(ma.auto_altitudes(0, 300, 3), [100, 200, 300])
+
+    def test_sea_level_range_starts_above_the_valley_floor(self):
+        values = ma.auto_altitudes(400, 3000, 4)
+        self.assertEqual(values[-1], 3000)
+        self.assertTrue(all(v > 400 for v in values))
+
+    def test_narrow_range_collapses_duplicates_and_ascends(self):
+        values = ma.auto_altitudes(0, 10, 8)
+        self.assertEqual(values, sorted(set(values)))
+        self.assertLessEqual(len(values), 8)
+        self.assertTrue(values)
+
+    def test_unusable_input_gives_nothing(self):
+        self.assertEqual(ma.auto_altitudes(100, 100, 4), [])
+        self.assertEqual(ma.auto_altitudes(0, 100, 0), [])
+
 
 
 if __name__ == "__main__":

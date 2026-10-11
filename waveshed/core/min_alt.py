@@ -30,6 +30,7 @@ pure Python that both the loader and the Altitude Explorer dock share.
 
 from __future__ import annotations
 
+import math
 from typing import Dict, List, NamedTuple, Optional, Sequence, Tuple, TypeVar
 
 # ---------------------------------------------------------------------------
@@ -46,6 +47,11 @@ MIN_ALT_SENTINEL: int = 0xFFFF  # 65535
 
 #: Largest *real* raw altitude value (sentinel - 1).
 MIN_ALT_MAX_RAW: int = 0xFFFE  # 65534
+
+#: Highest altitude the encoding can hold (65534 half-metres = 32767 m) — the
+#: most an altitude box may accept.  Anything above a layer's own data reaches
+#: no further than its top value, but asking is legitimate.
+MIN_ALT_MAX_ALTITUDE_M: int = MIN_ALT_MAX_RAW // 2
 
 
 def altitude_to_raw(altitude_m: float) -> int:
@@ -217,6 +223,36 @@ def nice_floor(value_m: float) -> int:
     return int(value_m // 5000) * 5000
 
 
+def snap_altitude(value_m: float) -> int:
+    """Round an altitude to something a person would say out loud."""
+    if value_m >= 1000:
+        return int(round(value_m / 50.0) * 50)
+    if value_m >= 100:
+        return int(round(value_m / 10.0) * 10)
+    return int(round(value_m / 5.0) * 5)
+
+
+def auto_altitudes(low_m: float, high_m: float, count: int) -> List[int]:
+    """*count* evenly spaced, rounded altitudes over ``(low_m, high_m]``.
+
+    The Altitude Explorer's one-click "Auto-pick": the top one sits on
+    *high_m* (the layer's tidy ceiling, so it shows the whole reach) and the
+    rest divide the climb up to it evenly.  ``low_m`` itself is left out — an
+    altitude at the floor of the data reaches nothing.  Rounding can make two
+    neighbours meet on a narrow range; those collapse, so fewer than *count*
+    may come back, strictly ascending and never empty for a usable range.
+    """
+    if count < 1 or high_m <= low_m:
+        return []
+    values: List[int] = []
+    for i in range(1, count + 1):
+        value = snap_altitude(low_m + (high_m - low_m) * i / count)
+        value = min(max(value, int(math.ceil(low_m)) + 1), int(high_m))
+        if not values or value > values[-1]:
+            values.append(value)
+    return values
+
+
 # ---------------------------------------------------------------------------
 # Altitude bands
 # ---------------------------------------------------------------------------
@@ -317,6 +353,7 @@ class BandStop(NamedTuple):
 def band_stops(
     bands: Sequence[AltitudeBand],
     reference: Optional[str] = REF_AGL,
+    hidden_leave_gaps: bool = False,
 ) -> List[BandStop]:
     """Turn nested altitude *bands* into discrete colour-ramp stops.
 
@@ -331,11 +368,24 @@ def band_stops(
     final transparent stop at the sentinel clips everything above the top band,
     so the renderer never paints the "needs more than you asked for" area.
 
+    What a hidden (unticked) band does depends on *hidden_leave_gaps*:
+
+    * ``False`` (default): a hidden altitude simply is not there — every shown
+      altitude keeps its full reach, so the next shown one above takes over
+      the hidden one's area.  With 3000 m covering everything, unticking it
+      shows 5000 m covering everything, which is what 5000 m actually reaches.
+    * ``True``: the hidden band still bounds the ring above it and is drawn
+      transparent, so hiding "≤ 100 m" leaves a hole rather than handing its
+      area to "≤ 200 m" — the strict "what does each step add" view.
+
     Returns an empty list for empty *bands* (the caller falls back to the
-    continuous full-range ramp).
+    continuous full-range ramp).  With *hidden_leave_gaps* off and every band
+    hidden, only the transparent tail is returned: nothing is drawn.
     """
     if not bands:
         return []
+    if not hidden_leave_gaps:
+        bands = [band for band in bands if band.visible]
 
     suffix = reference_suffix(reference)
     stops: List[BandStop] = []

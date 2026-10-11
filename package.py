@@ -46,6 +46,7 @@ import fnmatch
 import hashlib
 import re
 import os
+import stat
 import sys
 import urllib.error
 import urllib.request
@@ -254,7 +255,15 @@ def build_zip(repo_root: str, out_dir: str) -> str:
 
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
         for abs_path, arcname in entries:
-            zf.write(abs_path, arcname)
+            # Fixed rw-r--r-- rather than the source file's mode: a checkout on
+            # a Windows mount (or with core.fileMode off) marks every file
+            # executable, and plugins.qgis.org's file analysis flags each one
+            # (FILE_EXECUTABLE). Nothing in a plugin needs the bit.
+            info = zipfile.ZipInfo.from_file(abs_path, arcname)
+            info.external_attr = (stat.S_IFREG | 0o644) << 16
+            info.compress_type = zipfile.ZIP_DEFLATED
+            with open(abs_path, "rb") as source:
+                zf.writestr(info, source.read())
 
     size = os.path.getsize(zip_path)
     try:

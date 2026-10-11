@@ -995,7 +995,7 @@ class TestCacheKeyBuildings(unittest.TestCase):
         # OpenFreeMap has no file to fingerprint; it identifies itself with an
         # opaque token that must survive into the key unchanged (an earlier
         # version ran it through abspath, making the key depend on the cwd).
-        tok = ta._OSM_BUILDINGS_TOKEN
+        tok = ta._OSM_BUILDINGS_SOURCE_ID
         self.assertEqual(ta.source_fingerprint(tok), tok)
         self.assertNotEqual(self._key(tok), self._key())
 
@@ -1003,7 +1003,7 @@ class TestCacheKeyBuildings(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             b = os.path.join(d, "b.fgb")
             open(b, "w").close()
-            tok = ta._OSM_BUILDINGS_TOKEN
+            tok = ta._OSM_BUILDINGS_SOURCE_ID
             combined = f"{ta.source_fingerprint(b)}+{tok}"
             keys = {self._key(), self._key(b), self._key(tok), self._key(combined)}
             # none, file-only, osm-only and both must all be separate caches

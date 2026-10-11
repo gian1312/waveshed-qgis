@@ -22,9 +22,8 @@ over.  Twins are cached on disk and re-used, so the next one is instant.
 Each altitude carries its own reference, so "100 m AGL" and "2500 m AMSL" are on
 the map together, each in its own colour: the above-ground altitudes are painted
 on the layer the solver wrote, the sea-level ones on its twin, and both rasters
-are on at once.  The continuous ramp ("Colour by: Required altitude", and the
-full range after *Reset*) is one surface by nature, so it — like the contour
-tool — follows the reference of the *selected* altitude alone.
+are on at once.  The continuous ramp ("Ramp") is one surface by nature, so
+it — like the contour tool — follows the reference of the *selected* altitude alone.
 
 The heavy lifting (renderer construction, quantization, raster maths) lives in
 ``core.result_loader`` / ``core.min_alt`` / ``core.raster_tools``; this module
@@ -40,7 +39,7 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 from qgis.core import Qgis, QgsMessageLog, QgsProject, QgsRasterLayer
 from qgis.gui import QgsColorButton, QgsDockWidget, QgsMapLayerComboBox
-from qgis.PyQt.QtCore import Qt, QThread, pyqtSignal
+from qgis.PyQt.QtCore import QSize, Qt, QThread, pyqtSignal
 from qgis.PyQt.QtGui import QColor, QIcon, QPixmap
 from qgis.PyQt.QtWidgets import (
     QButtonGroup,
@@ -59,8 +58,11 @@ from qgis.PyQt.QtWidgets import (
     QProgressDialog,
     QPushButton,
     QRadioButton,
+    QScrollArea,
+    QSizePolicy,
     QSlider,
     QSpinBox,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
@@ -74,10 +76,12 @@ from ..core.layer_utils import (
 )
 from ..core.min_alt import (
     DEFAULT_RAMP_MAX_M,
+    MIN_ALT_MAX_ALTITUDE_M,
     REF_AGL,
     REF_AMSL,
     REFERENCES,
     AltitudeBand,
+    auto_altitudes,
     band_color,
     band_label,
     next_band_color,
@@ -85,6 +89,7 @@ from ..core.min_alt import (
     normalize_reference,
     reference_phrase,
     reference_suffix,
+    snap_altitude,
     split_bands_by_reference,
 )
 from ..core.result_loader import (
@@ -110,7 +115,10 @@ _LAYER_ID_ROLE = Qt.ItemDataRole.UserRole
 MAX_BANDS = 8
 
 #: Swatch size for the band list icons.
-_SWATCH_PX = 12
+_SWATCH_PX = 14
+
+#: How many altitudes Auto-pick offers by default.
+_AUTO_PICK_DEFAULT = 4
 
 #: Share of a result's reachable area that may fall outside the elevation data
 #: before the sea-level view says so. A run's own terrain is cut to the analysis
@@ -708,8 +716,10 @@ class AltitudeExplorerDock(QgsDockWidget):
         self.layer_list.setMaximumHeight(120)
         lg_layout.addWidget(self.layer_list)
         row = QHBoxLayout()
-        self.btn_all = QPushButton("Select all")
-        self.btn_none = QPushButton("Select none")
+        self.btn_all = QPushButton("All")
+        self.btn_all.setToolTip("Drive every layer in the list.")
+        self.btn_none = QPushButton("None")
+        self.btn_none.setToolTip("Drive no layer.")
         self.btn_refresh = QPushButton("Refresh")
         row.addWidget(self.btn_all)
         row.addWidget(self.btn_none)
@@ -718,19 +728,119 @@ class AltitudeExplorerDock(QgsDockWidget):
         lg_layout.addLayout(row)
         layout.addWidget(layer_group)
 
-        # ---- Altitude reference ----
+        # ---- Altitudes ----
+        # Top to bottom: how the set is drawn, the set, what to do with the
+        # set, then the editor for the selected altitude. One control per job:
+        # "show the whole layer" is the ramp with the top altitude at the
+        # layer's ceiling (Auto-pick puts one there), so it has no switch of
+        # its own.
+        alt_group = QGroupBox("Altitudes")
+        ag_layout = QVBoxLayout(alt_group)
+
+        style_row = QHBoxLayout()
+        self.radio_bands = QRadioButton("Bands")
+        self.radio_shade = QRadioButton("Ramp")
+        self.radio_bands.setChecked(True)
+        self.radio_bands.setToolTip(
+            "One colour per altitude — the area each altitude reaches."
+        )
+        self.radio_shade.setToolTip(
+            "One continuous ramp up to the highest altitude, colouring pixels "
+            "by the altitude they actually need (blue = low, red = high). One "
+            "ramp covers one reference: the one the selected altitude is "
+            "measured from."
+        )
+        self._style_group = QButtonGroup(self)
+        self._style_group.addButton(self.radio_bands)
+        self._style_group.addButton(self.radio_shade)
+        self.chk_gaps = QCheckBox("Leave gaps")
+        self.chk_gaps.setChecked(False)
+        self.chk_gaps.setToolTip(
+            "Leave a gap where an altitude is unticked.\n"
+            "Off (default): every ticked altitude shows its full reach — "
+            "untick 3000 m and 5000 m covers everything 5000 m reaches.\n"
+            "On: each altitude only shows the ring it adds over the one "
+            "below, and an unticked altitude leaves that ring empty."
+        )
+        style_row.addWidget(self.radio_bands)
+        style_row.addWidget(self.radio_shade)
+        style_row.addStretch()
+        style_row.addWidget(self.chk_gaps)
+        ag_layout.addLayout(style_row)
+
+        self.band_list = QListWidget()
+        # Breathing space between rows; at least three rows always on show,
+        # and room for every band the dock allows before it scrolls.
+        self.band_list.setSpacing(2)
+        self.band_list.setIconSize(QSize(_SWATCH_PX, _SWATCH_PX))
+        row_px = max(self.band_list.fontMetrics().height(), _SWATCH_PX) + 8
+        self.band_list.setMinimumHeight(row_px * 3 + 6)
+        self.band_list.setMaximumHeight(row_px * MAX_BANDS + 6)
+        self.band_list.setToolTip(
+            "Untick an altitude to hide it without losing it. Select one to "
+            "edit it below."
+        )
+        ag_layout.addWidget(self.band_list)
+
+        list_row = QHBoxLayout()
+        self.btn_add_band = QToolButton()
+        self.btn_add_band.setText("+")
+        self.btn_add_band.setToolTip("Add an altitude above the highest one.")
+        self.btn_remove_band = QToolButton()
+        self.btn_remove_band.setText("−")
+        self.btn_remove_band.setToolTip("Remove the selected altitude.")
+        self.btn_auto = QPushButton("Auto-pick")
+        self.btn_auto.setToolTip(
+            "Replace the altitudes measured the selected way with evenly "
+            "spaced, rounded ones across the layers' range — the highest one "
+            "shows the whole reach. Altitudes measured the other way are kept."
+        )
+        self.spin_auto = QSpinBox()
+        self.spin_auto.setRange(2, MAX_BANDS)
+        self.spin_auto.setValue(_AUTO_PICK_DEFAULT)
+        self.spin_auto.setToolTip("How many altitudes Auto-pick chooses.")
+        list_row.addWidget(self.btn_add_band)
+        list_row.addWidget(self.btn_remove_band)
+        list_row.addStretch()
+        list_row.addWidget(self.btn_auto)
+        list_row.addWidget(self.spin_auto)
+        ag_layout.addLayout(list_row)
+
+        # Editor for the selected altitude: value, colour, reference.
+        slider_row = QHBoxLayout()
+        self.slider = QSlider(Qt.Orientation.Horizontal)
+        self.slider.setMinimum(0)
+        self.slider.setMaximum(int(DEFAULT_RAMP_MAX_M))
+        self.spin = QSpinBox()
+        self.spin.setRange(0, int(DEFAULT_RAMP_MAX_M))
+        self.spin.setSuffix(reference_suffix(REF_AGL))
+        self.spin.setToolTip("Altitude of the selected row.")
+        # QSpinBox will not shrink below its full-range text by default, which
+        # alone made the dock wider than QGIS gives it.
+        self.spin.setSizePolicy(QSizePolicy.Policy.Preferred,
+                                QSizePolicy.Policy.Fixed)
+        self.btn_band_color = QgsColorButton()
+        self.btn_band_color.setAllowOpacity(False)
+        self.btn_band_color.setToolTip("Colour of the selected altitude.")
+        self.btn_band_color.setMaximumWidth(48)
+        slider_row.addWidget(self.slider, 1)
+        slider_row.addWidget(self.spin)
+        slider_row.addWidget(self.btn_band_color)
+        ag_layout.addLayout(slider_row)
+
         ref_row = QHBoxLayout()
-        ref_row.addWidget(QLabel("Measured from:"))
-        self.radio_agl = QRadioButton("Ground (AGL)")
-        self.radio_amsl = QRadioButton("Sea level (AMSL)")
+        ref_row.addWidget(QLabel("From:"))
+        self.radio_agl = QRadioButton("Ground")
+        self.radio_amsl = QRadioButton("Sea level")
         self.radio_agl.setChecked(True)
         self.radio_agl.setToolTip(
-            "Measure the selected altitude from the ground directly below — "
-            "what a mast or a terrain-following drone holds. Applies to the "
-            "altitude selected below, and to the next one you add."
+            "AGL: measure the selected altitude from the ground directly "
+            "below — "
+            "what a mast or a terrain-following drone holds. Also used for "
+            "the next one you add."
         )
         self.radio_amsl.setToolTip(
-            "Measure the selected altitude from sea level — what a pilot "
+            "AMSL: measure the selected altitude from sea level — what a pilot "
             "flies. Waveshed adds the terrain the analysis was run over to "
             "each layer the first time an altitude needs it; after that it is "
             "instant. Altitudes measured from the ground stay on show "
@@ -742,97 +852,13 @@ class AltitudeExplorerDock(QgsDockWidget):
         ref_row.addWidget(self.radio_agl)
         ref_row.addWidget(self.radio_amsl)
         ref_row.addStretch()
-        layout.addLayout(ref_row)
-
-        # ---- Altitude bands ----
-        alt_group = QGroupBox("Altitudes")
-        ag_layout = QVBoxLayout(alt_group)
-
-        self.chk_threshold = QCheckBox("Limit to these altitudes")
-        self.chk_threshold.setChecked(True)
-        self.chk_threshold.setToolTip(
-            "Off: show the whole layer with its continuous colour ramp, "
-            "ignoring the altitudes below."
-        )
-        ag_layout.addWidget(self.chk_threshold)
-
-        self.band_list = QListWidget()
-        self.band_list.setMaximumHeight(110)
-        self.band_list.setToolTip(
-            "Untick an altitude to hide its band without losing it — the bands "
-            "above keep their own areas. Each row is labelled with what it is "
-            "measured from; select one to change that above."
-        )
-        ag_layout.addWidget(self.band_list)
-
-        band_row = QHBoxLayout()
-        self.btn_add_band = QPushButton("Add altitude")
-        self.btn_remove_band = QPushButton("Remove")
-        self.btn_band_color = QgsColorButton()
-        self.btn_band_color.setAllowOpacity(False)
-        self.btn_band_color.setToolTip("Colour for the selected altitude.")
-        self.btn_band_color.setMaximumWidth(48)
-        band_row.addWidget(self.btn_add_band)
-        band_row.addWidget(self.btn_remove_band)
-        band_row.addStretch()
-        band_row.addWidget(QLabel("Colour:"))
-        band_row.addWidget(self.btn_band_color)
-        ag_layout.addLayout(band_row)
-
-        slider_row = QHBoxLayout()
-        self.slider = QSlider(Qt.Orientation.Horizontal)
-        self.slider.setMinimum(0)
-        self.slider.setMaximum(int(DEFAULT_RAMP_MAX_M))
-        self.spin = QSpinBox()
-        self.spin.setRange(0, int(DEFAULT_RAMP_MAX_M))
-        self.spin.setSuffix(reference_suffix(REF_AGL))
-        self.spin.setToolTip("Altitude of the band selected above.")
-        slider_row.addWidget(self.slider, 1)
-        slider_row.addWidget(self.spin)
-        ag_layout.addLayout(slider_row)
-
-        # ---- Display style ----
-        style_row = QHBoxLayout()
-        style_row.addWidget(QLabel("Colour by:"))
-        self.radio_bands = QRadioButton("Altitude band")
-        self.radio_shade = QRadioButton("Required altitude")
-        self.radio_bands.setChecked(True)
-        self.radio_bands.setToolTip(
-            "One colour per altitude above — the nested areas each altitude "
-            "buys you."
-        )
-        self.radio_shade.setToolTip(
-            "One continuous ramp up to the highest altitude, colouring pixels "
-            "by the altitude they actually need (blue = low, red = high). One "
-            "ramp covers one reference: the one the selected altitude is "
-            "measured from."
-        )
-        self._style_group = QButtonGroup(self)
-        self._style_group.addButton(self.radio_bands)
-        self._style_group.addButton(self.radio_shade)
-        style_row.addWidget(self.radio_bands)
-        style_row.addWidget(self.radio_shade)
-        style_row.addStretch()
-        ag_layout.addLayout(style_row)
+        ag_layout.addLayout(ref_row)
 
         self.lbl_readout = QLabel("")
         self.lbl_readout.setWordWrap(True)
         self.lbl_readout.setStyleSheet("font-weight: bold;")
         ag_layout.addWidget(self.lbl_readout)
         layout.addWidget(alt_group)
-
-        # ---- Actions ----
-        action_row = QHBoxLayout()
-        action_row.addStretch()
-        self.btn_reset = QPushButton("Reset to full range")
-        self.btn_reset.setToolTip(
-            "Restore the continuous LOS Floor colour ramp on the selected "
-            "layers. One ramp is one surface, so it is drawn on whichever "
-            "reference the selected altitude uses — above ground or above sea "
-            "level."
-        )
-        action_row.addWidget(self.btn_reset)
-        layout.addLayout(action_row)
 
         # ---- Tools (Options E and D) ----
         tools_group = QGroupBox("Tools")
@@ -858,15 +884,21 @@ class AltitudeExplorerDock(QgsDockWidget):
         layout.addWidget(tools_group)
 
         layout.addStretch()
-        self.setWidget(root)
+        # Scroll rather than squeeze: a dock shorter than its content would
+        # otherwise lay the rows on top of one another.
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QScrollArea.Shape.NoFrame)
+        scroll.setWidget(root)
+        self.setWidget(scroll)
 
     def _wire_signals(self) -> None:
         self.slider.valueChanged.connect(self._on_slider)
         self.spin.valueChanged.connect(self._on_spin)
-        self.chk_threshold.toggled.connect(self._on_threshold_toggled)
-        self.radio_shade.toggled.connect(lambda _: self._refresh_canvas())
+        self.radio_shade.toggled.connect(self._on_style_toggled)
+        self.chk_gaps.toggled.connect(lambda _: self._apply())
+        self.btn_auto.clicked.connect(self._on_auto_pick)
         self.radio_amsl.toggled.connect(self._on_reference_toggled)
-        self.btn_reset.clicked.connect(self._on_reset)
         self.btn_all.clicked.connect(lambda: self._set_all_checked(True))
         self.btn_none.clicked.connect(lambda: self._set_all_checked(False))
         self.btn_refresh.clicked.connect(self.refresh_layers)
@@ -982,13 +1014,12 @@ class AltitudeExplorerDock(QgsDockWidget):
         whole point of a per-band reference, and what lets a site's original and
         its sea-level twin be drawn at the same time.
 
-        A continuous ramp ("Colour by: Required altitude", and the full range
-        after *Reset*) is one surface by nature and cannot mean two
+        The continuous ramp is one surface by nature and cannot mean two
         measurements at once, so it follows the *selected* altitude's reference
         alone.  The same goes for a band set that is empty: there is nothing to
         take a reference from but the selection.
         """
-        if self.chk_threshold.isChecked() and self.radio_bands.isChecked():
+        if self.radio_bands.isChecked():
             grouped = split_bands_by_reference(self._bands)
             active = [ref for ref in REFERENCES if grouped[ref]]
             if active:
@@ -1322,11 +1353,7 @@ class AltitudeExplorerDock(QgsDockWidget):
     @staticmethod
     def _snap(value_m: float) -> int:
         """Round an altitude to something a person would say out loud."""
-        if value_m >= 1000:
-            return int(round(value_m / 50.0) * 50)
-        if value_m >= 100:
-            return int(round(value_m / 10.0) * 10)
-        return int(round(value_m / 5.0) * 5)
+        return snap_altitude(value_m)
 
     def _rebuild_band_list(self, select: Optional[_Band] = None) -> None:
         """Redraw the band list from :attr:`_bands`, grouped by reference and
@@ -1375,18 +1402,18 @@ class AltitudeExplorerDock(QgsDockWidget):
         """Point the slider/spin/colour strip at the selected band, and set
         every control's enabled state from one place.
 
-        One place on purpose: this runs after ``_on_threshold_toggled``, so
-        anything that one disables and this one does not would come straight
-        back on — editing a list the user cannot see.
+        One place on purpose, so no handler can leave a control enabled that
+        another one meant to switch off.
         """
         band = self._selected_band
-        limiting = self.chk_threshold.isChecked()
-        enabled = band is not None and limiting
+        enabled = band is not None
         self.slider.setEnabled(enabled)
         self.spin.setEnabled(enabled)
         self.btn_band_color.setEnabled(enabled)
-        self.btn_add_band.setEnabled(limiting and len(self._bands) < MAX_BANDS)
-        self.btn_remove_band.setEnabled(limiting and len(self._bands) > 1)
+        self.btn_add_band.setEnabled(len(self._bands) < MAX_BANDS)
+        self.btn_remove_band.setEnabled(len(self._bands) > 1)
+        # Gaps are a property of the per-altitude colours; the ramp has none.
+        self.chk_gaps.setEnabled(self.radio_bands.isChecked())
         if band is None:
             return
         self._updating = True
@@ -1430,7 +1457,11 @@ class AltitudeExplorerDock(QgsDockWidget):
         low, high = self._span_for(reference)
         self.slider.setMinimum(int(low))
         self.slider.setMaximum(int(high))
-        self.spin.setRange(int(low), int(high))
+        # The slider spans the data, which is what makes dragging useful; the
+        # box takes any altitude the encoding can hold. "What is at 5000 m?"
+        # is a fair question even when nothing needs more than 2500 m — the
+        # answer is simply the full reach.
+        self.spin.setRange(int(low), MIN_ALT_MAX_ALTITUDE_M)
 
     def _sync_range_to_layers(self) -> None:
         """Span the sliders over the altitudes the driven layers actually hold.
@@ -1452,15 +1483,16 @@ class AltitudeExplorerDock(QgsDockWidget):
         self._apply_slider_range(self._reference)
         self._updating = False
 
-        # Bands from a previous, smaller layer set — or one that has just
-        # changed reference — would otherwise sit outside their span and
-        # quietly draw nothing.
+        # A band below its span's floor (an above-ground 100 m switched to sea
+        # level, say) would sit under the terrain and quietly draw nothing, so
+        # it is lifted to the floor. Above the ceiling is left alone: an
+        # altitude the user typed stays what they typed.
         clamped = False
         for band in self._bands:
             span = spans.get(band.reference)
             if span is None:
                 continue
-            bounded = min(max(band.altitude_m, span[0]), span[1])
+            bounded = max(band.altitude_m, span[0])
             if bounded != band.altitude_m:
                 band.altitude_m = bounded
                 clamped = True
@@ -1555,7 +1587,7 @@ class AltitudeExplorerDock(QgsDockWidget):
         if band is not None:
             self._reference = band.reference
         self._sync_band_editor()
-        if not (self.chk_threshold.isChecked() and self.radio_bands.isChecked()):
+        if not self.radio_bands.isChecked():
             # The continuous ramp follows the selected altitude's reference, so
             # picking a different row can move it to the other surface.
             self._refresh_canvas()
@@ -1593,6 +1625,40 @@ class AltitudeExplorerDock(QgsDockWidget):
             return  # the first sea-level altitude has a twin to build first
         self._refresh_canvas()
 
+    def _on_auto_pick(self) -> None:
+        """Replace the selected reference's altitudes with an even, rounded set.
+
+        Only the selected reference is replaced: 100 m AGL and 2500 m AMSL are
+        separate ladders, and a one-click pick over one of them must not throw
+        away the other.  Colours restart from the palette (minus what the kept
+        ladder uses), so a fresh pick reads cool → warm again.
+        """
+        reference = self._reference
+        others = [b for b in self._bands if b.reference != reference]
+        count = min(self.spin_auto.value(), MAX_BANDS - len(others))
+        low, high = self._span_for(reference)
+        altitudes = auto_altitudes(low, high, count)
+        if not altitudes:
+            self.iface.messageBar().pushInfo(
+                "Waveshed",
+                f"No room for more altitudes — at most {MAX_BANDS} can be on "
+                "show. Remove some measured the other way first.",
+            )
+            return
+        used = [(b.color.red(), b.color.green(), b.color.blue())
+                for b in others]
+        picked: List[_Band] = []
+        for altitude in altitudes:
+            color = next_band_color(used)
+            used.append(color)
+            picked.append(_Band(altitude, QColor(*color), reference=reference))
+        self._bands = others + picked
+        self._selected_band = None
+        self._rebuild_band_list(select=picked[0])
+        if self._amsl_pending():
+            return  # the first sea-level altitude has a twin to build first
+        self._refresh_canvas()
+
     def _next_altitude(self) -> Optional[int]:
         """Where a newly added band goes, or None if the range is full.
 
@@ -1617,7 +1683,7 @@ class AltitudeExplorerDock(QgsDockWidget):
         if candidate <= high and candidate not in taken:
             return candidate
 
-        edges = [low] + used + [high]
+        edges = [low] + [u for u in used if u < high] + [high]
         widest = max(range(len(edges) - 1), key=lambda i: edges[i + 1] - edges[i])
         midpoint = int(self._snap((edges[widest] + edges[widest + 1]) / 2.0))
         if low <= midpoint <= high and midpoint not in taken:
@@ -1693,13 +1759,8 @@ class AltitudeExplorerDock(QgsDockWidget):
         if self._selected_band is not None:
             self._rebuild_band_list(select=self._selected_band)
 
-    def _on_threshold_toggled(self, on: bool) -> None:
-        self.band_list.setEnabled(on)
-        self._sync_band_editor()  # owns every other control's enabled state
-        self._refresh_canvas()
-
-    def _on_reset(self) -> None:
-        self.chk_threshold.setChecked(False)
+    def _on_style_toggled(self, _shade: bool) -> None:
+        self._sync_band_editor()  # owns every control's enabled state
         self._refresh_canvas()
 
     # ------------------------------------------------------------------
@@ -1724,10 +1785,11 @@ class AltitudeExplorerDock(QgsDockWidget):
         fact about the raster the solver wrote and a sea-level one about its
         twin, so each layer is handed only the bands measured the way it is.
         Nesting survives the split — coverage is still cumulative *within* one
-        reference, which is all :func:`min_alt.band_stops` ever needed.
+        reference, which is all :func:`min_alt.band_stops` ever needed.  An
+        unticked altitude hands its area to the next ticked one above unless
+        "Unticked altitudes leave a gap" is on.
         """
-        use_bands = self.chk_threshold.isChecked()
-        nested = use_bands and self.radio_bands.isChecked()
+        nested = self.radio_bands.isChecked()
         grouped = split_bands_by_reference(self._bands)
         active = self._active_references()
 
@@ -1749,13 +1811,13 @@ class AltitudeExplorerDock(QgsDockWidget):
                         layer.dataProvider(), 1,
                         [band.as_altitude_band() for band in bands],
                         reference=reference,
+                        hidden_leave_gaps=self.chk_gaps.isChecked(),
                     )
                 else:
                     renderer = build_min_alt_renderer(
                         layer.dataProvider(), 1,
-                        threshold_m=bands[-1].altitude_m if (use_bands and bands)
-                        else None,
-                        shade=self.radio_shade.isChecked() or not use_bands,
+                        threshold_m=bands[-1].altitude_m if bands else None,
+                        shade=True,
                         max_ramp_m=max_ramp_m,
                         min_ramp_m=min_ramp_m,
                         reference=reference,
@@ -1770,14 +1832,13 @@ class AltitudeExplorerDock(QgsDockWidget):
                     - len(self._layers_for_reference(REF_AMSL))
                     if REF_AMSL in active else 0)
         self.lbl_readout.setText(
-            self._readout(painted, self._bands, use_bands, undriven)
+            self._readout(painted, self._bands, undriven)
         )
 
-    def _readout(self, layer_count: int, bands, use_bands: bool,
-                 undriven: int = 0) -> str:
+    def _readout(self, layer_count: int, bands, undriven: int = 0) -> str:
         """One line saying exactly what is on the canvas right now."""
         return _readout_text(
-            layer_count, bands, use_bands,
+            layer_count, bands, True,
             nested=self.radio_bands.isChecked(),
             reference=self._reference,
             undriven=undriven,

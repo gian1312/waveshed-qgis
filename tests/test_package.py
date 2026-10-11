@@ -117,6 +117,19 @@ class TestIterAndBuild:
         assert not any(n.endswith(".exe") for n in names)
         assert not any("__pycache__" in n for n in names)
 
+    def test_build_zip_entries_are_never_executable(self, tmp_path):
+        """plugins.qgis.org flags every executable entry (FILE_EXECUTABLE);
+        a source tree on a Windows mount marks all files +x."""
+        root = str(tmp_path)
+        self._make_tree(root)
+        plugin_py = os.path.join(root, "waveshed", "plugin.py")
+        os.chmod(plugin_py, 0o755)
+        zip_path = pkg.build_zip(root, os.path.join(root, "dist"))
+        with zipfile.ZipFile(zip_path) as zf:
+            for info in zf.infolist():
+                assert (info.external_attr >> 16) & 0o777 == 0o644, info.filename
+            assert zf.read("waveshed/plugin.py") == open(plugin_py, "rb").read()
+
     def test_build_zip_ships_license_inside_plugin_folder(self, tmp_path):
         """plugins.qgis.org requires the licence inside the plugin folder."""
         root = str(tmp_path)

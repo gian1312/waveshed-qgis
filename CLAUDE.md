@@ -211,6 +211,20 @@ Plugin is distributed as a ZIP (build with `python3 package.py` →
 `dist/waveshed.<version>.zip`; `--release` additionally requires public
 metadata URLs and a trusted manifest key).
 
+Before uploading to plugins.qgis.org, run `python3 tools/release_check.py`
+(the pipeline GUI's *Run checks*): the full test suite — failures, errors AND
+skips fail it — then `tools/qgis_scan.py`. Needs GDAL + numpy (QGIS's Python on
+Windows) and `aether_converter` (`--bin-dir`, `AETHER_BIN_DIR` or
+`~/.aether/bin`); `--install-tools` sets up pytest and the analysers.
+`tools/qgis_scan.py` alone: it
+builds the ZIP and runs the registry's four scans (Bandit, detect-secrets,
+flake8, file analysis) with the registry's own Critical/Warning/Info grading;
+exit 1 on any Critical. The analysers live in a venv in the gitignored `tmp/`
+(setup in the script's docstring), never as plugin dependencies. Names that
+merely contain `token`/`password`/`secret` trip Bandit B105 (Critical) even for
+harmless values; `package.py` writes every ZIP entry 0644 because the registry
+flags executable bits.
+
 Release = push tag `v<metadata version>`. `.github/workflows/release.yml` runs
 the full test suite (distro Python + python3-gdal, so nothing is skipped for
 want of GDAL), `package.py --release`, `tools/make_plugin_repo.py` (writes

@@ -1070,19 +1070,31 @@ value.</p>
 
 <h3>Layers</h3>
 <p>The <b>Layers</b> group lists every LOS Floor raster in the project with a
-tick box, and <b>Select all</b> / <b>Select none</b> / <b>Refresh</b>. Whatever
+tick box, and <b>All</b> / <b>None</b> / <b>Refresh</b>. Whatever
 is ticked is what the controls below drive; several sites can be driven
 together.</p>
 
 <h3>Altitude bands, each with its own reference</h3>
-<p>The <b>Altitudes</b> group holds a list of bands. <b>Add altitude</b> adds
-one, <b>Remove</b> drops the selected one, the <b>Colour:</b> button sets its
-colour, and the slider and spin box set the altitude of the band currently
-selected. Untick a band to hide it without losing it — the bands above keep
-their own areas rather than inheriting its.</p>
-<p><b>Measured from:</b> (<b>Ground (AGL)</b> / <b>Sea level (AMSL)</b>) is a
-property of a band, not of the whole dock: it applies to the band selected in
-the list and to the next band you add. So a single view can carry
+<p>The <b>Altitudes</b> group holds a list of bands. <b>+</b> adds one above
+the highest, <b>&minus;</b> drops the selected one, and <b>Auto-pick</b>
+replaces the bands of the selected reference with evenly spaced, rounded
+altitudes across the layers' range (how many is set beside it; the highest one
+sits on the layer's ceiling, so it shows the whole reach) — bands of the other
+reference are kept. Below the list, the slider, spin box and colour button
+edit the band currently selected. The slider spans the altitudes the layers
+actually hold; the spin box accepts any altitude up to 32&nbsp;767&nbsp;m (the
+limit of the encoding). Above the layer's highest value the map simply shows
+the full reach.</p>
+<p>Untick a band to hide it without losing it. By default every ticked band
+keeps its full reach, so the next ticked band above takes over the hidden
+one's area: if 3000 m reaches everything, unticking it shows 5000 m reaching
+everything too. Tick <b>Leave gaps</b> for the stricter view in which
+each band only shows the ring it adds over the one below, and an unticked band
+leaves that ring empty.</p>
+<p><b>From:</b> (<b>Ground</b> = AGL / <b>Sea level</b> = AMSL), under the
+slider, says what the selected band is measured from. It is a property of a
+band, not of the whole dock: it applies to the band selected in the list and
+to the next band you add. So a single view can carry
 <b>100 m AGL</b> and <b>2500 m AMSL</b> at the same time — a terrain-following
 drone and an aircraft holding a flight level, side by side. The suffix in the
 spin box and the band's label always state which reference that band uses.</p>
@@ -1115,20 +1127,19 @@ express a negative altitude.</li>
 </ul>
 
 <h3>Colouring</h3>
+<p>Only what your altitudes reach is drawn; above the highest one the map is
+empty. The two buttons at the top of the group choose how it is coloured:</p>
 <ul>
-<li><b>Limit to these altitudes</b> — on, the map shows only what your bands
-reach; off, the whole layer is drawn with its continuous ramp.</li>
-<li><b>Colour by: Altitude band</b> — one colour per band. Coverage at altitude
-A always contains coverage at every lower altitude, so the bands draw as nested
-rings: the lowest band owns everything up to its altitude, each higher one owns
-only what the one below did not reach, and above the highest band nothing is
-drawn.</li>
-<li><b>Colour by: Required altitude</b> — one continuous ramp up to the highest
-band, colouring each pixel by the altitude it actually needs (blue = low,
-red = high). This is the "required altitude" ramp: a gradient of how far you
-would have to climb, location by location.</li>
-<li><b>Reset to full range</b> restores the default continuous styling on the
-selected layers.</li>
+<li><b>Bands</b> — one colour per band. Coverage at altitude A always contains
+coverage at every lower altitude, so the bands draw as nested rings: the
+lowest ticked band owns everything up to its altitude, each higher one owns
+only what the one below did not reach. One pixel takes one colour, so a higher
+band is only visible where the lower ticked bands do not reach — untick the
+lower ones to see a higher band's full area.</li>
+<li><b>Ramp</b> — one continuous ramp up to the highest band, colouring each
+pixel by the altitude it actually needs (blue = low, red = high): a gradient of
+how far you would have to climb, location by location. To see the whole layer
+this way, put the highest band on the layer's ceiling (Auto-pick does).</li>
 </ul>
 
 <h3>Tools</h3>

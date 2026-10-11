@@ -319,6 +319,7 @@ _qtcore.pyqtSignal = _MockSignalDescriptor
 _qtcore.QTimer = mock.MagicMock()
 _qtcore.QUrl = type("QUrl", (), {"__init__": lambda self, *a, **kw: None})
 _qtcore.QByteArray = type("QByteArray", (), {"__init__": lambda self, *a, **kw: None})
+_qtcore.QSize = type("QSize", (), {"__init__": lambda self, *a, **kw: None})
 
 # Qt Widgets — create lightweight stubs for all used widgets
 _widget_names = [

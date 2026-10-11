@@ -261,6 +261,7 @@ def build_band_renderer(
     bands: Sequence[_ma.AltitudeBand] = (),
     reference: str = _ma.REF_AGL,
     alpha: float = 0.75,
+    hidden_leave_gaps: bool = False,
 ) -> QgsSingleBandPseudoColorRenderer:
     """Build a renderer that paints several altitudes at once, each its own
     colour.
@@ -272,13 +273,15 @@ def build_band_renderer(
     this only turns them into QGIS objects.
 
     Anything above the highest band is transparent, so the map answers "where
-    can I get to at these altitudes" without a legend lookup.
+    can I get to at these altitudes" without a legend lookup.  A hidden band
+    hands its area to the next shown one unless *hidden_leave_gaps* (see
+    :func:`min_alt.band_stops`).
     """
     ramp = QgsColorRampShader()
     ramp.setColorRampType(QgsColorRampShader.Type.Discrete)
 
     items = []
-    for stop in _ma.band_stops(bands, reference):
+    for stop in _ma.band_stops(bands, reference, hidden_leave_gaps):
         if stop.color is None:
             color = QColor(0, 0, 0, 0)
         else:

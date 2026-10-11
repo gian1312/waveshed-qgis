@@ -264,9 +264,9 @@ class TestCoversTheUI:
         "Max VRAM budget (GB):", "Max RAM budget (GB):",
         "Download connections:", "Local terrain dir:", "Terrain cache:",
         # Altitude Explorer
-        "Altitude Explorer", "Measured from:", "Ground (AGL)",
-        "Sea level (AMSL)", "Add altitude", "Limit to these altitudes",
-        "Merge selected", "Iso-altitude contours", "Required altitude",
+        "Altitude Explorer", "From:", "Ground",
+        "Sea level", "Auto-pick", "Leave gaps",
+        "Merge selected", "Iso-altitude contours",
         # Processing
         "Site Analysis (Coverage)", "Point-to-Point Link Analysis",
         "Batch CSV File", "MIN_ALT",
