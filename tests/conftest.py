@@ -129,6 +129,8 @@ class _MockQDialog(_MockQWidget):
 
 
 class _MockQThread:
+    finished = None  # replaced by a signal descriptor below (as on QThread)
+
     def __init__(self, *args, **kwargs):
         pass
     def start(self): pass
@@ -314,12 +316,16 @@ _qtcore.Qt = type("Qt", (), {
     ),
     "WindowType": _enum_scope("WindowType", Widget=0, Window=1, Dialog=3),
 })
+_MockQThread.finished = _MockSignalDescriptor()
+_MockQThread.finished.__set_name__(_MockQThread, "finished")
 _qtcore.QThread = _MockQThread
 _qtcore.pyqtSignal = _MockSignalDescriptor
 _qtcore.QTimer = mock.MagicMock()
 _qtcore.QUrl = type("QUrl", (), {"__init__": lambda self, *a, **kw: None})
 _qtcore.QByteArray = type("QByteArray", (), {"__init__": lambda self, *a, **kw: None})
 _qtcore.QSize = type("QSize", (), {"__init__": lambda self, *a, **kw: None})
+_qtcore.QPointF = type("QPointF", (), {"__init__": lambda self, *a, **kw: None})
+_qtcore.QRectF = type("QRectF", (), {"__init__": lambda self, *a, **kw: None})
 
 # Qt Widgets — create lightweight stubs for all used widgets
 _widget_names = [
@@ -390,6 +396,8 @@ _qtwidgets.QFileDialog.Option = _enum_scope("Option", ShowDirsOnly=1)
 # Qt GUI
 _qtgui.QColor = type("QColor", (), {"__init__": lambda self, *a: None})
 _qtgui.QIcon = type("QIcon", (), {"__init__": lambda self, *a: None})
+_qtgui.QPainter = type("QPainter", (), {"__init__": lambda self, *a: None})
+_qtgui.QPen = type("QPen", (), {"__init__": lambda self, *a: None})
 _qtgui.QDesktopServices = type(
     "QDesktopServices", (), {"openUrl": staticmethod(lambda *a, **kw: True)}
 )

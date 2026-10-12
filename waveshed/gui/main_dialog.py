@@ -322,8 +322,9 @@ class AetherMainDialog(QDialog):
         # exits have to save. Geometry first: a throw in the teardown below
         # must not be what loses it.
         self._save_geometry()
-        # Save settings when closing
-        self._settings_widget.save_settings()
+        # Save settings when closing — without re-probing the engine for a
+        # status label that is about to be destroyed (that froze the close).
+        self._settings_widget.save_settings(revalidate=False)
         # Cancel any running workers
         self.site_tab.cancel_worker()
         self.p2p_tab.cancel_worker()
@@ -332,7 +333,7 @@ class AetherMainDialog(QDialog):
 
     def reject(self) -> None:
         self._save_geometry()
-        self._settings_widget.save_settings()
+        self._settings_widget.save_settings(revalidate=False)
         self.site_tab.cancel_worker()
         self.p2p_tab.cancel_worker()
         self.converter_tab.cancel_worker()

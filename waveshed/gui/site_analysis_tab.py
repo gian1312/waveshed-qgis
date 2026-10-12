@@ -12,6 +12,7 @@ The parent dialog must provide:
 
 from __future__ import annotations
 
+import dataclasses
 import os
 import platform
 import re
@@ -22,6 +23,7 @@ from typing import Dict, List, Optional, Tuple
 
 from qgis.PyQt.QtCore import QThread, pyqtSignal, Qt
 from qgis.PyQt.QtWidgets import (
+    QButtonGroup,
     QCheckBox,
     QComboBox,
     QDoubleSpinBox,
@@ -35,6 +37,7 @@ from qgis.PyQt.QtWidgets import (
     QMessageBox,
     QProgressBar,
     QPushButton,
+    QRadioButton,
     QSpinBox,
     QTableWidget,
     QTableWidgetItem,
@@ -88,14 +91,18 @@ from ..core.terrain_adapter import (
     buildings_identity,
     get_source_resolution_info,
     prepare_terrain,
+    prepare_terrain_profile,
     reset_terrain_warnings,
     terrain_coverage_warning,
     terrain_plan,
+    terrain_plan_profile,
     terrain_size_warning,
 )
+from ..core import range_profile as rp
 from .engine_notices import show_run_error
 from .height_inputs import MIN_AMSL_M, bind_height_mode
 from .map_tools import activate_point_capture
+from .range_profile_dialog import RangeProfileDialog
 
 TAG = "Waveshed"
 
@@ -228,10 +235,12 @@ class _SiteAnalysisWorker(QThread):
             # single time rather than once per site/height.
             reset_terrain_warnings()
 
-            # Pre-flight: every job shares one resolution, so one probe
-            # decides the run — before any terrain is fetched.
+            # Pre-flight before any terrain is fetched, once per distinct
+            # (resolution, profiled) combination in the run.
             from ..core import binary_manager as _bm
-            _bm.check_engine_for_job(self.jobs[0][0].resolution_m)
+            for res, profiled in sorted({(p.resolution_m, bool(p.range_profile))
+                                         for p, _ in self.jobs}):
+                _bm.check_engine_for_job(res, range_profile=profiled)
 
             for job_idx, (params, display_name) in enumerate(self.jobs):
                 if self._canceled:
@@ -251,18 +260,32 @@ class _SiteAnalysisWorker(QThread):
                 self.progress.emit(_job_progress(5))
 
                 from ..core import binary_manager as bm
-                abt_dir = prepare_terrain(
-                    dem_layer=self.dem_layer,
-                    tx_lat=params.tx_lat,
-                    tx_lon=params.tx_lon,
-                    max_range_km=params.max_range_km,
-                    resolution_m=params.resolution_m,
-                    binary_manager=bm,
-                    terrain_dir=self.terrain_dir or None,
-                    az_start=params.az_start,
-                    az_end=params.az_end,
-                    osm_buildings=self.osm_buildings,
-                )
+                if params.range_profile:
+                    # Adaptive / custom: each band's tiles at its own step.
+                    abt_dir = prepare_terrain_profile(
+                        dem_layer=self.dem_layer,
+                        tx_lat=params.tx_lat,
+                        tx_lon=params.tx_lon,
+                        bands=params.range_profile,
+                        binary_manager=bm,
+                        terrain_dir=self.terrain_dir or None,
+                        az_start=params.az_start,
+                        az_end=params.az_end,
+                        osm_buildings=self.osm_buildings,
+                    )
+                else:
+                    abt_dir = prepare_terrain(
+                        dem_layer=self.dem_layer,
+                        tx_lat=params.tx_lat,
+                        tx_lon=params.tx_lon,
+                        max_range_km=params.max_range_km,
+                        resolution_m=params.resolution_m,
+                        binary_manager=bm,
+                        terrain_dir=self.terrain_dir or None,
+                        az_start=params.az_start,
+                        az_end=params.az_end,
+                        osm_buildings=self.osm_buildings,
+                    )
 
                 if self._canceled:
                     return
@@ -645,11 +668,55 @@ class SiteAnalysisTab(QWidget):
         self.lbl_dem_info.setStyleSheet("color: gray; font-size: 11px;")
         layout.addRow("", self.lbl_dem_info)
 
-        # Resolution
+        # Resolution — Fixed, or a profile that coarsens with distance
+        # (core.range_profile): Adaptive = this resolution to 7 km, then
+        # stepping up to 90 m over the next 5 km; Custom = drawn by the user.
         self.combo_resolution = QComboBox()
         self.combo_resolution.addItems([str(r) for r in VALID_RESOLUTIONS])
         self.combo_resolution.setCurrentIndex(2)  # default 10
-        layout.addRow("Resolution (m):", self.combo_resolution)
+        self.radio_res_fixed = QRadioButton("Fixed")
+        self.radio_res_adaptive = QRadioButton("Adaptive")
+        self.radio_res_custom = QRadioButton("Custom…")
+        self.radio_res_fixed.setChecked(True)
+        self.radio_res_fixed.setToolTip("The chosen resolution over the whole range.")
+        self.radio_res_adaptive.setToolTip(
+            "The chosen resolution out to 7 km, then coarser steps up to 90 m "
+            "over the next 5 km, 90 m beyond. Only the near field needs the "
+            "fine resolution; the far field is computed much faster. The map "
+            "keeps the chosen pixel size everywhere (one layer per site). "
+            "Needs engine "
+            f"{rp.RANGE_PROFILE_MIN_ENGINE} or newer."
+        )
+        self.radio_res_custom.setToolTip(
+            "Draw your own resolution-against-distance profile."
+        )
+        self._res_group = QButtonGroup(self)
+        for btn in (self.radio_res_fixed, self.radio_res_adaptive, self.radio_res_custom):
+            self._res_group.addButton(btn)
+        #: Custom profile [(until_m, step_m), ...] for the base resolution it
+        #: was drawn for; None until the user draws one.
+        self._custom_bands: Optional[list] = None
+        self._res_mode_before_custom = rp.MODE_FIXED
+        res_row = QHBoxLayout()
+        res_row.setContentsMargins(0, 0, 0, 0)
+        res_row.addWidget(self.combo_resolution)
+        res_row.addWidget(self.radio_res_fixed)
+        res_row.addWidget(self.radio_res_adaptive)
+        res_row.addWidget(self.radio_res_custom)
+        res_row.addStretch()
+        res_widget = QWidget()
+        res_widget.setLayout(res_row)
+        layout.addRow("Resolution (m):", res_widget)
+        self.lbl_res_profile = QLabel("")
+        self.lbl_res_profile.setStyleSheet("color: gray; font-size: 11px;")
+        self.lbl_res_profile.setWordWrap(True)
+        layout.addRow("", self.lbl_res_profile)
+        self.combo_resolution.currentIndexChanged.connect(self._on_resolution_changed)
+        self.radio_res_fixed.toggled.connect(
+            lambda on: self._on_res_mode_toggled(on, rp.MODE_FIXED))
+        self.radio_res_adaptive.toggled.connect(
+            lambda on: self._on_res_mode_toggled(on, rp.MODE_ADAPTIVE))
+        self.radio_res_custom.clicked.connect(self._on_custom_resolution)
 
         # Buildings — fetched from OpenFreeMap and burned into the terrain
         # surface, so they obstruct exactly like terrain does.
@@ -1336,6 +1403,75 @@ class SiteAnalysisTab(QWidget):
     # Build CoverageParams for each (site x altitude) combination
     # ==================================================================
 
+    # -- Resolution profile (Fixed / Adaptive / Custom) ---------------------
+
+    def _resolution_mode(self) -> str:
+        if self.radio_res_adaptive.isChecked():
+            return rp.MODE_ADAPTIVE
+        if self.radio_res_custom.isChecked():
+            return rp.MODE_CUSTOM
+        return rp.MODE_FIXED
+
+    def _profile_range_km(self) -> float:
+        """Range the profile label and the Custom editor are drawn for — the
+        longest site range (each site's profile is clipped to its own)."""
+        ranges = [float(s.get("range") or 0) for s in self._read_sites()]
+        return max(ranges + [0.0]) or 50.0
+
+    def _bands_for(self, base_m: int, range_km: float) -> Optional[list]:
+        """The profile for one site, or None for a fixed (single-band) run."""
+        mode = self._resolution_mode()
+        if mode == rp.MODE_ADAPTIVE:
+            bands = rp.adaptive_bands(base_m, range_km)
+        elif mode == rp.MODE_CUSTOM and self._custom_bands:
+            bands = rp.normalise_bands(self._custom_bands, range_km)
+        else:
+            bands = None
+        return bands if bands and len(bands) > 1 else None
+
+    def _refresh_res_profile(self) -> None:
+        base = int(self.combo_resolution.currentText())
+        mode = self._resolution_mode()
+        if mode == rp.MODE_FIXED:
+            self.lbl_res_profile.setText("")
+            return
+        bands = self._bands_for(base, self._profile_range_km())
+        if bands is None:
+            self.lbl_res_profile.setText(
+                f"{base} m over the whole range — already as coarse as the far "
+                f"step, or the range ends inside the near field.")
+        else:
+            self.lbl_res_profile.setText(rp.describe(bands))
+
+    def _on_resolution_changed(self, _index: int) -> None:
+        # A custom profile is drawn from one base resolution; another base
+        # starts it over (the first band IS the chosen resolution).
+        base = int(self.combo_resolution.currentText())
+        if self._custom_bands and self._custom_bands[0][1] != base:
+            self._custom_bands = None
+            if self.radio_res_custom.isChecked():
+                self.radio_res_adaptive.setChecked(True)
+        self._refresh_res_profile()
+
+    def _on_res_mode_toggled(self, on: bool, mode: str) -> None:
+        if on:
+            self._res_mode_before_custom = mode  # where a cancelled Custom returns
+        self._refresh_res_profile()
+
+    def _on_custom_resolution(self) -> None:
+        """Custom clicked: open the profile editor (again, on every click)."""
+        base = int(self.combo_resolution.currentText())
+        dlg = RangeProfileDialog(base, self._profile_range_km(), self._custom_bands, self)
+        if dlg.exec() == dlg.DialogCode.Accepted:
+            self._custom_bands = dlg.bands()
+            self.radio_res_custom.setChecked(True)
+        elif not self._custom_bands:
+            # Nothing drawn yet: Custom has no profile to run, go back.
+            back = (self.radio_res_adaptive if self._res_mode_before_custom == rp.MODE_ADAPTIVE
+                    else self.radio_res_fixed)
+            back.setChecked(True)
+        self._refresh_res_profile()
+
     def _build_jobs(self) -> List[Tuple[CoverageParams, str]]:
         """Create a (CoverageParams, display_name) tuple for every combination.
 
@@ -1453,6 +1589,11 @@ class SiteAnalysisTab(QWidget):
                     earth_radius=self.combo_earth_radius.currentText(),
                     add_to_map=True,
                 )
+                bands = self._bands_for(resolution, float(params.max_range_km))
+                if bands:
+                    # Adaptive / custom: the same single job, with the profile.
+                    params = dataclasses.replace(params, range_profile=list(bands))
+                    display_name = f"{display_name} — {rp.describe(bands)}"
                 jobs.append((params, display_name))
 
         return jobs
@@ -1591,15 +1732,23 @@ class SiteAnalysisTab(QWidget):
             osm_buildings=self.chk_buildings.isChecked())
         for params, _name in jobs:
             key = (params.tx_lat, params.tx_lon, params.max_range_km,
-                   params.resolution_m, params.az_start, params.az_end)
+                   params.resolution_m, params.az_start, params.az_end,
+                   tuple(params.range_profile or ()))
             if key in seen:
                 continue
             seen.add(key)
-            plan = terrain_plan(
-                plan_source, params.tx_lat, params.tx_lon,
-                params.max_range_km, params.resolution_m,
-                params.az_start, params.az_end, plan_buildings,
-            )
+            if params.range_profile:
+                plan = terrain_plan_profile(
+                    plan_source, params.tx_lat, params.tx_lon,
+                    params.range_profile, params.az_start, params.az_end,
+                    plan_buildings,
+                )
+            else:
+                plan = terrain_plan(
+                    plan_source, params.tx_lat, params.tx_lon,
+                    params.max_range_km, params.resolution_m,
+                    params.az_start, params.az_end, plan_buildings,
+                )
             total_mb += plan["download_mb"]
             cached_mb += plan["total_mb"] - plan["download_mb"]
             tiles_cached += plan["tiles_cached"]

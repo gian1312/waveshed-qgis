@@ -39,6 +39,39 @@ from ..core.attribution import attribution_lines
 # Background worker for binary download
 # ---------------------------------------------------------------------------
 
+class _EngineProbeThread(QThread):
+    """Off-GUI-thread engine checks for the Settings tab: the installed engine
+    version (launches ``aether_core --version``) and the runtime prerequisites
+    (``vulkaninfo`` on Linux). Each can take a second or more — an antivirus
+    scan of the engine exe on Windows — and used to freeze the dialog on open.
+    Both answers are cached by binary_manager for the session.
+    """
+
+    probed = pyqtSignal(str, object, list)  # (binary_dir, version or None, issues)
+
+    def __init__(self, binary_dir: str) -> None:
+        super().__init__()
+        self.binary_dir = binary_dir
+
+    def run(self) -> None:
+        version = None
+        issues: list = []
+        try:
+            if binary_manager._dir_has_binary(self.binary_dir, "aether_core"):
+                version = binary_manager.installed_engine_version(self.binary_dir)
+            issues = binary_manager.check_prerequisites(self.binary_dir)
+        except Exception as exc:  # noqa: BLE001 — a probe must never take the GUI down
+            issues = [f"Engine check failed: {exc}"]
+        self.probed.emit(self.binary_dir, version, issues)
+
+
+#: Probe threads still running. Kept here, not parented to the dialog, so that
+#: closing the dialog mid-probe neither blocks on the probe nor destroys a
+#: running QThread; the result is simply dropped (Qt disconnects a deleted
+#: receiver).
+_LIVE_PROBES: set = set()
+
+
 class _ManifestThread(QThread):
     """Fetch the (signature-checked) release manifest and select the platform
     asset off-thread. ``fetch_eula=False`` skips the EULA text (update check)."""
@@ -399,7 +432,8 @@ class SettingsDialog(QDialog):
         # Binaries
         self._binary_dir_edit.setText(s.value("waveshed/binary_dir", ""))
         self._update_check_box.setChecked(binary_manager.auto_update_check_enabled())
-        self._refresh_binary_status()
+        # In the background: probing the engine on open froze the dialog.
+        self._refresh_binary_status(background=True)
 
         # API key
         self._api_key_edit.setText(api_key.get_stored_key())
@@ -423,13 +457,14 @@ class SettingsDialog(QDialog):
         snap["api_key"] = api_key.get_stored_key()
         return snap
 
-    def save_settings(self) -> None:
+    def save_settings(self, revalidate: bool = True) -> None:
         """Persist all settings to QgsSettings. Always saves, no validation dialogs.
 
         Emits :attr:`settings_changed` when a stored value actually changed,
         and re-checks the binary status so an invalid directory is called out
         immediately (fail loudly — never silently keep an old discovery
-        result).
+        result). *revalidate* False skips that re-check: the dialog's close
+        path saves without probing the engine for labels nobody will see.
         """
         before = self._snapshot()
         s = self._settings
@@ -444,7 +479,8 @@ class SettingsDialog(QDialog):
 
         # The saved binary dir is what runs use from now on — re-validate it
         # NOW so "Binaries: Missing" appears the moment a bad path is saved.
-        self._refresh_binary_status()
+        if revalidate:
+            self._refresh_binary_status()
 
         if self._snapshot() != before:
             self.settings_changed.emit()
@@ -506,13 +542,18 @@ class SettingsDialog(QDialog):
         self._refresh_engine_version()
         QMessageBox.warning(self, "Update check failed", error)
 
-    def _refresh_engine_version(self) -> None:
-        """Show "installed X / available Y" for the configured engine dir."""
+    def _refresh_engine_version(self, installed: object = None, probed: bool = False) -> None:
+        """Show "installed X / available Y" for the configured engine dir.
+
+        With *probed* the installed version comes from a background probe
+        (:class:`_EngineProbeThread`) instead of being probed here.
+        """
         binary_dir = self._binary_dir_edit.text().strip()
-        installed = None
-        if binary_dir and os.path.isdir(binary_dir) and binary_manager._dir_has_binary(
-                binary_dir, "aether_core"):
-            installed = binary_manager.installed_engine_version(binary_dir)
+        if not probed:
+            installed = None
+            if binary_dir and os.path.isdir(binary_dir) and binary_manager._dir_has_binary(
+                    binary_dir, "aether_core"):
+                installed = binary_manager.installed_engine_version(binary_dir)
         available = self._available_version
         text = (f"Installed engine: {installed or 'unknown'}"
                 f"  /  Latest release: {available or 'not checked'}")
@@ -678,11 +719,26 @@ class SettingsDialog(QDialog):
         self._refresh_binary_status()
         QMessageBox.critical(self, "Download Failed", error)
 
-    def _refresh_binary_status(self) -> None:
-        """Update the binary-status and prerequisites labels."""
+    def _refresh_binary_status(self, background: bool = False) -> None:
+        """Update the binary-status and prerequisites labels.
+
+        With *background* (dialog open) the slow parts — the engine version
+        probe and the prerequisite check — run in an :class:`_EngineProbeThread`
+        and fill their labels when they answer; the cheap file checks stay
+        immediate either way.
+        """
         binary_dir = self._binary_dir_edit.text().strip()
 
-        if hasattr(self, "_engine_version_label"):
+        if background and binary_dir and os.path.isdir(binary_dir):
+            if hasattr(self, "_engine_version_label"):
+                self._engine_version_label.setText("Installed engine: checking…")
+            self._prereq_label.setText("")
+            thread = _EngineProbeThread(binary_dir)
+            thread.probed.connect(self._on_engine_probed)
+            _LIVE_PROBES.add(thread)
+            thread.finished.connect(lambda t=thread: _LIVE_PROBES.discard(t))
+            thread.start()
+        elif hasattr(self, "_engine_version_label"):
             self._refresh_engine_version()
 
         if not binary_dir or not os.path.isdir(binary_dir):
@@ -704,12 +760,28 @@ class SettingsDialog(QDialog):
             self._binary_status_label.setText(f"Binaries: Missing ({found}/{total} found)")
             self._binary_status_label.setStyleSheet("color: red;")
 
-        issues = binary_manager.check_prerequisites(binary_dir)
+        if background:
+            return  # _on_engine_probed fills the prerequisites label
+        self._show_prerequisites(binary_manager.check_prerequisites(binary_dir))
+
+    def _show_prerequisites(self, issues: list) -> None:
         if issues:
             self._prereq_label.setText("\n".join(issues))
             self._prereq_label.setStyleSheet("color: orange;")
         else:
             self._prereq_label.setText("")
+
+    def _on_engine_probed(self, binary_dir: str, version: object, issues: list) -> None:
+        """Result of a background probe; dropped if the directory has changed
+        meanwhile (a newer refresh is already on its way)."""
+        try:
+            if binary_dir != self._binary_dir_edit.text().strip():
+                return
+            if hasattr(self, "_engine_version_label"):
+                self._refresh_engine_version(version, probed=True)
+            self._show_prerequisites(issues)
+        except RuntimeError:
+            return  # the dialog was closed while the probe ran
 
     # ------------------------------------------------------- API key helpers
     def _toggle_key_visibility(self, checked: bool) -> None:

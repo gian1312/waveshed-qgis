@@ -117,6 +117,21 @@ Defined in `aether_converter/src/ingest.rs` (contract v2.0):
   cross-checks it against the plugin's own enumeration before every run and
   aborts on mismatch (or on an engine too old to have `plan`).
 
+## Adaptive / custom resolution (`core/range_profile.py`)
+
+Site Analysis offers Fixed / Adaptive / Custom next to the resolution. A profile is
+`analysis.range_profile` (engine >= `RANGE_PROFILE_MIN_ENGINE`, 0.4.9 — older engines
+ignore the field and would run uniformly at the coarse step, so
+`check_engine_for_job(..., range_profile=True)` refuses them before any download).
+An adaptive site is ONE job: the profile with `resolution_m` = the chosen (base)
+resolution, which stays the output pixel size everywhere — one `.bit`, one `.tif`,
+one layer (`SiteAnalysisTab._build_jobs`). Band steps come from `VALID_RESOLUTIONS` and must
+have nesting tile extents (2 m only steps to 30/90/250). Terrain:
+`terrain_adapter.prepare_terrain_profile` builds each band's tiles only where its ring
+needs them and never a footprint a finer band holds (`min_range_km` /
+`skip_footprints`, also in `terrain_plan` for the pre-run estimate), then links all
+bands into one view.
+
 ## Sensitive Files (DO NOT commit)
 
 - `api_private_key.bin` / `api_private_key.pem` - Ed25519 signing key (server-side only)
@@ -197,6 +212,13 @@ after EULA consent (asked every time). Rules, all in `core/binary_manager.py`:
   (`chmod +x` + `xattr -cr`) runs at plugin load, after Browse/Auto-detect,
   and before every `--version` probe; a Gatekeeper-looking failure gets the
   `xattr -cr "<dir>"` hint (`macos_launch_hint`).
+- **No engine launches on the GUI thread when the dialog opens or closes.**
+  `probe_engine_version` caches successful answers per binary (path, size,
+  mtime) and `_vulkan_issue` caches the Linux `vulkaninfo` check per session;
+  the Settings tab probes in an `_EngineProbeThread` on open and the close path
+  saves with `save_settings(revalidate=False)`. Launching `aether_core
+  --version` synchronously (an AV-scanned exe on Windows) froze open and close
+  for 2–3 s.
 - **Notices** (`gui/engine_notices.py`): first start without an engine →
   message bar with "Open Settings"; once per session (switch
   `waveshed/engine_update_check`, default on; silent offline) a newer release

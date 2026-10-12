@@ -150,6 +150,9 @@ class CoverageParams:
     az_start: float = 0.0
     az_end: float = 360.0
     backend: str = "AUTO"
+    #: Variable radial step (core.range_profile): [(until_m, step_m), ...].
+    #: None = one uniform step of resolution_m. Needs engine >= 0.4.9.
+    range_profile: Optional[list] = None
 
     # Output
     output_name: str = "coverage"
@@ -576,7 +579,7 @@ def build_coverage_job(
     if params.max_vram_gb:
         processing["max_vram_usage_gb"] = params.max_vram_gb
 
-    return {
+    job = {
         "tx": _build_tx(params),
         "rx": {
             "height_m": params.rx_height,
@@ -598,6 +601,11 @@ def build_coverage_job(
         "processing": processing,
         "propagation": _build_propagation(params),
     }
+    if params.range_profile:
+        job["analysis"]["range_profile"] = [
+            {"until_m": float(u), "step_m": float(st)} for u, st in params.range_profile
+        ]
+    return job
 
 
 def build_p2p_job(

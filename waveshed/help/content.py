@@ -570,7 +570,24 @@ is elevation data. The grey line below shows <b>Source resolution:</b>, or
 imagery.</td></tr>
 <tr><td><b>Resolution (m):</b></td><td>2, 5, 10, 30, 90 or 250 — the computation
 grid, and the resolution of the terrain tiles that get built. Default 10. See
-the table in <a href="#terrain">Terrain</a>.</td></tr>
+the table in <a href="#terrain">Terrain</a>. Beside it:
+<ul>
+<li><b>Fixed</b> — that resolution over the whole range.</li>
+<li><b>Adaptive</b> — only the near field needs the fine resolution. The chosen
+resolution holds to 7 km, the step then grows through the coarser resolutions
+over the next 5 km to 90 m, and 90 m covers the rest. Each radial stays one
+continuous ray, so the far field still sees the near-field terrain at full
+detail — this is what keeps it accurate, not just fast. Terrain is downloaded
+at each band's resolution only where that band needs it. The result is one
+layer per site at the chosen pixel size; in the coarser bands neighbouring
+pixels share the value of their coarser radial sample. The grey line under the
+row spells the profile out.</li>
+<li><b>Custom…</b> — opens a resolution-against-distance chart: drag a step up or
+down to change its resolution, drag a boundary to move it, double-click to
+split a band, right-click a boundary to remove it.</li>
+</ul>
+Adaptive and Custom need engine 0.4.9 or newer; 2 m can only step up to 30, 90
+or 250 m (its terrain tiles do not line up with 5 m / 10 m ones).</td></tr>
 <tr><td><b>Buildings:</b></td><td><b>Include buildings (OpenFreeMap)</b> — burn
 OSM building footprints into the terrain surface.</td></tr>
 <tr><td><b>Backend:</b></td><td><b>AUTO</b> (GPU when one is usable, else CPU),

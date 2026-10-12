@@ -21,7 +21,7 @@ import tempfile
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, List, Optional, Sequence
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 from qgis.core import Qgis, QgsMessageLog, QgsSettings
 
@@ -1305,14 +1305,36 @@ def read_engine_version(timeout: float = 5.0) -> Optional[str]:
     return probe_engine_version(os.path.dirname(exe), timeout=timeout)
 
 
+#: Session cache of successful ``--version`` answers, keyed by the engine
+#: binary's identity (path, size, mtime) — a replaced binary (a download, a
+#: rebuild, another directory) misses by itself. Each probe launches the engine,
+#: which on Windows means an antivirus scan of a ~10 MB exe: the Settings tab used
+#: to pay that on every dialog open AND close. Failures are never cached (a fresh
+#: .exe still being scanned can time out once and answer the next time).
+_VERSION_CACHE: Dict[Tuple[str, int, int], str] = {}
+
+
+def _exe_identity(exe: str) -> Optional[Tuple[str, int, int]]:
+    try:
+        st = os.stat(exe)
+    except OSError:
+        return None
+    return (os.path.normcase(os.path.abspath(exe)), st.st_size, st.st_mtime_ns)
+
+
 def probe_engine_version(binary_dir: str, timeout: float = 5.0) -> Optional[str]:
     """``aether_core --version`` of the engine in *binary_dir*, or ``None``.
 
     Prepares the directory first on macOS (:func:`prepare_engine_dir`), so a
-    quarantined copy is fixed before it is launched. Never raises.
+    quarantined copy is fixed before it is launched. Never raises. A binary
+    that already answered this session is not launched again
+    (:data:`_VERSION_CACHE`).
     """
-    prepare_engine_dir(binary_dir)
     exe = os.path.join(binary_dir, _binary_name("aether_core"))
+    identity = _exe_identity(exe)
+    if identity is not None and identity in _VERSION_CACHE:
+        return _VERSION_CACHE[identity]
+    prepare_engine_dir(binary_dir)
     try:
         result = subprocess.run(
             [exe, "--version"],
@@ -1349,6 +1371,8 @@ def probe_engine_version(binary_dir: str, timeout: float = 5.0) -> Optional[str]
             f"aether_core --version gave no version line: {(result.stdout or '').strip()[:200]!r}",
             TAG, Qgis.MessageLevel.Warning,
         )
+    elif identity is not None:
+        _VERSION_CACHE[identity] = version
     return version
 
 
@@ -1393,7 +1417,7 @@ def engine_supports_resolution(
     return float(resolution_m) in {float(r) for r in LEGACY_ENGINE_RESOLUTIONS}
 
 
-def check_engine_for_job(resolution_m: float) -> str:
+def check_engine_for_job(resolution_m: float, range_profile: bool = False) -> str:
     """Pre-flight before any terrain is fetched: log the engine, gate the job.
 
     Logs the engine path and version on every run (so a stale local deploy
@@ -1401,6 +1425,10 @@ def check_engine_for_job(resolution_m: float) -> str:
     :class:`EngineTooOldError` when the installed engine cannot solve
     *resolution_m* — BEFORE the terrain download, which for a 90 m / 250 m
     run is the expensive part of a job the engine would then refuse anyway.
+
+    With *range_profile* (an adaptive / custom resolution run) it also
+    requires :data:`range_profile.RANGE_PROFILE_MIN_ENGINE`: an older engine
+    ignores the profile and would compute the whole range at the coarse step.
 
     Returns the version string that was logged (``"unknown"`` if the engine
     predates ``--version``), for callers that want to show it.
@@ -1423,6 +1451,16 @@ def check_engine_for_job(resolution_m: float) -> str:
             "required. Update it via Settings \u2192 Download binaries, or pick "
             "one of those resolutions. Nothing was downloaded."
         )
+    if range_profile:
+        from .range_profile import RANGE_PROFILE_MIN_ENGINE
+        if not version or compare_versions(version, RANGE_PROFILE_MIN_ENGINE) < 0:
+            raise EngineTooOldError(
+                f"The installed Aether engine (aether_core {shown}) does not "
+                f"support adaptive / custom resolution; engine "
+                f"{RANGE_PROFILE_MIN_ENGINE} or newer is required. Update it via "
+                "Settings \u2192 Download binaries, or choose Fixed resolution. "
+                "Nothing was downloaded."
+            )
     return shown
 
 
@@ -1493,6 +1531,35 @@ def mark_update_notified(version: str) -> None:
 # Prerequisites check
 # ---------------------------------------------------------------------------
 
+#: ``vulkaninfo`` answer for this session: installed Vulkan drivers do not change
+#: while QGIS runs, and the probe loads every driver and layer (~0.5 s and up).
+#: ``_VULKAN_UNCHECKED`` until the first check.
+_VULKAN_UNCHECKED = object()
+_VULKAN_ISSUE: object = _VULKAN_UNCHECKED
+
+
+def _vulkan_issue() -> Optional[str]:
+    """Why Vulkan looks unusable on this Linux machine, or None (cached)."""
+    global _VULKAN_ISSUE
+    if _VULKAN_ISSUE is _VULKAN_UNCHECKED:
+        issue: Optional[str] = None
+        try:
+            subprocess.run(
+                ["vulkaninfo", "--summary"],
+                capture_output=True,
+                timeout=5,
+                check=False,
+            )
+        except FileNotFoundError:
+            issue = ("Vulkan drivers not detected (vulkaninfo not found). "
+                     "GPU mode may not work. "
+                     "Install: apt install libvulkan1 mesa-vulkan-drivers")
+        except subprocess.TimeoutExpired:
+            issue = "vulkaninfo timed out — Vulkan driver may be misconfigured"
+        _VULKAN_ISSUE = issue
+    return _VULKAN_ISSUE  # type: ignore[return-value]
+
+
 def check_prerequisites(binary_dir: str) -> List[str]:
     """Check that all runtime dependencies are satisfied.
 
@@ -1531,23 +1598,9 @@ def check_prerequisites(binary_dir: str) -> List[str]:
             )
 
     if system == "Linux":
-        try:
-            subprocess.run(
-                ["vulkaninfo", "--summary"],
-                capture_output=True,
-                timeout=5,
-                check=False,
-            )
-        except FileNotFoundError:
-            issues.append(
-                "Vulkan drivers not detected (vulkaninfo not found). "
-                "GPU mode may not work. "
-                "Install: apt install libvulkan1 mesa-vulkan-drivers"
-            )
-        except subprocess.TimeoutExpired:
-            issues.append(
-                "vulkaninfo timed out — Vulkan driver may be misconfigured"
-            )
+        issue = _vulkan_issue()
+        if issue:
+            issues.append(issue)
 
     if issues:
         for issue in issues:

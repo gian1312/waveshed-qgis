@@ -1201,6 +1201,44 @@ def _compute_subtiles(
     return tiles
 
 
+def tile_footprint(tile: Dict[str, Any]) -> Tuple[float, float, float]:
+    """(north, west, extent) of a subtile in degrees — equal for two tiles of
+    different resolutions that cover the same ground (5 m and 10 m share the
+    0.25 deg grid). aether_core keeps one tile per footprint (the one closest to
+    the job resolution), so a profile must never hand it both."""
+    extent = tile["size_px"] * tile["exact_res_m"] / 111_111.0
+    return (round(tile["ul_lat"], 6), round(tile["ul_lon"], 6), round(extent, 6))
+
+
+def _band_tiles(subtiles: List[Dict[str, Any]], tx_lat: float, tx_lon: float,
+                min_range_km: float = 0.0,
+                skip_footprints: Optional[set] = None) -> List[Dict[str, Any]]:
+    """Drop the subtiles a finer profile band already covers: those lying
+    wholly inside the *min_range_km* disc and those whose footprint is in
+    *skip_footprints*. No-op with the defaults."""
+    if min_range_km <= 0 and not skip_footprints:
+        return subtiles
+    earth_r = 6_371_000.0
+    cos_tx = max(math.cos(math.radians(tx_lat)), 1e-6)
+    inner_m = min_range_km * 1000.0
+    kept = []
+    for t in subtiles:
+        fp = tile_footprint(t)
+        if skip_footprints and fp in skip_footprints:
+            continue
+        north, west, extent = fp
+        far = 0.0
+        for lat in (north - extent, north):
+            for lon in (west, west + extent):
+                dy = (lat - tx_lat) * earth_r * math.pi / 180.0
+                dx = (lon - tx_lon) * earth_r * cos_tx * math.pi / 180.0
+                far = max(far, math.hypot(dx, dy))
+        if inner_m > 0 and far < inner_m:
+            continue
+        kept.append(t)
+    return kept
+
+
 def _estimate_abt_disk_mb(subtiles: List[Dict[str, Any]]) -> int:
     """Estimate total disk space needed for .abt output files (MB)."""
     total = 0
@@ -1273,8 +1311,14 @@ def terrain_plan(
     az_start: float = 0.0,
     az_end: float = 360.0,
     buildings: Optional[str] = None,
+    min_range_km: float = 0.0,
+    skip_footprints: Optional[set] = None,
 ) -> Dict[str, Any]:
     """What one analysis will actually have to build, given what is pooled.
+
+    *min_range_km* / *skip_footprints* narrow it to one band of a range
+    profile, exactly as :func:`prepare_terrain` does (see
+    :func:`terrain_plan_profile`).
 
     The pre-run warning used to price the whole tile set every time, so a run
     whose terrain was already on disk still announced tens of gigabytes of
@@ -1284,6 +1328,7 @@ def terrain_plan(
     bbox = _compute_sector_bbox(tx_lat, tx_lon, max_range_km, az_start, az_end)
     subtiles = _compute_subtiles(bbox, resolution_m, tx_lat, tx_lon,
                                  max_range_km, az_start, az_end)
+    subtiles = _band_tiles(subtiles, tx_lat, tx_lon, min_range_km, skip_footprints)
     pool = _pool_dir(source, buildings)
     missing = [t for t in subtiles if not _tile_ready(pool, t["filename"])]
     return {
@@ -1293,7 +1338,36 @@ def terrain_plan(
         "tiles_missing": len(missing),
         "download_mb": _estimate_abt_disk_mb(missing),
         "total_mb": _estimate_abt_disk_mb(subtiles),
+        "footprints": {tile_footprint(t) for t in subtiles},
     }
+
+
+def terrain_plan_profile(
+    source: str,
+    tx_lat: float,
+    tx_lon: float,
+    bands: List[Tuple[float, int]],
+    az_start: float = 0.0,
+    az_end: float = 360.0,
+    buildings: Optional[str] = None,
+) -> Dict[str, Any]:
+    """:func:`terrain_plan` for a range profile — the sum of its bands, each
+    narrowed exactly as :func:`prepare_terrain_profile` builds it."""
+    total: Dict[str, Any] = {"bbox": None, "tiles_total": 0, "tiles_cached": 0,
+                             "tiles_missing": 0, "download_mb": 0, "total_mb": 0}
+    covered: set = set()
+    inner_km = 0.0
+    for until_m, step in bands:
+        plan = terrain_plan(source, tx_lat, tx_lon, until_m / 1000.0, step,
+                            az_start, az_end, buildings,
+                            min_range_km=inner_km, skip_footprints=covered)
+        for key in ("tiles_total", "tiles_cached", "tiles_missing",
+                    "download_mb", "total_mb"):
+            total[key] += plan[key]
+        total["bbox"] = plan["bbox"]
+        covered = covered | plan["footprints"]
+        inner_km = until_m / 1000.0
+    return total
 
 
 def terrain_size_warning(disk_mb: int,
@@ -3284,8 +3358,16 @@ def prepare_terrain(
     buildings_file: Optional[str] = None,
     osm_buildings: bool = False,
     progress_span: Optional[Tuple[float, float]] = None,
+    min_range_km: float = 0.0,
+    skip_footprints: Optional[set] = None,
 ) -> str:
     """Produce .abt terrain tiles for aether_core. Returns cache directory.
+
+    *min_range_km* and *skip_footprints* narrow the tile set for one band of a
+    range profile (:func:`prepare_terrain_profile`): tiles lying wholly inside
+    the *min_range_km* disc, and tiles whose footprint (:func:`tile_footprint`)
+    is in *skip_footprints*, are left out — a finer band already covers them, so
+    they are never downloaded. Both default to "keep everything".
 
     *progress_span* ``(lo, hi)``, when given together with a *feedback* that
     has ``setProgress``, maps the terrain-download fraction into that
@@ -3360,6 +3442,7 @@ def prepare_terrain(
     bbox = _compute_sector_bbox(tx_lat, tx_lon, max_range_km, az_start, az_end)
     subtiles = _compute_subtiles(bbox, resolution_m, tx_lat, tx_lon,
                                  max_range_km, az_start, az_end)
+    subtiles = _band_tiles(subtiles, tx_lat, tx_lon, min_range_km, skip_footprints)
     expected = [t["filename"] for t in subtiles]
 
     # The converter reads FlatGeobuf in WGS84 and nothing else, so a GeoJSON, a
@@ -3707,5 +3790,74 @@ def prepare_terrain(
                 os.remove(tf)
 
     _finish_view(pool_dir, view_dir, expected, t0)
+    _record_view_dir(view_dir)
+    return view_dir
+
+
+def prepare_terrain_profile(
+    dem_layer: Any,
+    tx_lat: float,
+    tx_lon: float,
+    bands: List[Tuple[float, int]],
+    binary_manager: Any,
+    feedback: Optional[Any] = None,
+    terrain_dir: Optional[str] = None,
+    az_start: float = 0.0,
+    az_end: float = 360.0,
+    osm_buildings: bool = False,
+) -> str:
+    """Terrain for a range-profile job (core.range_profile): one view directory
+    holding, per band, the tiles at that band's step.
+
+    Each band gets the tiles :func:`prepare_terrain` would build for its outer
+    edge, minus what a finer band already covers — tiles wholly inside the finer
+    disc, and tiles on a footprint a finer band holds (5 m and 10 m share the
+    0.25 deg grid). Those are filtered BEFORE anything is fetched, so the
+    download is the minimum: fine terrain only near the transmitter, coarse
+    terrain only where the coarse band needs it. All bands share the one pool,
+    so a later fixed run at any of these resolutions reuses the tiles.
+
+    aether_core keeps every tile group in the directory and lets finer tiles
+    win where they overlap (toolkit CONTRACT.md 3.3), which is what the
+    combined view relies on.
+    """
+    if is_abt_tile_dir(terrain_dir):
+        # Pre-built .abt tiles are handed over as they are, as for a fixed run.
+        return prepare_terrain(dem_layer, tx_lat, tx_lon, bands[-1][0] / 1000.0,
+                               bands[0][1], binary_manager, feedback,
+                               terrain_dir, az_start, az_end,
+                               osm_buildings=osm_buildings)
+    source = terrain_dir or dem_layer.source()
+    covered: set = set()
+    names: List[str] = []
+    inner_km = 0.0
+    for until_m, step in bands:
+        until_km = until_m / 1000.0
+        bbox = _compute_sector_bbox(tx_lat, tx_lon, until_km, az_start, az_end)
+        tiles = _band_tiles(
+            _compute_subtiles(bbox, step, tx_lat, tx_lon, until_km, az_start, az_end),
+            tx_lat, tx_lon, inner_km, covered)
+        _log(f"prepare_terrain_profile: band {inner_km:g}-{until_km:g} km @ {step} m "
+             f"— {len(tiles)} tile(s)")
+        if tiles:
+            prepare_terrain(dem_layer, tx_lat, tx_lon, until_km, step,
+                            binary_manager, feedback, terrain_dir, az_start, az_end,
+                            osm_buildings=osm_buildings,
+                            min_range_km=inner_km, skip_footprints=set(covered))
+            names.extend(t["filename"] for t in tiles)
+            covered.update(tile_footprint(t) for t in tiles)
+        inner_km = until_km
+
+    buildings_id = buildings_identity(None, osm_buildings)
+    pool_dir = _pool_dir(source, buildings_id)
+    view_dir = _view_dir(source, [{"filename": n} for n in names],
+                         "profile", buildings_id)
+    ensure_engine_dirs(pool_dir, view_dir)
+    gone = _sync_view(pool_dir, view_dir, names)
+    if gone:
+        raise RuntimeError(
+            f"{len(gone)} terrain tile(s) vanished from the cache while the "
+            f"profile view was assembled: {', '.join(gone[:5])}")
+    _log(f"  profile .abt view dir: {view_dir} ({len(names)} tile(s))")
     _record_view_dir(view_dir)
     return view_dir

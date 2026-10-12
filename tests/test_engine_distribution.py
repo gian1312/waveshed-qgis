@@ -808,5 +808,131 @@ class TestMainDialogAndPluginWiring(unittest.TestCase):
         dialog.show_engine_settings.assert_called_once_with(start_download=True)
 
 
+
+class TestEngineProbeCostIsPaidOnce(unittest.TestCase):
+    """Opening and closing the dialog used to launch ``aether_core --version``
+    each time on the GUI thread (an antivirus-scanned exe on Windows: 2-3 s of
+    freeze per open/close)."""
+
+    def setUp(self):
+        bm._VERSION_CACHE.clear()
+        self.addCleanup(bm._VERSION_CACHE.clear)
+
+    def _engine_dir(self, d):
+        exe = os.path.join(d, "aether_core" + bm._EXE_SUFFIX)
+        with open(exe, "w") as fh:
+            fh.write("x")
+        return exe
+
+    def test_a_binary_that_answered_is_not_launched_again(self):
+        with tempfile.TemporaryDirectory() as d:
+            self._engine_dir(d)
+            ok = mock.Mock(returncode=0, stdout="aether_core 0.4.9\n", stderr="")
+            with mock.patch.object(bm, "prepare_engine_dir"), \
+                    mock.patch.object(bm.subprocess, "run", return_value=ok) as run:
+                self.assertEqual(bm.probe_engine_version(d), "0.4.9")
+                self.assertEqual(bm.probe_engine_version(d), "0.4.9")
+            self.assertEqual(run.call_count, 1)
+
+    def test_a_replaced_binary_is_probed_again(self):
+        with tempfile.TemporaryDirectory() as d:
+            exe = self._engine_dir(d)
+            answers = [mock.Mock(returncode=0, stdout=f"aether_core {v}\n", stderr="")
+                       for v in ("0.4.8", "0.4.9")]
+            with mock.patch.object(bm, "prepare_engine_dir"), \
+                    mock.patch.object(bm.subprocess, "run", side_effect=answers) as run:
+                self.assertEqual(bm.probe_engine_version(d), "0.4.8")
+                with open(exe, "w") as fh:   # a download replaces the exe
+                    fh.write("new engine")
+                self.assertEqual(bm.probe_engine_version(d), "0.4.9")
+            self.assertEqual(run.call_count, 2)
+
+    def test_a_failed_probe_is_retried(self):
+        with tempfile.TemporaryDirectory() as d:
+            self._engine_dir(d)
+            timeout = subprocess.TimeoutExpired(["aether_core"], 5)
+            ok = mock.Mock(returncode=0, stdout="aether_core 0.4.9\n", stderr="")
+            with mock.patch.object(bm, "prepare_engine_dir"), \
+                    mock.patch.object(bm.subprocess, "run", side_effect=[timeout, ok]):
+                self.assertIsNone(bm.probe_engine_version(d))
+                self.assertEqual(bm.probe_engine_version(d), "0.4.9")
+
+    def test_vulkaninfo_runs_once_per_session(self):
+        old = bm._VULKAN_ISSUE
+        self.addCleanup(setattr, bm, "_VULKAN_ISSUE", old)
+        bm._VULKAN_ISSUE = bm._VULKAN_UNCHECKED
+        with mock.patch.object(bm.subprocess, "run", side_effect=FileNotFoundError) as run:
+            first = bm._vulkan_issue()
+            second = bm._vulkan_issue()
+        self.assertIn("vulkaninfo not found", first)
+        self.assertEqual(first, second)
+        self.assertEqual(run.call_count, 1)
+
+
+class TestSettingsProbesOffTheGuiThread(unittest.TestCase):
+    def _dlg(self, binary_dir):
+        dlg = SettingsDialog.__new__(SettingsDialog)
+        dlg._binary_dir_edit = _Edit(binary_dir)
+        dlg._engine_version_label = _Label()
+        dlg._binary_status_label = _Label()
+        dlg._prereq_label = _Label()
+        dlg._available_version = None
+        return dlg
+
+    def test_background_refresh_does_not_probe_on_the_calling_thread(self):
+        from waveshed.gui import settings_dialog as sd
+        with tempfile.TemporaryDirectory() as d:
+            dlg = self._dlg(d)
+            started = []
+            with mock.patch.object(bm, "installed_engine_version") as probe, \
+                    mock.patch.object(bm, "check_prerequisites") as prereq, \
+                    mock.patch.object(sd._EngineProbeThread, "start",
+                                      lambda self: started.append(self)):
+                dlg._refresh_binary_status(background=True)
+            probe.assert_not_called()
+            prereq.assert_not_called()
+            self.assertEqual(len(started), 1)
+            self.assertIn("checking", dlg._engine_version_label.text_value)
+            self.assertIn("Binaries:", dlg._binary_status_label.text_value)  # cheap part is immediate
+            sd._LIVE_PROBES.clear()
+
+    def test_probe_result_fills_the_labels(self):
+        with tempfile.TemporaryDirectory() as d:
+            dlg = self._dlg(d)
+            dlg._on_engine_probed(d, "0.4.9", ["Vulkan drivers not detected"])
+            self.assertIn("Installed engine: 0.4.9", dlg._engine_version_label.text_value)
+            self.assertIn("Vulkan", dlg._prereq_label.text_value)
+
+    def test_a_stale_result_is_dropped(self):
+        with tempfile.TemporaryDirectory() as d:
+            dlg = self._dlg(d)
+            dlg._engine_version_label.setText("Installed engine: checking…")
+            dlg._on_engine_probed("/an/older/choice", "0.1.0", ["old"])
+            self.assertIn("checking", dlg._engine_version_label.text_value)
+            self.assertEqual(dlg._prereq_label.text_value, "")
+
+    def test_the_probe_thread_reports_version_and_issues(self):
+        from waveshed.gui import settings_dialog as sd
+        with tempfile.TemporaryDirectory() as d:
+            open(os.path.join(d, "aether_core" + bm._EXE_SUFFIX), "w").close()
+            got = []
+            t = sd._EngineProbeThread(d)
+            t.probed.connect(lambda *a: got.append(a))
+            with mock.patch.object(bm, "installed_engine_version", return_value="0.4.9"), \
+                    mock.patch.object(bm, "check_prerequisites", return_value=[]):
+                t.run()
+            self.assertEqual(got, [(d, "0.4.9", [])])
+
+    def test_closing_saves_without_probing(self):
+        dlg = AetherMainDialog.__new__(AetherMainDialog)
+        dlg._save_geometry = mock.Mock()
+        dlg._settings_widget = mock.Mock()
+        for name in ("site_tab", "p2p_tab", "converter_tab"):
+            setattr(dlg, name, mock.Mock())
+        with mock.patch("waveshed.gui.main_dialog.QDialog.reject", create=True):
+            dlg.reject()
+        dlg._settings_widget.save_settings.assert_called_once_with(revalidate=False)
+
+
 if __name__ == "__main__":
     unittest.main()
