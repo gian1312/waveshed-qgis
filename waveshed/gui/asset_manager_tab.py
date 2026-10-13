@@ -682,6 +682,7 @@ class _PatternVisualizerDialog(QDialog):
             matplotlib.use("Qt5Agg")
             from matplotlib.backends.backend_qt5agg import (
                 FigureCanvasQTAgg,
+                NavigationToolbar2QT,
             )
             from matplotlib.figure import Figure
             import numpy as np
@@ -731,6 +732,8 @@ class _PatternVisualizerDialog(QDialog):
         fig.tight_layout()
 
         canvas = FigureCanvasQTAgg(fig)
+        # Zoom / pan / home / save, as on the P2P plots.
+        self._layout.addWidget(NavigationToolbar2QT(canvas, self))
         self._layout.addWidget(canvas)
 
         # Close button.

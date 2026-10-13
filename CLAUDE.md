@@ -235,9 +235,13 @@ metadata URLs and a trusted manifest key).
 
 Before uploading to plugins.qgis.org, run `python3 tools/release_check.py`
 (the pipeline GUI's *Run checks*): the full test suite — failures, errors AND
-skips fail it — then `tools/qgis_scan.py`. Needs GDAL + numpy (QGIS's Python on
-Windows) and `aether_converter` (`--bin-dir`, `AETHER_BIN_DIR` or
-`~/.aether/bin`); `--install-tools` sets up pytest and the analysers.
+skips fail it — then `tools/qgis_scan.py`. Needs GDAL + numpy + pytest and
+`aether_converter` (`--bin-dir`, `AETHER_BIN_DIR` or `~/.aether/bin`). The GUI
+runs it in Docker (`tools/check_container/Dockerfile`: bookworm PyQGIS/GDAL/
+numpy from apt, pinned pytest + analysers in a `--system-site-packages` venv,
+`WAVESHED_SCAN_TOOLS` points the scan at them) with AETHER's `bin/linux`
+mounted — the owner does not want check tooling installed on the Windows host.
+`--install-tools` (pytest + a `tmp/` analyser venv) is for the dev container only.
 `tools/qgis_scan.py` alone: it
 builds the ZIP and runs the registry's four scans (Bandit, detect-secrets,
 flake8, file analysis) with the registry's own Critical/Warning/Info grading;

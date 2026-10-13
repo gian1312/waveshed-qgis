@@ -18,8 +18,9 @@ run:
 2. **Registry scans** — ``tools/qgis_scan.py`` on a freshly built ZIP
    (Bandit, detect-secrets, flake8, file analysis).  FAIL on any Critical.
 
-The interpreter must provide GDAL (``osgeo``), numpy and pytest — on Windows
-that is QGIS's own Python (``python-qgis.bat``), which is what the GUI uses.
+The interpreter must provide GDAL (``osgeo``), numpy and pytest. The GUI runs
+this inside ``tools/check_container`` (Docker), which has all of them and the
+analysers, so nothing is installed on the host.
 The converter-backed tests need ``aether_converter``: ``--bin-dir``, then
 ``AETHER_BIN_DIR``, else ``~/.aether/bin`` (where the GUI's *Deploy engine* stages it)
 is used when it holds one.
@@ -57,7 +58,10 @@ def _exe(name: str) -> str:
 
 
 def scan_tools_dir() -> str:
-    return os.path.join(SCAN_VENV, "Scripts" if os.name == "nt" else "bin")
+    """The analysers' directory: ``WAVESHED_SCAN_TOOLS`` (set by the check
+    container, tools/check_container), else the ``tmp/scan-venv`` venv."""
+    return (os.environ.get("WAVESHED_SCAN_TOOLS")
+            or os.path.join(SCAN_VENV, "Scripts" if os.name == "nt" else "bin"))
 
 
 def _missing_modules() -> List[str]:
@@ -185,8 +189,9 @@ def main() -> int:
     missing = _missing_modules() + [f"{t} (scan venv)" for t in _missing_scan_tools()]
     if missing:
         print("[check] prerequisites missing: " + ", ".join(missing))
-        print("[check] run with --install-tools (GUI: Install check tools); "
-              "GDAL/numpy need QGIS's Python.")
+        print("[check] run it in the check container (tools/check_container, "
+              "GUI: Run checks) or with --install-tools; GDAL/numpy need "
+              "QGIS's Python.")
         return 2
 
     results = [("Tests", *run_tests(args.bin_dir)), ("Registry scans", *run_scan())]
