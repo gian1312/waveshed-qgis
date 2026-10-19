@@ -19,7 +19,7 @@ import subprocess
 import tempfile
 from typing import Any, Dict, List, Optional, Tuple
 
-from qgis.PyQt.QtCore import QThread, pyqtSignal, Qt
+from qgis.PyQt.QtCore import QThread, QTimer, pyqtSignal, Qt
 from qgis.PyQt.QtGui import QColor
 from qgis.PyQt.QtWidgets import (
     QAbstractItemView,
@@ -33,6 +33,7 @@ from qgis.PyQt.QtWidgets import (
     QHeaderView,
     QLabel,
     QLineEdit,
+    QMenu,
     QMessageBox,
     QApplication,
     QPlainTextEdit,
@@ -59,7 +60,8 @@ from qgis.core import (
 )
 from qgis.gui import QgsMapLayerComboBox, QgsRubberBand
 
-from ..core import terrain_adapter
+from ..core import run_progress, terrain_adapter, terrain_index
+from . import terrain_folder_scan
 from ..core.binary_manager import find_binary
 # The vector→FlatGeobuf machinery lives in core/ (business logic, no GUI): the
 # Site Analysis path needs it just as much, and two copies of a conversion
@@ -255,49 +257,106 @@ def _detect_layer_type(layer) -> str:
     return "terrain" if kind == "dem" else kind
 
 
-def _first_folder_geotiff(folder: str) -> Optional[str]:
-    """First GeoTIFF the run would use — via the ONE shared folder scanner."""
-    for path in terrain_adapter.list_terrain_files(folder):
-        if path.lower().endswith((".tif", ".tiff")):
-            return path
-    return None
+def _folder_index(folder: str):
+    """The folder's footprint index, refreshed (synchronous — worker threads
+    and the torture runner only; the tab scans through
+    gui/terrain_folder_scan, off the GUI thread)."""
+    from ..core import terrain_index
+    index = terrain_index.get_index(folder)
+    index.refresh(max_age_s=terrain_index.FRESH_S)
+    return index
 
 
 def _detect_folder_crs(folder: str) -> Optional[str]:
-    """Detect CRS from the first GeoTIFF in a folder (recursive, sorted)."""
+    """The folder's dominant CRS (most files), from the folder index.
+
+    Display / suggestion only: each file is read in its OWN CRS, and a file
+    without one is never given this one silently (the tab asks)."""
     try:
-        from osgeo import gdal
-        path = _first_folder_geotiff(folder)
-        if path:
-            ds = gdal.Open(path)
-            if ds and ds.GetProjection():
-                crs = QgsCoordinateReferenceSystem(ds.GetProjection())
-                if crs.isValid():
-                    return crs.authid()
-    except Exception:
-        pass
-    return None
+        from .terrain_folder_scan import suggested_crs
+        return suggested_crs(_folder_index(folder))
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _index_finest_res(index) -> Optional[float]:
+    vals = [e["px_m"] for e in index.entries.values()
+            if e.get("readable") and e.get("px_m")]
+    return round(min(vals), 1) if vals else None
 
 
 def _detect_folder_resolution(folder: str) -> Optional[float]:
-    """Detect ground resolution from the first GeoTIFF (recursive, sorted)."""
+    """The folder's finest ground resolution in metres, from the index."""
     try:
-        from osgeo import gdal
-        path = _first_folder_geotiff(folder)
-        if path:
-            ds = gdal.Open(path)
-            if ds:
-                gt = ds.GetGeoTransform()
-                proj = ds.GetProjection()
-                crs = QgsCoordinateReferenceSystem(proj) if proj else None
-                res = min(abs(gt[1]), abs(gt[5]))
-                if crs and crs.isGeographic():
-                    clat = gt[3] - (ds.RasterYSize / 2) * abs(gt[5])
-                    res *= 111_111 * max(math.cos(math.radians(clat)), 0.01)
-                return round(res, 1)
-    except Exception:
+        return _index_finest_res(_folder_index(folder))
+    except Exception:  # noqa: BLE001
+        return None
+
+
+#: Hidden manifest in a Map Converter output directory: per tile, the
+#: fingerprint of the stack inputs it was built from (files: path + size +
+#: mtime from the folder index). A tile whose inputs changed is rebuilt even
+#: without "Rebuild existing tiles"; a tile with no record (built before the
+#: manifest existed, or from a rendered service) keeps the old rule.
+_OUTPUT_MANIFEST = ".waveshed_tiles.json"
+
+
+def _read_output_manifest(output_dir: str) -> Dict[str, str]:
+    try:
+        with open(os.path.join(output_dir, _OUTPUT_MANIFEST), "r",
+                  encoding="utf-8") as fh:
+            doc = json.load(fh)
+        return dict(doc.get("tiles") or {})
+    except (OSError, ValueError, AttributeError):
+        return {}
+
+
+def _write_output_manifest(output_dir: str, updates: Dict[str, Optional[str]]
+                           ) -> None:
+    tiles = _read_output_manifest(output_dir)
+    for name, fp in updates.items():
+        if fp:
+            tiles[name] = fp
+        else:
+            tiles.pop(name, None)
+    try:
+        with open(os.path.join(output_dir, _OUTPUT_MANIFEST), "w",
+                  encoding="utf-8") as fh:
+            json.dump({"schema": 1, "tiles": tiles}, fh)
+    except OSError:
         pass
-    return None
+
+
+def _stack_tile_fingerprints(expected, resolved_entries, buildings_path
+                             ) -> Dict[str, Optional[str]]:
+    """Per output tile, a fingerprint of everything in the stack that feeds
+    it (None for every tile when a rendered entry is in the stack — a
+    server answer has no file to fingerprint)."""
+    import hashlib
+    if any(e.get("kind") == "rendered" for e in resolved_entries):
+        return {t["filename"]: None for _r, t in expected}
+    btag = ""
+    if buildings_path:
+        try:
+            btag = terrain_adapter.source_fingerprint(buildings_path)
+        except Exception:  # noqa: BLE001
+            btag = buildings_path
+    out: Dict[str, Optional[str]] = {}
+    for res, tile in expected:
+        sub = _subtile_degrees(res)
+        tb = {"north": tile["ul_lat"], "south": tile["ul_lat"] - sub,
+              "west": tile["ul_lon"], "east": tile["ul_lon"] + sub}
+        parts = []
+        for ent in resolved_entries:
+            if ent.get("kind") == "files":
+                parts.append(terrain_adapter.tile_source_fingerprint(
+                    ent["infos"], tb, tile["exact_res_m"]))
+            elif ent.get("kind") == "xyz":
+                parts.append(terrain_adapter.source_identity(ent.get("uri", "")))
+        parts.append(btag)
+        out[tile["filename"]] = hashlib.md5(
+            "\n".join(parts).encode("utf-8"), usedforsecurity=False).hexdigest()
+    return out
 
 
 # NB: file-vs-extent filtering is generic now — per-file WGS84 bounds come
@@ -427,11 +486,13 @@ def _build_tile_jobs(
     resolved_entries: List[Dict[str, Any]],
     buildings_path: Optional[str],
     tmp_dir: str,
+    rebuild: Optional[set] = None,
 ) -> Tuple[List[Dict[str, Any]], List[str]]:
     """Ingest jobs for one Map Converter run; ``(jobs, temp files)``.
 
     One job per enumerated tile (minus the already-existing ones unless
-    *overwrite*). ``sources[]`` holds, in UI stack order (entry 0 = highest
+    *overwrite*, or unless the tile is in *rebuild* — its inputs changed
+    since it was built, see ``_stack_tile_fingerprints``). ``sources[]`` holds, in UI stack order (entry 0 = highest
     priority), each resolved entry's per-tile contribution:
 
     * ``{"kind": "files", "infos": […]}`` — bounds+halo-filtered files via
@@ -451,7 +512,8 @@ def _build_tile_jobs(
     for res, tile in expected:
         fn = tile["filename"]
         out = os.path.join(output_dir, fn)
-        if not overwrite and os.path.exists(out):
+        if (not overwrite and os.path.exists(out)
+                and fn not in (rebuild or ())):
             continue
         sub = _subtile_degrees(res)
         tile_bbox = {
@@ -493,12 +555,105 @@ def _build_tile_jobs(
     return jobs, temp_tifs
 
 
+def _xyz_download_plan(
+    entries: List[Dict[str, Any]],
+    expected: List[Tuple[int, Dict[str, Any]]],
+) -> List[Tuple[int, Dict[str, Any], int, List[Dict[str, Any]]]]:
+    """``[(entry index, entry, res, specs)]`` — one shared-pool download call
+    per XYZ entry and resolution, the tiles overlapping the entry's extent.
+    The ONE enumeration both the download and its progress estimate use."""
+    plan = []
+    for k, ent in enumerate(entries):
+        for res in sorted({r for r, _t in expected}):
+            jobs = _jobs_overlapping_extent(
+                [(r, t) for r, t in expected if r == res], ent.get("extent"))
+            specs = [t for _r, t in jobs]
+            if specs:
+                plan.append((k, ent, res, specs))
+    return plan
+
+
+def _download_key(k: int, res: int) -> Tuple[str, int, int]:
+    return ("download", k, res)
+
+
+def _estimate_download_work(model: Any, entries: List[Dict[str, Any]],
+                            expected: List[Tuple[int, Dict[str, Any]]],
+                            pool_check: bool) -> None:
+    """Register every download call's source-tile count on *model*.
+
+    *pool_check* False (GUI thread, before the run): pure geometry, every
+    tile counted. True (worker): tiles already in the pool cost nothing —
+    the same count the downloader's own progress then reports.
+    """
+    for k, ent, res, specs in _xyz_download_plan(entries, expected):
+        model.set_work(_download_key(k, res),
+                       terrain_adapter.estimate_pool_download_units(
+                           ent["uri"], specs, pool_check=pool_check))
+
+
+def _convert_work(tiles: List[Dict[str, Any]]) -> float:
+    """Convert-phase units of output tiles (``size_px`` each)."""
+    return sum(run_progress.tile_blocks(t["size_px"]) for t in tiles) \
+        * run_progress.CONVERT_UNITS_PER_BLOCK
+
+
+def _render_tile_work(tile: Dict[str, Any]) -> float:
+    return (run_progress.tile_blocks(tile["size_px"])
+            * run_progress.RENDER_UNITS_PER_BLOCK)
+
+
+class _DownloadProgressSink:
+    """``progress_cb`` for one ``ensure_pool_tiles`` call of a run.
+
+    Callable as the plain ``(frac, label)`` callback, plus the
+    ``download_event(info)`` hook ``_try_rust_download`` feeds the source
+    tile counts into: they drive the run's :class:`run_progress.RunProgress`
+    slot for this call, so the whole-run bar counts real tiles, retry passes
+    included.
+    """
+
+    def __init__(self, model: Any, key: Any, res: int, call_no: int,
+                 n_calls: int, outer: Any = None) -> None:
+        self._model = model
+        self._key = key
+        self._res = res
+        self._tag = f" [{call_no}/{n_calls}]" if n_calls > 1 else ""
+        self._outer = outer
+        self._events = False
+
+    def __call__(self, frac: float, label: str) -> None:
+        if self._model is not None and not self._events:
+            # A downloader that sends no events: the fraction still moves.
+            self._model.set_done(self._key, frac * self._model.work(self._key))
+        if self._outer is not None:
+            self._outer(frac, label)
+
+    def download_event(self, info: Dict[str, Any]) -> None:
+        self._events = True
+        m = self._model
+        if m is None:
+            return
+        m.set_work(self._key, info["total_units"])
+        m.set_done(self._key, info["done_units"],
+                   ceiling=info.get("ceiling_units"))
+        phase = (f"Downloading terrain {self._res} m"
+                 f"{self._tag} z{info.get('zoom', '?')}")
+        m.set_phase(phase, {
+            "pass": info.get("pass"), "passes": info.get("max_passes"),
+            "done": info.get("pass_done"), "total": info.get("pass_total"),
+            "unit": "source tiles", "mbps": info.get("mbps"),
+            "errors": info.get("errors"),
+        }, reset=info.get("event") == "pass_start")
+
+
 def _download_xyz_entries(
     entries: List[Dict[str, Any]],
     expected: List[Tuple[int, Dict[str, Any]]],
     progress_cb: Any = None,
     should_cancel: Any = None,
     on_start: Any = None,
+    progress_model: Any = None,
 ) -> None:
     """Fill each XYZ entry's ``["pool"]`` via the shared pool downloader.
 
@@ -506,28 +661,31 @@ def _download_xyz_entries(
     extent go through ``terrain_adapter.ensure_pool_tiles`` (same pool cache
     and gap-repair retries as Site Analysis). *progress_cb(frac, label)*
     receives the aggregate download fraction across ALL entries and
-    resolutions. Failures propagate (RuntimeError) — no render fallback.
+    resolutions; *progress_model* (a ``RunProgress``) gets the real source
+    tile counts per call (slot ``("download", entry, res)``, see
+    :func:`_estimate_download_work`). Failures propagate (RuntimeError) — no
+    render fallback.
     """
-    plan: List[Tuple[Dict[str, Any], int, List[Dict[str, Any]]]] = []
+    plan = _xyz_download_plan(entries, expected)
     for ent in entries:
-        for res in sorted({r for r, _t in expected}):
-            jobs = _jobs_overlapping_extent(
-                [(r, t) for r, t in expected if r == res], ent.get("extent"))
-            specs = [t for _r, t in jobs]
-            if specs:
-                plan.append((ent, res, specs))
         ent["pool"] = {}
 
-    total = sum(len(specs) for _e, _r, specs in plan) or 1
+    total = sum(len(specs) for _k, _e, _r, specs in plan) or 1
     done = 0
-    for ent, res, specs in plan:
+    for call_no, (k, ent, res, specs) in enumerate(plan, start=1):
         def cb(frac: float, label: str, _done=done, _n=len(specs)) -> None:
             if progress_cb is not None:
                 progress_cb((_done + frac * _n) / total, label)
 
+        key = _download_key(k, res)
+        sink = _DownloadProgressSink(progress_model, key, res, call_no,
+                                     len(plan), cb)
         ent["pool"][res] = terrain_adapter.ensure_pool_tiles(
-            ent["uri"], specs, res, progress_cb=cb,
+            ent["uri"], specs, res, progress_cb=sink,
             should_cancel=should_cancel, on_start=on_start)
+        if progress_model is not None:
+            # A pool hit sends nothing; either way this call is over.
+            progress_model.finish(key)
         done += len(specs)
         if progress_cb is not None:
             progress_cb(done / total,
@@ -543,6 +701,7 @@ class _LayerEntry:
     __slots__ = (
         "layer_type", "source_path", "qgis_layer", "crs_authid",
         "native_res_m", "target_resolutions", "extent", "priority",
+        "crs_overrides", "decisions", "overlap_priority",
     )
 
     def __init__(
@@ -564,6 +723,14 @@ class _LayerEntry:
         self.target_resolutions = target_resolutions or [30]
         self.extent = extent
         self.priority = priority
+        # Folder entries only. crs_overrides: {file: CRS the user assigned}
+        # (CRS-less files never inherit crs_authid, which is display only for
+        # a folder); decisions: {file: "skip"|"use"} from the pre-flight
+        # prompt; overlap_priority: "finest" | "name" (None = the folder's
+        # stored setting).
+        self.crs_overrides: Dict[str, str] = {}
+        self.decisions: Dict[str, str] = {}
+        self.overlap_priority: Optional[str] = None
 
 
 # ---------------------------------------------------------------------------
@@ -574,18 +741,30 @@ class _LayerEntry:
 # Acquisition router + main-thread resolve/render phase
 # ---------------------------------------------------------------------------
 
-#: Phase spans of the single run progress bar (percent).
-_PHASE_SPANS = {"resolve": (0, 20), "download": (20, 70), "convert": (70, 100)}
+def _estimate_run_work(model: Any, layers: List[_LayerEntry],
+                       render_jobs: List[Tuple[int, Dict[str, Any]]]) -> None:
+    """Register the whole run's estimated work on *model* before it starts.
 
-
-def phase_progress(phase: str, frac: float) -> int:
-    """Map a 0..1 within-phase fraction onto the run's ONE progress bar.
-
-    Phase weights: resolve/render 0-20 %, download 20-70 %, convert 70-100 %.
+    One bar for the run, weighted by work (``core/run_progress.py``):
+    rendered servers per tile (``("render", i)``, only entries that render),
+    XYZ downloads in source tiles (``("download", k, res)``, geometry only —
+    no pool stat on the GUI thread; the worker refines it), and the convert
+    phase per output tile (``("convert",)``). Phases with nothing to do get
+    no weight. *render_jobs* is the run's pending ``(res, tile)`` list.
     """
-    lo, hi = _PHASE_SPANS[phase]
-    frac = min(max(frac, 0.0), 1.0)
-    return round(lo + (hi - lo) * frac)
+    xyz: List[Dict[str, Any]] = []
+    for i, e in enumerate(layers):
+        kind = _entry_kind(e)
+        if kind == "rendered":
+            model.set_work(("render", i), sum(
+                _render_tile_work(t)
+                for _r, t in _jobs_overlapping_extent(render_jobs, e.extent)))
+        elif kind == "xyz":
+            src = (e.qgis_layer.source() if e.qgis_layer is not None
+                   else e.source_path)
+            xyz.append({"uri": src, "extent": e.extent})
+    _estimate_download_work(model, xyz, render_jobs, pool_check=False)
+    model.set_work(("convert",), _convert_work([t for _r, t in render_jobs]))
 
 
 def _classify_acquisition(source: str) -> str:
@@ -607,6 +786,71 @@ def _classify_acquisition(source: str) -> str:
     return "rendered"
 
 
+def _bounds_union(bounds) -> Optional[Dict[str, float]]:
+    """WGS84 union of an iterable of ``{south, north, west, east}`` dicts
+    (falsy items skipped); None when there is none."""
+    combined: Optional[Dict[str, float]] = None
+    for b in bounds:
+        if not b:
+            continue
+        if combined is None:
+            combined = {k: float(b[k]) for k in ("south", "north",
+                                                 "west", "east")}
+            continue
+        combined["south"] = min(combined["south"], b["south"])
+        combined["north"] = max(combined["north"], b["north"])
+        combined["west"] = min(combined["west"], b["west"])
+        combined["east"] = max(combined["east"], b["east"])
+    return combined
+
+
+def _apply_extent(entries: List[Any], extent: Optional[Dict[str, float]],
+                  rows) -> List[int]:
+    """Give each row in *rows* its OWN copy of *extent*; the rows changed.
+
+    Copies, never shares: a later edit of one row's extent must not move
+    another's. Out-of-range rows are ignored.
+    """
+    if not extent:
+        return []
+    changed = []
+    for r in sorted(set(rows)):
+        if 0 <= r < len(entries):
+            entries[r].extent = dict(extent)
+            changed.append(r)
+    return changed
+
+
+def _folder_extent(index: Any, decisions: Optional[Dict[str, str]] = None,
+                   crs_overrides: Optional[Dict[str, str]] = None
+                   ) -> Optional[Dict[str, float]]:
+    """Union of the WGS84 bounds of every file the run would use.
+
+    Read from the folder's footprint index (already built off-thread by
+    ``terrain_folder_scan.scan_folder``) — no file is opened here. Files the
+    user skipped and unusable ones do not count; a CRS-less file counts in
+    the CRS the user assigned to it (the same rule as
+    ``terrain_index.source_infos``).
+    """
+    decisions = decisions or {}
+    crs_overrides = crs_overrides or {}
+    bounds = []
+    for p, e in index.entries.items():
+        if decisions.get(p) == terrain_index.DECISION_SKIP:
+            continue
+        prob = terrain_index.problem_of(e)
+        if prob is not None:
+            if prob[0] == terrain_index.KIND_NOCRS and p in crs_overrides:
+                e = terrain_index.with_crs(e, crs_overrides[p])
+                if e is None:
+                    continue
+            elif not (prob[0] == terrain_index.KIND_SUSPECT
+                      and decisions.get(p) == terrain_index.DECISION_USE):
+                continue
+        bounds.append(e.get("wgs84_bounds"))
+    return _bounds_union(bounds)
+
+
 def _union_extent(entries) -> Optional[Dict[str, float]]:
     """WGS84 union of the raster entries' extents; None when none has one.
 
@@ -616,20 +860,13 @@ def _union_extent(entries) -> Optional[Dict[str, float]]:
     Entries may be ``_LayerEntry`` objects (main thread) or the worker's
     plain dicts; both spell ``layer_type`` and ``extent``.
     """
-    combined: Optional[Dict[str, float]] = None
-    for e in entries:
-        layer_type = e["layer_type"] if isinstance(e, dict) else e.layer_type
-        extent = e["extent"] if isinstance(e, dict) else e.extent
-        if layer_type == "buildings" or not extent:
-            continue
-        if combined is None:
-            combined = dict(extent)
-        else:
-            combined["south"] = min(combined["south"], extent["south"])
-            combined["north"] = max(combined["north"], extent["north"])
-            combined["west"] = min(combined["west"], extent["west"])
-            combined["east"] = max(combined["east"], extent["east"])
-    return combined
+    def raster_extents():
+        for e in entries:
+            layer_type = (e["layer_type"] if isinstance(e, dict)
+                          else e.layer_type)
+            if layer_type != "buildings":
+                yield e["extent"] if isinstance(e, dict) else e.extent
+    return _bounds_union(raster_extents())
 
 
 def _pending_render_jobs(entries, out_res, output_dir, overwrite):
@@ -839,14 +1076,16 @@ def _kill_proc(proc: subprocess.Popen) -> None:
 
 
 def resolve_sources_with_progress(layers, parent=None, render_jobs=None,
-                                  on_progress=None):
+                                  on_progress=None, progress_model=None):
     """Resolve every layer on the main thread, visibly, per-tile for renders.
 
     *render_jobs* is the run's enumerated ``(res, tile)`` list (minus tiles
     that will be skipped as existing); rendered servers are exported per
     tile here, and the dialog ticks per TILE — the old per-layer tick froze
-    at 0 for the whole multi-minute export. *on_progress(frac)* additionally
-    drives the tab's main bar (resolve phase, 0-20 %).
+    at 0 for the whole multi-minute export. *on_progress(frac)* is called
+    after every tick; *progress_model* (the run's ``RunProgress``) is
+    advanced per rendered tile on slot ``("render", i)`` — the tab's ONE bar
+    (see :func:`_estimate_run_work`).
 
     This work cannot move to the worker: rendering goes through a
     ``QgsRasterLayer``, and QGIS map layers are main-thread-only.
@@ -877,9 +1116,17 @@ def resolve_sources_with_progress(layers, parent=None, render_jobs=None,
 
     done = 0
 
-    def tick(label: Optional[str] = None) -> None:
+    tile_work = {t["filename"]: _render_tile_work(t) for _r, t in render_jobs}
+
+    def tick(label: Optional[str] = None, slot: Any = None,
+             fn: Optional[str] = None) -> None:
         nonlocal done
         done += 1
+        if progress_model is not None and slot is not None:
+            progress_model.set_phase("Rendering map service tiles",
+                                     {"done": done, "total": total,
+                                      "unit": "tiles"})
+            progress_model.advance(slot, tile_work.get(fn, 0.0))
         dlg.setValue(min(done, total))
         if label:
             dlg.setLabelText(label)
@@ -900,7 +1147,10 @@ def resolve_sources_with_progress(layers, parent=None, render_jobs=None,
             if _entry_kind(entry) == "rendered":
                 resolved.append(_resolve_source_on_main_thread(
                     entry, render_jobs,
-                    on_tile=lambda fn, _n=name: tick(f"Rendering {_n}: {fn}")))
+                    on_tile=lambda fn, _n=name, _i=i: tick(
+                        f"Rendering {_n}: {fn}", ("render", _i), fn)))
+                if progress_model is not None:
+                    progress_model.finish(("render", i))
             else:
                 resolved.append(
                     _resolve_source_on_main_thread(entry, render_jobs))
@@ -935,8 +1185,13 @@ class _MapConverterWorker(QThread):
     finished_err = pyqtSignal(str)
 
     def __init__(self, layers, output_dir, out_res, resolved_sources,
-                 parent=None, overwrite=False):
+                 parent=None, overwrite=False, progress_model=None):
         super().__init__(parent)
+        # The run's ONE progress model (core/run_progress.py). The tab hands
+        # in the one its resolve/render phase already advanced; a caller
+        # without one (torture runner, tests) gets a fresh model the worker
+        # estimates itself.
+        self.progress_model = progress_model or run_progress.RunProgress()
         # Deep-copy the layer config so the main thread can't mutate it.
         #
         # `resolved_sources` is resolved by the caller, on the main thread,
@@ -951,6 +1206,9 @@ class _MapConverterWorker(QThread):
                 "native_res_m": e.native_res_m,
                 "extent": dict(e.extent) if e.extent else None,
                 "priority": e.priority,
+                "crs_overrides": dict(getattr(e, "crs_overrides", {}) or {}),
+                "decisions": dict(getattr(e, "decisions", {}) or {}),
+                "overlap_priority": getattr(e, "overlap_priority", None),
                 # qgis_layer can't be passed to another thread.
                 "resolved_source": src,
             }
@@ -976,12 +1234,27 @@ class _MapConverterWorker(QThread):
     def _log(self, msg):
         self.log_line.emit(msg)
 
+    def _say(self, text: str, phase: Optional[str] = None,
+             final: bool = False) -> None:
+        """Status line (signal, unchanged texts) + the model's phase."""
+        if final:
+            self.progress_model.stop(text)
+        else:
+            self.progress_model.set_phase(phase or text)
+        self.status.emit(text)
+
+    def _emit_progress(self) -> None:
+        self.progress.emit(self.progress_model.percent())
+
     def run(self):
         try:
+            # Every folder index is re-checked once per run (stat only for
+            # unchanged files), so a file changed since the last run is seen.
+            terrain_adapter.terrain_index.expire_all()
             # ---- Phase 1: Resolve ALL layers in parallel ----
-            self.status.emit("Preparing layers...")
+            self._say("Preparing layers...")
             self._log("Phase 1: Resolving layers (parallel)...")
-            self.progress.emit(2)
+            self._emit_progress()
 
             raster_entries = [e for e in self._layers
                               if e["layer_type"] != "buildings"]
@@ -1021,10 +1294,8 @@ class _MapConverterWorker(QThread):
                             f"Layer {idx + 1} could not be prepared: {exc}")
                         return
                     done_tasks += 1
-                    self.progress.emit(phase_progress(
-                        "resolve", done_tasks / max(total_tasks, 1)))
-                    self.status.emit(
-                        f"Resolved layer {done_tasks}/{total_tasks}")
+                    self._say(f"Resolved layer {done_tasks}/{total_tasks}",
+                              "Preparing layers")
 
                 # Collect building results.
                 for fut in as_completed(building_futures):
@@ -1043,8 +1314,6 @@ class _MapConverterWorker(QThread):
                             f"Buildings could not be prepared: {exc}")
                         return
                     done_tasks += 1
-                    self.progress.emit(phase_progress(
-                        "resolve", done_tasks / max(total_tasks, 1)))
 
             # Reassemble resolved entries in UI stack order: entry 0 sits on
             # top of the stack and is therefore the HIGHEST priority —
@@ -1071,8 +1340,7 @@ class _MapConverterWorker(QThread):
             # ---- Phase 2: Build tile job list ----
             if self._canceled:
                 return
-            self.progress.emit(phase_progress("resolve", 1.0))
-            self.status.emit("Building tile list...")
+            self._say("Building tile list...")
             self._log("Phase 2: Building .abt tile jobs...")
 
             combined = _union_extent(self._layers)
@@ -1102,7 +1370,7 @@ class _MapConverterWorker(QThread):
             # it an already-snapped bbox double-snaps on its side and the
             # check falsely aborts. Both sides snapping exactly once from
             # bit-identical input is what makes the equality meaningful.
-            self.status.emit("Cross-checking tile grid with the engine...")
+            self._say("Cross-checking tile grid with the engine...")
             try:
                 _plan_cross_check(converter_exe, combined, self._out_res,
                                   expected)
@@ -1110,33 +1378,72 @@ class _MapConverterWorker(QThread):
                 self.finished_err.emit(str(exc))
                 return
 
-            # ---- Download phase (20-70 %): XYZ entries via the shared
-            # toolkit pool downloader. Hard errors abort the run — there is
-            # no QGIS-render fallback for XYZ any more.
+            # Tiles whose inputs changed since they were built: rebuilt even
+            # without "Rebuild existing tiles" (a changed or added file in a
+            # folder used to leave the old pixels in place, silently).
+            tile_fps = _stack_tile_fingerprints(expected, all_entries,
+                                                buildings_path)
+            rebuild: set = set()
+            unknown = 0
+            if not self._overwrite:
+                manifest = _read_output_manifest(self._output_dir)
+                for _r, t in expected:
+                    fn = t["filename"]
+                    cur = tile_fps.get(fn)
+                    if cur is None or not os.path.exists(
+                            os.path.join(self._output_dir, fn)):
+                        continue
+                    if fn not in manifest:
+                        unknown += 1
+                    elif manifest[fn] != cur:
+                        rebuild.add(fn)
+            if rebuild:
+                self._log(f"  {len(rebuild)} existing tile(s) are rebuilt — "
+                          f"the files that feed them changed since they were "
+                          f"built (first: {sorted(rebuild)[0]})")
+            if unknown:
+                self._log(f"  {unknown} existing tile(s) have no record of "
+                          f"their sources (built by an older version) — kept; "
+                          f"tick \"Rebuild existing tiles\" to refresh them")
+
+            # Only the tiles this run will actually build: render and job
+            # building both skip existing outputs, so downloading terrain
+            # for skipped tiles would be pure waste.
+            pending = [
+                (r, t) for r, t in expected
+                if self._overwrite or t["filename"] in rebuild
+                or not os.path.exists(
+                    os.path.join(self._output_dir, t["filename"]))
+            ]
+            # Re-estimate the remaining work now that the tile list is final:
+            # downloads against the pool (tiles already there cost nothing),
+            # conversion over the tiles that will really be built.
             xyz_entries = [e for e in all_entries if e.get("kind") == "xyz"]
+            _estimate_download_work(self.progress_model, xyz_entries, pending,
+                                    pool_check=True)
+            self.progress_model.set_work(
+                ("convert",), _convert_work([t for _r, t in pending]))
+            self._emit_progress()
+
+            # ---- Download phase: XYZ entries via the shared toolkit pool
+            # downloader. Hard errors abort the run — there is no QGIS-render
+            # fallback for XYZ any more.
             if xyz_entries:
-                self.status.emit("Downloading terrain tiles...")
+                self._say("Downloading terrain tiles...")
                 self._log(f"Downloading terrain for {len(xyz_entries)} XYZ "
                           f"entr(ies) via the shared pool...")
 
                 def dl_progress(frac: float, label: str) -> None:
                     if self._canceled:
                         return
-                    self.progress.emit(phase_progress("download", frac))
+                    self._emit_progress()
                     self.status.emit(label)
 
-                # Only the tiles this run will actually build: render and
-                # job building both skip existing outputs, so downloading
-                # terrain for skipped tiles would be pure waste.
-                pending = [
-                    (r, t) for r, t in expected
-                    if self._overwrite or not os.path.exists(
-                        os.path.join(self._output_dir, t["filename"]))
-                ]
                 try:
                     _download_xyz_entries(
                         xyz_entries, pending,
                         progress_cb=dl_progress,
+                        progress_model=self.progress_model,
                         # Cancel must reach the running download: polled per
                         # output line (raises ConverterCancelled), and the
                         # subprocess handle is exposed so cancel() can kill
@@ -1145,20 +1452,23 @@ class _MapConverterWorker(QThread):
                         on_start=self._register_proc)
                 except terrain_adapter.ConverterCancelled:
                     self._log("Cancelled by user.")
-                    self.status.emit("Cancelled.")
+                    self._say("Cancelled.", final=True)
                     return
                 except RuntimeError as exc:
                     if self._canceled:
                         # cancel() killed the download subprocess; the
                         # resulting "download failed" is not an error.
                         self._log("Cancelled by user.")
-                        self.status.emit("Cancelled.")
+                        self._say("Cancelled.", final=True)
                         return
                     self.finished_err.emit(str(exc))
                     return
                 finally:
                     self._proc = None
-            self.progress.emit(phase_progress("download", 1.0))
+            self.progress_model.finish_where(
+                lambda k: isinstance(k, tuple) and k[:1] in (("download",),
+                                                             ("render",)))
+            self._emit_progress()
 
             if self._canceled:
                 return
@@ -1167,7 +1477,7 @@ class _MapConverterWorker(QThread):
             try:
                 jobs, mat_temps = _build_tile_jobs(
                     expected, self._output_dir, self._overwrite, all_entries,
-                    buildings_path, tempfile.gettempdir())
+                    buildings_path, tempfile.gettempdir(), rebuild=rebuild)
             except RuntimeError as exc:
                 self.finished_err.emit(str(exc))
                 return
@@ -1176,7 +1486,9 @@ class _MapConverterWorker(QThread):
             self._temp_tifs.extend(mat_temps)
 
             if not jobs:
-                self.status.emit("All tiles already exist.")
+                self.progress_model.finish_all()
+                self._emit_progress()
+                self._say("All tiles already exist.", final=True)
                 self.finished_ok.emit(self._output_dir)
                 return
 
@@ -1189,7 +1501,11 @@ class _MapConverterWorker(QThread):
             # converter_exe was resolved in Phase 2 (the plan cross-check
             # needed it before any job was built).
             total = len(jobs)
-            self.status.emit(f"Converting {total} .abt tiles...")
+            # Exact now: the jobs that will really run, weighted by size.
+            convert_units = _convert_work(jobs)
+            self.progress_model.set_work(("convert",), convert_units)
+            self._say(f"Converting {total} .abt tiles...",
+                      "Converting tiles")
             self._log(f"Phase 3: Running converter ({total} tiles)...")
 
             job_file = os.path.join(
@@ -1221,11 +1537,16 @@ class _MapConverterWorker(QThread):
                 # path below can say what the output actually holds.
                 if "[Warn] NO-DATA batch:" in line:
                     no_data_batch.append(line)
-                prog = self._parse_progress(line)
+                prog = run_progress.parse_ingest_progress(line)
                 if prog:
                     curr, tot = prog
-                    self.progress.emit(
-                        phase_progress("convert", curr / max(tot, 1)))
+                    per = convert_units / max(tot, 1)
+                    self.progress_model.set_done(
+                        ("convert",), curr * per,
+                        ceiling=run_progress.next_ingest_report(curr, tot) * per)
+                    self.progress_model.set_phase("Converting tiles", {
+                        "done": curr, "total": tot, "unit": "tiles"})
+                    self._emit_progress()
                     self.status.emit(f"Converting tile {curr}/{tot}")
 
             try:
@@ -1235,7 +1556,7 @@ class _MapConverterWorker(QThread):
                     on_line, on_start=self._register_proc)
             except terrain_adapter.ConverterCancelled:
                 self._log("Cancelled by user.")
-                self.status.emit("Cancelled.")
+                self._say("Cancelled.", final=True)
                 return
             finally:
                 self._proc = None
@@ -1250,7 +1571,7 @@ class _MapConverterWorker(QThread):
                 # race against the per-line check, so rc is the kill signal
                 # (-15), not a converter failure. End cleanly, no error.
                 self._log("Cancelled by user.")
-                self.status.emit("Cancelled.")
+                self._say("Cancelled.", final=True)
                 return
 
             if rc != 0:
@@ -1259,8 +1580,18 @@ class _MapConverterWorker(QThread):
                 self.finished_err.emit(msg)
                 return
 
-            self.progress.emit(100)
-            self.status.emit("Done.")
+            # Record what each built tile was made from (whole tiles only —
+            # a short one has no valid record and is rebuilt next time).
+            built_fps = {}
+            for job in jobs:
+                name = os.path.basename(job["output_path"])
+                whole = terrain_adapter._tile_is_whole(job["output_path"])
+                built_fps[name] = tile_fps.get(name) if whole else None
+            _write_output_manifest(self._output_dir, built_fps)
+
+            self.progress_model.finish_all()
+            self._emit_progress()
+            self._say("Done.", final=True)
             if no_data_batch:
                 self._log(
                     "WARNING: no source covered any pixel of this area — "
@@ -1328,24 +1659,24 @@ class _MapConverterWorker(QThread):
         extent = entry.get("extent")
 
         if os.path.isdir(source):
-            files = terrain_adapter.list_terrain_files(source)
-            if not files:
-                raise RuntimeError(f"No terrain files in {source}")
-            self._log(f"  Folder: {source} ({len(files)} files, recursive)")
-            # The entry CRS is a FOLDER-level answer (detected from the first
-            # file, or asked from the user) — each file's own embedded CRS
-            # must win, the folder answer only fills in files without one.
-            infos = [terrain_adapter.source_file_info(
-                         f, crs_authid=crs or None, declared_is_fallback=True)
-                     for f in files]
+            self._log(f"  Folder: {source} (recursive, from its footprint "
+                      f"index)")
+            # Each file in its OWN CRS. The entry's crs_authid is display
+            # only for a folder: a CRS-less file is georeferenced ONLY by a
+            # CRS the user assigned to it (crs_overrides) — it used to get
+            # the first file's CRS silently and land kilometres off. Problem
+            # files the user did not answer are a hard error naming them.
+            infos = terrain_adapter.folder_source_infos(
+                source, decisions=entry.get("decisions") or {},
+                crs_overrides=entry.get("crs_overrides") or {},
+                mode=entry.get("overlap_priority"),
+                should_cancel=lambda: self._canceled, log=self._log)
         else:
-            files = [source]
             self._log(f"  File: {os.path.basename(source)}")
             # A single-file entry carries the LAYER's authid — authoritative,
             # since a user can deliberately override a layer's CRS in QGIS.
-            infos = [terrain_adapter.source_file_info(
-                         f, crs_authid=crs or None)
-                     for f in files]
+            infos = [terrain_adapter.file_layer_info(
+                         source, crs_authid=crs or None)]
 
         if extent:
             before = len(infos)
@@ -1559,6 +1890,9 @@ _COL_TARGET_RES = 4
 _COL_EXTENT = 5
 _LAYER_COLS = ["Type", "Source", "CRS", "Native Res", "Target Res", "Extent"]
 
+#: Extent-picker choice for folder rows: the union of the folder's files.
+_WHOLE_FOLDER = "Whole folder (all files)"
+
 
 class MapConverterTab(QWidget):
     """Map Converter tab — fuse layers into .abt terrain tiles."""
@@ -1570,7 +1904,14 @@ class MapConverterTab(QWidget):
         self._worker = None
         self._layers: List[_LayerEntry] = []
         self._rect_tool = None
-        self._drawing_for_layer: Optional[int] = None
+        self._drawing_for_layer: Optional[List[int]] = None
+        self._extent_clipboard: Optional[Dict[str, float]] = None
+        self._run_model: Optional[run_progress.RunProgress] = None
+        # Re-renders the bar/label between converter lines (extrapolation up
+        # to the next certain report, ETA countdown).
+        self._progress_timer = QTimer(self)
+        self._progress_timer.setInterval(500)
+        self._progress_timer.timeout.connect(self._refresh_progress)
 
         self._build_ui()
         self._connect_signals()
@@ -1598,6 +1939,14 @@ class MapConverterTab(QWidget):
         self._btn_add_layer = QPushButton("Add Layer")
         self._btn_add_layer.setToolTip("Add QGIS layer (DEM or buildings).")
         add_row.addWidget(self._btn_add_layer)
+
+        self._btn_add_all_layers = QPushButton("Add All Layers")
+        self._btn_add_all_layers.setToolTip(
+            "Add every loaded elevation raster layer that is not in the "
+            "stack yet, each with its own layer extent.\nLayers that look "
+            "like imagery are skipped; map services (XYZ / WMS) get no "
+            "extent — set it with Draw Extent or Extent from Layer.")
+        add_row.addWidget(self._btn_add_all_layers)
 
         self._btn_add_folder = QPushButton("Add Folder...")
         self._btn_add_folder.setToolTip("Add a folder of GeoTIFF/DEM files.")
@@ -1627,7 +1976,13 @@ class MapConverterTab(QWidget):
         self._table = QTableWidget(0, len(_LAYER_COLS))
         self._table.setHorizontalHeaderLabels(_LAYER_COLS)
         self._table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
-        self._table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        # Extended: Ctrl/Shift-click several rows, then Draw Extent, Extent
+        # from Layer, Paste extent or Remove act on all of them. Up/Down and
+        # the overlap rule act on the current row.
+        self._table.setSelectionMode(
+            QAbstractItemView.SelectionMode.ExtendedSelection)
+        self._table.setContextMenuPolicy(
+            Qt.ContextMenuPolicy.CustomContextMenu)
         self._table.horizontalHeader().setSectionResizeMode(
             _COL_SOURCE, QHeaderView.ResizeMode.Stretch
         )
@@ -1641,16 +1996,38 @@ class MapConverterTab(QWidget):
         self._btn_remove = QPushButton("Remove")
         self._btn_draw_extent = QPushButton("Draw Extent for Layer")
         self._btn_draw_extent.setToolTip(
-            "Draw a rectangle on the map to set this layer's extent."
+            "Draw a rectangle on the map to set the extent of the selected "
+            "row(s)."
         )
         self._btn_layer_extent = QPushButton("Extent from Layer")
         self._btn_layer_extent.setToolTip(
-            "Set extent from the selected layer's own geographic bounds."
+            "Set the selected row(s)' extent from a loaded layer's "
+            "geographic bounds — or, for folder rows, from all files of the "
+            "folder."
+        )
+        self._btn_extent_all = QPushButton("Apply Extent to All")
+        self._btn_extent_all.setToolTip(
+            "Copy the current row's extent to every other row.\n"
+            "Right-click the table to copy / paste an extent between rows."
         )
         btn_row.addWidget(self._btn_up)
         btn_row.addWidget(self._btn_down)
         btn_row.addWidget(self._btn_draw_extent)
         btn_row.addWidget(self._btn_layer_extent)
+        btn_row.addWidget(self._btn_extent_all)
+        btn_row.addWidget(QLabel("Where files overlap:"))
+        self._combo_overlap = QComboBox()
+        for mode in (terrain_index.PRIORITY_FINEST, terrain_index.PRIORITY_NAME):
+            self._combo_overlap.addItem(terrain_index.PRIORITY_LABELS[mode], mode)
+        self._combo_overlap.setToolTip(
+            "For the selected FOLDER: which file wins where two files of the "
+            "folder overlap.\n\nFinest resolution wins (default): the file "
+            "with the smallest pixel size (in metres) is used; equal "
+            "resolutions fall back to file name order.\nFile name order: the "
+            "alphabetically first path wins — a coarse filler named before a "
+            "fine dataset then beats it (the log warns).")
+        self._combo_overlap.setEnabled(False)
+        btn_row.addWidget(self._combo_overlap)
         btn_row.addStretch()
         btn_row.addWidget(self._btn_remove)
         gl.addLayout(btn_row)
@@ -1743,6 +2120,10 @@ class MapConverterTab(QWidget):
 
     def _connect_signals(self):
         self._btn_add_layer.clicked.connect(self._on_add_layer)
+        self._btn_add_all_layers.clicked.connect(self._on_add_all_layers)
+        self._btn_extent_all.clicked.connect(self._on_apply_extent_to_all)
+        self._table.customContextMenuRequested.connect(
+            self._on_table_context_menu)
         self._btn_add_folder.clicked.connect(self._on_add_folder)
         self._btn_add_buildings.clicked.connect(self._on_add_buildings)
         self._btn_download_buildings.clicked.connect(self._on_download_buildings)
@@ -1756,6 +2137,8 @@ class MapConverterTab(QWidget):
         self._btn_cancel.clicked.connect(self._on_cancel)
         self._btn_inspect.clicked.connect(self._on_inspect_abt)
         self._table.cellDoubleClicked.connect(self._on_table_double_clicked)
+        self._table.itemSelectionChanged.connect(self._sync_overlap_combo)
+        self._combo_overlap.currentIndexChanged.connect(self._on_overlap_changed)
 
     # ------------------------------------------------------------------
     # Add layers
@@ -1766,9 +2149,91 @@ class MapConverterTab(QWidget):
         if layer is None:
             QMessageBox.warning(self, "No Layer", "Select a layer first.")
             return
+        self._add_qgis_layer(layer)
 
+    def _layer_in_stack(self, layer) -> bool:
+        """True if *layer* (same QGIS layer, or same source) is a row."""
+        src = layer.source()
+        for e in self._layers:
+            if e.qgis_layer is layer:
+                return True
+            try:
+                if e.qgis_layer is not None and e.qgis_layer.id() == layer.id():
+                    return True
+            except RuntimeError:       # the row's layer was deleted
+                pass
+            if e.source_path and e.source_path == src:
+                return True
+        return False
+
+    def _on_add_all_layers(self):
+        """Add every loaded elevation raster not in the stack yet.
+
+        The same candidates the layer combo offers (raster layers of the
+        project), minus vectors (buildings stay a deliberate Add), minus
+        layers that classify as imagery (Add Layer asks about those one by
+        one; a bulk add must not slip a picture into the terrain stack).
+        Each row starts with its own layer extent (see ``_add_qgis_layer``).
+        """
+        added, present, imagery = [], 0, []
+        for layer in QgsProject.instance().mapLayers().values():
+            if not isinstance(layer, QgsRasterLayer):
+                continue
+            if self._layer_in_stack(layer):
+                present += 1
+                continue
+            if _detect_layer_type(layer) == "imagery":
+                imagery.append(layer.name())
+                continue
+            if self._add_qgis_layer(layer, ask_imagery=False,
+                                    with_extent=True, refresh=False):
+                added.append(layer.name())
+        self._rebuild_table()
+        self._update_estimate()
+        msg = f"Add All Layers: {len(added)} added"
+        if present:
+            msg += f", {present} already in the stack"
+        if imagery:
+            msg += (f", {len(imagery)} skipped as imagery "
+                    f"({', '.join(imagery[:5])}"
+                    + (", …" if len(imagery) > 5 else "") + ")")
+        self._log_msg(msg)
+        if not added:
+            QMessageBox.information(
+                self, "Add All Layers",
+                "No elevation raster layer to add." + (
+                    f"\n{present} loaded layer(s) are already in the stack."
+                    if present else "") + (
+                    f"\n{len(imagery)} layer(s) look like imagery — add "
+                    f"those with Add Layer if they really are elevation."
+                    if imagery else ""))
+
+    @staticmethod
+    def _layer_wgs84_extent(layer) -> Optional[Dict[str, float]]:
+        """*layer*'s extent in WGS84 (``{south, north, west, east}``)."""
+        ext = layer.extent()
+        if ext is None or ext.isEmpty():
+            return None
+        crs = layer.crs()
+        wgs84 = QgsCoordinateReferenceSystem("EPSG:4326")
+        if crs.isValid() and crs != wgs84:
+            xform = QgsCoordinateTransform(crs, wgs84, QgsProject.instance())
+            ext = xform.transformBoundingBox(ext)
+        return {"south": ext.yMinimum(), "north": ext.yMaximum(),
+                "west": ext.xMinimum(), "east": ext.xMaximum()}
+
+    def _add_qgis_layer(self, layer, ask_imagery: bool = True,
+                        with_extent: bool = False,
+                        refresh: bool = True) -> bool:
+        """Append *layer* as a stack row; False when the user declined.
+
+        *with_extent* pre-fills the row with the layer's own WGS84 extent —
+        for local files only: a map service's "extent" is the whole service
+        (an XYZ layer is the world), which would turn a run into a download
+        of everything.
+        """
         ltype = _detect_layer_type(layer)
-        if ltype == "imagery":
+        if ltype == "imagery" and ask_imagery:
             r = QMessageBox.warning(
                 self, "Possible Imagery",
                 f"'{layer.name()}' looks like imagery (RGB), not a DEM.\n"
@@ -1777,7 +2242,7 @@ class MapConverterTab(QWidget):
                 QMessageBox.StandardButton.No,
             )
             if r != QMessageBox.StandardButton.Yes:
-                return
+                return False
 
         is_buildings = isinstance(layer, QgsVectorLayer)
 
@@ -1800,11 +2265,23 @@ class MapConverterTab(QWidget):
             target_resolutions=[30] if not is_buildings else [],
             priority=len(self._layers) + 1,
         )
+        note = ""
+        if with_extent and not is_buildings:
+            if _classify_acquisition(layer.source()) == "file":
+                try:
+                    entry.extent = self._layer_wgs84_extent(layer)
+                except Exception as exc:  # noqa: BLE001 — row stays unset
+                    note = f"; extent not set ({exc})"
+            else:
+                note = ("; map service — set its extent with Draw Extent or "
+                        "Extent from Layer")
         self._layers.append(entry)
-        self._rebuild_table()
-        self._update_estimate()
+        if refresh:
+            self._rebuild_table()
+            self._update_estimate()
         self._log_msg(f"Added layer: {layer.name()} "
-                      f"(native ~{native_res or '?'}m)")
+                      f"(native ~{native_res or '?'}m){note}")
+        return True
 
     def _on_add_folder(self):
         folder = QFileDialog.getExistingDirectory(
@@ -1812,33 +2289,116 @@ class MapConverterTab(QWidget):
         )
         if not folder:
             return
-        # Recursive, sorted — the same scanner the worker (and Site
-        # Analysis) uses, so what is counted here is what converts.
-        tifs = terrain_adapter.list_terrain_files(folder)
-        if not tifs:
+        # The folder index is built in a worker thread behind a progress
+        # dialog (a 2,500-file folder used to be opened file by file on the
+        # GUI thread). Recursive, sorted, zip members included — the same
+        # scanner the worker (and Site Analysis) uses.
+        try:
+            scan = terrain_folder_scan.scan_folder(self, folder)
+        except RuntimeError as exc:
+            QMessageBox.critical(self, "Folder could not be read", str(exc))
+            return
+        if scan is None:
+            return
+        index = scan["index"]
+        if not index.entries:
             QMessageBox.warning(self, "No Terrain Files",
-                                f"No GeoTIFF/DEM/HGT files in:\n{folder}\n"
-                                f"(searched recursively)")
+                                f"No elevation rasters in:\n{folder}\n"
+                                f"(searched recursively; .vrt files are "
+                                f"ignored — load a .vrt as a layer)")
             return
 
-        crs_id = _detect_folder_crs(folder)
-        if not crs_id:
-            crs_id = self._ask_crs(f"CRS unknown for files in:\n{folder}")
-            if not crs_id:
-                return
+        # CRS-less files: asked, never inherited. Unusable / 8-bit files:
+        # one skip prompt, default Cancel.
+        answer = terrain_folder_scan.resolve_folder_problems(
+            self, folder, index, ask_crs=True)
+        if answer is None:
+            return
+        crs_overrides, decisions = answer
 
-        native_res = _detect_folder_resolution(folder)
+        crs_id = terrain_folder_scan.suggested_crs(index) or "?"
+        authids = {e.get("crs_authid") for e in index.entries.values()
+                   if e.get("readable") and e.get("crs_authid")}
+        if len(authids) > 1:
+            crs_id = f"mixed ({len(authids)})"
+        native_res = _index_finest_res(index)
 
-        self._layers.append(_LayerEntry(
+        entry = _LayerEntry(
             layer_type="raster", source_path=folder,
             crs_authid=crs_id, native_res_m=native_res,
             target_resolutions=[30],
             priority=len(self._layers) + 1,
-        ))
+        )
+        entry.crs_overrides = crs_overrides
+        entry.decisions = decisions
+        entry.overlap_priority = terrain_index.get_overlap_priority(folder)
+        # The whole folder by default: every usable file's bounds, from the
+        # index the scan above just built (no further file access).
+        entry.extent = _folder_extent(index, decisions, crs_overrides)
+        self._layers.append(entry)
         self._rebuild_table()
+        self._table.selectRow(len(self._layers) - 1)
         self._update_estimate()
-        self._log_msg(f"Added folder: {folder} ({len(tifs)} files, "
-                      f"~{native_res or '?'}m)")
+        skipped = sum(1 for d in decisions.values()
+                      if d == terrain_index.DECISION_SKIP)
+        self._log_msg(f"Added folder: {folder} ({len(index.entries)} files"
+                      + (f", {skipped} skipped" if skipped else "")
+                      + f", finest ~{native_res or '?'}m; overlaps: "
+                      f"{terrain_index.PRIORITY_LABELS[entry.overlap_priority]}"
+                      + ("; extent = whole folder" if entry.extent else
+                         "; no usable file, extent not set") + ")")
+
+    def _selected_folder_entry(self) -> Optional[_LayerEntry]:
+        row = self._table.currentRow()
+        if 0 <= row < len(self._layers):
+            e = self._layers[row]
+            if e.layer_type == "raster" and os.path.isdir(e.source_path or ""):
+                return e
+        return None
+
+    def _sync_overlap_combo(self, *_args) -> None:
+        """Enable the overlap rule for a selected FOLDER entry and show its
+        current value."""
+        e = self._selected_folder_entry()
+        self._combo_overlap.blockSignals(True)
+        self._combo_overlap.setEnabled(e is not None)
+        mode = (e.overlap_priority if e is not None and e.overlap_priority
+                else terrain_index.PRIORITY_FINEST)
+        idx = self._combo_overlap.findData(mode)
+        self._combo_overlap.setCurrentIndex(max(idx, 0))
+        self._combo_overlap.blockSignals(False)
+
+    def _on_overlap_changed(self, _index: int) -> None:
+        e = self._selected_folder_entry()
+        if e is None:
+            return
+        mode = self._combo_overlap.currentData()
+        e.overlap_priority = mode
+        terrain_index.set_overlap_priority(e.source_path, mode)
+        self._log_msg(f"{e.source_path}: where files overlap, "
+                      f"{terrain_index.PRIORITY_LABELS[mode]}")
+
+    def _preflight_folders(self) -> bool:
+        """Re-scan every folder entry (off the GUI thread) and ask about any
+        problem file the user has not answered yet. False = cancelled."""
+        for e in self._layers:
+            if e.layer_type != "raster" or not os.path.isdir(e.source_path or ""):
+                continue
+            try:
+                scan = terrain_folder_scan.scan_folder(self, e.source_path)
+            except RuntimeError as exc:
+                QMessageBox.critical(self, "Folder could not be read",
+                                     str(exc))
+                return False
+            if scan is None:
+                return False
+            answer = terrain_folder_scan.resolve_folder_problems(
+                self, e.source_path, scan["index"], e.crs_overrides,
+                e.decisions, ask_crs=True)
+            if answer is None:
+                return False
+            e.crs_overrides, e.decisions = answer
+        return True
 
     def _on_add_buildings(self):
         # Show a dialog with two clearly labeled buttons.
@@ -2015,11 +2575,102 @@ class MapConverterTab(QWidget):
         self._rebuild_table()
         self._table.selectRow(row + 1)
 
-    def _on_remove(self):
-        row = self._table.currentRow()
-        if row < 0:
+    def _selected_rows(self) -> List[int]:
+        """Selected table rows, ascending (the current row if none is)."""
+        rows = set()
+        sel = self._table.selectionModel()
+        if sel is not None:
+            rows = {ix.row() for ix in sel.selectedRows()}
+        if not rows:
+            cur = self._table.currentRow()
+            if cur >= 0:
+                rows = {cur}
+        return sorted(r for r in rows if 0 <= r < len(self._layers))
+
+    def _set_extent_rows(self, extent: Optional[Dict[str, float]],
+                         rows: List[int], how: str) -> None:
+        """Set *extent* on *rows*, refresh the table + estimate, log it."""
+        changed = _apply_extent(self._layers, extent, rows)
+        if not changed:
             return
-        del self._layers[row]
+        keep = self._selected_rows()
+        self._rebuild_table()
+        self._reselect(keep)
+        self._update_estimate()
+        ext = extent
+        self._log_msg(
+            f"Extent {how} for row(s) {', '.join(str(r + 1) for r in changed)}"
+            f": S={ext['south']:.4f} N={ext['north']:.4f} "
+            f"W={ext['west']:.4f} E={ext['east']:.4f}")
+
+    def _reselect(self, rows: List[int]) -> None:
+        """Select *rows* again after a table rebuild."""
+        from qgis.PyQt.QtCore import QItemSelectionModel
+        sel = self._table.selectionModel()
+        if sel is None or not rows:
+            return
+        self._table.clearSelection()
+        for r in rows:
+            if 0 <= r < self._table.rowCount():
+                sel.select(self._table.model().index(r, 0),
+                           QItemSelectionModel.SelectionFlag.Select
+                           | QItemSelectionModel.SelectionFlag.Rows)
+
+    def _on_apply_extent_to_all(self, _checked: bool = False,
+                                row: Optional[int] = None) -> None:
+        """Copy one row's extent (the current row) to every other row."""
+        if row is None:
+            row = self._table.currentRow()
+        if not (0 <= row < len(self._layers)):
+            QMessageBox.information(self, "Select Layer",
+                                    "Select the row whose extent to copy.")
+            return
+        ext = self._layers[row].extent
+        if not ext:
+            QMessageBox.information(
+                self, "No Extent",
+                f"Row {row + 1} has no extent to copy yet. Set it with "
+                f"'Draw Extent for Layer' or 'Extent from Layer'.")
+            return
+        others = [r for r in range(len(self._layers)) if r != row]
+        self._set_extent_rows(ext, others, f"copied from row {row + 1}")
+
+    def _on_table_context_menu(self, pos) -> None:
+        """Right-click: copy / paste / apply-to-all an extent."""
+        row = self._table.rowAt(pos.y())
+        if row >= 0 and row not in self._selected_rows():
+            self._table.selectRow(row)
+        if row < 0:
+            row = self._table.currentRow()
+        rows = self._selected_rows()
+        src = (self._layers[row].extent
+               if 0 <= row < len(self._layers) else None)
+        menu = QMenu(self)
+        act_copy = menu.addAction("Copy extent")
+        act_copy.setEnabled(bool(src))
+        n = len(rows)
+        act_paste = menu.addAction(
+            f"Paste extent to {n} selected row{'s' if n != 1 else ''}")
+        act_paste.setEnabled(bool(self._extent_clipboard) and n > 0)
+        act_all = menu.addAction("Apply extent to all rows")
+        act_all.setEnabled(bool(src) and len(self._layers) > 1)
+        chosen = menu.exec(self._table.viewport().mapToGlobal(pos))
+        if chosen is None:
+            return
+        if chosen == act_copy and src:
+            self._extent_clipboard = dict(src)
+            self._log_msg(f"Extent of row {row + 1} copied.")
+        elif chosen == act_paste and self._extent_clipboard:
+            self._set_extent_rows(self._extent_clipboard, rows, "pasted")
+        elif chosen == act_all:
+            self._on_apply_extent_to_all(row=row)
+
+    def _on_remove(self):
+        rows = self._selected_rows()
+        if not rows:
+            return
+        for row in reversed(rows):
+            del self._layers[row]
         self._renumber()
         self._rebuild_table()
         self._update_estimate()
@@ -2083,29 +2734,24 @@ class MapConverterTab(QWidget):
     # ------------------------------------------------------------------
 
     def _on_draw_extent(self):
-        row = self._table.currentRow()
-        if row < 0:
+        rows = self._selected_rows()
+        if not rows:
             QMessageBox.information(self, "Select Layer",
                                     "Select a layer row first.")
             return
-        self._drawing_for_layer = row
+        self._drawing_for_layer = rows
         parent = self._dialog
         if hasattr(parent, "showMinimized"):
             parent.showMinimized()
         self._rect_tool = _RectangleDrawTool(self.iface, self._on_extent_drawn)
 
     def _on_extent_drawn(self, s, n, w, e):
-        row = self._drawing_for_layer
-        if row is not None and 0 <= row < len(self._layers):
-            self._layers[row].extent = {
-                "south": s, "north": n, "west": w, "east": e
-            }
-            self._rebuild_table()
-            self._update_estimate()
-            self._log_msg(
-                f"Extent set for layer {row + 1}: "
-                f"S={s:.4f} N={n:.4f} W={w:.4f} E={e:.4f}"
-            )
+        rows = self._drawing_for_layer
+        if isinstance(rows, int):          # a single row, as it used to be
+            rows = [rows]
+        if rows:
+            self._set_extent_rows(
+                {"south": s, "north": n, "west": w, "east": e}, rows, "drawn")
         self._drawing_for_layer = None
         parent = self._dialog
         if hasattr(parent, "showNormal"):
@@ -2113,13 +2759,16 @@ class MapConverterTab(QWidget):
             parent.raise_()
             parent.activateWindow()
 
-    def _choose_project_layer_for_extent(self, preferred=None):
+    def _choose_project_layer_for_extent(self, preferred=None,
+                                         whole_folder: bool = False):
         """Prompt for a loaded project layer to source an extent from.
 
         *preferred*, when given, is preselected in the list (e.g. the row's
         own layer) — but the user can still pick any other loaded layer.
-        Returns the chosen QgsRasterLayer/QgsVectorLayer, or None if cancelled
-        or no suitable layer is loaded.
+        *whole_folder* adds :data:`_WHOLE_FOLDER` ("Whole folder (all
+        files)") as the first, preselected choice — for folder rows.
+        Returns the chosen QgsRasterLayer/QgsVectorLayer, ``_WHOLE_FOLDER``,
+        or None if cancelled or no suitable layer is loaded.
         """
         from qgis.PyQt.QtWidgets import QInputDialog
 
@@ -2127,7 +2776,7 @@ class MapConverterTab(QWidget):
             lyr for lyr in QgsProject.instance().mapLayers().values()
             if isinstance(lyr, (QgsRasterLayer, QgsVectorLayer))
         ]
-        if not layers:
+        if not layers and not whole_folder:
             QMessageBox.information(
                 self, "No Layers",
                 "No raster or vector layers are loaded to take an extent "
@@ -2143,6 +2792,9 @@ class MapConverterTab(QWidget):
                 preselect = layers.index(preferred)
             except ValueError:
                 preselect = 0
+        if whole_folder:
+            names.insert(0, _WHOLE_FOLDER)
+            preselect = 0
         name, ok = QInputDialog.getItem(
             self, "Extent from Layer",
             "Use the geographic extent of which layer?",
@@ -2150,40 +2802,67 @@ class MapConverterTab(QWidget):
         )
         if not ok or not name:
             return None
+        if whole_folder and name == _WHOLE_FOLDER:
+            return _WHOLE_FOLDER
         for lyr in layers:
             if lyr.name() == name:
                 return lyr
         return None
 
     def _on_set_layer_extent(self):
-        row = self._table.currentRow()
-        if row < 0:
+        rows = self._selected_rows()
+        if not rows:
             QMessageBox.information(self, "Select Layer",
                                     "Select a layer row first.")
             return
-        entry = self._layers[row]
+        cur = self._table.currentRow()
+        entry = self._layers[cur if cur in rows else rows[0]]
+        folders = all(self._layers[r].layer_type == "raster"
+                      and os.path.isdir(self._layers[r].source_path or "")
+                      for r in rows)
         # Always let the user choose which layer's extent to use, preselecting
         # this row's own layer when it has one. This makes the button useful
         # for every row type — a building/folder row can borrow the DEM's
-        # extent, and any row can be re-bounded to a different layer.
-        layer = self._choose_project_layer_for_extent(preferred=entry.qgis_layer)
+        # extent, and any row can be re-bounded to a different layer. Folder
+        # rows also offer their own files ("Whole folder (all files)").
+        layer = self._choose_project_layer_for_extent(
+            preferred=entry.qgis_layer, whole_folder=folders)
         if layer is None:
             return
+        if layer == _WHOLE_FOLDER:
+            self._set_whole_folder_extent(rows)
+            return
+        ext = self._layer_wgs84_extent(layer)
+        if ext is None:
+            QMessageBox.warning(self, "No Extent",
+                                f"'{layer.name()}' has an empty extent.")
+            return
+        self._set_extent_rows(ext, rows, f"from layer {layer.name()}")
 
-        ext = layer.extent()
-        crs = layer.crs()
-        wgs84 = QgsCoordinateReferenceSystem("EPSG:4326")
-        if crs.isValid() and crs != wgs84:
-            xform = QgsCoordinateTransform(crs, wgs84, QgsProject.instance())
-            ext = xform.transformBoundingBox(ext)
+    def _set_whole_folder_extent(self, rows: List[int]) -> None:
+        """Each folder row's extent = all of its usable files.
 
-        entry.extent = {
-            "south": ext.yMinimum(), "north": ext.yMaximum(),
-            "west": ext.xMinimum(), "east": ext.xMaximum(),
-        }
-        self._rebuild_table()
-        self._update_estimate()
-        self._log_msg(f"Extent set from layer: {layer.name()}")
+        The folder is re-read through its index first (off the GUI thread,
+        unchanged files are only stat'ed), so files added since Add Folder
+        count too.
+        """
+        for r in rows:
+            e = self._layers[r]
+            try:
+                scan = terrain_folder_scan.scan_folder(self, e.source_path)
+            except RuntimeError as exc:
+                QMessageBox.critical(self, "Folder could not be read",
+                                     str(exc))
+                return
+            if scan is None:
+                return
+            ext = _folder_extent(scan["index"], e.decisions, e.crs_overrides)
+            if ext is None:
+                QMessageBox.warning(
+                    self, "No Usable Files",
+                    f"No usable file with known bounds in:\n{e.source_path}")
+                continue
+            self._set_extent_rows(ext, [r], "= whole folder")
 
     # ------------------------------------------------------------------
     # Target resolution editing (double-click on Target Res cell)
@@ -2411,6 +3090,12 @@ class MapConverterTab(QWidget):
                     if r != QMessageBox.StandardButton.Yes:
                         return
 
+        # Folder entries: files added/changed since Add Folder are read now
+        # (off the GUI thread) and any new problem file is asked about.
+        if not self._preflight_folders():
+            self._lbl_status.setText("Cancelled.")
+            return
+
         output_dir = self._get_output_dir()
 
         self._log.clear()
@@ -2425,21 +3110,30 @@ class MapConverterTab(QWidget):
             self._chk_overwrite.isChecked())
 
         self._log_msg("Preparing layers (rendered servers render per tile)...")
-        self._progress.setValue(phase_progress("resolve", 0.0))
+        # ONE bar for the whole run, weighted by the work each phase really
+        # does (core/run_progress.py) — estimated up front here, refined by
+        # the worker as soon as each total is known.
+        self._run_model = run_progress.RunProgress()
+        _estimate_run_work(self._run_model, self._layers, render_jobs)
+        self._run_model.set_phase("Preparing layers")
+        self._progress.setValue(0)
+        self._progress_timer.start()
         try:
             resolved = resolve_sources_with_progress(
                 self._layers, self, render_jobs=render_jobs,
-                on_progress=lambda frac: self._progress.setValue(
-                    phase_progress("resolve", frac)),
+                on_progress=lambda _frac: self._refresh_progress(),
+                progress_model=self._run_model,
             )
         except RuntimeError as exc:
             # Hard error (render failure, unloaded layer): blocking dialog,
             # nothing runs.
+            self._progress_timer.stop()
             self._log_msg(f"ERROR: {exc}")
             QMessageBox.critical(self, "Layer preparation failed", str(exc))
             self._lbl_status.setText("Failed.")
             return
         if resolved is None:
+            self._progress_timer.stop()
             self._log_msg("Cancelled while preparing layers.")
             self._lbl_status.setText("Cancelled.")
             return
@@ -2448,9 +3142,10 @@ class MapConverterTab(QWidget):
         self._worker = _MapConverterWorker(
             self._layers, output_dir, out_res, resolved, self,
             overwrite=self._chk_overwrite.isChecked(),
+            progress_model=self._run_model,
         )
-        self._worker.progress.connect(self._progress.setValue)
-        self._worker.status.connect(self._lbl_status.setText)
+        self._worker.progress.connect(self._on_worker_progress)
+        self._worker.status.connect(self._on_worker_status)
         self._worker.log_line.connect(self._log_msg)
         self._worker.finished_ok.connect(self._on_done)
         self._worker.finished_err.connect(self._on_error)
@@ -2460,24 +3155,58 @@ class MapConverterTab(QWidget):
     # Worker callbacks
     # ------------------------------------------------------------------
 
+    def _refresh_progress(self) -> None:
+        """Bar + label from the run model (timer, and after every signal).
+
+        The bar only ever moves forward here: the model is monotonic, and a
+        queued worker signal that arrives after a timer tick cannot pull it
+        back either.
+        """
+        model = self._run_model
+        if model is None:
+            return
+        pct, label = model.snapshot()
+        if pct > self._progress.value():
+            self._progress.setValue(pct)
+        if label:
+            self._lbl_status.setText(label)
+
+    def _on_worker_progress(self, pct: int) -> None:
+        if pct > self._progress.value():
+            self._progress.setValue(pct)
+        self._refresh_progress()
+
+    def _on_worker_status(self, text: str) -> None:
+        if self._run_model is None:
+            self._lbl_status.setText(text)
+        else:
+            self._refresh_progress()
+
     def _on_done(self, path):
         self._set_running(False)
         QMessageBox.information(self, "Done", f"Tiles written to:\n{path}")
 
     def _on_error(self, msg):
+        if self._run_model is not None:
+            self._run_model.stop("Failed.")
         self._set_running(False)
         QMessageBox.critical(self, "Failed", msg)
 
     def _on_cancel(self):
         if self._worker and self._worker.isRunning():
             self._worker.cancel()
+            if self._run_model is not None:
+                self._run_model.set_phase("Cancelling...")
             self._lbl_status.setText("Cancelling...")
 
     def _set_running(self, running):
         self._btn_run.setEnabled(not running)
         self._btn_cancel.setEnabled(running)
-        if running:
-            self._progress.setValue(0)
+        # The bar is reset when a run STARTS (_on_run), before the render
+        # phase moves it — resetting here, after that phase, walked it back.
+        if not running:
+            self._progress_timer.stop()
+            self._refresh_progress()
 
     # ------------------------------------------------------------------
     # Logging

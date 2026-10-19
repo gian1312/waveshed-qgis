@@ -26,7 +26,6 @@ from waveshed.gui.map_converter_tab import (
     _MapConverterWorker,
     _fgb_cache_name,
     _fgb_translate_options,
-    phase_progress,
 )
 import waveshed.core.buildings_source as buildings_source
 import waveshed.core.terrain_adapter as ta
@@ -808,21 +807,8 @@ class TestPlanCrossCheckUsesTheRawBbox(unittest.TestCase):
              _enumerate_tiles(_snap_bbox(self.RAW, [2]), [2])])
 
 
-class TestPhaseProgress(unittest.TestCase):
-    """One bar, phase-weighted: resolve 0-20, download 20-70, convert 70-100."""
-
-    def test_phase_spans(self):
-        self.assertEqual(phase_progress("resolve", 0.0), 0)
-        self.assertEqual(phase_progress("resolve", 1.0), 20)
-        self.assertEqual(phase_progress("download", 0.0), 20)
-        self.assertEqual(phase_progress("download", 0.5), 45)
-        self.assertEqual(phase_progress("download", 1.0), 70)
-        self.assertEqual(phase_progress("convert", 0.0), 70)
-        self.assertEqual(phase_progress("convert", 1.0), 100)
-
-    def test_fraction_is_clamped(self):
-        self.assertEqual(phase_progress("download", -0.5), 20)
-        self.assertEqual(phase_progress("download", 1.5), 70)
+# The run's one progress bar (work-weighted, retry-aware) is tested in
+# tests/test_run_progress.py; the fixed phase spans it replaced are gone.
 
 
 class TestAcquisitionRouter(unittest.TestCase):
@@ -1145,7 +1131,7 @@ class TestWorkerDownloadCancel(unittest.TestCase):
             seen = {}
 
             def spy_download(entries, exp, progress_cb=None,
-                             should_cancel=None, on_start=None):
+                             should_cancel=None, on_start=None, **_kw):
                 seen["expected"] = list(exp)
                 raise ta.ConverterCancelled()   # stop the run cleanly here
 

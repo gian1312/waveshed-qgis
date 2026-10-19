@@ -2410,7 +2410,13 @@ class TestTryRustDownloadReportsProgress(unittest.TestCase):
                     _XYZ_SOURCE, pool, self.BBOX, 30, subtiles, bm,
                     progress_cb=lambda frac, label: fracs.append(frac))
         self.assertTrue(ok)
-        self.assertEqual(fracs, [0.5, 1.0])
+        # pass start (0), the two [Download] lines, group end (1.0). The
+        # pass's own 100 % line stays below 1.0: a small tail is held until
+        # the group's outcome is known, so a retry pass still has room.
+        self.assertEqual(len(fracs), 4)
+        self.assertEqual(fracs[0], 0.0)
+        self.assertTrue(0.0 < fracs[1] < fracs[2] < 1.0, fracs)
+        self.assertEqual(fracs[-1], 1.0)
 
 
 # ---------------------------------------------------------------------------

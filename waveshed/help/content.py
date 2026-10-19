@@ -967,6 +967,10 @@ with <b>&#9650; Up</b> / <b>&#9660; Down</b>. Sources are added with:</p>
 <ul>
 <li><b>Add Layer</b> — a raster (or vector, for buildings) layer from the
 project, chosen in the dropdown beside the button.</li>
+<li><b>Add All Layers</b> — every loaded raster layer not in the stack yet,
+each row with its own layer extent. Layers that look like imagery are skipped
+(add those one by one with <b>Add Layer</b>); map services (XYZ, WMS) get no
+extent, since theirs is the whole service.</li>
 <li><b>Add Folder...</b> — a folder of elevation rasters (any GDAL format,
 zip archives included), read recursively in the background. Each file is read
 in its own CRS. Files without one are <i>never</i> given another file's CRS:
@@ -974,7 +978,8 @@ you are asked — <b>Use EPSG:… for all</b> (the folder's own CRS offered),
 <b>Choose per file…</b>, or <b>Skip them</b>. Other unusable files are
 listed in one <b>Skip N unusable file(s) and continue?</b> prompt (default
 Cancel). <b>Convert</b> re-reads the folder first and asks about any new
-problem file.</li>
+problem file. The row's extent starts as the whole folder (all usable
+files).</li>
 <li><b>Where files overlap:</b> — for the selected folder row: <b>finest
 resolution wins</b> (default; equal resolutions fall back to file name order)
 or <b>file name order</b> (the alphabetically first path wins; the log warns
@@ -992,10 +997,14 @@ back into QGIS as a terrain layer, under <b>Waveshed &rarr; Terrain</b>. Useful
 for checking a build before running an analysis over it.</li>
 </ul>
 <p>The table shows <b>Type</b>, <b>Source</b>, <b>CRS</b>, <b>Native Res</b>,
-<b>Target Res</b> and <b>Extent</b>. Every raster row needs an extent: select a
-row and use <b>Draw Extent for Layer</b> (drag a rectangle on the map) or
-<b>Extent from Layer</b> (the layer's own bounds). <b>Remove</b> drops a
-row.</p>
+<b>Target Res</b> and <b>Extent</b>. Every raster row needs an extent: select
+one or more rows (Ctrl/Shift-click) and use <b>Draw Extent for Layer</b> (drag
+a rectangle on the map) or <b>Extent from Layer</b> (a loaded layer's bounds;
+for folder rows also <b>Whole folder (all files)</b>). <b>Apply Extent to
+All</b> copies the current row's extent to every other row; right-click the
+table to <b>Copy extent</b>, <b>Paste extent</b> to the selected rows or
+<b>Apply extent to all rows</b>. <b>Remove</b> drops the selected
+row(s).</p>
 
 <h3>Output</h3>
 <ul>
@@ -1016,9 +1025,13 @@ root. <b>Browse...</b> to pick another.</li>
 and turns orange past 50 GB and red past 200 GB. It prices only what will
 actually be built.</li>
 </ul>
-<p><b>Convert</b> starts the run, <b>Cancel</b> stops it, the progress bar and
-the status line track it, and the converter's own output is streamed into the
-log box at the bottom.</p>
+<p><b>Convert</b> starts the run, <b>Cancel</b> stops it, and the converter's
+own output is streamed into the log box at the bottom. The progress bar covers
+the whole run, weighted by the work each step really does (rendered service
+tiles, downloaded source tiles, converted output tiles), and keeps moving
+through download retry passes. The status line shows the step, the retry pass
+(<i>pass 2/3</i>), tiles done of total, MB/s, errors and an ETA — and says so
+when no tile has finished for a while (a server backing off).</p>
 
 <h3>The plan cross-check</h3>
 <p>Before every conversion the worker runs <code>aether_converter plan</code>

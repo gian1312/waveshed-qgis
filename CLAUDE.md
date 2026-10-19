@@ -203,6 +203,36 @@ the listing, the probe reuses the scan's stat, and the index is written in one
 `write`. 2,500 files on the container's Windows mount: first scan 24.9 s →
 3.3 s (raw open+read floor there 1.35 s), repeat 1.2 s → 0.7 s.
 
+## Map Converter progress and extents
+
+**One bar, weighted by work (`core/run_progress.py`).** No fixed phase spans.
+`RunProgress` holds slots of estimated work in one unit (a downloaded 256²
+source tile; convert/render per 256² output block, `*_UNITS_PER_BLOCK`):
+`("render", i)` only for entries that render, `("download", k, res)` per
+`ensure_pool_tiles` call, `("convert",)`. `_on_run` estimates (geometry only,
+no pool stat on the GUI thread), the worker refines (pool-checked, exact jobs).
+Remaining-work rule — finishing Δ advances `f += Δ(1−f)/remaining` — so the bar
+never goes back, moves with every finished unit (retry passes ADD their work
+when they start), and is 100 % only when all slots are done. Between converter
+lines (download: every 10 % of a pass; ingest: every 10 tiles) it may creep at
+the smoothed rate up to the next certain report (`next_download_report`). Only
+existing toolkit lines are parsed: `[Download] z= tiles=AxB=N` (pass total up
+front), `[Download] X% (a/b) — MB/s, errors, in-flight`, `Progress: a/b`.
+`DownloadProgressAggregator` counts source tiles per zoom group + a 1 % tail held
+until the group's outcome is known; `progress_cb(frac, label)` stays the
+contract (Site Analysis, Processing), a callback with a `download_event(info)`
+attribute also gets the counts. The worker's `status` texts are unchanged (the
+torture runner filters them); the tab's label comes from the model.
+
+**Extents.** Rows: ExtendedSelection — Draw Extent / Extent from Layer / Paste /
+Remove act on all selected rows; Up/Down/overlap rule on the current row.
+Extents are copied per row (`_apply_extent`), never shared. A folder row's
+extent defaults to the union of its usable files' `wgs84_bounds` from the scan's
+index (`_folder_extent`; skipped/unusable files excluded, CRS-less files only
+with the user's CRS); "Whole folder (all files)" in the picker re-scans
+off-thread. Add All Layers prefills each file layer's own extent; services
+(XYZ/WMS) get none — their extent is the whole service.
+
 ## Adaptive / custom resolution (`core/range_profile.py`)
 
 Site Analysis offers Fixed / Adaptive / Custom next to the resolution. A profile is
