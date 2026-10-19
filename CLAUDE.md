@@ -263,6 +263,20 @@ matching the finest step that footprint needs) into an `abt_selection_view`.
 Footprints lacking that resolution are listed in a pre-run Yes/No dialog
 ("Terrain resolution not available") and logged as `terrain substitution`.
 
+**Buildings per band.** `rp.band_buildings(bands, overrides, master)`: Adaptive
+gives buildings to bands with step < `BUILDINGS_SKIP_STEP_M` (90) only; Custom
+keeps per-band choices keyed by step (`_custom_buildings`, session-only like
+`_custom_bands`; missing steps follow the same rule); "Include buildings" is the
+master switch. Flags ride in `CoverageParams.range_profile_buildings` (never in the
+job JSON) to `prepare_terrain_profile(band_buildings=...)`, which builds each band
+into its own pool (with / without buildings) and links both into one view whose
+key encodes which steps carry buildings; `terrain_plan_profile` prices the same.
+A Custom site whose range ends inside the first band runs as a fixed job but keeps
+that band's flag (one-element `range_profile_buildings`, read by the worker's fixed
+path and the estimate). Multi-site (2026-10-19, Rigi/Pilatus, real terrarium +
+OpenFreeMap): sites share pool tiles, each gets its own view; pinned by
+`MultiSiteBuildingsViews`.
+
 ## Sensitive Files (DO NOT commit)
 
 - `api_private_key.bin` / `api_private_key.pem` - Ed25519 signing key (server-side only)

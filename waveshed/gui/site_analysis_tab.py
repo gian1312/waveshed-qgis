@@ -277,6 +277,8 @@ class _SiteAnalysisWorker(QThread):
                         az_start=params.az_start,
                         az_end=params.az_end,
                         osm_buildings=self.osm_buildings,
+                        band_buildings=params.range_profile_buildings,
+                        buildings_notes=params.range_profile_buildings_notes,
                     )
                 else:
                     abt_dir = prepare_terrain(
@@ -289,7 +291,10 @@ class _SiteAnalysisWorker(QThread):
                         terrain_dir=self.terrain_dir or None,
                         az_start=params.az_start,
                         az_end=params.az_end,
-                        osm_buildings=self.osm_buildings,
+                        # A Custom site whose range ends inside the first band
+                        # carries that band's flag (_build_jobs).
+                        osm_buildings=self.osm_buildings and all(
+                            params.range_profile_buildings or [True]),
                     )
 
                 if self._canceled:
@@ -708,6 +713,10 @@ class SiteAnalysisTab(QWidget):
         #: Custom profile [(until_m, step_m), ...] for the base resolution it
         #: was drawn for; None until the user draws one.
         self._custom_bands: Optional[list] = None
+        #: Custom profile's per-band buildings choices, keyed by band step
+        #: (core.range_profile.band_buildings); steps not in it follow the
+        #: default rule (on below 90 m). Reset with _custom_bands.
+        self._custom_buildings: Dict[int, bool] = {}
         self._res_mode_before_custom = rp.MODE_FIXED
         res_row = QHBoxLayout()
         res_row.setContentsMargins(0, 0, 0, 0)
@@ -753,9 +762,14 @@ class SiteAnalysisTab(QWidget):
             "of the terrain.\n\n"
             "Buildings are only published at zoom 14, so this adds a sizeable "
             "download and is limited to smaller analysis areas.\n\n"
+            "With Adaptive / Custom resolution this is the master switch: "
+            f"Adaptive skips buildings on bands of {rp.BUILDINGS_SKIP_STEP_M} m "
+            "and coarser; Custom sets them per band (same default). Unchecked, "
+            "no band gets buildings.\n\n"
             + source_credit("OpenFreeMap")
         )
         layout.addRow("Buildings:", self.chk_buildings)
+        self.chk_buildings.toggled.connect(lambda _on: self._refresh_res_profile())
 
         # Compute Backend
         self.combo_backend = QComboBox()
@@ -1456,6 +1470,16 @@ class SiteAnalysisTab(QWidget):
             bands = None
         return bands if bands and len(bands) > 1 else None
 
+    def _band_buildings_for(self, bands: list) -> Tuple[List[bool], List[str]]:
+        """Per-band buildings flags for *bands* and the reason for each: the
+        "Include buildings" checkbox is the master switch, Adaptive skips
+        bands at >= 90 m, Custom uses the editor's per-band choice."""
+        mode = self._resolution_mode()
+        master = self.chk_buildings.isChecked()
+        overrides = self._custom_buildings if mode == rp.MODE_CUSTOM else None
+        flags = rp.band_buildings(bands, overrides, master)
+        return flags, rp.buildings_notes(bands, flags, mode, master)
+
     def _refresh_res_profile(self) -> None:
         base = int(self.combo_resolution.currentText())
         mode = self._resolution_mode()
@@ -1468,7 +1492,13 @@ class SiteAnalysisTab(QWidget):
                 f"{base} m over the whole range — already as coarse as the far "
                 f"step, or the range ends inside the near field.")
         else:
-            self.lbl_res_profile.setText(rp.describe(bands))
+            text = rp.describe(bands)
+            if self.chk_buildings.isChecked():
+                flags, _ = self._band_buildings_for(bands)
+                with_b = [f"{s} m" for (_, s), f in zip(bands, flags) if f]
+                text += (" — buildings on " + ", ".join(with_b) if with_b
+                         else " — no band gets buildings")
+            self.lbl_res_profile.setText(text)
 
     def _output_res(self) -> int:
         """The result map's pixel size: the resolution in Fixed mode, the
@@ -1522,6 +1552,7 @@ class SiteAnalysisTab(QWidget):
         base = int(self.combo_resolution.currentText())
         if self._custom_bands and self._custom_bands[0][1] != base:
             self._custom_bands = None
+            self._custom_buildings = {}
             if self.radio_res_custom.isChecked():
                 self.radio_res_adaptive.setChecked(True)
         self._refresh_res_profile()
@@ -1536,9 +1567,12 @@ class SiteAnalysisTab(QWidget):
     def _on_custom_resolution(self) -> None:
         """Custom clicked: open the profile editor (again, on every click)."""
         base = int(self.combo_resolution.currentText())
-        dlg = RangeProfileDialog(base, self._profile_range_km(), self._custom_bands, self)
+        dlg = RangeProfileDialog(base, self._profile_range_km(), self._custom_bands, self,
+                                 buildings=self._custom_buildings,
+                                 buildings_master=self.chk_buildings.isChecked())
         if dlg.exec() == dlg.DialogCode.Accepted:
             self._custom_bands = dlg.bands()
+            self._custom_buildings = dlg.buildings()
             self.radio_res_custom.setChecked(True)
         elif not self._custom_bands:
             # Nothing drawn yet: Custom has no profile to run, go back.
@@ -1670,11 +1704,22 @@ class SiteAnalysisTab(QWidget):
                     # Adaptive / custom: the same single job, with the profile,
                     # written at the output pixel the user chose.
                     out_res = self._output_res()
+                    flags, notes = self._band_buildings_for(bands)
                     params = dataclasses.replace(params, range_profile=list(bands),
+                                                 range_profile_buildings=flags,
+                                                 range_profile_buildings_notes=notes,
                                                  resolution_m=out_res)
                     display_name = f"{display_name} — {rp.describe(bands)}"
                     if out_res != resolution:
                         display_name += f" · output {out_res} m"
+                elif self._resolution_mode() == rp.MODE_CUSTOM:
+                    # This site's range ends inside the first custom band: a
+                    # fixed run at that band's step, which keeps the band's
+                    # buildings choice (one flag, read by the worker).
+                    flags, notes = self._band_buildings_for(
+                        [(float(params.max_range_km) * 1000.0, resolution)])
+                    params = dataclasses.replace(params, range_profile_buildings=flags,
+                                                 range_profile_buildings_notes=notes)
                 jobs.append((params, display_name))
 
         return jobs
@@ -1836,7 +1881,8 @@ class SiteAnalysisTab(QWidget):
         for params, _name in jobs:
             key = (params.tx_lat, params.tx_lon, params.max_range_km,
                    params.resolution_m, params.az_start, params.az_end,
-                   tuple(params.range_profile or ()))
+                   tuple(params.range_profile or ()),
+                   tuple(params.range_profile_buildings or ()))
             if key in seen:
                 continue
             seen.add(key)
@@ -1845,12 +1891,15 @@ class SiteAnalysisTab(QWidget):
                     plan_source, params.tx_lat, params.tx_lon,
                     params.range_profile, params.az_start, params.az_end,
                     plan_buildings,
+                    band_buildings=params.range_profile_buildings,
                 )
             else:
                 plan = terrain_plan(
                     plan_source, params.tx_lat, params.tx_lon,
                     params.max_range_km, params.resolution_m,
-                    params.az_start, params.az_end, plan_buildings,
+                    params.az_start, params.az_end,
+                    plan_buildings if all(params.range_profile_buildings or [True])
+                    else None,
                 )
             total_mb += plan["download_mb"]
             cached_mb += plan["total_mb"] - plan["download_mb"]

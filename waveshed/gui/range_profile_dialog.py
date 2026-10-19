@@ -9,6 +9,9 @@ of the staircase is one band of ``analysis.range_profile`` (core.range_profile):
   snap, finer when zoomed in — down to 10 m);
 * double-click inside a band to split it there; right-click a boundary to
   remove it;
+* one "Buildings" checkbox per band below the chart: OpenFreeMap buildings
+  for that band (default on below 90 m, off at 90 m and coarser); the Site
+  Analysis "Include buildings" checkbox stays the master switch;
 * mouse wheel zooms the distance axis around the cursor, middle- or
   right-drag pans it, *Reset zoom* shows the whole range again — on a long
   range the near field is otherwise a few pixels wide.
@@ -18,11 +21,12 @@ Plain QPainter, no extra dependency.
 
 from __future__ import annotations
 
-from typing import List, Optional, Tuple
+from typing import Dict, List, Mapping, Optional, Tuple
 
 from qgis.PyQt.QtCore import QPointF, QRectF, Qt, pyqtSignal
 from qgis.PyQt.QtGui import QColor, QPainter, QPen
 from qgis.PyQt.QtWidgets import (
+    QCheckBox,
     QDialog,
     QDialogButtonBox,
     QHBoxLayout,
@@ -316,8 +320,16 @@ class RangeProfileDialog(QDialog):
     """Edit a resolution profile for one base resolution and range."""
 
     def __init__(self, base_m: int, range_km: float, bands: Optional[List[Band]] = None,
-                 parent=None):
+                 parent=None, buildings: Optional[Mapping[int, bool]] = None,
+                 buildings_master: bool = True):
         super().__init__(parent)
+        #: Per-band buildings choice, keyed by band step (core.range_profile.
+        #: band_buildings); steps not in it follow the default rule.
+        self._buildings: Dict[int, bool] = {int(k): bool(v)
+                                            for k, v in (buildings or {}).items()}
+        self.buildings_master = buildings_master
+        self._bld_key: Optional[tuple] = None
+        self._bld_boxes: Dict[int, QCheckBox] = {}
         self.setWindowTitle("Custom resolution profile")
         self.base_m = base_m
         self.range_km = range_km
@@ -325,6 +337,10 @@ class RangeProfileDialog(QDialog):
         self.chart = ProfileChart(rp.normalise_bands(start, range_km), base_m, range_km)
         self.lbl = QLabel("")
         self.lbl.setWordWrap(True)
+        self.bld_row = QHBoxLayout()
+        self.lbl_bld = QLabel("")
+        self.lbl_bld.setWordWrap(True)
+        self.lbl_bld.setStyleSheet("color: gray; font-size: 11px;")
         intro = QLabel(
             f"Resolution against distance from the transmitter, starting at the "
             f"chosen {base_m} m. Coarser steps further out are much faster and "
@@ -351,6 +367,8 @@ class RangeProfileDialog(QDialog):
         layout.addWidget(intro)
         layout.addWidget(self.chart, 1)
         layout.addWidget(self.lbl)
+        layout.addLayout(self.bld_row)
+        layout.addWidget(self.lbl_bld)
         layout.addLayout(row)
         self.chart.changed.connect(self._refresh)
         self.chart.zoomed.connect(self._refresh_zoom)
@@ -364,6 +382,8 @@ class RangeProfileDialog(QDialog):
 
     def _on_reset(self) -> None:
         self.chart.bands = rp.normalise_bands(self._default(), self.range_km)
+        self._buildings = {}  # Adaptive's rule: on below 90 m
+        self._bld_key = None
         self.chart.update()
         self._refresh()
 
@@ -371,6 +391,54 @@ class RangeProfileDialog(QDialog):
         problem = rp.validate_bands(self.chart.bands, self.range_km)
         self.lbl.setText(problem or rp.describe(self.bands()))
         self.buttons.button(QDialogButtonBox.StandardButton.Ok).setEnabled(problem is None)
+        self._refresh_buildings()
+
+    def _refresh_buildings(self) -> None:
+        """One checkbox per (normalised) band; rebuilt only when the bands
+        change, so a drag does not churn widgets."""
+        bands = self.bands()
+        key = tuple(bands)
+        if key == self._bld_key:
+            return
+        self._bld_key = key
+        while self.bld_row.count():
+            item = self.bld_row.takeAt(0)
+            if item.widget() is not None:
+                item.widget().deleteLater()
+        self._bld_boxes = {}
+        self.bld_row.addWidget(QLabel("Buildings:"))
+        flags = rp.band_buildings(bands, self._buildings)
+        start = 0.0
+        for (until, step), on in zip(bands, flags):
+            box = QCheckBox(f"{step} m ({_km_label(start)} – {_km_label(until)})")
+            box.setChecked(on)
+            box.setEnabled(self.buildings_master)
+            box.setToolTip(
+                f"Burn OpenFreeMap buildings into the {step} m band's terrain. "
+                f"Default: on below {rp.BUILDINGS_SKIP_STEP_M} m, off at "
+                f"{rp.BUILDINGS_SKIP_STEP_M} m and coarser (a coarse step barely "
+                f"samples a building, while its large ring costs thousands of "
+                f"zoom-14 building tiles). Only applies while 'Include "
+                f"buildings (OpenFreeMap)' is checked.")
+            box.toggled.connect(lambda checked, st=step: self._set_building(st, checked))
+            self.bld_row.addWidget(box)
+            self._bld_boxes[step] = box
+            start = until
+        self.bld_row.addStretch()
+        self.lbl_bld.setText(
+            "Per band, used while 'Include buildings (OpenFreeMap)' is checked."
+            if self.buildings_master else
+            "'Include buildings (OpenFreeMap)' is unchecked in Site Analysis — "
+            "no band gets buildings. Tick it there to use these settings.")
+
+    def _set_building(self, step: int, on: bool) -> None:
+        self._buildings[int(step)] = bool(on)
+
+    def buildings(self) -> Dict[int, bool]:
+        """The per-band buildings choice for the current bands, keyed by
+        step — the master switch is NOT applied here (the tab applies it)."""
+        bands = self.bands()
+        return {int(s): f for (_, s), f in zip(bands, rp.band_buildings(bands, self._buildings))}
 
     def _refresh_zoom(self) -> None:
         self.btn_zoom.setEnabled(self.chart.is_zoomed())

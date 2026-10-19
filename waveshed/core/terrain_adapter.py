@@ -27,7 +27,7 @@ import subprocess
 import tempfile
 import time
 import urllib.parse
-from typing import Any, Dict, List, NamedTuple, Optional, Tuple
+from typing import Any, Dict, List, NamedTuple, Optional, Sequence, Tuple
 
 from osgeo import gdal
 
@@ -1080,17 +1080,20 @@ def _fill_view_voids(src: str, dst: str) -> bool:
         return False
 
 
-def _sync_view(pool_dir: str, view_dir: str, names: List[str]) -> List[str]:
+def _sync_view(pool_dir: str, view_dir: str, names: List[str],
+               keep: Optional[Sequence[str]] = None) -> List[str]:
     """Populate *view_dir* with exactly *names*, linked from the pool.
 
     Hardlinks cost nothing; where the filesystem refuses one (a different
     volume, FAT, or Windows without the privilege) we fall back to a copy.
     A pool tile that contains voids is not linked but COPIED WITH ITS VOIDS
     FILLED to 0 m — see :func:`_fill_view_voids`; the pool copy keeps them.
+    *keep* names further tiles the view legitimately holds from ANOTHER pool
+    (a range profile whose bands differ in buildings): they are not pruned.
     Returns the names that could not be provided.
     """
     os.makedirs(view_dir, exist_ok=True)
-    wanted = set(names)
+    wanted = set(names) | set(keep or ())
 
     # Anything else in the view would be read as terrain by the engine.
     try:
@@ -1450,16 +1453,23 @@ def terrain_plan_profile(
     az_start: float = 0.0,
     az_end: float = 360.0,
     buildings: Optional[str] = None,
+    band_buildings: Optional[Sequence[bool]] = None,
 ) -> Dict[str, Any]:
     """:func:`terrain_plan` for a range profile — the sum of its bands, each
-    narrowed exactly as :func:`prepare_terrain_profile` builds it."""
+    narrowed exactly as :func:`prepare_terrain_profile` builds it.
+
+    *band_buildings* (one flag per band) prices a band without buildings
+    against the building-free pool, as the run will build it; None = every
+    band uses *buildings*."""
     total: Dict[str, Any] = {"bbox": None, "tiles_total": 0, "tiles_cached": 0,
                              "tiles_missing": 0, "download_mb": 0, "total_mb": 0}
     covered: set = set()
     inner_km = 0.0
-    for until_m, step in bands:
+    for idx, (until_m, step) in enumerate(bands):
+        band_b = (buildings if band_buildings is None or band_buildings[idx]
+                  else None)
         plan = terrain_plan(source, tx_lat, tx_lon, until_m / 1000.0, step,
-                            az_start, az_end, buildings,
+                            az_start, az_end, band_b,
                             min_range_km=inner_km, skip_footprints=covered)
         for key in ("tiles_total", "tiles_cached", "tiles_missing",
                     "download_mb", "total_mb"):
@@ -4574,6 +4584,8 @@ def prepare_terrain_profile(
     az_start: float = 0.0,
     az_end: float = 360.0,
     osm_buildings: bool = False,
+    band_buildings: Optional[Sequence[bool]] = None,
+    buildings_notes: Optional[Sequence[str]] = None,
 ) -> str:
     """Terrain for a range-profile job (core.range_profile): one view directory
     holding, per band, the tiles at that band's step.
@@ -4589,6 +4601,14 @@ def prepare_terrain_profile(
     aether_core keeps every tile group in the directory and lets finer tiles
     win where they overlap (toolkit CONTRACT.md 3.3), which is what the
     combined view relies on.
+
+    *osm_buildings* is the master switch; *band_buildings* (one flag per band,
+    core.range_profile.band_buildings) narrows it per band — None means every
+    band follows *osm_buildings*. A band without buildings builds into the
+    building-free pool, one with them into the buildings pool; the view links
+    each tile from its own pool (footprints never repeat across bands, so a
+    view still holds one tile per footprint). *buildings_notes* is the per-band
+    reason, logged alongside each band.
     """
     if is_abt_tile_dir(terrain_dir):
         # Pre-built .abt tiles: chosen per footprint for each band's step (never
@@ -4599,32 +4619,63 @@ def prepare_terrain_profile(
         return _abt_view_for(terrain_dir, tx_lat, tx_lon, list(bands),
                              az_start, az_end)
     source = terrain_dir or dem_layer.source()
+    if band_buildings is None:
+        flags = [bool(osm_buildings)] * len(bands)
+    else:
+        if len(band_buildings) != len(bands):
+            raise ValueError(f"band_buildings has {len(band_buildings)} flag(s) "
+                             f"for {len(bands)} band(s)")
+        flags = [bool(osm_buildings) and bool(f) for f in band_buildings]
     covered: set = set()
+    # pool identity (buildings id or None) -> tile names linked from that pool
+    groups: Dict[Optional[str], List[str]] = {}
     names: List[str] = []
     inner_km = 0.0
-    for until_m, step in bands:
+    for idx, (until_m, step) in enumerate(bands):
+        band_osm = flags[idx]
         until_km = until_m / 1000.0
         bbox = _compute_sector_bbox(tx_lat, tx_lon, until_km, az_start, az_end)
         tiles = _band_tiles(
             _compute_subtiles(bbox, step, tx_lat, tx_lon, until_km, az_start, az_end),
             tx_lat, tx_lon, inner_km, covered)
+        if buildings_notes and idx < len(buildings_notes):
+            note = buildings_notes[idx]
+        elif band_osm:
+            note = "buildings on"
+        elif osm_buildings:
+            note = "buildings skipped (band setting)"
+        else:
+            note = "buildings off"
         _log(f"prepare_terrain_profile: band {inner_km:g}-{until_km:g} km @ {step} m "
-             f"— {len(tiles)} tile(s)")
+             f"— {len(tiles)} tile(s), {note}")
         if tiles:
             prepare_terrain(dem_layer, tx_lat, tx_lon, until_km, step,
                             binary_manager, feedback, terrain_dir, az_start, az_end,
-                            osm_buildings=osm_buildings,
+                            osm_buildings=band_osm,
                             min_range_km=inner_km, skip_footprints=set(covered))
-            names.extend(t["filename"] for t in tiles)
+            band_names = [t["filename"] for t in tiles]
+            names.extend(band_names)
+            groups.setdefault(buildings_identity(None, band_osm), []).extend(band_names)
             covered.update(tile_footprint(t) for t in tiles)
         inner_km = until_km
 
-    buildings_id = buildings_identity(None, osm_buildings)
-    pool_dir = _pool_dir(source, buildings_id)
+    # The view identity carries WHICH bands have buildings: the same tile
+    # names with buildings on every band, on the fine bands only, or on none
+    # are different terrain and must never share a view directory.
+    if len(groups) > 1:
+        osm_steps = ",".join(str(s) for (_, s), f in zip(bands, flags) if f)
+        view_buildings: Optional[str] = (
+            f"{buildings_identity(None, True)}@{osm_steps}m")
+    else:
+        view_buildings = next(iter(groups), buildings_identity(None, osm_buildings))
     view_dir = _view_dir(source, [{"filename": n} for n in names],
-                         "profile", buildings_id)
-    ensure_engine_dirs(pool_dir, view_dir)
-    gone = _sync_view(pool_dir, view_dir, names)
+                         "profile", view_buildings)
+    gone: List[str] = []
+    for buildings_id, group_names in (groups.items() or
+                                      [(view_buildings, [])]):
+        pool_dir = _pool_dir(source, buildings_id)
+        ensure_engine_dirs(pool_dir, view_dir)
+        gone += _sync_view(pool_dir, view_dir, group_names, keep=names)
     if gone:
         raise RuntimeError(
             f"{len(gone)} terrain tile(s) vanished from the cache while the "

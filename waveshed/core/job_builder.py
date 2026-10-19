@@ -153,6 +153,14 @@ class CoverageParams:
     #: Variable radial step (core.range_profile): [(until_m, step_m), ...].
     #: None = one uniform step of resolution_m. Needs engine >= 0.4.9.
     range_profile: Optional[list] = None
+    #: Plugin-only (never in the job JSON — buildings are burned into the
+    #: terrain): per-band buildings flags for range_profile, same order
+    #: (core.range_profile.band_buildings), and the per-band reason for the
+    #: log. None = every band follows the run's "Include buildings". A Custom
+    #: site without range_profile (its range ends inside the first band)
+    #: carries that one band's flag.
+    range_profile_buildings: Optional[list] = None
+    range_profile_buildings_notes: Optional[list] = None
 
     # Output
     output_name: str = "coverage"

@@ -594,7 +594,8 @@ pixels share the value of their coarser radial sample. The grey line under the
 row spells the profile out.</li>
 <li><b>Custom…</b> — opens a resolution-against-distance chart: drag a step up or
 down to change its resolution, drag a boundary to move it, double-click to
-split a band, right-click a boundary to remove it.</li>
+split a band, right-click a boundary to remove it. A <b>Buildings</b> checkbox
+per band chooses which bands get OpenFreeMap buildings (default: below 90 m).</li>
 </ul>
 Adaptive and Custom need engine 0.4.9 or newer; 2 m can only step up to 30, 90
 or 250 m (its terrain tiles do not line up with 5 m / 10 m ones).</td></tr>
@@ -611,7 +612,11 @@ tile area, the tile whose resolution matches the step that area needs, and only
 those tiles reach the engine. If the folder lacks that resolution somewhere, the
 run asks first and lists the areas.</td></tr>
 <tr><td><b>Buildings:</b></td><td><b>Include buildings (OpenFreeMap)</b> — burn
-OSM building footprints into the terrain surface.</td></tr>
+OSM building footprints into the terrain surface. With <b>Adaptive</b>, bands of
+90 m and coarser skip buildings (a far 90 m ring costs thousands of building
+tiles for a step that barely samples a building); with <b>Custom</b> each band
+has its own checkbox, same default. This checkbox stays the master switch:
+unchecked, no band gets buildings.</td></tr>
 <tr><td><b>Backend:</b></td><td><b>AUTO</b> (GPU when one is usable, else CPU),
 <b>GPU</b> or <b>CPU</b>. Forcing CPU is much slower but sidesteps a driver
 problem.</td></tr>

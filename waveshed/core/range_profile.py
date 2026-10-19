@@ -23,7 +23,7 @@ No GUI code — the Site Analysis tab and its worker both build on it.
 
 from __future__ import annotations
 
-from typing import List, Optional, Sequence, Tuple
+from typing import List, Mapping, Optional, Sequence, Tuple
 
 from .job_builder import VALID_RESOLUTIONS
 from .terrain_adapter import ABT_EXTENT_DEG
@@ -44,6 +44,13 @@ ADAPTIVE_NEAR_M = 7000.0
 ADAPTIVE_RAMP_M = 5000.0
 #: ... to this step, kept to the end of the range.
 ADAPTIVE_FAR_STEP_M = 90
+
+#: Bands stepping at this or coarser skip buildings by default (Adaptive always,
+#: Custom unless the user ticks the band). OpenFreeMap buildings come at z14
+#: only, so a far 90 m band fetched thousands of building tiles (3844 for a
+#: 12-50 km ring, most of a 44 s run, close to openfreemap.MAX_TILES) to burn a
+#: few tens of thousands of pixels a 90 m ray step barely samples.
+BUILDINGS_SKIP_STEP_M = 90
 
 #: aether_core accepts at most this many bands.
 MAX_BANDS = 8
@@ -152,3 +159,48 @@ def describe(bands: Sequence[Band]) -> str:
     parts.append(f"{bands[-1][1]} m beyond" if len(bands) > 1
                  else f"{bands[-1][1]} m")
     return " · ".join(parts)
+
+
+# ---- buildings per band ----------------------------------------------------
+#
+# A band's buildings flag is keyed by its step: after normalise_bands steps
+# strictly increase, so a step names exactly one band, and the setting survives
+# boundary drags and range clipping. The global "Include buildings" checkbox is
+# the master switch: off, no band gets buildings whatever its flag says.
+
+def default_band_buildings(step_m: int) -> bool:
+    """Default buildings flag for a band stepping at *step_m* metres: on below
+    :data:`BUILDINGS_SKIP_STEP_M`, off at it and coarser."""
+    return int(step_m) < BUILDINGS_SKIP_STEP_M
+
+
+def band_buildings(bands: Sequence[Band],
+                   overrides: Optional[Mapping[int, bool]] = None,
+                   master: bool = True) -> List[bool]:
+    """Per-band buildings flags for *bands* (same order). *overrides* maps a
+    step to the user's choice (Custom); steps it does not mention — and every
+    step when it is None (Adaptive, or a profile saved before the flag
+    existed) — follow :func:`default_band_buildings`. *master* False (the
+    global checkbox off) turns every band off."""
+    if not master:
+        return [False] * len(bands)
+    over = {int(k): bool(v) for k, v in (overrides or {}).items()}
+    return [over.get(int(s), default_band_buildings(s)) for _, s in bands]
+
+
+def buildings_notes(bands: Sequence[Band], flags: Sequence[bool], mode: str,
+                    master: bool = True) -> List[str]:
+    """Why each band has or lacks buildings, for the run log."""
+    notes = []
+    for (_, step), on in zip(bands, flags):
+        if not master:
+            notes.append("buildings off (Include buildings unchecked)")
+        elif mode == MODE_CUSTOM:
+            notes.append("buildings on (custom)" if on
+                         else "buildings skipped (custom: band unticked)")
+        elif on:
+            notes.append(f"buildings on (adaptive: < {BUILDINGS_SKIP_STEP_M} m)")
+        else:
+            notes.append(f"buildings skipped (adaptive: \u2265 {BUILDINGS_SKIP_STEP_M} m)")
+    return notes
+
