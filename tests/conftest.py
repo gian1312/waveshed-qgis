@@ -288,6 +288,11 @@ _gui.QgsMapToolEmitPoint = type("MTEP", (), {"__init__": lambda self, *a: None})
 
 # Qt Core — scoped exactly as PyQt6 spells them (see section 2b).
 _qtcore.Qt = type("Qt", (), {
+    # gui/plotting combines these with | in a default argument (import time).
+    "AlignmentFlag": _enum_scope(
+        "AlignmentFlag", AlignLeft=0x1, AlignRight=0x2, AlignHCenter=0x4,
+        AlignTop=0x20, AlignBottom=0x40, AlignVCenter=0x80, AlignCenter=0x84,
+    ),
     "CheckState": _enum_scope(
         "CheckState", Unchecked=0, PartiallyChecked=1, Checked=2,
     ),
@@ -304,7 +309,7 @@ _qtcore.Qt = type("Qt", (), {
     "Key": _enum_scope("Key", Key_Escape=0x01000000),
     "MouseButton": _enum_scope("MouseButton", LeftButton=1, RightButton=2),
     "Orientation": _enum_scope("Orientation", Horizontal=1, Vertical=2),
-    "PenStyle": _enum_scope("PenStyle", SolidLine=1, DashLine=2),
+    "PenStyle": _enum_scope("PenStyle", SolidLine=1, DashLine=2, DotLine=3),
     "ScrollBarPolicy": _enum_scope(
         "ScrollBarPolicy",
         ScrollBarAsNeeded=0, ScrollBarAlwaysOff=1, ScrollBarAlwaysOn=2,
@@ -338,7 +343,7 @@ _widget_names = [
     "QVBoxLayout", "QWidget", "QInputDialog", "QDialogButtonBox",
     "QTextBrowser", "QTextEdit", "QProgressDialog", "QApplication",
     "QListWidget",
-    "QListWidgetItem", "QScrollArea", "QStackedWidget", "QSlider",
+    "QListWidgetItem", "QScrollArea", "QStackedWidget", "QSlider", "QMenu",
 ]
 for name in _widget_names:
     if name in ("QWidget",):
@@ -398,6 +403,12 @@ _qtgui.QColor = type("QColor", (), {"__init__": lambda self, *a: None})
 _qtgui.QIcon = type("QIcon", (), {"__init__": lambda self, *a: None})
 _qtgui.QPainter = type("QPainter", (), {"__init__": lambda self, *a: None})
 _qtgui.QPen = type("QPen", (), {"__init__": lambda self, *a: None})
+# gui/plotting (paint-time only; never exercised under the mocks).
+for _name in ("QBrush", "QCursor", "QFont", "QFontMetrics", "QPolygonF"):
+    setattr(_qtgui, _name, type(_name, (), {"__init__": lambda self, *a, **kw: None}))
+_qtgui.QPalette = type("QPalette", (), {
+    "ColorRole": _enum_scope("ColorRole", Base=9, Text=6),
+})
 _qtgui.QDesktopServices = type(
     "QDesktopServices", (), {"openUrl": staticmethod(lambda *a, **kw: True)}
 )

@@ -1560,6 +1560,32 @@ def _vulkan_issue() -> Optional[str]:
     return _VULKAN_ISSUE  # type: ignore[return-value]
 
 
+#: aether_core's own success line after it ran aether_export itself
+#: (engines/coverage.rs, single-site CLI runs).
+ENGINE_TIF_DONE = "[Core] GeoTIFF export complete"
+
+
+def engine_exported_tif(engine_lines: List[str], tif_path: str,
+                        raster_path: str) -> bool:
+    """True when aether_core already wrote *tif_path* from *raster_path*.
+
+    A CLI coverage run exports the GeoTIFF itself (next to the .bit, same name)
+    when aether_export sits beside it; running aether_export again rewrote the
+    same file — 44 s and ~4 GB of I/O for a 500 km run. Trust it only when the
+    engine said so AND the file is there and not older than the raster, so an
+    engine without the step, a failed export, or a stale .tif from an earlier
+    run still gets exported by the plugin.
+    """
+    if not any(ENGINE_TIF_DONE in line for line in engine_lines):
+        return False
+    try:
+        tif = os.stat(tif_path)
+        raster = os.stat(raster_path)
+    except OSError:
+        return False
+    return tif.st_size > 0 and tif.st_mtime >= raster.st_mtime
+
+
 def check_prerequisites(binary_dir: str) -> List[str]:
     """Check that all runtime dependencies are satisfied.
 

@@ -54,6 +54,7 @@ from ..core.asset_manager import (
     save_asset,
 )
 from .height_inputs import MIN_AMSL_M, bind_height_mode
+from .plotting import PolarPlotWidget
 
 
 # ---------------------------------------------------------------------------
@@ -654,8 +655,9 @@ class _PatternGeneratorDialog(QDialog):
 class _PatternVisualizerDialog(QDialog):
     """Polar-plot dialog for visualising antenna patterns.
 
-    Uses matplotlib with deferred import so the dialog module itself does not
-    require matplotlib at import time.
+    Draws on :class:`PolarPlotWidget` (``gui/plotting``, MPT SIGMA's widget):
+    azimuth with north up and clockwise winding, elevation on the -90..90
+    semicircle with the horizon to the right. Right-click saves the image.
     """
 
     def __init__(self, parent: Optional[QWidget] = None) -> None:
@@ -663,6 +665,11 @@ class _PatternVisualizerDialog(QDialog):
         self.setWindowTitle("Antenna Pattern")
         self.setMinimumSize(550, 550)
         self._layout = QVBoxLayout(self)
+        self.plot_widget = PolarPlotWidget()
+        self._layout.addWidget(self.plot_widget, 1)
+        btn_close = QPushButton("Close")
+        btn_close.clicked.connect(self.accept)
+        self._layout.addWidget(btn_close)
 
     def plot(
         self,
@@ -670,76 +677,35 @@ class _PatternVisualizerDialog(QDialog):
         pattern_type: str,
         emitter_name: str,
     ) -> None:
-        """Render the pattern on a polar plot.
+        """Render the pattern on the polar chart.
 
         Args:
             pattern_data: ``[[angle_deg, gain], ...]``
             pattern_type: ``"azimuth"`` or ``"elevation"``
-            emitter_name: Used in the plot title.
+            emitter_name: Used in the window title.
         """
-        try:
-            import matplotlib
-            matplotlib.use("Qt5Agg")
-            from matplotlib.backends.backend_qt5agg import (
-                FigureCanvasQTAgg,
-                NavigationToolbar2QT,
-            )
-            from matplotlib.figure import Figure
-            import numpy as np
-        except ImportError:
-            QMessageBox.warning(
-                self,
-                "Missing Dependency",
-                "matplotlib and/or numpy are not available.\n"
-                "Install them to use the pattern visualiser.",
-            )
-            self.reject()
-            return
-
+        widget = self.plot_widget
         if not pattern_data:
-            QMessageBox.information(
-                self,
-                "No Data",
-                "The pattern table is empty -- nothing to plot.",
-            )
-            self.reject()
+            widget.set_message("The pattern table is empty -- nothing to plot.")
             return
 
-        angles_deg = np.array([row[0] for row in pattern_data])
-        gains = np.array([row[1] for row in pattern_data])
-
-        fig = Figure(figsize=(6, 6), dpi=100)
-        ax = fig.add_subplot(111, polar=True)
-
+        angles = [row[0] for row in pattern_data]
+        gains = [row[1] for row in pattern_data]
+        widget.set_message(None)
+        widget.set_r_max(1.0)
+        widget.set_r_ticks([0.25, 0.5, 0.75, 1.0])
         if pattern_type == "azimuth":
-            ax.set_theta_zero_location("N")
-            ax.set_theta_direction(-1)
-            theta = np.radians(angles_deg)
-            title = f"Azimuth Pattern: {emitter_name}"
+            self.setWindowTitle(f"Azimuth Pattern: {emitter_name}")
+            widget.set_title("Azimuth (Horizontal) Pattern")
+            widget.set_theta_zero("N")
+            widget.set_theta_direction("cw")
         else:
-            ax.set_theta_zero_location("E")
-            ax.set_theta_direction(1)
-            ax.set_thetamin(-90)
-            ax.set_thetamax(90)
-            theta = np.radians(angles_deg)
-            title = f"Elevation Pattern: {emitter_name}"
-
-        ax.plot(theta, gains, linewidth=1.2, color="#1f77b4")
-        ax.fill(theta, gains, alpha=0.15, color="#1f77b4")
-        ax.set_rmax(1.0)
-        ax.set_rticks([0.25, 0.5, 0.75, 1.0])
-        ax.set_title(title, va="bottom", fontsize=10)
-        fig.tight_layout()
-
-        canvas = FigureCanvasQTAgg(fig)
-        # Zoom / pan / home / save, as on the P2P plots.
-        self._layout.addWidget(NavigationToolbar2QT(canvas, self))
-        self._layout.addWidget(canvas)
-
-        # Close button.
-        btn_close = QPushButton("Close")
-        btn_close.clicked.connect(self.accept)
-        self._layout.addWidget(btn_close)
+            self.setWindowTitle(f"Elevation Pattern: {emitter_name}")
+            widget.set_title("Elevation (Vertical) Pattern")
+            widget.set_theta_zero("E")
+            widget.set_theta_direction("ccw")
+            widget.set_theta_range(-90, 90)
+        widget.set_series(angles, gains, color="#1f77b4", width=2.0)
 
 
 # ---------------------------------------------------------------------------

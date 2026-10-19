@@ -923,15 +923,44 @@ class TestSettingsProbesOffTheGuiThread(unittest.TestCase):
                 t.run()
             self.assertEqual(got, [(d, "0.4.9", [])])
 
-    def test_closing_saves_without_probing(self):
+    def _closing(self, unsaved, answer_name=None):
+        from waveshed.gui import main_dialog as md
         dlg = AetherMainDialog.__new__(AetherMainDialog)
         dlg._save_geometry = mock.Mock()
         dlg._settings_widget = mock.Mock()
+        dlg._settings_widget.unsaved_changes.return_value = unsaved
         for name in ("site_tab", "p2p_tab", "converter_tab"):
             setattr(dlg, name, mock.Mock())
-        with mock.patch("waveshed.gui.main_dialog.QDialog.reject", create=True):
+        box = mock.MagicMock()
+        if answer_name:
+            box.warning.return_value = getattr(box.StandardButton, answer_name)
+        with mock.patch("qgis.PyQt.QtWidgets.QMessageBox", box, create=True), \
+                mock.patch.object(md.QDialog, "reject", create=True) as base_reject:
             dlg.reject()
+        return dlg, box, base_reject
+
+    def test_closing_with_unsaved_settings_asks_and_saves_without_probing(self):
+        dlg, box, base_reject = self._closing(["waveshed/terrain_dir"], "Save")
+        box.warning.assert_called_once()
         dlg._settings_widget.save_settings.assert_called_once_with(revalidate=False)
+        base_reject.assert_called_once()
+
+    def test_closing_without_changes_neither_asks_nor_saves(self):
+        dlg, box, base_reject = self._closing([])
+        box.warning.assert_not_called()
+        dlg._settings_widget.save_settings.assert_not_called()
+        base_reject.assert_called_once()
+
+    def test_cancel_keeps_the_dialog_open(self):
+        dlg, box, base_reject = self._closing(["waveshed/cache_dir"], "Cancel")
+        dlg._settings_widget.save_settings.assert_not_called()
+        base_reject.assert_not_called()
+
+    def test_discard_reloads_the_form(self):
+        dlg, box, base_reject = self._closing(["waveshed/cache_dir"], "Discard")
+        dlg._settings_widget.discard_changes.assert_called_once()
+        dlg._settings_widget.save_settings.assert_not_called()
+        base_reject.assert_called_once()
 
 
 if __name__ == "__main__":

@@ -28,6 +28,7 @@ except Exception:  # noqa: BLE001 — numpy is optional here (only the .abt
     _HAVE_NUMPY = False
 
 import waveshed.core.terrain_adapter as ta
+from _real_gdal import HAVE_GDAL, real_gdal, write_tif
 from waveshed.core.terrain_adapter import (
     _compute_sector_bbox,
     _compute_subtiles,
@@ -943,7 +944,7 @@ class TestCacheKeyBuildings(unittest.TestCase):
         # None / "" are the same cache as "no buildings requested".
         names = ",".join(t["filename"] for t in self.TILES)
         plain = hashlib.md5(
-            f"{ta._CACHE_SCHEMA}|src|{names}|30".encode()).hexdigest()
+            f"{ta._schema_for('src')}|src|{names}|30".encode()).hexdigest()
         self.assertEqual(self._key(), plain)
         self.assertEqual(self._key(None), plain)
         self.assertEqual(self._key(""), plain)
@@ -1063,6 +1064,7 @@ class TestBboxesIntersect(unittest.TestCase):
             self._bb(48, 47, 9, 8), self._bb(48, 47, 10, 9)))
 
 
+@unittest.skipUnless(HAVE_GDAL, "needs the real GDAL")
 class TestTerrainCoverageWarning(unittest.TestCase):
     """Fires when the directory cannot cover the analysis area.
 
@@ -1087,15 +1089,16 @@ class TestTerrainCoverageWarning(unittest.TestCase):
             self.assertIsNotNone(ta.terrain_coverage_warning(d, self.BBOX))
 
     def _run_with_extent(self, extent):
-        """Invoke the check with GDAL mocked to report *extent* as coverage."""
-        with tempfile.TemporaryDirectory() as d:
-            open(os.path.join(d, "a.tif"), "w").close()
-            with mock.patch.object(ta.gdal, "BuildVRT", create=True,
-                                   return_value=object()), \
-                 mock.patch.object(ta.gdal, "_dummy", create=True):
-                with mock.patch.object(ta, "_dataset_wgs84_bbox",
-                                       return_value=extent):
-                    return ta.terrain_coverage_warning(d, self.BBOX)
+        """Invoke the check on a folder holding ONE real GeoTIFF of *extent*
+        (the index probes it with real GDAL — no mosaic, no mocks)."""
+        with tempfile.TemporaryDirectory() as d, \
+                mock.patch.object(ta, "get_cache_dir",
+                                  return_value=os.path.join(d, "_cache")):
+            dem = os.path.join(d, "dem")
+            os.makedirs(dem)
+            with real_gdal():
+                write_tif(os.path.join(dem, "a.tif"), extent)
+                return ta.terrain_coverage_warning(dem, self.BBOX)
 
     def test_full_coverage_is_silent(self):
         self.assertIsNone(self._run_with_extent(
@@ -1126,9 +1129,6 @@ class TestTerrainCoverageWarning(unittest.TestCase):
             {"north": 60.0, "south": 59.0, "east": 20.0, "west": 19.0})
         self.assertIsNotNone(msg)
         self.assertIn("does not cover", msg)
-
-    def test_unknown_extent_is_silent(self):
-        self.assertIsNone(self._run_with_extent(None))
 
     def test_missing_directory_warns(self):
         msg = ta.terrain_coverage_warning("/no/such/dir/anywhere", self.BBOX)
@@ -1302,18 +1302,24 @@ class TestPrebuiltAbtTiles(unittest.TestCase):
         self.assertFalse(ta.is_abt_tile_dir(None))
         self.assertFalse(ta.is_abt_tile_dir("/no/such/dir"))
 
-    def test_prepare_terrain_returns_the_dir_untouched(self):
-        """No download, no conversion — the tiles are already the answer."""
+    def test_prepare_terrain_hands_over_exactly_the_chosen_tiles(self):
+        """No download, no conversion — and the engine gets a view holding
+        just the tiles the plugin chose, never the whole folder to pick from."""
         layer = mock.Mock()
         layer.source.return_value = _XYZ_SOURCE
         with tempfile.TemporaryDirectory() as root:
             d = self._tile_dir(root)
+            # One more tile, at 30 m and inside the analysis area.
+            _write_pool_abt(os.path.join(d, "in_range_30m.abt"), size=400,
+                            res_m=30, ul_lat=48.25, ul_lon=8.15)
             with mock.patch.object(ta, "get_cache_dir", return_value=root), \
                  mock.patch.object(ta, "_try_rust_download") as dl, \
                  mock.patch.object(ta, "_run_converter") as conv:
                 out = ta.prepare_terrain(layer, 48.2, 8.2, 20.0, 30,
                                          mock.Mock(), terrain_dir=d)
-            self.assertEqual(out, d)
+            self.assertNotEqual(out, d)
+            # The out-of-range tile is not handed to the engine.
+            self.assertEqual(os.listdir(out), ["in_range_30m.abt"])
             dl.assert_not_called()
             conv.assert_not_called()
 
@@ -1458,7 +1464,7 @@ class TestPrebuiltAbtSuitability(unittest.TestCase):
                 out = ta.prepare_terrain(layer, 48.0, 8.0, 1.0, 5,
                                          mock.Mock(), terrain_dir=d,
                                          osm_buildings=True)
-            self.assertEqual(out, d)
+            self.assertTrue(os.path.isdir(out))
             self.assertTrue(any("WARNING" in ln for ln in logged),
                             f"no warning logged; got {logged}")
 
@@ -1948,6 +1954,17 @@ def _info(path, bounds, crs="EPSG:4326", halo=0.001):
             "halo_deg": halo}
 
 
+def _fake_probe(bounds, authid="EPSG:4326", px_m=30.0):
+    """A folder-index probe entry for a usable single-band GeoTIFF."""
+    return {"probe": ta.terrain_index.PROBE_VERSION, "readable": True,
+            "reason": "", "driver": "GTiff", "bands": 1, "dtype": "Float32",
+            "compression": "", "scale": 1.0, "offset": 0.0, "nodata": None,
+            "rotated": False, "flipped": False, "crs_wkt": "WKT",
+            "crs_authid": authid, "crs_proj4": "", "geographic": True,
+            "native_bounds": dict(bounds), "wgs84_bounds": dict(bounds),
+            "px_m": px_m, "xsize": 100, "ysize": 100}
+
+
 class TestBuildTileSources(unittest.TestCase):
 
     TILE = {"west": 8.0, "east": 8.5, "south": 47.0, "north": 47.5}
@@ -2105,12 +2122,13 @@ class TestPrepareTerrainSourcesJobs(unittest.TestCase):
             "elsewhere.tif": self.ELSEWHERE,
         }
 
-        def fake_info(path, crs_authid=None):
-            return _info(path, infos[os.path.basename(path)])
+        def fake_probe(path, *_siblings):
+            # The folder index's probe, faked: a usable WGS84 GeoTIFF.
+            return _fake_probe(infos[os.path.basename(path)])
 
         with mock.patch.object(ta, "get_cache_dir", return_value=root), \
-             mock.patch.object(ta, "source_file_info",
-                               side_effect=fake_info), \
+             mock.patch.object(ta.terrain_index, "probe_file",
+                               side_effect=fake_probe), \
              mock.patch.object(ta, "_run_converter",
                                side_effect=fake_run_converter):
             ta.prepare_terrain(layer, 47.4, 8.5, 5.0, 30, bm,
@@ -2991,9 +3009,10 @@ class TestImageryIsRefusedAsTerrain(unittest.TestCase):
              mock.patch.object(ta, "is_abt_tile_dir", return_value=True), \
              mock.patch.object(ta, "list_abt_tiles", return_value=["a.abt"]), \
              mock.patch.object(ta, "_abt_coverage_warning", return_value=""):
-            out = ta.prepare_terrain(layer, 47.4, 8.5, 3.0, 30, mock.Mock(),
-                                     terrain_dir=tdir)
-        self.assertEqual(out, tdir)
+            with mock.patch.object(ta, "get_cache_dir", return_value=tdir):
+                out = ta.prepare_terrain(layer, 47.4, 8.5, 3.0, 30, mock.Mock(),
+                                         terrain_dir=tdir)
+        self.assertNotEqual(out, tdir)  # a selection view, not the raw folder
         classify.assert_not_called()
 
 
@@ -3355,16 +3374,17 @@ class TestPreparedViewDirRecorder(unittest.TestCase):
         self.assertEqual(recorded[-1], os.path.abspath(out))
 
     def test_prebuilt_abt_directory_records_too(self):
-        """``terrain_dir`` passes straight through — and is still recorded."""
+        """A pre-built folder becomes a selection view — which is recorded."""
         with tempfile.TemporaryDirectory() as tdir, \
-             mock.patch.object(ta, "is_abt_tile_dir", return_value=True), \
-             mock.patch.object(ta, "list_abt_tiles", return_value=["a.abt"]), \
-             mock.patch.object(ta, "_abt_coverage_warning", return_value=""):
+             mock.patch.object(ta, "get_cache_dir", return_value=tdir):
+            src = os.path.join(tdir, "src")
+            os.makedirs(src)
+            _write_pool_abt(os.path.join(src, "a.abt"), size=64, res_m=30,
+                            ul_lat=46.95, ul_lon=7.40)
             out = ta.prepare_terrain(None, 46.945, 7.41, 1.0, 30, mock.Mock(),
-                                     terrain_dir=tdir)
+                                     terrain_dir=src)
             recorded = ta.pop_prepared_view_dirs()
-        self.assertEqual(out, tdir)
-        self.assertEqual(recorded[-1], os.path.abspath(tdir))
+        self.assertEqual(recorded[-1], os.path.abspath(out))
 
     def test_pop_returns_a_copy_and_clears(self):
         ta._record_view_dir("/tmp/one")
@@ -3718,3 +3738,89 @@ class TestCacheRootIsAbsolute(unittest.TestCase):
             root = ta.get_cache_dir()
         self.assertTrue(os.path.isabs(root), root)
         self.assertNotIn("~", root)
+
+
+class TestFileSourceSchema(unittest.TestCase):
+    """The non-square ingest fix invalidates file-built pools only."""
+
+    XYZ = "type=xyz&url=https://s3.amazonaws.com/elevation-tiles-prod/terrarium/{z}/{x}/{y}.png"
+
+    def test_xyz_pools_keep_the_plain_schema(self):
+        # Downloads never go through ingest: re-downloading them would be pure cost.
+        self.assertEqual(ta._schema_for(self.XYZ), ta._CACHE_SCHEMA)
+
+    def test_file_pools_carry_the_ingest_schema(self):
+        for src in ("/data/dem/swissalti3d", "C:/dem/copernicus.tif"):
+            self.assertEqual(ta._schema_for(src),
+                             f"{ta._CACHE_SCHEMA}.{ta._FILE_SOURCE_SCHEMA}")
+
+    def test_a_file_pool_moves_and_an_xyz_pool_does_not(self):
+        import hashlib
+        with mock.patch.object(ta, "get_cache_dir", return_value="/cache"):
+            file_pool = ta._pool_dir("/data/dem/folder")
+            old_file = hashlib.md5(f"{ta._CACHE_SCHEMA}|/data/dem/folder".encode()).hexdigest()
+            self.assertNotIn(old_file, file_pool)
+            xyz_pool = ta._pool_dir(self.XYZ)
+            old_xyz = hashlib.md5(
+                f"{ta._CACHE_SCHEMA}|{ta.source_identity(self.XYZ)}".encode()).hexdigest()
+            self.assertIn(old_xyz, xyz_pool)
+
+
+class TestExplicitAbtSelection(unittest.TestCase):
+    """Pre-built tiles are chosen by the plugin, per footprint, for the step
+    that footprint needs — the engine's silent closest-to-output pick is never
+    reached, and every substitution is reported."""
+
+    TX = (47.0086, 8.0086)  # inside the 0.01728° footprint at N47.0172 E8.0
+
+    def _tile(self, d, name, res, size, ul_lat=47.01728, ul_lon=8.0):
+        _write_pool_abt(os.path.join(d, name), size=size, res_m=res,
+                        ul_lat=ul_lat, ul_lon=ul_lon)
+        return os.path.join(d, name)
+
+    def test_same_footprint_two_resolutions_fixed_run_takes_its_own(self):
+        with tempfile.TemporaryDirectory() as d:
+            t30 = self._tile(d, "a_30m.abt", 30, 64)
+            self._tile(d, "a_2m.abt", 2, 960)   # same corner, same extent
+            sel = ta.select_abt_tiles(d, *self.TX, [(2000.0, 30)])
+            self.assertEqual(sel.paths, [t30])
+            self.assertEqual(sel.substitutions, [])
+
+    def test_profile_takes_the_near_field_step_for_that_footprint(self):
+        with tempfile.TemporaryDirectory() as d:
+            self._tile(d, "a_30m.abt", 30, 64)
+            t2 = self._tile(d, "a_2m.abt", 2, 960)
+            # Output would be 30 m; the near-field step is 2 m — terrain must be 2 m.
+            sel = ta.select_abt_tiles(d, *self.TX, [(500.0, 2), (2000.0, 30)])
+            self.assertEqual(sel.paths, [t2])
+            self.assertIn("2 m × 1", sel.summary)
+
+    def test_a_missing_resolution_is_reported_not_silently_replaced(self):
+        with tempfile.TemporaryDirectory() as d:
+            t30 = self._tile(d, "a_30m.abt", 30, 64)
+            sel = ta.select_abt_tiles(d, *self.TX, [(500.0, 2), (2000.0, 30)])
+            self.assertEqual(sel.paths, [t30])
+            self.assertEqual(len(sel.substitutions), 1)
+            self.assertIn("needs 2 m", sel.substitutions[0])
+            self.assertIn("only 30 m", sel.substitutions[0])
+
+    def test_a_finer_patch_inside_a_coarse_tile_is_left_out_of_a_coarse_run(self):
+        # The engine would let the 2 m patch win where it lies; a 30 m run
+        # must stay 30 m, so the patch is dropped (no substitution needed).
+        with tempfile.TemporaryDirectory() as d:
+            big = self._tile(d, "big_30m.abt", 30, 400, ul_lat=47.05, ul_lon=7.95)
+            self._tile(d, "patch_2m.abt", 2, 64)
+            sel = ta.select_abt_tiles(d, *self.TX, [(2000.0, 30)])
+            self.assertEqual(sel.paths, [big])
+            self.assertEqual(sel.substitutions, [])
+
+    def test_the_view_holds_only_the_chosen_tiles(self):
+        with tempfile.TemporaryDirectory() as d, \
+             mock.patch.object(ta, "get_cache_dir", return_value=d):
+            src = os.path.join(d, "src")
+            os.makedirs(src)
+            self._tile(src, "a_30m.abt", 30, 64)
+            self._tile(src, "a_2m.abt", 2, 960)
+            sel = ta.select_abt_tiles(src, *self.TX, [(500.0, 2), (2000.0, 30)])
+            view = ta.abt_selection_view(src, sel)
+            self.assertEqual(os.listdir(view), ["a_2m.abt"])

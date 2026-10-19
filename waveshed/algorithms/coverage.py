@@ -360,14 +360,19 @@ class CoverageAlgorithm(QgsProcessingAlgorithm):
         json_sidecar = os.path.join(output_dir, output_name + ".json")
         tif_path = os.path.join(output_dir, output_name + ".tif")
 
-        result = subprocess.run(
-            [export_exe, "-i", input_file, "-j", json_sidecar, "-o", tif_path],
-            capture_output=True,
-            text=True,
-            creationflags=_SUBPROCESS_FLAGS,
-        )
+        if bm.engine_exported_tif(output_lines, tif_path, input_file):
+            # aether_core exported it already — once is enough.
+            feedback.pushInfo(f"GeoTIFF already written by aether_core: {tif_path}")
+            result = None
+        else:
+            result = subprocess.run(
+                [export_exe, "-i", input_file, "-j", json_sidecar, "-o", tif_path],
+                capture_output=True,
+                text=True,
+                creationflags=_SUBPROCESS_FLAGS,
+            )
 
-        if result.returncode != 0:
+        if result is not None and result.returncode != 0:
             raise QgsProcessingException(
                 f"aether_export failed (exit {result.returncode}):\n{result.stderr}"
             )

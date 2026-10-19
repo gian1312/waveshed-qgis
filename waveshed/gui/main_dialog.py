@@ -232,6 +232,7 @@ class AetherMainDialog(QDialog):
         self._mode_group.buttonClicked.connect(self._on_mode_changed)
         self.combo_loss_model.currentIndexChanged.connect(self._on_loss_model_changed)
         self.tabs.currentChanged.connect(self._on_tab_changed)
+        self._last_tab_index = self.tabs.currentIndex()
         # Saved settings must reach the OPEN tabs — they read QgsSettings at
         # construction, and without this fan-out every settings-derived
         # dropdown/path/status stayed stale until the dialog was reopened.
@@ -253,6 +254,37 @@ class AetherMainDialog(QDialog):
         if callable(clear):
             clear()
 
+    def confirm_unsaved_settings(self, revalidate: bool = True) -> bool:
+        """Ask before unsaved Settings edits are lost. True = go ahead.
+
+        Save stores them (and the open tabs refresh); Discard puts the form
+        back; Cancel keeps the user where they are. Without this, a folder
+        picked in Settings but never saved did not reach the DEM pickers, and
+        closing the plugin saved whatever was in the form without asking.
+        """
+        changed = self._settings_widget.unsaved_changes()
+        if not changed:
+            return True
+        from qgis.PyQt.QtWidgets import QMessageBox
+        answer = QMessageBox.warning(
+            self, "Unsaved settings",
+            "You changed settings that are not saved yet. Save them now?\n\n"
+            "Until they are saved, the other tabs (e.g. the DEM layer list) "
+            "do not see them.",
+            QMessageBox.StandardButton.Save | QMessageBox.StandardButton.Discard
+            | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Save,
+        )
+        if answer == QMessageBox.StandardButton.Save:
+            # Closing passes revalidate=False: no engine probe for a status
+            # label that is about to be destroyed (that froze the close).
+            self._settings_widget.save_settings(revalidate=revalidate)
+            return True
+        if answer == QMessageBox.StandardButton.Discard:
+            self._settings_widget.discard_changes()
+            return True
+        return False
+
     def _on_tab_changed(self, index: int) -> None:
         """Keep the mode selector consistent with the active tab.
 
@@ -261,6 +293,18 @@ class AetherMainDialog(QDialog):
         was previously possible to select MIN_ALT and then have the P2P tab
         disabled underneath, which reads as the tab being broken.
         """
+        settings_index = self.tabs.indexOf(self.settings_tab)
+        previous = getattr(self, "_last_tab_index", index)
+        if previous == settings_index and index != settings_index:
+            if not self.confirm_unsaved_settings():
+                # Cancel: stay on Settings (no recursion — the index now
+                # matches, so this branch is skipped on the re-entry).
+                self._last_tab_index = settings_index
+                self.tabs.blockSignals(True)
+                self.tabs.setCurrentIndex(settings_index)
+                self.tabs.blockSignals(False)
+                return
+        self._last_tab_index = index
         on_p2p = index == self.tabs.indexOf(self.p2p_tab)
         self.radio_min_alt.setEnabled(not on_p2p)
         self.radio_min_alt.setToolTip(
@@ -321,10 +365,12 @@ class AetherMainDialog(QDialog):
         # Esc closes through reject() without ever reaching here — so both
         # exits have to save. Geometry first: a throw in the teardown below
         # must not be what loses it.
+        # Unsaved Settings edits: ask (Cancel keeps the dialog open) instead
+        # of saving whatever is in the form without a word.
+        if not self.confirm_unsaved_settings(revalidate=False):
+            event.ignore()
+            return
         self._save_geometry()
-        # Save settings when closing — without re-probing the engine for a
-        # status label that is about to be destroyed (that froze the close).
-        self._settings_widget.save_settings(revalidate=False)
         # Cancel any running workers
         self.site_tab.cancel_worker()
         self.p2p_tab.cancel_worker()
@@ -332,8 +378,9 @@ class AetherMainDialog(QDialog):
         super().closeEvent(event)
 
     def reject(self) -> None:
+        if not self.confirm_unsaved_settings(revalidate=False):
+            return
         self._save_geometry()
-        self._settings_widget.save_settings(revalidate=False)
         self.site_tab.cancel_worker()
         self.p2p_tab.cancel_worker()
         self.converter_tab.cancel_worker()

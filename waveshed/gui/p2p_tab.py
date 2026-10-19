@@ -23,7 +23,7 @@ import re
 import subprocess
 import tempfile
 from datetime import datetime
-from typing import List, Optional, Tuple
+from typing import Any, List, Optional, Tuple
 
 from qgis.PyQt.QtCore import QThread, pyqtSignal, Qt
 from qgis.PyQt.QtGui import QColor
@@ -54,6 +54,7 @@ from qgis.core import (
     QgsPointXY,
     QgsProject,
     QgsRasterLayer,
+    QgsSettings,
     QgsWkbTypes,
 )
 from qgis.gui import QgsRubberBand
@@ -78,13 +79,21 @@ from ..core.job_builder import (
     write_job_file,
 )
 from ..core.layer_utils import dem_layer_warning, hide_from_dem_picker
+from ..core import terrain_index
 from ..core.terrain_adapter import (
+    analysis_bbox,
+    is_abt_tile_dir,
+    select_abt_tiles,
+    terrain_coverage_warning,
     terrain_plan,
     terrain_size_warning,
 )
 from .engine_notices import show_run_error
 from .height_inputs import MIN_AMSL_M, bind_height_mode
+from .output_dir import P2P_OUTPUT_DIR_KEY, bind_output_dir, save_output_dir
 from .map_tools import activate_point_capture
+from .plotting import XYPlotWidget
+from . import terrain_folder_scan
 
 TAG = "Waveshed"
 
@@ -303,17 +312,20 @@ def _write_temp_batch_csv(
 
 
 # ---------------------------------------------------------------------------
-# P2P Result Viewer Dialog (matplotlib plots)
+# P2P Result Viewer Dialog (QPainter plots, as in MPT SIGMA)
 # ---------------------------------------------------------------------------
 
 class _P2PResultViewer(QDialog):
-    """Dialog showing P2P result plots with matplotlib.
+    """Dialog showing the P2P result plots on :class:`XYPlotWidget`.
 
-    Tab 1 -- Combined Link: dual-axis with terrain profile and signal
-    strength overlay.
+    The widgets are MPT SIGMA's (``gui/plotting``): scroll to zoom, drag to
+    pan, double-click to reset, right-click to save the image.
 
-    Tab 2 -- Curved Earth Profile: terrain on earth bulge, LOS line,
-    and first Fresnel zone.
+    Tab 1 -- Terrain Profile: terrain (left axis) with the received signal
+    strength on a second axis.
+
+    Tab 2 -- Curved Earth Profile: terrain on the earth bulge, LOS line,
+    first Fresnel zone and its 0.6 clearance band.
     """
 
     def __init__(
@@ -329,6 +341,7 @@ class _P2PResultViewer(QDialog):
         super().__init__(parent)
         self.setWindowTitle("P2P Link Analysis Plots")
         self.setMinimumSize(800, 550)
+        self.resize(1100, 750)
         self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
 
         self._output_dir = output_dir
@@ -338,145 +351,83 @@ class _P2PResultViewer(QDialog):
         self._rx_height = rx_height
         self._tx_dbm = tx_dbm
 
-        # Deferred matplotlib import with Qt5Agg backend.
-        import matplotlib
-        matplotlib.use("Qt5Agg")
-        from matplotlib.backends.backend_qt5agg import (
-            FigureCanvasQTAgg,
-            NavigationToolbar2QT,
-        )
-        from matplotlib.figure import Figure
-
-        self._FigureCanvasQTAgg = FigureCanvasQTAgg
-        self._NavigationToolbar2QT = NavigationToolbar2QT
-        self._Figure = Figure
-
-        self._build_ui()
-
-    # ---- UI ---------------------------------------------------------------
-
-    def _build_ui(self) -> None:
         layout = QVBoxLayout(self)
-        tabs = QTabWidget()
-
-        # Tab 1: Combined Link
-        combined_widget = self._build_combined_tab()
-        tabs.addTab(combined_widget, "Terrain Profile")
-
-        # Tab 2: Curved Earth Profile
-        curved_widget = self._build_curved_earth_tab()
-        tabs.addTab(curved_widget, "Curved Earth Profile")
-
-        layout.addWidget(tabs)
+        self.tabs = QTabWidget()
+        self.tabs.addTab(self._build_combined_tab(), "Terrain Profile")
+        self.tabs.addTab(self._build_curved_earth_tab(), "Curved Earth Profile")
+        layout.addWidget(self.tabs)
 
     # ---- Tab 1: Combined Link ---------------------------------------------
 
-    def _build_combined_tab(self) -> QWidget:
+    def _build_combined_tab(self) -> XYPlotWidget:
         """Dual-axis plot: terrain profile (left) and signal strength (right)."""
-        widget = QWidget()
-        layout = QVBoxLayout(widget)
+        plot = XYPlotWidget()
+        plot.set_title("Combined Link Profile")
+        plot.set_x_label("Distance (km)")
 
-        fig = self._Figure(figsize=(8, 4), dpi=100)
-        canvas = self._FigureCanvasQTAgg(fig)
-        toolbar = self._NavigationToolbar2QT(canvas, widget)
-        layout.addWidget(toolbar)
-        layout.addWidget(canvas)
+        dist_terrain, elev = _parse_gp_file(
+            os.path.join(self._output_dir, "terrain_profile.gp"))
+        dist_path, path_loss = _parse_gp_file(
+            os.path.join(self._output_dir, "path_profile.gp"))
 
-        terrain_file = os.path.join(self._output_dir, "terrain_profile.gp")
-        path_file = os.path.join(self._output_dir, "path_profile.gp")
+        if not dist_terrain or not elev:
+            plot.set_message("No terrain profile data")
+            return plot
 
-        dist_terrain, elev = _parse_gp_file(terrain_file)
-        dist_path, path_loss = _parse_gp_file(path_file)
-
-        ax1 = fig.add_subplot(111)
-
-        if dist_terrain and elev:
-            ax1.fill_between(dist_terrain, elev, alpha=0.4, color="green",
-                             label="Terrain")
-            ax1.plot(dist_terrain, elev, color="darkgreen", linewidth=0.8)
-            ax1.set_xlabel("Distance (km)")
-            ax1.set_ylabel("Elevation (m)", color="darkgreen")
-            ax1.tick_params(axis="y", labelcolor="darkgreen")
-        else:
-            ax1.set_xlabel("Distance (km)")
-            ax1.set_ylabel("Elevation (m)")
-            ax1.text(0.5, 0.5, "No terrain profile data",
-                     transform=ax1.transAxes, ha="center", va="center",
-                     fontsize=12, color="gray")
+        plot.set_y_label("Elevation (m)", color="darkgreen")
+        # Filled down to the lowest point, not to 0 m, so the relief keeps
+        # its detail at altitude (MPT SIGMA does the same).
+        plot.add_fill(dist_terrain, min(elev), elev, color="green", alpha=0.4,
+                      label="Terrain")
+        plot.add_line(dist_terrain, elev, color="darkgreen", width=1.0)
 
         if dist_path and path_loss:
-            # Compute signal: tx_dbm - path_loss
             signal = [self._tx_dbm - pl for pl in path_loss]
-            ax2 = ax1.twinx()
-            ax2.plot(dist_path, signal, color="red", linewidth=1.5,
-                     label="Signal (dBm)")
-            ax2.set_ylabel("Signal Strength (dBm)", color="red")
-            ax2.tick_params(axis="y", labelcolor="red")
-
-            # Combined legend
-            lines1, labels1 = ax1.get_legend_handles_labels()
-            lines2, labels2 = ax2.get_legend_handles_labels()
-            ax1.legend(lines1 + lines2, labels1 + labels2, loc="upper right",
-                       fontsize=8)
-        elif dist_terrain and elev:
-            ax1.legend(loc="upper right", fontsize=8)
-
-        ax1.set_title("Combined Link Profile")
-        fig.tight_layout()
-        canvas.draw()
-
-        return widget
+            plot.set_y2_label("Signal Strength (dBm)", color="red")
+            plot.add_line(dist_path, signal, color="red", width=1.5,
+                          label="Signal (dBm)", axis="right")
+        else:
+            plot.set_title("Combined Link Profile\n"
+                           "No signal data (path_profile.gp missing)")
+        plot.set_legend(True, loc="upper right")
+        return plot
 
     # ---- Tab 2: Curved Earth Profile --------------------------------------
 
-    def _build_curved_earth_tab(self) -> QWidget:
+    def _build_curved_earth_tab(self) -> XYPlotWidget:
         """Terrain on curved earth with LOS line and Fresnel zone."""
-        widget = QWidget()
-        layout = QVBoxLayout(widget)
+        plot = XYPlotWidget()
+        plot.set_title("Curved Earth Profile (4/3 earth radius)")
 
-        fig = self._Figure(figsize=(8, 4), dpi=100)
-        canvas = self._FigureCanvasQTAgg(fig)
-        toolbar = self._NavigationToolbar2QT(canvas, widget)
-        layout.addWidget(toolbar)
-        layout.addWidget(canvas)
-
-        terrain_file = os.path.join(self._output_dir, "terrain_profile.gp")
-        dist_km, elev = _parse_gp_file(terrain_file)
-
-        ax = fig.add_subplot(111)
-
+        dist_km, elev = _parse_gp_file(
+            os.path.join(self._output_dir, "terrain_profile.gp"))
         if not dist_km or not elev:
-            ax.text(0.5, 0.5, "No terrain profile data",
-                    transform=ax.transAxes, ha="center", va="center",
-                    fontsize=12, color="gray")
-            ax.set_title("Curved Earth Profile")
-            canvas.draw()
-            return widget
+            plot.set_message("No terrain profile data")
+            return plot
 
         total_dist_km = dist_km[-1] if dist_km else 1.0
         r_eff = 6371000.0 * (4.0 / 3.0)  # effective earth radius (m)
 
-        # Compute earth bulge for each sample point
+        # Earth bulge at each sample point
         h_bulge = []
         for d in dist_km:
             d1_m = d * 1000.0
             d2_m = (total_dist_km - d) * 1000.0
-            bulge = (d1_m * d2_m) / (2.0 * r_eff)
-            h_bulge.append(bulge)
+            h_bulge.append((d1_m * d2_m) / (2.0 * r_eff))
 
-        # Terrain on curved earth
         terrain_curved = [e + b for e, b in zip(elev, h_bulge)]
-        ax.fill_between(dist_km, terrain_curved, alpha=0.35, color="saddlebrown",
-                        label="Terrain")
-        ax.plot(dist_km, terrain_curved, color="saddlebrown", linewidth=0.8)
+        plot.add_fill(dist_km, h_bulge, terrain_curved, color="saddlebrown",
+                      alpha=0.35, label="Terrain")
+        plot.add_line(dist_km, terrain_curved, color="saddlebrown", width=0.8)
+        plot.add_line(dist_km, h_bulge, color="blue", width=0.8, alpha=0.6,
+                      label="Sea level (curved)")
 
         # Antenna tip heights (at endpoints the bulge is 0)
         tx_tip = elev[0] + self._tx_height + h_bulge[0]
         rx_tip = elev[-1] + self._rx_height + h_bulge[-1]
 
-        # LOS line
-        ax.plot([dist_km[0], dist_km[-1]], [tx_tip, rx_tip],
-                color="blue", linewidth=1.2, linestyle="--", label="LOS")
+        plot.add_line([dist_km[0], dist_km[-1]], [tx_tip, rx_tip],
+                      color="blue", width=1.2, style="dashed", label="LOS")
 
         # Fresnel zone: the full first zone (F1) as an outline, and the 0.6*F1
         # clearance envelope shaded inside it.
@@ -491,36 +442,31 @@ class _P2PResultViewer(QDialog):
             f1_upper, f1_lower = [], []
             c60_upper, c60_lower = [], []
             for d in dist_km:
-                d1_km = d
-                d2_km = total_dist_km - d
-                frac = d / total_dist_km if total_dist_km > 0 else 0
+                frac = d / total_dist_km
                 los_h = tx_tip + frac * (rx_tip - tx_tip)
-                f1 = fresnel_radius_m(d1_km, d2_km, self._freq_mhz)
+                f1 = fresnel_radius_m(d, total_dist_km - d, self._freq_mhz)
                 f1_upper.append(los_h + f1)
                 f1_lower.append(los_h - f1)
                 c60_upper.append(los_h + FRESNEL_CLEARANCE * f1)
                 c60_lower.append(los_h - FRESNEL_CLEARANCE * f1)
 
-            ax.fill_between(dist_km, c60_lower, c60_upper,
-                            alpha=0.18, color="orange",
-                            label=f"{FRESNEL_CLEARANCE:g} F1 clearance")
-            ax.plot(dist_km, f1_upper, color="orange", linewidth=0.7,
-                    linestyle=":", label="F1")
-            ax.plot(dist_km, f1_lower, color="orange", linewidth=0.7,
-                    linestyle=":")
+            plot.add_fill(dist_km, c60_lower, c60_upper, color="orange",
+                          alpha=0.18, label=f"{FRESNEL_CLEARANCE:g} F1 clearance")
+            plot.add_line(dist_km, f1_upper, color="orange", width=0.7,
+                          style="dotted", label="F1")
+            plot.add_line(dist_km, f1_lower, color="orange", width=0.7,
+                          style="dotted")
 
         # Site markers
-        ax.plot(dist_km[0], tx_tip, "rv", markersize=8, label="TX")
-        ax.plot(dist_km[-1], rx_tip, "b^", markersize=8, label="RX")
+        plot.add_line([dist_km[0]], [tx_tip], color="red", width=3.0,
+                      markers=True, label="TX")
+        plot.add_line([dist_km[-1]], [rx_tip], color="blue", width=3.0,
+                      markers=True, label="RX")
 
-        ax.set_xlabel("Distance (km)")
-        ax.set_ylabel("Height (m)")
-        ax.set_title("Curved Earth Profile (4/3 earth radius)")
-        ax.legend(loc="upper right", fontsize=7)
-        fig.tight_layout()
-        canvas.draw()
-
-        return widget
+        plot.set_x_label("Distance (km)")
+        plot.set_y_label("Height (m)")
+        plot.set_legend(True, loc="upper right")
+        return plot
 
 
 # ---------------------------------------------------------------------------
@@ -546,14 +492,17 @@ class _P2PWorker(QThread):
     def __init__(
         self,
         params: P2PParams,
-        dem_layer: QgsRasterLayer,
+        dem_layer: Optional[QgsRasterLayer],
         output_dir: str,
         batch_file: str,
         parent: Optional[QWidget] = None,
+        terrain_dir: str = "",
     ) -> None:
         super().__init__(parent)
         self.params = params
         self.dem_layer = dem_layer
+        #: The Settings terrain folder ("Local: …" in the DEM list), else "".
+        self.terrain_dir = terrain_dir
         self.output_dir = output_dir
         self.batch_file = batch_file
         self._canceled = False
@@ -606,6 +555,7 @@ class _P2PWorker(QThread):
                 max_range_km=terrain_radius_km,
                 resolution_m=params.resolution_m,
                 binary_manager=bm,
+                terrain_dir=self.terrain_dir or None,
             )
 
             if self._canceled:
@@ -1142,9 +1092,8 @@ class P2PTab(QWidget):
         backend_row.addWidget(self.combo_backend)
         backend_row.addWidget(QLabel("Output Dir:"))
         self.line_output_dir = QLineEdit()
-        self.line_output_dir.setText(
-            os.path.join(tempfile.gettempdir(), "aether_output")
-        )
+        # Remembered across dialog opens (the dialog is rebuilt each time).
+        bind_output_dir(self.line_output_dir, P2P_OUTPUT_DIR_KEY)
         backend_row.addWidget(self.line_output_dir, stretch=1)
         self.btn_browse_dir = QPushButton("Browse")
         backend_row.addWidget(self.btn_browse_dir)
@@ -1197,14 +1146,17 @@ class P2PTab(QWidget):
         idx = self.combo_dem.currentIndex()
         prev_id = None
         if getattr(self, "_dem_layers", None) and 0 <= idx < len(self._dem_layers):
-            try:
-                prev_id = self._dem_layers[idx].id()
-            except Exception:
-                prev_id = None
+            prev_id = self._dem_key(self._dem_layers[idx])
 
         self.combo_dem.blockSignals(True)
         self.combo_dem.clear()
-        self._dem_layers: list[QgsRasterLayer] = []
+        self._dem_layers: list = []  # QgsRasterLayer or str (folder path)
+        # The terrain folder from Settings, as in the 360° tab — P2P used to
+        # list project layers only, so the folder could never be chosen here.
+        terrain_dir = str(QgsSettings().value("waveshed/terrain_dir", "") or "").strip()
+        if terrain_dir and os.path.isdir(terrain_dir):
+            self.combo_dem.addItem(f"{self._LOCAL_DIR_PREFIX}{terrain_dir}")
+            self._dem_layers.append(terrain_dir)
         for layer in QgsProject.instance().mapLayers().values():
             # Skip our own result rasters (coverage/P2P); keep terrain we made.
             if isinstance(layer, QgsRasterLayer) and not hide_from_dem_picker(layer):
@@ -1212,26 +1164,45 @@ class P2PTab(QWidget):
                 self._dem_layers.append(layer)
 
         if prev_id is not None:
-            for i, layer in enumerate(self._dem_layers):
-                try:
-                    same = layer.id() == prev_id
-                except Exception:
-                    same = False
-                if same:
+            for i, entry in enumerate(self._dem_layers):
+                if self._dem_key(entry) == prev_id:
                     self.combo_dem.setCurrentIndex(i)
                     break
         self.combo_dem.blockSignals(False)
+
+    _LOCAL_DIR_PREFIX = "Local: "
+
+    @staticmethod
+    def _dem_key(entry) -> Optional[str]:
+        """Stable identity of a DEM list entry (folder path or layer id)."""
+        if isinstance(entry, str):
+            return "dir:" + entry
+        try:
+            return "layer:" + entry.id()
+        except Exception:  # noqa: BLE001 — a deleted layer has no id
+            return None
 
     def _on_project_layers_changed(self, *args) -> None:
         """Repopulate the DEM combo when project layers are added/removed."""
         self._populate_raster_layers()
 
     def _selected_dem_layer(self) -> Optional[QgsRasterLayer]:
-        """Return the currently selected DEM layer, or None."""
+        """Return the currently selected DEM layer, or None (also when the
+        Settings terrain folder is selected — see :meth:`_selected_terrain_dir`)."""
         idx = self.combo_dem.currentIndex()
         if 0 <= idx < len(self._dem_layers):
-            return self._dem_layers[idx]
+            entry = self._dem_layers[idx]
+            return None if isinstance(entry, str) else entry
         return None
+
+    def _selected_terrain_dir(self) -> str:
+        """The Settings terrain folder when it is the selected DEM entry, else ""."""
+        idx = self.combo_dem.currentIndex()
+        if 0 <= idx < len(self._dem_layers):
+            entry = self._dem_layers[idx]
+            if isinstance(entry, str):
+                return entry
+        return ""
 
     # ------------------------------------------------------------------
     # Slot: Pick from Map
@@ -1310,13 +1281,14 @@ class P2PTab(QWidget):
         )
         if path:
             self.line_output_dir.setText(path)
+            save_output_dir(P2P_OUTPUT_DIR_KEY, path)
 
     # ------------------------------------------------------------------
     # Slot: View Plots
     # ------------------------------------------------------------------
 
     def _on_view_plots(self) -> None:
-        """Open the P2P result viewer dialog with matplotlib plots."""
+        """Open the P2P result viewer dialog."""
         if not self._last_output_dir or not self._last_output_name:
             QMessageBox.information(
                 self, "No Results", "Run an analysis first to generate plots."
@@ -1349,12 +1321,6 @@ class P2PTab(QWidget):
                 parent=self,
             )
             viewer.show()
-        except ImportError:
-            QMessageBox.warning(
-                self, "Missing Dependency",
-                "matplotlib is required for P2P plots but is not installed.\n"
-                "Install it with: pip install matplotlib"
-            )
         except Exception as exc:
             QMessageBox.critical(
                 self, "Plot Error", f"Failed to open plot viewer:\n{exc}"
@@ -1404,6 +1370,60 @@ class P2PTab(QWidget):
             output_name=f"p2p_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
         )
 
+    def _check_terrain_folder(self, terrain_dir: str, batch_file: str,
+                              params: Any) -> bool:
+        """The 360° tab's pre-run folder checks, for the link's terrain area.
+
+        Raster folder: index scan off the GUI thread, one prompt for unusable
+        files (skip or cancel), coverage over the link area. Pre-built .abt
+        folder: the tile per footprint is chosen by the plugin and any missing
+        resolution is asked about. False = the user cancelled.
+        """
+        c_lat, c_lon, range_km = _terrain_extent_for_batch(batch_file)
+        if not is_abt_tile_dir(terrain_dir):
+            try:
+                scan = terrain_folder_scan.scan_folder(self, terrain_dir)
+            except RuntimeError as exc:
+                QMessageBox.critical(self, "Terrain folder could not be read", str(exc))
+                return False
+            if scan is None:
+                return False
+            answer = terrain_folder_scan.resolve_folder_problems(
+                self, terrain_dir, scan["index"],
+                decisions=terrain_index.approved_decisions(terrain_dir, scan["index"]))
+            if answer is None:
+                return False
+            terrain_index.approve(terrain_dir, answer[1], scan["index"])
+            union = analysis_bbox(c_lat, c_lon, range_km, 0.0, 360.0)
+            try:
+                checked = terrain_folder_scan.scan_folder(
+                    self, terrain_dir, refresh=False, title="Checking terrain coverage",
+                    after=lambda _idx: terrain_coverage_warning(
+                        terrain_dir, union, resolution_m=params.resolution_m))
+            except RuntimeError:
+                checked = {"extra": None}
+            if checked is None:
+                return False
+            cov = checked["extra"]
+            return not cov or QMessageBox.warning(
+                self, "Incomplete terrain coverage", cov + "\n\nRun anyway?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No) == QMessageBox.StandardButton.Yes
+        sel = select_abt_tiles(terrain_dir, c_lat, c_lon,
+                               [(range_km * 1000.0, params.resolution_m)])
+        if not sel.substitutions:
+            return True
+        shown = "\n".join(f"  • {x}" for x in sel.substitutions[:12])
+        more = (f"\n  … and {len(sel.substitutions) - 12} more"
+                if len(sel.substitutions) > 12 else "")
+        return QMessageBox.warning(
+            self, "Terrain resolution not available",
+            "The pre-built terrain folder does not have the resolution these "
+            "areas need:\n\n" + shown + more + "\n\nRun anyway with the closest "
+            "resolution the folder has there?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No) == QMessageBox.StandardButton.Yes
+
     # ------------------------------------------------------------------
     # Validation
     # ------------------------------------------------------------------
@@ -1413,8 +1433,8 @@ class P2PTab(QWidget):
 
         Returns an error message string, or None if everything is valid.
         """
-        if self._selected_dem_layer() is None:
-            return "Please select a DEM raster layer."
+        if self._selected_dem_layer() is None and not self._selected_terrain_dir():
+            return "Please select a DEM raster layer or the local terrain folder."
 
         output_dir = self.line_output_dir.text().strip()
         if not output_dir:
@@ -1460,6 +1480,8 @@ class P2PTab(QWidget):
         if error:
             QMessageBox.warning(self, "Validation Error", error)
             return
+        # The folder this run uses is the one the next dialog opens with.
+        save_output_dir(P2P_OUTPUT_DIR_KEY, self.line_output_dir.text())
 
         # The engine has to be there. Terrain preparation falls back to the
         # slow QGIS raster path when aether_converter is missing, so without
@@ -1470,10 +1492,11 @@ class P2PTab(QWidget):
             return
 
         dem_layer = self._selected_dem_layer()
+        terrain_dir = self._selected_terrain_dir()
 
         # Guard against a basemap/imagery layer (e.g. OpenStreetMap) being
         # used as the terrain source — elevation data is required.
-        warn = dem_layer_warning(dem_layer)
+        warn = dem_layer_warning(dem_layer) if dem_layer is not None else None
         if warn and QMessageBox.warning(
             self, "Not a DEM?", warn + "\n\nUse it anyway?",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
@@ -1524,7 +1547,7 @@ class P2PTab(QWidget):
         try:
             c_lat, c_lon, range_km = _terrain_extent_for_batch(batch_file)
             plan = terrain_plan(
-                dem_layer.source() if dem_layer else "",
+                terrain_dir or (dem_layer.source() if dem_layer else ""),
                 c_lat, c_lon, range_km, params.resolution_m,
             )
             disk_mb = plan["download_mb"]
@@ -1532,6 +1555,8 @@ class P2PTab(QWidget):
         except Exception:  # noqa: BLE001 — an estimate must never block a run.
             disk_mb = 0
             cached_mb = 0
+        if terrain_dir and not self._check_terrain_folder(terrain_dir, batch_file, params):
+            return
         warn = terrain_size_warning(disk_mb, cached_mb)
         if warn is not None:
             msg, strong = warn
@@ -1559,6 +1584,7 @@ class P2PTab(QWidget):
 
         self._worker = _P2PWorker(
             params, dem_layer, output_dir, batch_file, self,
+            terrain_dir=terrain_dir,
         )
         self._worker.progress.connect(self.progress_bar.setValue)
         self._worker.status.connect(self._on_status)

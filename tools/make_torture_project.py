@@ -681,8 +681,9 @@ def stage_fabricate(cfg: Cfg, force: bool = False) -> None:
         REPORT.ok("ascii.dem (USGSDEM — non-TIFF, materialize helper path)")
 
     # --- more non-TIFF formats: the materialize path is the thinnest part ---
-    # The folder scanner takes .tif/.tiff/.dem/.hgt only, so these are layer-only
-    # inputs and every one of them goes through materialize_for_converter.
+    # Every one of them goes through materialize_for_converter — as a layer,
+    # and (since the folder scanner takes every GDAL raster format) as a
+    # folder member too (folder:asc-folder).
     for name, driver, opts in (("erdas.img", "HFA", []),
                                ("bil/base.bil", "EHdr", []),
                                ("ignored_formats/base.asc", "AAIGrid", [])):
@@ -1153,12 +1154,14 @@ FOLDER_CASES: Sequence[Dict[str, Any]] = (
      "note": "EPSG:5514 (Krovak) over the Prague box: unsupported by proj4rs, "
              "so ingest must hard-error naming the CRS before any tile is "
              "written — the feet file beside it is bounds-filtered out"},
-    {"id": "unsupported-only", "path": "dem/variants/ignored_formats",
-     "expect": "error", "res_m": 30, "range_km": 3,
-     "must_name": ["No terrain files"],
-     "note": "a folder holding only .asc: the shared scanner refuses the "
-             "extension and the worker errors instead of converting nothing "
-             "(row 2.26 proves the very same file converts as a LAYER)"},
+    {"id": "asc-folder", "path": "dem/variants/ignored_formats",
+     "expect": "ok", "res_m": 30, "range_km": 3,
+     "probes": [[PROBE_LAT, PROBE_LON]], "elev_m": [200.0, 2600.0],
+     "note": "a folder holding only .asc (the folder name predates the "
+             "change): the scanner takes every GDAL raster format since "
+             "2026-10, and a non-GeoTIFF reaches the converter through the "
+             "materialize copy — the probe must be real ground, the same "
+             "file row 2.26 converts as a LAYER"},
     {"id": "empty-folder", "path": None, "expect": "error",
      "res_m": 30, "range_km": 3,
      "must_name": ["No terrain files"],
@@ -1859,10 +1862,9 @@ def build_catalogue(cfg: Cfg) -> List[Layer]:
                                "open — that is the network."))
     # The three non-TIFF formats the fabricate stage has always built and no row
     # ever claimed. CHECKLIST 3.k even told the reader "row 2.26 proves the same
-    # file loads fine as a layer" — a row that did not exist anywhere. They are
-    # layer-only inputs (the folder scanner takes .tif/.tiff/.dem/.hgt only), so
-    # each one exercises materialize_for_converter, which is the thinnest part
-    # of that path.
+    # file loads fine as a layer" — a row that did not exist anywhere. Each one
+    # exercises materialize_for_converter, which is the thinnest part of that
+    # path (the folder scanner takes these formats too since 2026-10).
     add_file("2.24", G_LOCAL, "2.24 ERDAS Imagine .img", dem / "variants" / "erdas.img",
              "EPSG:4326", "HFA — layer-only input; the converter reaches it through "
                           "materialize_for_converter, never through the folder scanner.")
@@ -1871,8 +1873,8 @@ def build_catalogue(cfg: Cfg) -> List[Layer]:
                           "likely to lose its geotransform on the way through.")
     add_file("2.26", G_LOCAL, "2.26 ASCII grid .asc",
              dem / "variants" / "ignored_formats" / "base.asc", "EPSG:4326",
-             "The counterpart to checklist 3.k: the folder scanner must refuse this "
-             "extension, and the very same file must still load and convert as a LAYER.")
+             "The counterpart to checklist 3.k (folder:asc-folder): the same file "
+             "converts as a LAYER here and as a FOLDER member there.")
 
     # ---------------- §3 buildings ------------------------------------------
     bld = out / "buildings"
@@ -3874,13 +3876,14 @@ def write_checklist(cfg: Cfg, layers: Sequence[Layer], project: Path) -> Path:
     add("  - pass: ingest hard-errors naming the CRS (\"Projection not found\") before")
     add("    any tile is written. Real Prague terrain, so the failure is about the CRS.")
     add("- [ ] **3.j** `dem/broken/truncated.tif` (40 % of a GeoTIFF) as a folder input")
-    add("  - pass: fails loudly naming the file. Never skipped, never counted as covered.")
+    add("  - pass: Add Folder lists it in the ONE skip prompt (\"truncated or")
+    add("    corrupt\"), default Cancel; skipped only when the user says so, never")
+    add("    counted as covered. A worker driven with it unanswered fails naming it.")
     add("- [ ] **3.k** `dem/variants/ignored_formats/` as a terrain folder — holds only")
-    add("  `base.asc`, which the scanner does not accept")
-    add("  - pass: the Add Folder dialog refuses it naming what it accepts")
-    add("    (GeoTIFF/DEM/HGT), and a worker driven with it anyway errors with")
-    add("    `No terrain files in …` — never a silent all-void conversion. Row 2.26")
-    add("    proves the very same file loads and converts fine as a layer.")
+    add("  `base.asc` (the folder name predates the format widening)")
+    add("  - pass: Add Folder accepts it (every GDAL raster format is scanned;")
+    add("    `.vrt` and sidecars are not) and the conversion is real Bern ground —")
+    add("    the same file row 2.26 converts as a layer.")
     add("")
 
     # ---------------- phase 4 ----------------------------------------------

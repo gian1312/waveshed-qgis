@@ -376,13 +376,23 @@ no intermediate file.</td>
 <td>Fastest path by far, and the only path for an XYZ layer: rendering XYZ
 tiles through QGIS instead is <i>not</i> offered as a fallback, because it
 would silently produce terrain built the wrong way.</td></tr>
-<tr><td><b>Local DEM files and folders</b> (.tif, .tiff, .dem, .hgt)</td>
+<tr><td><b>Local DEM files and folders</b> (any GDAL elevation raster:
+.tif, .dem, .hgt, .asc, .img, .bil, gridded .xyz, .jp2, single-variable .nc,
+files inside .zip archives, …)</td>
 <td>Handed to <code>aether_converter ingest</code> as <code>sources[]</code>
 entries in their own CRS; the converter reprojects while sampling.</td>
-<td>Folders are scanned recursively and sorted; for overlapping files the
-earlier-sorted path wins per pixel. Formats the converter's reader cannot open
-(.hgt/.dem, VRT, <code>/vsi*</code>, GeoTIFFs over 512 MB) are first
-window-copied to a plain GeoTIFF at native resolution — never resampled.</td></tr>
+<td>Folders are scanned recursively (<code>.vrt</code> files are ignored — a
+VRT is usually a mosaic of the files beside it; load it as a layer instead —
+and so are sidecars such as <code>.aux.xml</code>, <code>.ovr</code>,
+<code>.msk</code> and world files). Each folder keeps an <b>index</b> in the
+terrain cache: a file is opened once, then only checked for size and date, so
+a repeat run does not re-read thousands of files. Where files overlap, the
+<b>finest resolution wins</b> by default (or file name order — see <b>Where
+files overlap:</b>). A file the converter cannot read directly (another
+format, ZSTD/LERC compression, a rotated grid, a scale/offset such as Int16
+&times; 0.1, a GeoTIFF over 512 MB) is first window-copied to a plain GeoTIFF
+in metres at native resolution. A tile is rebuilt when a file that feeds it is
+added, changed or removed — and only that tile.</td></tr>
 <tr><td><b>Rendered services</b> (WMS, WMTS, ArcGIS, WCS)</td>
 <td>QGIS renders the layer per tile into a temporary WGS84 GeoTIFF, which is
 then ingested.</td>
@@ -588,6 +598,18 @@ split a band, right-click a boundary to remove it.</li>
 </ul>
 Adaptive and Custom need engine 0.4.9 or newer; 2 m can only step up to 30, 90
 or 250 m (its terrain tiles do not line up with 5 m / 10 m ones).</td></tr>
+<tr><td><b>Output pixel (m):</b></td><td>The pixel size of the result map —
+<b>one size for the whole map</b>. With <b>Fixed</b> it is the resolution. With
+<b>Adaptive</b> / <b>Custom</b> you choose it: the steps decide how finely each
+ray samples the terrain, the output pixel decides the map's grid. A coarser
+output keeps the near-field accuracy of the fine steps at a fraction of the file
+size (2 m steps to 500 km: ~370 GB at 2 m pixels for LOS Floor, ~1.8 GB at 30 m).
+Each pixel then shows the value at one point of its cell, not an average of the
+cell. The grey line under it shows the estimated size.
+<br>With a pre-built <code>.abt</code> terrain folder the plugin picks, per
+tile area, the tile whose resolution matches the step that area needs, and only
+those tiles reach the engine. If the folder lacks that resolution somewhere, the
+run asks first and lists the areas.</td></tr>
 <tr><td><b>Buildings:</b></td><td><b>Include buildings (OpenFreeMap)</b> — burn
 OSM building footprints into the terrain surface.</td></tr>
 <tr><td><b>Backend:</b></td><td><b>AUTO</b> (GPU when one is usable, else CPU),
@@ -597,7 +619,8 @@ problem.</td></tr>
 <b>ADVANCED</b> — see <a href="#models">Modes and models</a>.</td></tr>
 <tr><td><b>Output Dir:</b></td><td>Where results are written, with
 <b>Browse...</b>. Defaults to <code>aether_output</code> in the system temp
-directory. Each job gets its own sub-directory.</td></tr>
+directory. The folder you choose (or type) is remembered for the next time the
+dialog opens. Each job gets its own sub-directory.</td></tr>
 </table>
 <p>The RAM and VRAM budgets sent with every job come from the <b>Settings</b>
 tab, not from this tab.</p>
@@ -622,10 +645,19 @@ raise <b>Outside the propagation model's range</b>, listing each problem; you
 can run anyway, but the numbers are probably invalid. See
 <a href="#itm">ITM parameters</a>.</li>
 <li><b>Terrain size.</b> The tiles that still have to be built are priced
-against the pool; a large figure asks for confirmation. A local terrain
-directory that does not reach across the analysis area (or was built at a
-different resolution, or without the buildings you asked for) raises
-<b>Incomplete terrain coverage</b>.</li>
+against the pool; a large figure asks for confirmation.</li>
+<li><b>Local terrain folder.</b> The folder is read in the background (a
+progress dialog; Cancel stops it). Files that cannot be used — no
+coordinate system, no georeferencing, truncated, a picture (RGB/hillshade,
+colour table), or 8-bit values that are probably not elevation — are listed
+in ONE prompt, <b>Skip N unusable file(s) and continue?</b>, default
+<b>Cancel</b>. Skipped files are logged; 8-bit files can be kept as elevation
+with the second button. A folder that does not reach across the analysis
+area, or that has a hole in the middle (a missing file), raises
+<b>Incomplete terrain coverage</b> — each file is measured by its own
+footprint, whatever its CRS. A pre-built <code>.abt</code> folder built at a
+different resolution, or without the buildings you asked for, raises it
+too.</li>
 <li><b>Per job:</b> prepare terrain &rarr; write the job JSON &rarr; run
 <code>aether_core</code> (its wedge progress drives the bar and every line
 lands in the log) &rarr; run <code>aether_export</code> to a GeoTIFF &rarr;
@@ -747,7 +779,8 @@ from north; only meaningful for a directional asset.</li>
 <p><b>DEM Layer:</b> (a raster layer in the project — this tab has no
 <b>Local:</b> terrain-directory entry), <b>Resolution:</b>, <b>Backend:</b>,
 <b>Output Dir:</b> with <b>Browse</b>, and <b>Earth Radius Mode:</b>. The same
-meanings as in the <a href="#site-analysis">360&deg; tab</a>.</p>
+meanings as in the <a href="#site-analysis">360&deg; tab</a>; this tab remembers
+its own output folder, separately from the 360&deg; tab.</p>
 
 <h3>Running</h3>
 <p><b>Run Analysis</b> validates the inputs (both endpoints placed, a DEM
@@ -786,8 +819,9 @@ inside it. 0.6&nbsp;F1 is the criterion that matters: once terrain stays outside
 space. F1 = 547.7 &times; &radic;(d1&middot;d2 / (f&middot;D)) with distances in
 km, frequency in MHz and the radius in metres.</li>
 </ul>
-<p>The plots need <b>matplotlib</b>. QGIS normally ships it; if it is missing
-you get <b>Missing Dependency</b> and everything else still works.</p>
+<p>Both plots are interactive: <b>scroll</b> to zoom around the cursor,
+<b>drag</b> to pan, <b>double-click</b> to reset the view, <b>right-click</b> →
+<b>Save Image...</b> to export a PNG.</p>
 
 <h3>Batch CSV</h3>
 <p>The batch mode is exposed through the Processing algorithm
@@ -891,8 +925,8 @@ containing <code>;</code> or <code>#</code> skipped, gains validated to
 <b>Tilt:</b> — plus a beam table with <b>Add Beam</b> / <b>Remove Beam</b> for
 the generic types.</li>
 <li><b>Visualize</b> draws the table as a polar plot (azimuth clockwise from
-north; elevation from -90&deg; to +90&deg;). It needs matplotlib and
-numpy.</li>
+north; elevation from -90&deg; to +90&deg;). Right-click the plot →
+<b>Save Image...</b> to export it.</li>
 </ul>
 
 <h3>How an asset is applied today</h3>
@@ -933,8 +967,18 @@ with <b>&#9650; Up</b> / <b>&#9660; Down</b>. Sources are added with:</p>
 <ul>
 <li><b>Add Layer</b> — a raster (or vector, for buildings) layer from the
 project, chosen in the dropdown beside the button.</li>
-<li><b>Add Folder...</b> — a folder of GeoTIFF/DEM files, scanned recursively;
-the CRS is detected, or you are asked for it.</li>
+<li><b>Add Folder...</b> — a folder of elevation rasters (any GDAL format,
+zip archives included), read recursively in the background. Each file is read
+in its own CRS. Files without one are <i>never</i> given another file's CRS:
+you are asked — <b>Use EPSG:… for all</b> (the folder's own CRS offered),
+<b>Choose per file…</b>, or <b>Skip them</b>. Other unusable files are
+listed in one <b>Skip N unusable file(s) and continue?</b> prompt (default
+Cancel). <b>Convert</b> re-reads the folder first and asks about any new
+problem file.</li>
+<li><b>Where files overlap:</b> — for the selected folder row: <b>finest
+resolution wins</b> (default; equal resolutions fall back to file name order)
+or <b>file name order</b> (the alphabetically first path wins; the log warns
+when a coarser file then beats a finer one). Remembered per folder.</li>
 <li><b>Add Buildings...</b> — building footprints from a file (FGB, SHP, GPKG,
 GeoJSON) or a folder of <code>.fgb</code> parts or an ESRI <code>.gdb</code>.
 Anything that is not FlatGeobuf in WGS84 is converted first.</li>
@@ -961,9 +1005,11 @@ per resolution (<b>2m</b>, <b>5m</b>, <b>10m</b>, <b>30m</b>, <b>90m</b>,
 extent in degrees and the tile size in pixels. Several may be ticked at
 once.</li>
 <li><b>Rebuild existing tiles</b> — tiles are normally skipped when a file of
-the same name already exists, and tile names encode only position and
-resolution, not the source or the plugin version. After changing a source or an
-export setting, tick this or you will keep looking at the old pixels.</li>
+the same name already exists. The output folder records what each tile was
+built from (<code>.waveshed_tiles.json</code>), so a tile whose source files
+were added, changed or removed is rebuilt anyway. Tick this to force a rebuild
+of everything — needed for tiles built by an older version, from a rendered
+service, or after changing an export setting.</li>
 <li><b>Output:</b> — the target directory; the placeholder is the terrain cache
 root. <b>Browse...</b> to pick another.</li>
 <li>The estimate line reports <code>.abt tiles: N | Est. disk: X MB (Y GB)</code>
@@ -1033,6 +1079,9 @@ engine</a>.</p>
 files, or of pre-built <code>.abt</code> tiles. When set it appears in both
 analysis tabs' DEM dropdown as <b>Local: &lt;path&gt;</b>. Selected, it is the
 <i>only</i> source — whatever it does not cover is computed over 0 m.</td></tr>
+<tr><td><b>Where files overlap:</b></td><td>finest resolution wins</td>
+<td>Which file of the local terrain dir wins where two files overlap: the
+finest resolution, or file name order. Stored per folder.</td></tr>
 <tr><td><b>Terrain cache:</b></td><td><code>~/.aether/cache</code></td>
 <td>Where the tile pool and the per-run views live. <b>Clear...</b> reports how
 many entries and how many megabytes would go, then deletes them.</td></tr>
@@ -1508,8 +1557,16 @@ in sequence in one worker; if the first site fails, the remaining sites and
 altitudes are not attempted and you get one <b>Analysis Failed</b> dialog.
 Fix the cause and re-run — cached terrain means the retry is much faster.</li>
 <li><b>"Incomplete terrain coverage"</b> — the selected local terrain directory
-does not span the analysis area, was built at a different resolution, or lacks
-the buildings you asked for. Anything it misses is computed over 0 m.</li>
+does not span the analysis area, has a hole inside (a file missing between the
+others — the message gives its location), was built at a different
+resolution, or lacks the buildings you asked for. Anything it misses is
+computed over 0 m.</li>
+<li><b>"Unusable terrain files"</b> — some files in the terrain folder cannot
+be used (the prompt names each one and why). Skip them, or cancel and fix
+them. A Processing run cannot ask, so it refuses with the same list.</li>
+<li><b>"terrain tile(s) were filled from coarser data"</b> (log) — some
+elevation tiles failed to download and the engine filled them from a coarser
+zoom. They are used for this run and downloaded again on the next one.</li>
 <li><b>The job is rejected with a VRAM message.</b> The engine loads every tile
 a wedge touches into one contiguous allocation capped near 3.86 GB. Raising
 <b>Max VRAM budget (GB):</b> does not help — reduce the range, narrow the
@@ -1522,9 +1579,6 @@ when <code>vulkaninfo</code> is missing.</li>
 
 <h3>Other</h3>
 <ul>
-<li><b>"Missing Dependency: matplotlib"</b> — the P2P plots and the polar
-pattern viewer need matplotlib (and numpy for the viewer). Everything else
-works without them.</li>
 <li><b>A layer will not appear in the DEM dropdown.</b> The plugin's own
 coverage and P2P results are filtered out deliberately; terrain it generated is
 kept. Reload the layer, or use <b>Local terrain dir:</b>.</li>

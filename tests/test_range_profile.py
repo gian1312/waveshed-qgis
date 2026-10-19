@@ -191,12 +191,14 @@ class EngineGate(unittest.TestCase):
 class OneJobPerSite(unittest.TestCase):
     """Adaptive changes the radial step only: one job, one output, per site."""
 
-    def _tab(self, mode):
+    def _tab(self, mode, output_res="5"):
         from waveshed.gui.site_analysis_tab import SiteAnalysisTab
         tab = SiteAnalysisTab.__new__(SiteAnalysisTab)
         tab._dialog = mock.Mock(get_mode=mock.Mock(return_value="LOSS"),
                                 get_loss_model=mock.Mock(return_value="ITM"))
         tab.combo_resolution = mock.Mock(currentText=mock.Mock(return_value="5"))
+        tab.combo_output_res = mock.Mock(currentText=mock.Mock(return_value=output_res),
+                                         count=mock.Mock(return_value=6))
         tab.combo_backend = mock.Mock(currentText=mock.Mock(return_value="AUTO"))
         tab.combo_climate = mock.Mock(currentIndex=mock.Mock(return_value=4))
         tab.combo_pol = mock.Mock(currentIndex=mock.Mock(return_value=0))
@@ -223,6 +225,19 @@ class OneJobPerSite(unittest.TestCase):
             self.assertEqual(params.range_profile, rp.adaptive_bands(5, 50))
             self.assertIn("90 m beyond", name)
         self.assertEqual(len({p.output_name for p, _ in jobs}), 2)
+
+    def test_output_pixel_is_explicit_and_steps_keep_the_near_field(self):
+        # The owner's case: fine rays near the TX, a 30 m map — one job, the
+        # profile still starting at 5 m, resolution_m (the map grid) 30 m.
+        jobs = self._tab(rp.MODE_ADAPTIVE, output_res="30")._build_jobs()
+        for params, name in jobs:
+            self.assertEqual(params.resolution_m, 30)
+            self.assertEqual(params.range_profile[0][1], 5)
+            self.assertIn("output 30 m", name)
+
+    def test_fixed_ignores_the_output_pixel_choice(self):
+        jobs = self._tab(rp.MODE_FIXED, output_res="30")._build_jobs()
+        self.assertEqual({p.resolution_m for p, _ in jobs}, {5})
 
     def test_fixed_has_no_profile(self):
         jobs = self._tab(rp.MODE_FIXED)._build_jobs()

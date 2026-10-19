@@ -13,6 +13,7 @@ from qgis.PyQt.QtCore import Qt, QThread, QUrl, pyqtSignal
 from qgis.PyQt.QtGui import QDesktopServices
 from qgis.PyQt.QtWidgets import (
     QCheckBox,
+    QComboBox,
     QDialog,
     QDialogButtonBox,
     QFileDialog,
@@ -31,7 +32,7 @@ from qgis.PyQt.QtWidgets import (
 )
 from qgis.core import Qgis, QgsMessageLog, QgsSettings
 
-from ..core import api_key, binary_manager, eula
+from ..core import api_key, binary_manager, eula, terrain_index
 from ..core.attribution import attribution_lines
 
 
@@ -370,6 +371,23 @@ class SettingsDialog(QDialog):
         row_terrain.addWidget(btn_terrain)
         vbox.addLayout(row_terrain)
 
+        # Overlap rule for that folder (stored per folder path).
+        row_overlap = QHBoxLayout()
+        row_overlap.addWidget(QLabel("Where files overlap:"))
+        self._overlap_combo = QComboBox()
+        for mode in (terrain_index.PRIORITY_FINEST, terrain_index.PRIORITY_NAME):
+            self._overlap_combo.addItem(terrain_index.PRIORITY_LABELS[mode], mode)
+        self._overlap_combo.setToolTip(
+            "Which file of the local terrain folder wins where two files "
+            "overlap.\n\nFinest resolution wins (default): smallest pixel "
+            "size in metres; equal resolutions fall back to file name order."
+            "\nFile name order: the alphabetically first path wins — a "
+            "coarse filler named first then beats a fine dataset (the log "
+            "warns).")
+        row_overlap.addWidget(self._overlap_combo)
+        row_overlap.addStretch()
+        vbox.addLayout(row_overlap)
+
         # Terrain cache directory
         row = QHBoxLayout()
         row.addWidget(QLabel("Terrain cache:"))
@@ -441,6 +459,10 @@ class SettingsDialog(QDialog):
 
         # Defaults
         self._terrain_dir_edit.setText(s.value("waveshed/terrain_dir", ""))
+        mode = terrain_index.get_overlap_priority(
+            self._terrain_dir_edit.text().strip())
+        self._overlap_combo.setCurrentIndex(
+            max(self._overlap_combo.findData(mode), 0))
         default_cache = os.path.join(str(Path.home()), ".aether", "cache")
         self._cache_dir_edit.setText(s.value("waveshed/cache_dir", default_cache))
         self._vram_spin.setValue(int(s.value("waveshed/max_vram_gb", 0)))
@@ -455,7 +477,48 @@ class SettingsDialog(QDialog):
         """
         snap = {k: str(self._settings.value(k, "")) for k in _WATCHED_KEYS}
         snap["api_key"] = api_key.get_stored_key()
+        snap["overlap_priority"] = terrain_index.get_overlap_priority(
+            str(self._settings.value("waveshed/terrain_dir", "")).strip())
         return snap
+
+    def _form_values(self) -> dict:
+        """What the form would save, in :meth:`_snapshot`'s normalized shape."""
+        terrain = self._terrain_dir_edit.text().strip()
+        form = {
+            "waveshed/binary_dir": self._binary_dir_edit.text().strip(),
+            "waveshed/terrain_dir": terrain,
+            "waveshed/cache_dir": self._cache_dir_edit.text().strip(),
+            "waveshed/max_vram_gb": str(self._vram_spin.value()),
+            "waveshed/max_ram_gb": str(self._ram_spin.value()),
+            "waveshed/download_connections": str(self._conn_spin.value()),
+            binary_manager.UPDATE_CHECK_KEY: bool(self._update_check_box.isChecked()),
+            "api_key": self._api_key_edit.text().strip(),
+        }
+        if terrain:
+            form["overlap_priority"] = self._overlap_combo.currentData()
+        return form
+
+    def unsaved_changes(self) -> list:
+        """Settings keys whose form value differs from what is stored.
+
+        Compared as stored values are read back (strings; the update-check flag
+        as a boolean), so an untouched form never reports a change.
+        """
+        stored = self._snapshot()
+        changed = []
+        for key, value in self._form_values().items():
+            old = stored.get(key, "")
+            if isinstance(value, bool):
+                old = str(old).strip().lower() in ("true", "1", "yes")
+            elif key not in ("api_key", "overlap_priority"):
+                old = str(old).strip()
+            if value != old:
+                changed.append(key)
+        return changed
+
+    def discard_changes(self) -> None:
+        """Put the form back to the stored settings."""
+        self._load_settings()
 
     def save_settings(self, revalidate: bool = True) -> None:
         """Persist all settings to QgsSettings. Always saves, no validation dialogs.
@@ -470,6 +533,10 @@ class SettingsDialog(QDialog):
         s = self._settings
         s.setValue("waveshed/binary_dir", self._binary_dir_edit.text().strip())
         s.setValue("waveshed/terrain_dir", self._terrain_dir_edit.text().strip())
+        if self._terrain_dir_edit.text().strip():
+            terrain_index.set_overlap_priority(
+                self._terrain_dir_edit.text().strip(),
+                self._overlap_combo.currentData())
         s.setValue("waveshed/cache_dir", self._cache_dir_edit.text().strip())
         s.setValue("waveshed/max_vram_gb", self._vram_spin.value())
         s.setValue("waveshed/max_ram_gb", self._ram_spin.value())

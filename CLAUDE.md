@@ -72,7 +72,8 @@ Defined in `aether_converter/src/ingest.rs` (contract v2.0):
 - `sources[]`: priority = array order (first valid sample wins per pixel).
   `crs` is optional (`"EPSG:nnnn"` or a proj string); when absent the
   converter reads the GeoTIFF's GeoKeys and hard-errors if they are
-  user-defined/absent. `nodata` is optional per source (else `GDAL_NODATA`
+  user-defined/absent — so the plugin states it for every file it knows a CRS
+  for, as a proj string when there is no EPSG code (see Terrain folders). `nodata` is optional per source (else `GDAL_NODATA`
   tag). The converter reprojects while sampling — the plugin never warps.
 - A source `path` may also be a pool **`.abt` tile** (detected by its `AETH`
   magic): self-describing — geometry from its own header, values already
@@ -108,6 +109,16 @@ Defined in `aether_converter/src/ingest.rs` (contract v2.0):
   answer and gets its own warning. Without it a dropped block reached the
   user as silent sea level, visible only as a cross-tab terrain
   disagreement (row 4.3, 2026-09-20: up to 402 m).
+- **Degraded download tiles** (toolkit protocol, 2026-10): a source tile whose
+  fetch failed and was filled from a coarser zoom prints `[Degraded] z= x= y=
+  reason=… filled_from=z<k>` (+ `[Stats] DEGRADED: n of total …`) and is NOT
+  counted in `[Stats] Tiles: ok/total OK`. Such an output tile has no hole, so
+  `_download_zoom_group` maps each line (`_xyz_tile_bbox`) onto the output
+  specs it intersects (`_specs_hit_by_degraded`), retries those at reduced
+  connections, and after the last pass keeps them for this run with a
+  `.rebuild` flag plus the warning "N terrain tile(s) were filled from coarser
+  data (z…) … re-downloaded next run". A degraded pass never takes the
+  complete, all-404 or total-failure branches.
 - `base_tif` / `swiss_tifs` are DEPRECATED aliases still accepted by the
   converter for older callers; the plugin no longer emits them, and emitting
   them alongside `sources` is an error.
@@ -116,6 +127,81 @@ Defined in `aether_converter/src/ingest.rs` (contract v2.0):
   prints the tile grid as JSON (`aether-plan/1`); the Map Converter worker
   cross-checks it against the plugin's own enumeration before every run and
   aborts on mismatch (or on an engine too old to have `plan`).
+
+## Terrain folders (`core/terrain_index.py`, `gui/terrain_folder_scan.py`)
+
+A local terrain folder (Settings → Local terrain dir, Map Converter → Add
+Folder) is read through ONE persistent footprint index per folder
+(`<cache>/index/<md5(folder)>.json`): per file size+mtime (change detector),
+readable flag + reason, driver, CRS (WKT / EPSG authid / proj string),
+native + WGS84 bounds and a densified WGS84 footprint ring, pixel size
+(native + metres), dtype, bands, compression, rotation, scale/offset, nodata.
+Pure GDAL/OSR, thread-safe. Rules:
+
+- **Never on the GUI thread.** `FolderIndex.refresh` stats every file
+  (threaded) and probes only new/changed ones in a 16-thread pool. The GUI runs
+  it through `terrain_folder_scan.scan_folder` (QThread + progress dialog +
+  local event loop), also for the coverage check. Measured on 2,500 small LV95
+  GeoTIFFs on the Windows mount: first scan 11.5 s (was 50 s per run through
+  `source_file_info`), repeat 0.6 s, coverage 0.2–1.3 s off-thread (was 74 s
+  of BuildVRT on the GUI thread). A run re-checks each index once
+  (`reset_terrain_warnings` / the Map Converter worker call `expire_all`);
+  jobs of one run reuse it for `FRESH_S`.
+- **Scan** = every GDAL raster extension in `RASTER_EXTS` plus `.zip` members
+  (`/vsizip/`), recursive. Excluded by construction: `.vrt` (a mosaic of the
+  files beside it — scanning it duplicates them; reason in `EXCLUDED_EXTS`;
+  torture `folder:vrt-ignored`), sidecars (`.aux.xml`, `.ovr`, `.msk`, world
+  files, `.hdr`), `._*`. File-name order sorts a zip member where its archive
+  sorts (`name_key`).
+- **Problem files are asked, never dropped or guessed.** `problem_of`:
+  unusable (cannot open, no geotransform, truncated — bottom-right block read,
+  ≥2 bands / colour table = picture, CRS not transformable), no CRS, 8-bit
+  single band ("not elevation?"). One prompt (`confirm_problem_files`: "Skip
+  N unusable file(s) and continue?", default Cancel; skipped files logged).
+  Site Analysis lists CRS-less files there; the Map Converter asks a CRS for
+  them first (`ask_crs_for_files`: the folder's dominant CRS offered, for all
+  or per file; a CRS the coordinates cannot be in is refused). A folder
+  entry's `crs_authid` is display only — files NEVER inherit it. Answers are
+  `terrain_index.approve` (Site Analysis, bound to size+mtime) or the entry's
+  `decisions`/`crs_overrides` (Map Converter). Unanswered problems are a hard
+  error naming every file (`source_infos`) — Processing and the torture
+  runner see that.
+- **Routing by metadata, not extension** (`materialize_reason`): non-GTiff,
+  `/vsi*`, compression outside NONE/LZW/DEFLATE/PACKBITS (ZSTD/LERC abort the
+  converter batch), rotated/flipped geotransform (`gdal.Warp` to north-up in
+  the SAME CRS — the one resampling, unavoidable), scale/offset (copied as
+  Float32 metres via `unscale`, so it can neither be lost nor applied twice
+  whatever the toolkit does), odd NBITS, > 512 MB. Non-EPSG CRSs go to the
+  converter as a proj string (`crs_arg`).
+- **Overlap priority** per folder (`waveshed/overlap_priority/<md5>`): finest
+  resolution wins (default; ties = file-name order) or file name order (warns
+  when a coarser file then beats a finer one). The effective order is logged.
+  UI: Settings "Where files overlap:" and the Map Converter row combo.
+- **Coverage** (`coverage`) from per-file WGS84 footprints on a 512² grid:
+  covered %, and holes INSIDE the data (sandwiched between covered cells,
+  ≥3×3 cells) reported even above the 98 % overhang tolerance.
+- **Per-tile invalidation.** Pools stay keyed on the folder path
+  (`_schema_for`/`_FILE_SOURCE_SCHEMA` unchanged); each file-built pool tile
+  has a `<name>.src` sidecar = `tile_source_fingerprint` (path + size+mtime +
+  CRS + route of exactly the files `_tile_contributors` admits, in priority
+  order, `_SOURCE_ROUTE_VERSION`). Missing/different = stale, rebuilt alone.
+  Views are unchanged (`_sync_view` refreshes by mtime). The Map Converter
+  keeps `.waveshed_tiles.json` in its output dir and rebuilds tiles whose
+  stack fingerprint changed even without "Rebuild existing tiles"; tiles with
+  no record keep the old skip rule (logged).
+
+**Index speed (2026-10-14).** `terrain_index.probe_geotiff_fast` reads an
+ordinary GeoTIFF's first IFD from one 64 KB read (no GDAL; CRS + WGS84 transform
+looked up once per EPSG code) — one band, standard sample type, known
+compression, one tiepoint or a matrix, an EPSG code, no sidecar (`.aux.xml`,
+`.prj`, world file…); anything else returns None and goes through the GDAL
+probe, so unusual files are judged exactly as before
+(`tests/test_terrain_index_fast.py` holds both probes to identical entries,
+incl. the torture fixtures). The scan takes sizes/mtimes from the directory
+listing (free on Windows, parallel `stat` elsewhere), sidecars are looked up in
+the listing, the probe reuses the scan's stat, and the index is written in one
+`write`. 2,500 files on the container's Windows mount: first scan 24.9 s →
+3.3 s (raw open+read floor there 1.35 s), repeat 1.2 s → 0.7 s.
 
 ## Adaptive / custom resolution (`core/range_profile.py`)
 
@@ -131,6 +217,21 @@ have nesting tile extents (2 m only steps to 30/90/250). Terrain:
 needs them and never a footprint a finer band holds (`min_range_km` /
 `skip_footprints`, also in `terrain_plan` for the pre-run estimate), then links all
 bands into one view.
+
+**Output pixel is explicit.** `resolution_m` is the map grid — one pixel size for
+the whole result, never several. Fixed: = the resolution. Adaptive / Custom: the
+user picks it ("Output pixel (m)", any size ≥ the first step); the profile steps
+only set ray sampling (`_output_res`, `_build_jobs`). Verified 2026-10-13: a 30 m
+output of a 2 m-start profile equals the 2 m output at the same points (MIN_ALT,
+LOS, ITM), exports to an ordinary 30 m GeoTIFF; each pixel is a point sample.
+
+**No silent tile picking.** aether_core keeps, per footprint, the tile closest to
+`resolution_m` and lets finer footprints win — silently. The plugin therefore
+never hands the engine a choice: its own views hold one tile per footprint, and a
+pre-built `.abt` folder goes through `select_abt_tiles` (per footprint the tile
+matching the finest step that footprint needs) into an `abt_selection_view`.
+Footprints lacking that resolution are listed in a pre-run Yes/No dialog
+("Terrain resolution not available") and logged as `terrain substitution`.
 
 ## Sensitive Files (DO NOT commit)
 

@@ -27,6 +27,35 @@ Running list of follow-up work. Keep items short; link to the code site.
 
 ## Terrain / live download
 
+- [ ] **LiDAR point clouds as terrain (`.las` / `.laz` / `.copc.laz`).** E.g.
+  swisstopo swissSURFACE3D (`swisssurface3d_2024_2685-1243_2056_5728.copc.laz`,
+  1 km tiles, LV95 + LN02). Neither GDAL nor the converter reads point clouds,
+  and the folder scan skips them. Plan (owner, 2026-10-14: later, not now):
+  rasterise each tile with QGIS's own PDAL Processing tool "Export to raster"
+  (`pdal:exportraster`, ships with QGIS 3.32+/4 via OSGeo4W — no new
+  dependency), cache the GeoTIFF, then feed it to the normal folder pipeline
+  (`terrain_index`, coverage check, per-tile cache fingerprint). Choices to
+  offer: ground only (class 2 → bare terrain, like swissALTI3D) or all first
+  returns (surface with buildings + vegetation), and the pixel size (0.5 m
+  possible at swissSURFACE3D density; 1–2 m much faster). Until then the
+  ready-made rasters swissALTI3D / swissSURFACE3D Raster cover the same lidar.
+
+- [ ] **swisstopo `.xyz` is readable but has no CRS.** GDAL's XYZ driver reads
+  the real files (`SWISSALTI3D_2_XYZ_CHLV95_LN02_*.xyz`, also inside the
+  `.xyz.zip`) as a correct regular grid, but they carry no CRS, so the folder
+  index flags them `nocrs`: Site Analysis can only skip them, the Map
+  Converter asks — and a folder of only `.xyz` has no other file to suggest
+  EPSG:2056 from. Options: a CRS prompt in Site Analysis too (as the Map
+  Converter has), and/or suggest — never auto-assign — EPSG:2056 when the
+  name says `CHLV95`/`_2056_`. Prefer the COG `.tif` assets for swisstopo.
+
+- [ ] **Overlap ties between survey years go to the OLDER file.** swisstopo
+  publishes several years of the same tile (e.g. `swissalti3d_2019_2703-1226`
+  and `swissalti3d_2026_2703-1226`); with equal resolution the overlap order
+  falls back to the file name, so 2019 beats 2026. Keep one year per tile in a
+  folder (the pipeline swisstopo downloader keeps the newest), or break
+  resolution ties by newer acquisition / file mtime.
+
 - [ ] **Test the live XYZ download with services other than Mapzen Global
   Terrain.** The Rust live-download path (`waveshed/core/terrain_adapter.py`,
   `_try_rust_download`) has so far only been exercised against Mapzen Global

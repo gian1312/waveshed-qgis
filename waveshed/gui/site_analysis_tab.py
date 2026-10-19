@@ -17,7 +17,6 @@ import os
 import platform
 import re
 import subprocess
-import tempfile
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple
 
@@ -80,6 +79,7 @@ from ..core.job_builder import (
     write_job_file,
 )
 from ..core.layer_utils import dem_layer_warning, hide_from_dem_picker
+from ..core.output_estimate import output_space_problem
 from ..core.result_loader import (
     GROUP_COVERAGE,
     add_layer_to_project,
@@ -90,17 +90,22 @@ from ..core.terrain_adapter import (
     analysis_bbox,
     buildings_identity,
     get_source_resolution_info,
+    is_abt_tile_dir,
     prepare_terrain,
     prepare_terrain_profile,
     reset_terrain_warnings,
+    select_abt_tiles,
     terrain_coverage_warning,
     terrain_plan,
     terrain_plan_profile,
     terrain_size_warning,
 )
 from ..core import range_profile as rp
+from ..core import terrain_index
+from . import terrain_folder_scan
 from .engine_notices import show_run_error
 from .height_inputs import MIN_AMSL_M, bind_height_mode
+from .output_dir import SITE_OUTPUT_DIR_KEY, bind_output_dir, save_output_dir
 from .map_tools import activate_point_capture
 from .range_profile_dialog import RangeProfileDialog
 
@@ -381,18 +386,25 @@ class _SiteAnalysisWorker(QThread):
                     job_output_dir, params.output_name + ".tif",
                 )
 
-                result = subprocess.run(
-                    [
-                        export_exe,
-                        "-i", input_file,
-                        "-j", json_sidecar,
-                        "-o", tif_path,
-                    ],
-                    capture_output=True,
-                    text=True,
-                    creationflags=_SUBPROCESS_FLAGS,
-                )
-                if result.returncode != 0:
+                if bm.engine_exported_tif(stderr_lines, tif_path, input_file):
+                    # aether_core exported it already — once is enough.
+                    QgsMessageLog.logMessage(
+                        f"GeoTIFF already written by aether_core: {tif_path}",
+                        TAG, Qgis.MessageLevel.Info)
+                    result = None
+                else:
+                    result = subprocess.run(
+                        [
+                            export_exe,
+                            "-i", input_file,
+                            "-j", json_sidecar,
+                            "-o", tif_path,
+                        ],
+                        capture_output=True,
+                        text=True,
+                        creationflags=_SUBPROCESS_FLAGS,
+                    )
+                if result is not None and result.returncode != 0:
                     raise RuntimeError(
                         f"aether_export failed for {display_name}"
                         f" (exit {result.returncode}):\n{result.stderr}"
@@ -711,6 +723,21 @@ class SiteAnalysisTab(QWidget):
         self.lbl_res_profile.setStyleSheet("color: gray; font-size: 11px;")
         self.lbl_res_profile.setWordWrap(True)
         layout.addRow("", self.lbl_res_profile)
+
+        # Output pixel — the map's grid, chosen explicitly (never inferred).
+        # Fixed: the resolution itself. Adaptive / Custom: any size from the
+        # first step up; the steps keep sampling the rays as drawn.
+        self.combo_output_res = QComboBox()
+        self.combo_output_res.setToolTip(
+            "Pixel size of the result map. One size for the whole map.")
+        self.lbl_output_res = QLabel("")
+        self.lbl_output_res.setStyleSheet("color: gray; font-size: 11px;")
+        self.lbl_output_res.setWordWrap(True)
+        layout.addRow("Output pixel (m):", self.combo_output_res)
+        layout.addRow("", self.lbl_output_res)
+        self._fill_output_res()
+        self.combo_output_res.currentIndexChanged.connect(
+            lambda _i: self._refresh_output_res())
         self.combo_resolution.currentIndexChanged.connect(self._on_resolution_changed)
         self.radio_res_fixed.toggled.connect(
             lambda on: self._on_res_mode_toggled(on, rp.MODE_FIXED))
@@ -750,9 +777,8 @@ class SiteAnalysisTab(QWidget):
         # Output Directory
         dir_layout = QHBoxLayout()
         self.line_output_dir = QLineEdit()
-        self.line_output_dir.setText(
-            os.path.join(tempfile.gettempdir(), "aether_output"),
-        )
+        # Remembered across dialog opens (the dialog is rebuilt each time).
+        bind_output_dir(self.line_output_dir, SITE_OUTPUT_DIR_KEY)
         dir_layout.addWidget(self.line_output_dir)
         self.btn_browse_dir = QPushButton("Browse...")
         dir_layout.addWidget(self.btn_browse_dir)
@@ -1323,6 +1349,7 @@ class SiteAnalysisTab(QWidget):
         )
         if path:
             self.line_output_dir.setText(path)
+            save_output_dir(SITE_OUTPUT_DIR_KEY, path)
 
     # ==================================================================
     # Read tables into structured data
@@ -1443,6 +1470,52 @@ class SiteAnalysisTab(QWidget):
         else:
             self.lbl_res_profile.setText(rp.describe(bands))
 
+    def _output_res(self) -> int:
+        """The result map's pixel size: the resolution in Fixed mode, the
+        user's explicit choice with Adaptive / Custom."""
+        base = int(self.combo_resolution.currentText())
+        if self._resolution_mode() == rp.MODE_FIXED or not self.combo_output_res.count():
+            return base
+        return int(self.combo_output_res.currentText())
+
+    def _fill_output_res(self) -> None:
+        """Offer the first step and every coarser size; keep a still-valid pick."""
+        base = int(self.combo_resolution.currentText())
+        keep = self.combo_output_res.currentText()
+        self.combo_output_res.blockSignals(True)
+        self.combo_output_res.clear()
+        self.combo_output_res.addItems([str(r) for r in VALID_RESOLUTIONS if r >= base])
+        idx = self.combo_output_res.findText(keep)
+        self.combo_output_res.setCurrentIndex(idx if idx >= 0 else 0)
+        self.combo_output_res.blockSignals(False)
+        self._refresh_output_res()
+
+    def _refresh_output_res(self) -> None:
+        fixed = self._resolution_mode() == rp.MODE_FIXED
+        base = int(self.combo_resolution.currentText())
+        if fixed:
+            self.combo_output_res.blockSignals(True)
+            self.combo_output_res.setCurrentIndex(0)  # = the resolution
+            self.combo_output_res.blockSignals(False)
+        self.combo_output_res.setEnabled(not fixed)
+        out = self._output_res()
+        text = ("One pixel size for the whole map. The steps above set how finely "
+                "the rays sample terrain; this sets the map grid. Coarser = much "
+                "smaller file, near field still computed at the fine steps (each "
+                "pixel shows one point of its cell, not an average).")
+        if fixed:
+            text = "Fixed: the output pixel is the resolution (" + f"{base} m)."
+        try:
+            from ..core import output_estimate as oe
+            mode = self._dialog.get_mode()
+            model = ("MIN_ALT" if mode == "MIN_ALT"
+                     else self._dialog.get_loss_model() if mode == "LOSS" else "LOS")
+            size = oe.engine_output_bytes(model, self._profile_range_km(), out)
+            text += f" Result at {out} m to {self._profile_range_km():g} km: ~{oe.format_bytes(size)}."
+        except Exception:  # noqa: BLE001 — the estimate is informative only
+            pass
+        self.lbl_output_res.setText(text)
+
     def _on_resolution_changed(self, _index: int) -> None:
         # A custom profile is drawn from one base resolution; another base
         # starts it over (the first band IS the chosen resolution).
@@ -1452,11 +1525,13 @@ class SiteAnalysisTab(QWidget):
             if self.radio_res_custom.isChecked():
                 self.radio_res_adaptive.setChecked(True)
         self._refresh_res_profile()
+        self._fill_output_res()
 
     def _on_res_mode_toggled(self, on: bool, mode: str) -> None:
         if on:
             self._res_mode_before_custom = mode  # where a cancelled Custom returns
         self._refresh_res_profile()
+        self._refresh_output_res()
 
     def _on_custom_resolution(self) -> None:
         """Custom clicked: open the profile editor (again, on every click)."""
@@ -1471,6 +1546,7 @@ class SiteAnalysisTab(QWidget):
                     else self.radio_res_fixed)
             back.setChecked(True)
         self._refresh_res_profile()
+        self._refresh_output_res()
 
     def _build_jobs(self) -> List[Tuple[CoverageParams, str]]:
         """Create a (CoverageParams, display_name) tuple for every combination.
@@ -1591,9 +1667,14 @@ class SiteAnalysisTab(QWidget):
                 )
                 bands = self._bands_for(resolution, float(params.max_range_km))
                 if bands:
-                    # Adaptive / custom: the same single job, with the profile.
-                    params = dataclasses.replace(params, range_profile=list(bands))
+                    # Adaptive / custom: the same single job, with the profile,
+                    # written at the output pixel the user chose.
+                    out_res = self._output_res()
+                    params = dataclasses.replace(params, range_profile=list(bands),
+                                                 resolution_m=out_res)
                     display_name = f"{display_name} — {rp.describe(bands)}"
+                    if out_res != resolution:
+                        display_name += f" · output {out_res} m"
                 jobs.append((params, display_name))
 
         return jobs
@@ -1656,6 +1737,8 @@ class SiteAnalysisTab(QWidget):
                 "Please specify an output directory.",
             )
             return
+        # The folder this run uses is the one the next dialog opens with.
+        save_output_dir(SITE_OUTPUT_DIR_KEY, output_dir)
 
         # ---- The engine has to be there ----
         # Checked before anything else: terrain preparation falls back to the
@@ -1715,6 +1798,26 @@ class SiteAnalysisTab(QWidget):
             ) != QMessageBox.StandardButton.Yes:
                 return
 
+        # ---- Disk for the coverage rasters (before any terrain is fetched) ----
+        # The raster is written at the chosen resolution over the whole range,
+        # also for Adaptive / Custom: 2 m to 500 km is ~370 GB for LOS Floor,
+        # which used to fail with "not enough space" deep into the engine run.
+        problem, blocking = output_space_problem(
+            [(name, params.model, params.max_range_km, params.resolution_m,
+              params.az_start, params.az_end) for params, name in jobs],
+            output_dir,
+        )
+        # A warning, never a hard stop (owner, 2026-10-13): the estimate is an
+        # upper bound for LOS / ITM, and the user may free space meanwhile.
+        if problem and QMessageBox.warning(
+            self,
+            "Not enough disk space for the result" if blocking else "Very large result",
+            problem,
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        ) != QMessageBox.StandardButton.Yes:
+            return
+
         # ---- Confirm an unreasonably large terrain download ----
         # Jobs that only differ by receiver altitude share one terrain cache,
         # so dedupe on the parameters the cache key is built from — otherwise
@@ -1768,20 +1871,77 @@ class SiteAnalysisTab(QWidget):
         # area is a mistake worth stopping for: it is the only source once
         # selected, so whatever it misses is computed over 0 m sea level.
         if terrain_dir and union is not None:
+            # A raster folder is read through its footprint index, in a
+            # worker thread (it used to be opened file by file on the GUI
+            # thread: 84 s frozen for 2,500 files). Files that cannot be
+            # used are listed in ONE prompt — skip them, or cancel (default).
+            raster_folder = not is_abt_tile_dir(terrain_dir)
+            if raster_folder:
+                try:
+                    scan = terrain_folder_scan.scan_folder(self, terrain_dir)
+                except RuntimeError as exc:
+                    QMessageBox.critical(self, "Terrain folder could not be "
+                                         "read", str(exc))
+                    return
+                if scan is None:
+                    return
+                answer = terrain_folder_scan.resolve_folder_problems(
+                    self, terrain_dir, scan["index"],
+                    decisions=terrain_index.approved_decisions(
+                        terrain_dir, scan["index"]))
+                if answer is None:
+                    return
+                terrain_index.approve(terrain_dir, answer[1], scan["index"])
             # Resolution and buildings matter for a pre-built .abt folder:
             # neither can be changed by the run, so a mismatch has to be
-            # raised here or it becomes a silently wrong result.
-            cov = terrain_coverage_warning(
-                terrain_dir, union,
-                resolution_m=jobs[0][0].resolution_m if jobs else None,
-                osm_buildings=self.chk_buildings.isChecked(),
-            )
+            # raised here or it becomes a silently wrong result. Off the GUI
+            # thread too: per-file footprints over the whole folder.
+            res_m = jobs[0][0].resolution_m if jobs else None
+            osm = self.chk_buildings.isChecked()
+            try:
+                checked = terrain_folder_scan.scan_folder(
+                    self, terrain_dir, refresh=False,
+                    title="Checking terrain coverage",
+                    after=lambda _idx: terrain_coverage_warning(
+                        terrain_dir, union, resolution_m=res_m,
+                        osm_buildings=osm))
+            except RuntimeError:
+                checked = {"extra": None}
+            if checked is None:
+                return
+            cov = checked["extra"]
             if cov and QMessageBox.warning(
                 self, "Incomplete terrain coverage", cov + "\n\nRun anyway?",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                 QMessageBox.StandardButton.No,
             ) != QMessageBox.StandardButton.Yes:
                 return
+
+        # Pre-built .abt folder: the plugin chooses the tile per footprint for
+        # the step it needs (the engine never picks). Where the folder lacks
+        # that resolution, say so before running — no silent substitution.
+        if terrain_dir and is_abt_tile_dir(terrain_dir):
+            subs: List[str] = []
+            for params, _name in jobs:
+                bands = params.range_profile or [
+                    (params.max_range_km * 1000.0, params.resolution_m)]
+                sel = select_abt_tiles(terrain_dir, params.tx_lat, params.tx_lon,
+                                       list(bands), params.az_start, params.az_end)
+                subs.extend(x for x in sel.substitutions if x not in subs)
+            if subs:
+                shown = "\n".join(f"  • {x}" for x in subs[:12])
+                more = f"\n  … and {len(subs) - 12} more" if len(subs) > 12 else ""
+                if QMessageBox.warning(
+                    self, "Terrain resolution not available",
+                    "The pre-built terrain folder does not have the resolution "
+                    "these areas need:\n\n" + shown + more +
+                    "\n\nRun anyway with the closest resolution the folder has "
+                    "there? (Otherwise build the missing tiles in the Map "
+                    "Converter, or change the resolution steps.)",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                    QMessageBox.StandardButton.No,
+                ) != QMessageBox.StandardButton.Yes:
+                    return
 
         _log_terrain_plan(tiles_cached, tiles_missing, total_mb, cached_mb)
         warn = terrain_size_warning(total_mb, cached_mb)
