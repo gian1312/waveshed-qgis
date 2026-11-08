@@ -13,10 +13,6 @@ Hygiene excludes (silently skipped): the directories in ``SKIP_DIRS``
 ``dist``, …), the extensions in ``SKIP_EXTS`` (``*.pyc`` / ``*.pyo``) and the
 name patterns in ``SKIP_GLOBS`` (generated ``*_rc.py``, ``deploy.local.ini``).
 
-The build WARNS loudly (stderr, the ZIP is still built) when a packaged text
-file still contains ``?prv``, the waveshed.io private-preview flag set in
-``waveshed/core/site_links.py`` (TODO(release): remove it before publishing).
-
 The build HARD-FAILS (raising :class:`BuildError`, non-zero exit) if:
   * a native/binary artifact (.exe/.dll/.so/.dylib/.pyd/.whl) would be zipped,
   * a file matching a secret pattern (*.key, *.pem, *.bin, vendor_keys*,
@@ -41,6 +37,7 @@ Uses only the standard library (no external ``zip`` binary required).
 
 from __future__ import annotations
 
+import argparse
 import ast
 import fnmatch
 import hashlib
@@ -95,13 +92,6 @@ SECRET_GLOBS = ("*.key", "*.pem", "*.bin", "vendor_keys*", "api_key*")
 
 #: Maximum allowed size of the produced ZIP.
 MAX_ZIP_BYTES = 20 * 1024 * 1024
-
-#: Marker of the waveshed.io private-preview links (core/site_links.py).
-#: TODO(release): the published plugin must not contain it — the build warns.
-PREVIEW_MARKER = "?prv"
-
-#: Extensions scanned for :data:`PREVIEW_MARKER` (text files only).
-PREVIEW_SCAN_EXTS = {".py", ".txt", ".html", ".md", ".json", ".ini", ".cfg"}
 
 
 class BuildError(Exception):
@@ -192,37 +182,6 @@ def iter_plugin_files(
             yield abs_path, arcname
 
 
-def find_preview_links(entries: List[Tuple[str, str]]) -> List[str]:
-    """Return the arcnames of packaged text files that contain ``?prv``.
-
-    ``?prv`` unlocks the private preview of waveshed.io pages; a published
-    plugin must link the public pages (see ``core/site_links.py``).
-    """
-    hits = []
-    for abs_path, arcname in entries:
-        if os.path.splitext(arcname)[1].lower() not in PREVIEW_SCAN_EXTS:
-            continue
-        with open(abs_path, encoding="utf-8", errors="replace") as fh:
-            if PREVIEW_MARKER in fh.read():
-                hits.append(arcname)
-    return hits
-
-
-def _warn_preview_links(hits: List[str]) -> None:
-    if not hits:
-        return
-    bar = "!" * 72
-    lines = [
-        bar,
-        "WARNING: the packaged plugin still links waveshed.io preview pages",
-        f"({PREVIEW_MARKER!r} found). Do NOT publish this ZIP. Before release set",
-        "PREVIEW_QUERY = \"\" in waveshed/core/site_links.py. Files:",
-        *(f"    {h}" for h in hits),
-        bar,
-    ]
-    print("\n".join(lines), file=sys.stderr)
-
-
 def read_version(metadata_path: str) -> str:
     """Return the ``version=`` value from a metadata.txt file."""
     with open(metadata_path, encoding="utf-8") as fh:
@@ -273,7 +232,6 @@ def build_zip(repo_root: str, out_dir: str) -> str:
         raise
 
     _print_summary(zip_path, [a for _, a in entries], size)
-    _warn_preview_links(find_preview_links(entries))
     return zip_path
 
 
@@ -388,12 +346,32 @@ def check_manifest_keys(repo_root: str, release: bool) -> None:
     print(f"WARNING: {message}. Do NOT publish this ZIP.", file=sys.stderr)
 
 
+def parse_args(argv: List[str] | None = None) -> argparse.Namespace:
+    """``[--release] [OUT_DIR]``. ``--help`` prints the usage and exits 0; an
+    unknown option or a second positional prints it and exits 2 — before
+    anything is built (it used to be taken for the output directory)."""
+    parser = argparse.ArgumentParser(
+        prog="package.py", allow_abbrev=False,
+        description=f"Build {PACKAGE_NAME}.<version>.zip, the distributable "
+                    "QGIS plugin ZIP (version from waveshed/metadata.txt).")
+    parser.add_argument(
+        "out_dir", nargs="?", metavar="OUT_DIR",
+        help="directory the ZIP is written to (default: dist/ beside this "
+             "script)")
+    parser.add_argument(
+        "--release", action="store_true",
+        help="pre-publish build: also fail unless every homepage/tracker/"
+             "repository URL in metadata.txt answers HTTP 200 and "
+             "release_keys.py lists a trusted manifest-signing key")
+    return parser.parse_args(argv)
+
+
 def main(argv: List[str] | None = None) -> int:
-    argv = list(sys.argv[1:] if argv is None else argv)
-    release = "--release" in argv
-    argv = [a for a in argv if a != "--release"]
+    args = parse_args(argv)
+    release = args.release
     repo_root = os.path.dirname(os.path.abspath(__file__))
-    out_dir = argv[0] if argv else os.path.join(repo_root, "dist")
+    out_dir = (args.out_dir if args.out_dir is not None
+               else os.path.join(repo_root, "dist"))
     try:
         if release:
             print("Release check: metadata.txt URLs must resolve publicly")

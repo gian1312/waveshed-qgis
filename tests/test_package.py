@@ -206,3 +206,47 @@ class TestReleaseUrlCheck:
         out = tmp_path / "dist"
         assert pkg.main(["--release", str(out)]) == 1
         assert not out.exists() or not any(out.iterdir())
+
+
+class TestCommandLine:
+    """argparse front end: every existing call form works, and an option the
+    script does not know never becomes the output directory (``--help`` once
+    built ``--help/waveshed.0.3.0.zip``)."""
+
+    def _no_build(self, monkeypatch):
+        monkeypatch.setattr(pkg, "build_zip", lambda *a: pytest.fail("built a ZIP"))
+
+    def test_help_prints_usage_and_builds_nothing(self, tmp_path, monkeypatch, capsys):
+        self._no_build(monkeypatch)
+        monkeypatch.chdir(tmp_path)
+        with pytest.raises(SystemExit) as exc:
+            pkg.main(["--help"])
+        assert exc.value.code == 0
+        out = capsys.readouterr().out
+        assert out.startswith("usage: package.py") and "--release" in out
+        assert list(tmp_path.iterdir()) == []
+
+    @pytest.mark.parametrize("argv", [["--bogus"], ["out", "extra"], ["--relase", "dist"],
+                                      ["--rel", "dist"]])
+    def test_unknown_arguments_exit_2_with_usage(self, tmp_path, monkeypatch, capsys, argv):
+        self._no_build(monkeypatch)
+        monkeypatch.chdir(tmp_path)
+        with pytest.raises(SystemExit) as exc:
+            pkg.main(argv)
+        assert exc.value.code == 2
+        assert "usage: package.py" in capsys.readouterr().err
+        assert list(tmp_path.iterdir()) == []
+
+    def test_existing_call_forms(self, monkeypatch):
+        built, checked = [], []
+        monkeypatch.setattr(pkg, "build_zip", lambda root, out: built.append(out))
+        monkeypatch.setattr(pkg, "check_manifest_keys",
+                            lambda root, release: checked.append(release))
+        monkeypatch.setattr(pkg, "check_public_urls", lambda path: [])
+        repo = os.path.dirname(os.path.abspath(pkg.__file__))
+        assert pkg.main([]) == 0                        # pipeline GUI
+        assert pkg.main(["/tmp/scan-out"]) == 0         # tools/qgis_scan.py
+        assert pkg.main(["--release", "dist"]) == 0     # release.yml
+        assert pkg.main(["dist", "--release"]) == 0
+        assert built == [os.path.join(repo, "dist"), "/tmp/scan-out", "dist", "dist"]
+        assert checked == [False, False, True, True]
