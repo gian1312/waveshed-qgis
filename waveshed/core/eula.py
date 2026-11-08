@@ -35,7 +35,7 @@ CONTACT_EMAIL = "info@waveshed.io"
 
 #: EULA version the :data:`KEY_POINTS` summary was written for. Must equal the
 #: ``**Version:**`` token of the canonical EULA.
-SUMMARY_EULA_VERSION = "2026-09-23"
+SUMMARY_EULA_VERSION = "1.0"
 
 #: Settings key recording which EULA version the user last accepted. Consent is
 #: still asked on every download; this is the record of what was accepted.
