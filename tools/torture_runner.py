@@ -84,8 +84,10 @@ Tier C — the whole pipeline, and the reason this file exists:
 Tier B — needs the engine binaries:
   * ``aether_converter plan`` agrees with the plugin's OWN tile enumeration for
     each run-matrix case. Not a re-implementation: ``_snap_bbox`` and
-    ``_enumerate_tiles`` are imported from ``waveshed.gui.map_converter_tab``,
-    so this runs the very cross-check the Map Converter runs before every
+    ``_enumerate_tiles`` are imported from ``waveshed.gui.map_converter_tab``
+    and gated on the converter's version as the worker gates them
+    (``_converter_snaps_with_epsilon``: the epsilon snap from 0.2.9), so this
+    runs the very cross-check the Map Converter runs before every
     conversion, at the resolutions each case names;
   * the run-matrix cases that must be REFUSED are asserted as refusals.
     Everything downstream of the tile grid belongs to tier C.
@@ -1503,16 +1505,24 @@ def find_binary(name: str) -> Optional[Path]:
     return None
 
 
-def _plugin_enumeration(bbox: Dict[str, float], resolutions: Sequence[int]):
+def _plugin_enumeration(bbox: Dict[str, float], resolutions: Sequence[int],
+                        converter: Optional[Path] = None):
     """``(snapped_bbox, [filenames])`` from the PLUGIN's own tile enumeration.
 
     Imported, not re-implemented. A second implementation of the tile grid
     inside the test harness would agree with itself and prove nothing; these
-    are the exact functions the Map Converter runs before every conversion.
+    are the exact functions the Map Converter runs before every conversion —
+    gated as its worker gates them: with *converter* >= 0.2.9
+    (``_converter_snaps_with_epsilon``) the grid of toolkit changelog 43
+    (epsilon snap, rounded edge, epsilon start), else the bare snap of
+    <= 0.2.8.
     """
-    from waveshed.gui.map_converter_tab import _enumerate_tiles, _snap_bbox
-    snapped = _snap_bbox(bbox, list(resolutions))
-    tiles = _enumerate_tiles(snapped, list(resolutions))
+    from waveshed.gui.map_converter_tab import (_converter_snaps_with_epsilon,
+                                                _enumerate_tiles, _snap_bbox)
+    epsilon = (converter is not None
+               and _converter_snaps_with_epsilon(str(converter)))
+    snapped = _snap_bbox(bbox, list(resolutions), epsilon=epsilon)
+    tiles = _enumerate_tiles(snapped, list(resolutions), epsilon=epsilon)
     return snapped, sorted(tile["filename"] for _res, tile in tiles)
 
 
@@ -1674,7 +1684,7 @@ def _check_plan_case(converter: Path, name: str, case: Dict[str, Any],
     bbox = {"west": float(west), "south": float(south),
             "east": float(east), "north": float(north)}
     try:
-        _snapped, ours = _plugin_enumeration(bbox, resolutions)
+        _snapped, ours = _plugin_enumeration(bbox, resolutions, converter)
     except Exception as exc:
         results.add("plan", f"plan.enumeration:{name}",
                     f"engine grid == plugin grid for {name}", FAIL,
@@ -2358,7 +2368,8 @@ def _agree(a_dir, b_dir, plugin, bbox=None) -> Tuple[str, str]:
     return SAME, f"both sides agree to {worst_m:,.1f} m over {n:,} samples"
 
 
-def _cross_tab_contract(mc_dir, sa_dir, plugin) -> Tuple[bool, str]:
+def _cross_tab_contract(mc_dir, sa_dir, plugin,
+                        bbox=None) -> Tuple[bool, str]:
     """The two tabs' terrain contract, stated in full and then measured.
 
     (a) They enumerate the SAME tiles — a tile only one side built is a
@@ -2367,6 +2378,12 @@ def _cross_tab_contract(mc_dir, sa_dir, plugin) -> Tuple[bool, str]:
         has LESS data than the Map Converter — its ``void_fill_m: 0.0``
         only ever adds. The old check compared the intersection only, so a
         path that dropped most of its terrain still "agreed".
+
+    *bbox* (the Site Analysis run's analysis box) restricts (b) and (c) to
+    the pixels whose centres lie inside it: a file source builds a pool tile
+    only for the part the site needs (a partial ``.part`` tile, 0 m fill
+    elsewhere), so outside that ground the two tabs legitimately differ —
+    the coverage cannot see it.
     """
     import numpy as np
     abt_mod = plugin["abt"]
@@ -2388,6 +2405,10 @@ def _cross_tab_contract(mc_dir, sa_dir, plugin) -> Tuple[bool, str]:
             return False, f"{name}: unreadable or different shapes"
         mask_a = _real_mask(ga, plugin)
         mask_b = _real_mask(gb, plugin)
+        if bbox is not None:
+            inside = _bbox_mask(abt_mod.read_header(b[name]), gb.shape, bbox)
+            mask_a = mask_a & inside
+            mask_b = mask_b & inside
         mc_real += int(mask_a.sum())
         sa_real += int(mask_b.sum())
         both = mask_a & mask_b
@@ -2852,6 +2873,20 @@ def _check_agrees(rid: str, row, tiles, reference: Optional["_Reference"],
                 known_fail_for(row, "pipeline.agrees"))
 
 
+def _pool_tile_files(root: Path) -> List[Path]:
+    """Every pooled terrain tile under *root*: whole ``*.abt`` tiles and
+    partial ``*.abt.part`` ones (built for one site's region — the plugin
+    reaches them only through ``resolve_pool_tile``)."""
+    return list(root.rglob("*.abt")) + list(root.rglob("*.abt.part"))
+
+
+def _rebuild_flag_for(path: str, suffix: str) -> str:
+    """The ``.rebuild`` flag of a pool tile file — named after the tile's
+    canonical ``.abt`` name, also for its ``.part``."""
+    base = path[:-len(".part")] if path.endswith(".abt.part") else path
+    return base + suffix
+
+
 def _check_nothing_cached(row, rid, plugin, results: Results, pipe) -> None:
     """After a refusal, the run's cache must hold nothing a later run reuses.
 
@@ -2864,7 +2899,8 @@ def _check_nothing_cached(row, rid, plugin, results: Results, pipe) -> None:
     """
     abt_mod = plugin["abt"]
     left, reusable = [], []
-    for path in sorted(Path(pipe.cache).rglob("*.abt")):
+    # Partial pool tiles (<name>.abt.part) are reusable terrain too.
+    for path in sorted(_pool_tile_files(Path(pipe.cache))):
         left.append(path)
         grid = abt_mod.read_tile(abt_mod.read_header(str(path)))
         if grid is None:
@@ -3549,7 +3585,11 @@ def _pipeline_row(row, layer, plugin, pipe: "Pipeline", manifest, results,
     sa_view, caveat = _sa_view_from_run(sa_views, layer.source(), lat, lon,
                                         float(range_km), resolution, plugin)
     if sa_view and os.path.isdir(sa_view):
-        ok, why = _cross_tab_contract(mc_out, sa_view, plugin)
+        # Over the ground the coverage sees: a file source pools only that
+        # part of each tile (partial pool tiles, 0 m elsewhere).
+        ok, why = _cross_tab_contract(
+            mc_out, sa_view, plugin,
+            bbox=plugin["adapter"].analysis_bbox(lat, lon, float(range_km)))
         results.add(rid, "pipeline.both_tabs",
                     "Site Analysis and the Map Converter build the same terrain",
                     PASS if ok else FAIL,
@@ -4946,7 +4986,7 @@ def _cache_drills(row, layer, plugin, pipe: "Pipeline", manifest,
     def pool_tiles():
         root = Path(adapter.get_cache_dir()) / adapter._POOL_DIRNAME
         return {str(p): os.stat(p).st_mtime_ns
-                for p in sorted(root.rglob("*.abt"))}
+                for p in sorted(_pool_tile_files(root))}
 
     first, _tap = run_once("seed")
     before = pool_tiles()
@@ -4979,12 +5019,13 @@ def _cache_drills(row, layer, plugin, pipe: "Pipeline", manifest,
                     "no pool tile to flag")
     else:
         victim = sorted(tiles)[0]
-        open(victim + adapter._REBUILD_SUFFIX, "w").close()
+        flag = _rebuild_flag_for(victim, adapter._REBUILD_SUFFIX)
+        open(flag, "w").close()
         third, _tap = run_once("rebuild")
         after = pool_tiles()
         rebuilt = [Path(p).name for p, stamp in tiles.items()
                    if after.get(p) != stamp]
-        flag_cleared = not os.path.exists(victim + adapter._REBUILD_SUFFIX)
+        flag_cleared = not os.path.exists(flag)
         ok = (bool(third["ok"]) and rebuilt == [Path(victim).name]
               and flag_cleared)
         results.add("mx", "matrix:cache rebuild-flag",
@@ -5000,7 +5041,7 @@ def _cache_drills(row, layer, plugin, pipe: "Pipeline", manifest,
 
     # -- the plugin's own Clear cache --------------------------------------
     adapter.clear_cache()
-    left = [str(p) for p in Path(pipe.cache).rglob("*.abt")]
+    left = [str(p) for p in _pool_tile_files(Path(pipe.cache))]
     results.add("mx", "matrix:cache clear",
                 "Clear cache leaves no tile behind",
                 PASS if not left else FAIL,

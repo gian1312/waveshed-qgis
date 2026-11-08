@@ -127,7 +127,7 @@ class MinimumDownload(unittest.TestCase):
         seen = []
 
         def fake_plan(source, lat, lon, rng, res, a0, a1, b, min_range_km=0.0,
-                      skip_footprints=None):
+                      skip_footprints=None, **_kw):
             bbox = ta._compute_sector_bbox(lat, lon, rng, a0, a1)
             tiles = ta._band_tiles(ta._compute_subtiles(bbox, res, lat, lon, rng, a0, a1),
                                    lat, lon, min_range_km, skip_footprints)
@@ -328,7 +328,7 @@ class BuildingsPerBandTerrain(unittest.TestCase):
         seen = []
 
         def fake_plan(source, lat, lon, rng, res, a0, a1, b, min_range_km=0.0,
-                      skip_footprints=None):
+                      skip_footprints=None, **_kw):
             seen.append((res, b))
             return {"bbox": None, "tiles_total": 0, "tiles_cached": 0, "tiles_missing": 0,
                     "download_mb": 0, "total_mb": 0, "footprints": set()}
@@ -497,6 +497,85 @@ class MultiSiteBuildingsViews(unittest.TestCase):
         self.assertNotIn("tile_N48.00E9.00_30m.abt", os.listdir(view))
         self.assertTrue(os.path.samefile(os.path.join(view, n90),
                                          os.path.join(self.pool[False], n90)))
+
+
+    def test_partial_pool_tiles_are_linked_per_site_from_their_pool(self):
+        # A FILE source pools each band tile only for the site's region —
+        # ``<name>.part`` + ``.part.json`` (terrain_adapter.resolve_pool_tile).
+        # Both sites' views link their tiles from the band's own pool under
+        # the canonical names; a tile the sites share is ONE .part holding
+        # both regions, re-linked into the earlier view on its next run.
+        infos = [{"path": "/dem/a.tif", "halo_deg": 0.001,
+                  "wgs84_bounds": {"west": 7.0, "east": 9.0, "south": 46.0,
+                                   "north": 48.0}}]
+
+        def fake_prepare(dem, lat, lon, rng, step, bm_, fb, tdir, a0, a1, **kw):
+            bbox = ta._compute_sector_bbox(lat, lon, rng, a0, a1)
+            tiles = ta._band_tiles(ta._compute_subtiles(bbox, step, lat, lon, rng, a0, a1),
+                                   lat, lon, kw["min_range_km"], kw["skip_footprints"])
+            regions = ta.tile_regions(tiles, bbox, step, kw.get("output_res_m"))
+            osm = kw["osm_buildings"]
+            pool = self.pool[osm]
+            os.makedirs(pool, exist_ok=True)
+            listing = ta._pool_listing(pool)
+            for t in tiles:
+                name, region = t["filename"], regions[t["filename"]]
+                v = ta.resolve_pool_tile(pool, t, region, listing=listing)
+                if v.hit:
+                    continue
+                target = os.path.join(pool, name + (ta._PART_SUFFIX if v.regions else ""))
+                tmp = target + ".tmp"
+                self._write_abt(tmp, self.OSM if osm else self.PLAIN)
+                os.replace(tmp, target)
+                if v.regions:
+                    ta._write_part_meta(pool, t, [{"bbox": r, "fp": None}
+                                                  for r in v.regions])
+                self.built.append((osm, name))
+            return "per-band-view"
+
+        flags = rp.band_buildings(self.bands)                        # T T F
+        with mock.patch.object(ta, "prepare_terrain", side_effect=fake_prepare), \
+             mock.patch.object(ta, "_read_source_once",
+                               return_value=(infos, False, None)):
+            self.layer.source.return_value = "/dem"
+            self.pool = {False: ta._pool_dir("/dem", None),
+                         True: ta._pool_dir("/dem", ta.buildings_identity(None, True))}
+            by_step = dict(zip([s for _, s in self.bands], flags))
+
+            def audit(view):
+                parts = 0
+                for name in os.listdir(view):
+                    osm = by_step[int(name.rsplit("_", 1)[1][:-5])]
+                    whole = os.path.join(self.pool[osm], name)
+                    src = whole if os.path.exists(whole) else whole + ta._PART_SUFFIX
+                    parts += src.endswith(ta._PART_SUFFIX)
+                    self.assertTrue(os.path.samefile(os.path.join(view, name), src),
+                                    f"{name} in {view} is not its pool's tile")
+                    self.assertFalse(os.path.exists(os.path.join(
+                        self.pool[not osm], name + ta._PART_SUFFIX)), name)
+                return parts
+
+            def site(tx):
+                return ta.prepare_terrain_profile(
+                    self.layer, *tx, self.bands, None, terrain_dir="/dem",
+                    osm_buildings=True, band_buildings=flags, output_res_m=30)
+
+            va = site(self.A)
+            self.assertGreater(audit(va), 0, "no band tile was partial")
+            vb = site(self.B)
+            self.assertNotEqual(va, vb)
+            self.assertGreater(audit(vb), 0)
+            # Tiles the sites share: one .part per tile holding both regions
+            # (B extended A's); A's next run re-links its view to it and
+            # builds nothing.
+            shared = [n for n in set(os.listdir(va)) & set(os.listdir(vb))
+                      if os.path.exists(os.path.join(self.pool[by_step[int(
+                          n.rsplit("_", 1)[1][:-5])]], n + ta._PART_SUFFIX))]
+            self.assertTrue(shared)
+            n_built = len(self.built)
+            self.assertEqual((site(self.A), len(self.built)), (va, n_built))
+            audit(va)
+            audit(vb)
 
 
 class EngineGate(unittest.TestCase):

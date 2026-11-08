@@ -38,6 +38,14 @@ def _abt_size_px(res_m: int, extent_deg: float) -> int:
     return _tile_params(extent_deg, 0.0, 0.0, res_m)["size_px"]
 
 
+def _write_whole(path: str, size_px: int) -> str:
+    """A full-length output tile (sparse): what a finished conversion
+    leaves. An empty or short file is rebuilt, not skipped."""
+    with open(path, "wb") as fh:
+        fh.truncate(ta._abt_whole_bytes(size_px))
+    return path
+
+
 class TestFgbCacheName(unittest.TestCase):
     """The conversion cache lives in a shared, session-spanning temp dir, so
     its file name must pin everything that determines the output."""
@@ -208,11 +216,21 @@ class TestSharedTileEnumeration(unittest.TestCase):
                                  _tile_params(ext, 0.0, 0.0, res)["size_px"])
 
     def test_estimate_matches_the_worker_enumeration(self):
+        # What the worker builds: its grid (bare snap on converters <=
+        # 0.2.8, the epsilon snap from 0.2.9) without the tiles outside
+        # every source (2026-11-07) — at [2, 250] the bare snap's stray 2 m
+        # row and column (16 tiles wholly outside the bbox) are among them,
+        # so both grids build 57.
+        rows = [_LayerEntry(layer_type="raster", source_path="/a.tif",
+                            extent=dict(self.BBOX))]
         for resolutions in ([30], [10, 30], [2, 250], [2, 5, 10, 30, 90, 250]):
             count, _mb = _estimate_tile_count_and_mb(self.BBOX, resolutions)
-            worker = _enumerate_tiles(_snap_bbox(self.BBOX, resolutions),
-                                      resolutions)
-            self.assertEqual(count, len(worker), resolutions)
+            for epsilon in (False, True):
+                worker, _outside = mct._tiles_within_sources(
+                    _enumerate_tiles(_snap_bbox(self.BBOX, resolutions,
+                                                epsilon=epsilon),
+                                     resolutions, epsilon=epsilon), rows)
+                self.assertEqual(count, len(worker), (resolutions, epsilon))
 
     def test_estimate_snaps_outward_exactly_as_the_worker_does(self):
         snapped = _snap_bbox(self.BBOX, [10, 30])
@@ -229,8 +247,14 @@ class TestSharedTileEnumeration(unittest.TestCase):
             self.assertGreater(total, 1)
 
             res, tile = _enumerate_tiles(_snap_bbox(self.BBOX, [30]), [30])[0]
-            open(os.path.join(out_dir, _abt_tile_name(
-                res, tile["ul_lat"], tile["ul_lon"])), "w").close()
+            path = os.path.join(out_dir, _abt_tile_name(
+                res, tile["ul_lat"], tile["ul_lon"]))
+            # A short (here: empty) file is rebuilt — priced.
+            open(path, "w").close()
+            self.assertEqual(_estimate_tile_count_and_mb(
+                self.BBOX, [30], output_dir=out_dir, overwrite=False)[0],
+                total)
+            _write_whole(path, tile["size_px"])
 
             left, left_mb = _estimate_tile_count_and_mb(
                 self.BBOX, [30], output_dir=out_dir, overwrite=False)
@@ -348,8 +372,28 @@ class TestLayerEntry(unittest.TestCase):
     def test_defaults(self):
         e = _LayerEntry()
         self.assertEqual(e.layer_type, "raster")
-        self.assertEqual(e.target_resolutions, [30])
         self.assertIsNone(e.extent)
+        # No per-row resolution any more (the run's are the checkboxes).
+        self.assertFalse(hasattr(e, "target_resolutions"))
+
+    def test_an_old_config_with_target_resolutions_loads_silently(self):
+        import warnings
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            by_kw = _LayerEntry(layer_type="raster", source_path="/a.tif",
+                                target_resolutions=[2, 30],
+                                extent={"south": 1, "north": 2,
+                                        "west": 3, "east": 4})
+            # The old positional order still lands every field right.
+            by_pos = _LayerEntry("raster", "/b.tif", None, "EPSG:2056", 2.0,
+                                 [5], {"south": 1, "north": 2, "west": 3,
+                                       "east": 4}, 3)
+        self.assertEqual(by_kw.source_path, "/a.tif")
+        self.assertEqual(by_kw.extent["east"], 4)
+        self.assertFalse(hasattr(by_kw, "target_resolutions"))
+        self.assertEqual((by_pos.crs_authid, by_pos.native_res_m,
+                          by_pos.extent["west"], by_pos.priority),
+                         ("EPSG:2056", 2.0, 3, 3))
 
     def test_buildings(self):
         e = _LayerEntry(layer_type="buildings", source_path="/b.fgb")
@@ -435,34 +479,21 @@ class TestXyzNativeResolution(unittest.TestCase):
         self.assertIsNone(ta.xyz_native_resolution_m("/data/dem.tif"))
 
 
-class TestOverpassToGeojson(unittest.TestCase):
+class TestNoOverpass(unittest.TestCase):
+    """The Overpass path is gone (2026-10-22): one query for the whole
+    extent answered empty after 107 s and the run went on without
+    buildings. The OSM buildings row fetches OpenFreeMap z14 tiles now
+    (tests/test_mc_osm_buildings.py)."""
 
-    def test_basic_conversion(self):
+    def test_no_overpass_code_or_endpoint_is_left(self):
         from waveshed.gui.map_converter_tab import MapConverterTab
-        data = {
-            "elements": [
-                {"type": "node", "id": 1, "lat": 47.0, "lon": 8.0},
-                {"type": "node", "id": 2, "lat": 47.0, "lon": 8.001},
-                {"type": "node", "id": 3, "lat": 47.001, "lon": 8.001},
-                {"type": "node", "id": 4, "lat": 47.001, "lon": 8.0},
-                {
-                    "type": "way", "id": 100,
-                    "nodes": [1, 2, 3, 4, 1],
-                    "tags": {"building": "yes"},
-                },
-            ]
-        }
-        geojson = MapConverterTab._overpass_to_geojson(data)
-        self.assertEqual(geojson["type"], "FeatureCollection")
-        self.assertEqual(len(geojson["features"]), 1)
-        self.assertEqual(
-            geojson["features"][0]["geometry"]["type"], "Polygon"
-        )
-
-    def test_empty(self):
-        from waveshed.gui.map_converter_tab import MapConverterTab
-        geojson = MapConverterTab._overpass_to_geojson({"elements": []})
-        self.assertEqual(len(geojson["features"]), 0)
+        self.assertFalse(hasattr(MapConverterTab, "_overpass_to_geojson"))
+        self.assertFalse(hasattr(_MapConverterWorker,
+                                 "_download_osm_buildings"))
+        with open(mct.__file__, encoding="utf-8") as fh:
+            source = fh.read()
+        self.assertNotIn("overpass-api.de", source)
+        self.assertNotIn("[out:json]", source)
 
 
 if __name__ == "__main__":
@@ -510,6 +541,13 @@ class TestUnifiedTileNaming(unittest.TestCase):
             self.assertEqual(len(jobs), len(expected))
 
             open(os.path.join(out_dir, tile["filename"]), "w").close()
+            jobs, _temps = mct._build_tile_jobs(
+                expected, out_dir, False,
+                [{"kind": "files", "infos": [info]}], None, out_dir)
+            self.assertEqual(len(jobs), len(expected),
+                             "an empty file suppressed its tile")
+            _write_whole(os.path.join(out_dir, tile["filename"]),
+                         tile["size_px"])
             jobs, _temps = mct._build_tile_jobs(
                 expected, out_dir, False,
                 [{"kind": "files", "infos": [info]}], None, out_dir)
@@ -731,6 +769,29 @@ class TestPlanIntegrationRealBinary(unittest.TestCase):
         # Must not raise: same tile count, same filenames.
         mct._plan_cross_check(exe, bbox, [30, 90], expected)
 
+    def test_owner_bbox_float_edge_matches_the_engine(self):
+        """The owner's run (2026-10-23), RAW bbox as the worker sends it,
+        on whichever converter the gate provides — the worker's own rule
+        (``_converter_snaps_with_epsilon``): a converter <= 0.2.8 snaps
+        E 11.6466 to ceil(116.466) * 0.1 = 11.700000000000001 and so
+        enumerates a 69th 2 m column (E11.70, 25 tiles east of the area),
+        2,463 tiles; from 0.2.9 both sides snap with the epsilon and the
+        column is gone, 2,438. The plugin keeps the engine's grid on
+        purpose — a snap rule on one side alone makes this cross-check
+        abort every such run."""
+        exe = _find_real_converter()
+        if not exe:
+            self.skipTest("aether_converter not provided via "
+                          "AETHER_BIN_DIR or PATH")
+        raw = {"south": 45.7161, "north": 48.1913,
+               "west": 4.9482, "east": 11.6466}
+        res = [2, 5, 10, 30, 90]
+        epsilon = mct._converter_snaps_with_epsilon(exe)
+        expected = _enumerate_tiles(_snap_bbox(raw, res, epsilon=epsilon),
+                                    res, epsilon=epsilon)
+        self.assertEqual(len(expected), 2438 if epsilon else 2463)
+        mct._plan_cross_check(exe, raw, res, expected)
+
 
 class TestPlanCrossCheckUsesTheRawBbox(unittest.TestCase):
     """Snapping is NOT idempotent on the 0.1-degree float grid.
@@ -939,7 +1000,8 @@ class TestDownloadXyzEntries(unittest.TestCase):
 
     BBOX = {"north": 47.4, "south": 47.1, "east": 8.4, "west": 8.1}
 
-    def test_downloads_per_resolution_and_fills_the_pool(self):
+    def test_downloads_per_zoom_and_fills_the_pool(self):
+        # 30 m tiles need z12 here, 90 m z11: two zooms, two calls.
         expected = _enumerate_tiles(_snap_bbox(self.BBOX, [30, 90]), [30, 90])
         entry = {"kind": "xyz", "uri": "type=xyz&url=u", "extent": self.BBOX}
         calls = []
@@ -958,7 +1020,10 @@ class TestDownloadXyzEntries(unittest.TestCase):
                 [entry], expected,
                 progress_cb=lambda f, label: fracs.append(f))
 
-        self.assertEqual([c[2] for c in calls], [30, 90])
+        self.assertEqual([c[2] for c in calls], [90, 30])   # z11, then z12
+        self.assertEqual([c[1] for c in calls],
+                         [[t["filename"] for r, t in expected if r == 90],
+                          [t["filename"] for r, t in expected if r == 30]])
         self.assertEqual(calls[0][0], "type=xyz&url=u")
         # Pool filled per resolution with the tiles of THAT resolution.
         self.assertEqual(sorted(entry["pool"]), [30, 90])
@@ -994,6 +1059,216 @@ class TestDownloadXyzEntries(unittest.TestCase):
                                side_effect=RuntimeError("service down")):
             with self.assertRaises(RuntimeError):
                 mct._download_xyz_entries([entry], expected)
+
+
+class TestOneDownloadPerZoom(unittest.TestCase):
+    """One shared-pool download per XYZ entry and ZOOM: resolutions whose
+    tiles need the same source zoom share ONE converter job (the owner's
+    2 m + 5 m run fetched its z15 source tiles twice: 12 GB, then ~15 GB
+    again). The plan, the progress estimate, the disk need and the worker
+    group alike."""
+
+    BBOX = {"south": 47.1, "north": 47.3, "west": 8.1, "east": 8.3}
+    URI = ("type=xyz&url=https%3A//example.com/terrarium/%7Bz%7D/%7Bx%7D/"
+           "%7By%7D.png&zmax=15")
+
+    def _expected(self, res):
+        return _enumerate_tiles(_snap_bbox(self.BBOX, res), res)
+
+    def test_2m_and_5m_are_one_z15_job_with_both_specs(self):
+        expected = self._expected([2, 5])
+        entry = {"kind": "xyz", "uri": self.URI, "extent": None}
+        plan = mct._xyz_download_plan([entry], expected)
+        self.assertEqual([(k, z) for k, _e, z, _g in plan], [(0, 15)])
+        (_k, _e, _z, group), = plan
+        self.assertEqual(sorted({r for r, _t in group}), [2, 5])
+        self.assertEqual(len(group), len(expected))
+        # ONE ensure_pool_tiles call, its specs of both resolutions — the
+        # downloader then builds ONE job: zoom per job, resolution per spec.
+        calls = []
+
+        def fake_ensure(uri, specs, res, **_kw):
+            calls.append(ta._download_specs_by_zoom(uri, specs))
+            return {t["filename"]: f"/pool/{t['filename']}" for t in specs}
+
+        with mock.patch.object(ta, "ensure_pool_tiles",
+                               side_effect=fake_ensure):
+            mct._download_xyz_entries([entry], expected)
+        self.assertEqual(len(calls), 1)
+        (zoom, specs), = calls[0].items()
+        self.assertEqual(zoom, 15)
+        self.assertEqual(
+            sorted({round(s["resolution_m"]) for s in specs}), [2, 5])
+        self.assertEqual({s["size_px"] for s in specs},
+                         {t["size_px"] for _r, t in expected})
+        for res in (2, 5):
+            self.assertEqual(sorted(entry["pool"][res]), sorted(
+                t["filename"] for r, t in expected if r == res))
+
+    def test_2m_and_30m_are_two_jobs(self):
+        expected = self._expected([2, 30])
+        plan = mct._xyz_download_plan(
+            [{"kind": "xyz", "uri": self.URI, "extent": None}], expected)
+        self.assertEqual([z for _k, _e, z, _g in plan], [12, 15])
+        self.assertEqual([sorted({r for r, _t in g}) for _k, _e, _z, g
+                          in plan], [[30], [2]])
+
+    def test_the_zoom_is_the_downloaders_own_rule(self):
+        expected = self._expected([2, 5, 10, 30, 90, 250])
+        plan = mct._xyz_download_plan(
+            [{"kind": "xyz", "uri": self.URI, "extent": None}], expected)
+        for _k, _e, zoom, group in plan:
+            for _r, tile in group:
+                self.assertEqual(zoom, ta.tile_zoom(
+                    ta._tile_center_lat(tile), tile["exact_res_m"], 15))
+        # A service that stops at z11 puts 30 m and 90 m on one job too.
+        low = self.URI.replace("zmax=15", "zmax=11")
+        plan = mct._xyz_download_plan(
+            [{"kind": "xyz", "uri": low, "extent": None}],
+            self._expected([30, 90]))
+        self.assertEqual([z for _k, _e, z, _g in plan], [11])
+
+    def test_estimate_disk_and_progress_slots_follow_the_plan(self):
+        expected = self._expected([2, 5])
+        entries = [{"kind": "xyz", "uri": self.URI, "extent": None}]
+        model = mct.run_progress.RunProgress()
+        with tempfile.TemporaryDirectory() as d, \
+             mock.patch.object(ta, "get_cache_dir", return_value=d):
+            mct._estimate_download_work(model, entries, expected,
+                                        pool_check=True)
+            items = mct._disk_items([], entries, d, d, download=expected)
+        self.assertEqual(model.keys(), [("download", 0, 15)])
+        self.assertEqual(model.work(("download", 0, 15)),
+                         ta.estimate_pool_download_units(
+                             self.URI, [t for _r, t in expected],
+                             pool_check=False))
+        self.assertEqual(
+            [i[2] for i in items if i[0] == mct._NEED_POOL],
+            [sum(ta._abt_whole_bytes(t["size_px"]) for _r, t in expected)])
+        self.assertEqual(mct._download_key(0, 15, stage=2),
+                         ("download", 0, 15, 2))
+
+
+def _png_rgb(rows):
+    """A minimal 8-bit RGB PNG from a list of rows of (r, g, b) bytes."""
+    import struct
+    import zlib
+
+    def chunk(tag, data):
+        return (struct.pack(">I", len(data)) + tag + data
+                + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF))
+
+    h, w = len(rows), len(rows[0]) // 3
+    raw = b"".join(b"\x00" + bytes(r) for r in rows)
+    return (b"\x89PNG\r\n\x1a\n"
+            + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0))
+            + chunk(b"IDAT", zlib.compress(raw, 6)) + chunk(b"IEND", b""))
+
+
+def _terrarium_tiles(root, zoom, xs, ys):
+    """Terrarium PNGs of a smooth, non-planar surface (metres from the
+    sample's lat/lon) — every resampling difference would show."""
+    for x in xs:
+        for y in ys:
+            rows = []
+            for j in range(256):
+                n = 2.0 ** zoom
+                lat = math.degrees(math.atan(math.sinh(
+                    math.pi * (1 - 2 * (y + (j + 0.5) / 256) / n))))
+                row = bytearray()
+                for i in range(256):
+                    lon = (x + (i + 0.5) / 256) / n * 360.0 - 180.0
+                    elev = (800.0 + 300.0 * math.sin(lat * 7.0)
+                            * math.cos(lon * 5.0) + 40.0 * lat)
+                    v = elev + 32768.0
+                    r = int(v // 256)
+                    g = int(v) % 256
+                    b = int((v - int(v)) * 256) % 256
+                    row += bytes((r, g, b))
+                rows.append(row)
+            d = os.path.join(root, str(zoom), str(x))
+            os.makedirs(d, exist_ok=True)
+            with open(os.path.join(d, f"{y}.png"), "wb") as fh:
+                fh.write(_png_rgb(rows))
+
+
+class TestOneJobPerZoomRealConverter(unittest.TestCase):
+    """With the real aether_converter (AETHER_BIN_DIR) and a local tile
+    server: two resolutions on one zoom are ONE ``download`` process, and
+    its pool tiles are byte for byte those of one job per resolution (the
+    old plan) — so merging the jobs cannot change a result."""
+
+    def test_one_process_and_byte_identical_pool_tiles(self):
+        exe = _find_real_converter()
+        if not exe:
+            self.skipTest("aether_converter not provided via "
+                          "AETHER_BIN_DIR or PATH")
+        import functools
+        import http.server
+        import threading
+        from waveshed.core import binary_manager
+
+        bbox = {"south": 47.0, "north": 48.0, "west": 8.0, "east": 9.0}
+        expected = [(r, t) for r, t in _enumerate_tiles(
+            _snap_bbox(bbox, [30, 90]), [30, 90])
+            if t["ul_lat"] == 47.5 and t["ul_lon"] == 8.0 or r == 90]
+        self.assertEqual(sorted(r for r, _t in expected), [30, 90])
+        with tempfile.TemporaryDirectory() as root:
+            tiles = os.path.join(root, "tiles")
+            # z11 over 47..48 N, 8..9 E, with a tile of slack all round.
+            _terrarium_tiles(tiles, 11, range(1068, 1077), range(714, 726))
+
+            class Quiet(http.server.SimpleHTTPRequestHandler):
+                def log_message(self, *_a):
+                    pass
+
+            class Server(http.server.ThreadingHTTPServer):
+                request_queue_size = 512
+
+            server = Server(("127.0.0.1", 0),
+                            functools.partial(Quiet, directory=tiles))
+            threading.Thread(target=server.serve_forever,
+                             daemon=True).start()
+            self.addCleanup(server.server_close)
+            self.addCleanup(server.shutdown)
+            uri = ("type=xyz&url=" + "http%3A//127.0.0.1%3A"
+                   f"{server.server_address[1]}/%7Bz%7D/%7Bx%7D/%7By%7D.png"
+                   "&zmax=11&interpretation=terrarium")
+            ent = {"kind": "xyz", "uri": uri, "extent": None}
+            plan = mct._xyz_download_plan([ent], expected)
+            self.assertEqual([z for _k, _e, z, _g in plan], [11])
+
+            launches = []
+            real_runner = ta.run_converter_streaming
+
+            def runner(exe_, args, on_line, **kw):
+                launches.append(args[0])
+                return real_runner(exe_, args, on_line, **kw)
+
+            def pool_bytes(cache, calls):
+                with mock.patch.object(ta, "get_cache_dir",
+                                       return_value=cache), \
+                     mock.patch.object(binary_manager, "find_binary",
+                                       return_value=exe), \
+                     mock.patch.object(ta, "run_converter_streaming",
+                                       side_effect=runner):
+                    for group in calls:
+                        ta.ensure_pool_tiles(uri, [t for _r, t in group],
+                                             group[0][0])
+                    pool = ta._pool_dir(uri)
+                    return {t["filename"]: open(os.path.join(
+                        pool, t["filename"]), "rb").read()
+                        for _r, t in expected}
+
+            merged = pool_bytes(os.path.join(root, "a"), [plan[0][3]])
+            self.assertEqual(launches, ["download"])
+            per_res = pool_bytes(os.path.join(root, "b"),
+                                 [[rt] for rt in expected])
+            self.assertEqual(launches, ["download"] * 3)
+        self.assertEqual(sorted(merged), sorted(per_res))
+        for name in merged:
+            self.assertGreater(len(merged[name]), 44)
+            self.assertEqual(merged[name], per_res[name], name)
 
 
 class TestAbtAndRenderedSourcesInTileJobs(unittest.TestCase):
@@ -1123,29 +1398,273 @@ class TestWorkerDownloadCancel(unittest.TestCase):
         # same filtered list, not the full enumeration.
         with tempfile.TemporaryDirectory() as out_dir:
             expected = _enumerate_tiles(_snap_bbox(self.RAW, [2]), [2])
-            existing = expected[0][1]["filename"]
-            open(os.path.join(out_dir, existing), "w").close()
+            # The tiles the XYZ entry's extent overlaps; one of them is on
+            # disk already.
+            inside = mct._jobs_overlapping_extent(expected, self.RAW)
+            self.assertGreater(len(inside), 2)
+            existing = inside[0][1]["filename"]
+            _write_whole(os.path.join(out_dir, existing),
+                         inside[0][1]["size_px"])
 
             worker = self._worker(out_dir, overwrite=False)
             rec = _worker_signals(worker)
-            seen = {}
+            asked, calls = [], []
 
-            def spy_download(entries, exp, progress_cb=None,
-                             should_cancel=None, on_start=None, **_kw):
-                seen["expected"] = list(exp)
-                raise ta.ConverterCancelled()   # stop the run cleanly here
+            def spy_download(uri, specs, res, **_kw):
+                asked.extend(t["filename"] for t in specs)
+                calls.append(sorted(t["ul_lat"] for t in specs))
+                return {t["filename"]: f"/pool/{t['filename']}"
+                        for t in specs}
 
+            # The run goes on to its batches: an engine that writes nothing.
             with mock.patch.object(mct, "find_binary",
                                    return_value="/bin/conv"), \
                  mock.patch.object(mct, "_plan_cross_check"), \
-                 mock.patch.object(mct, "_download_xyz_entries",
-                                   side_effect=spy_download):
+                 mock.patch.object(ta, "ensure_pool_tiles",
+                                   side_effect=spy_download), \
+                 mock.patch.object(ta, "preflight_ingest_jobs"), \
+                 mock.patch.object(ta, "run_converter_streaming",
+                                   return_value=0), \
+                 mock.patch("waveshed.core.output_estimate.free_bytes",
+                            return_value=10 ** 15):
                 worker.run()
 
-            names = [t["filename"] for _r, t in seen["expected"]]
-            self.assertNotIn(existing, names)
-            self.assertEqual(len(names), len(expected) - 1)
+            self.assertNotIn(existing, asked)
+            # 2 m tiles at ~47 N all need z15: one call per 0.25 deg
+            # latitude band (2026-10-23), north first — every pending tile
+            # exactly once.
+            self.assertEqual(sorted(asked), sorted(
+                t["filename"] for _r, t in inside[1:]))
+            self.assertEqual(len(asked), len(set(asked)))
+            self.assertEqual(len(calls), 2)
+            self.assertGreater(min(calls[0]), max(calls[1]))
         self.assertEqual(rec["err"], [])
+        self.assertEqual(rec["ok"], [out_dir])
+
+
+class TestTargetResColumnRemoved(unittest.TestCase):
+    """The per-row "Target Res" column was never read by a run (the
+    resolutions are the "Generate tiles at" checkboxes): gone, editor and
+    model field included."""
+
+    def test_no_column_no_editor(self):
+        self.assertNotIn("Target Res", mct._LAYER_COLS)
+        self.assertEqual(mct._LAYER_COLS,
+                         ["Type", "Source", "CRS", "Native Res", "Extent"])
+        self.assertEqual(mct._COL_EXTENT, len(mct._LAYER_COLS) - 1)
+        self.assertFalse(hasattr(mct, "_COL_TARGET_RES"))
+        self.assertFalse(hasattr(mct.MapConverterTab,
+                                 "_on_table_double_clicked"))
+
+    def test_the_table_fills_the_five_columns(self):
+        tab = mct.MapConverterTab.__new__(mct.MapConverterTab)
+        cells = {}
+        table = mock.Mock()
+        table.setItem.side_effect = lambda r, c, item: cells.__setitem__(
+            (r, c), item)
+        tab._table = table
+        tab._layers = [
+            _LayerEntry(layer_type="raster", source_path="/dem/a.tif",
+                        native_res_m=2.0, target_resolutions=[2, 30],
+                        extent={"south": 47.0, "north": 47.5,
+                                "west": 8.0, "east": 8.5}),
+            _LayerEntry(layer_type="buildings", source_path="/b.fgb")]
+        with mock.patch.object(mct, "QTableWidgetItem",
+                               side_effect=lambda text: mock.Mock(
+                                   text=text, flags=mock.Mock(
+                                       return_value=0))):
+            tab._rebuild_table()
+        self.assertEqual(sorted({c for _r, c in cells}), [0, 1, 2, 3, 4])
+        self.assertEqual(cells[(0, mct._COL_EXTENT)].text,
+                         "47.00-47.50N 8.00-8.50E")
+        self.assertEqual(cells[(0, mct._COL_NATIVE_RES)].text, "2.0m")
+
+
+class TestUpsamplingWarningAtRunStart(unittest.TestCase):
+    """Finer than native: one line per source for the CHECKED resolutions,
+    said when the run starts (log), listed in the pre-run confirmation —
+    never on a row edit (there is no row editor any more)."""
+
+    XYZ = ("type=xyz&url=https%3A//example.com/terrarium/%7Bz%7D/%7Bx%7D/"
+           "%7By%7D.png&zmax=15")
+    EXT = {"south": 47.0, "north": 47.2, "west": 8.0, "east": 8.2}
+
+    def _rows(self, file_res):
+        layer = mock.Mock()
+        layer.name.return_value = "AWS Terrain"
+        layer.source.return_value = self.XYZ
+        return [_LayerEntry(layer_type="raster", source_path="/dem/a.tif",
+                            native_res_m=file_res, extent=dict(self.EXT)),
+                _LayerEntry(layer_type="raster", source_path=self.XYZ,
+                            qgis_layer=layer, native_res_m=4.8,
+                            extent=dict(self.EXT)),
+                _LayerEntry(layer_type="buildings", source_path="/b.fgb")]
+
+    def test_one_line_per_source_naming_its_finer_outputs(self):
+        lines = mct._upsampling_warnings(self._rows(25.0), [2, 5, 10, 30])
+        self.assertEqual(lines, [
+            "'a.tif' (native ~25.0 m): the 2 m, 5 m, 10 m output is finer "
+            "than this source — interpolated where it fills, no detail "
+            "gained",
+            "'AWS Terrain' (native ~4.8 m): the 2 m output is finer than "
+            "this source — interpolated where it fills, no detail gained"])
+        self.assertEqual(mct._upsampling_warnings(self._rows(2.0), [5, 30]),
+                         [])
+
+    def _tab(self, rows, out_res):
+        tab = mct.MapConverterTab.__new__(mct.MapConverterTab)
+        tab._worker = None
+        tab._run_reported = False
+        tab._run_model = None
+        tab._est_cache = {}
+        tab._layers = rows
+        tab._get_output_resolutions = lambda: list(out_res)
+        tab._preflight_folders = lambda: True
+        tab._get_output_dir = lambda: tempfile.gettempdir()
+        tab._log = mock.Mock()
+        tab._chk_overwrite = mock.Mock(isChecked=mock.Mock(return_value=True))
+        tab._progress = mock.Mock(value=mock.Mock(return_value=0))
+        tab._progress_timer = mock.Mock()
+        tab._lbl_status = mock.Mock()
+        return tab
+
+    def _run(self, tab, answer):
+        box = mock.Mock()
+        box.StandardButton = mct.QMessageBox.StandardButton
+        box.warning.return_value = answer
+        with mock.patch.object(mct, "QMessageBox", box), \
+             mock.patch.object(mct, "_estimate_disk_need", return_value=None), \
+             mock.patch.object(mct, "_pending_render_jobs",
+                               return_value=(None, [])), \
+             mock.patch.object(mct, "resolve_sources_with_progress",
+                               return_value=None) as resolve:
+            tab._on_run()
+        logged = [c.args[0] for c in tab._log.appendPlainText.call_args_list]
+        return box, logged, resolve
+
+    def test_logged_when_the_run_starts_no_dialog_while_a_source_has_it(self):
+        tab = self._tab(self._rows(2.0), [2, 5])
+        box, logged, resolve = self._run(tab, None)
+        box.warning.assert_not_called()       # the 2 m files have 2 m
+        resolve.assert_called_once()
+        start = logged.index("Starting conversion...")
+        self.assertEqual(logged[start + 1],
+                         "WARNING: 'AWS Terrain' (native ~4.8 m): the 2 m "
+                         "output is finer than this source — interpolated "
+                         "where it fills, no detail gained")
+        self.assertEqual(sum(ln.startswith("WARNING: '") for ln in logged), 1)
+
+    def test_the_confirmation_lists_every_source_line(self):
+        tab = self._tab(self._rows(25.0), [2])
+        box, logged, resolve = self._run(
+            tab, mct.QMessageBox.StandardButton.No)
+        box.warning.assert_called_once()
+        title, text = box.warning.call_args[0][1:3]
+        self.assertEqual(title, "Upsampling Warning")
+        for line in mct._upsampling_warnings(tab._layers, [2]):
+            self.assertIn(f"• {line}", text)
+        self.assertEqual(text.count("• "), 2)
+        resolve.assert_not_called()           # declined: no run
+        self.assertNotIn("Starting conversion...", logged)
+
+
+class TestRustTileLinesNeverReachThePanel(unittest.TestCase):
+    """The converter's per-tile ``[Rust] tile …`` diagnostic (one line per
+    tile) flooded the log panel; the ``[Rust] run:`` summary stays."""
+
+    TILE_LINE = ("[Rust] tile tile_N47.50E8.00_30m.abt: 12 sources, header "
+                 "0.1s (open 0.2 ms, read 0.1 ms avg), decode 0.4s, sample "
+                 "0.2s")
+    RUN_LINE = ("[Rust] run: wall 1.2s, cpu user 0.8s sys 0.1s, page faults "
+                "10, threads 16")
+
+    def _worker(self):
+        return _MapConverterWorker([], tempfile.gettempdir(), [30], [])
+
+    def test_filtered_next_to_the_tile_parse(self):
+        worker = self._worker()
+        logs = []
+        worker.log_line.connect(logs.append)
+
+        def fake_runner(exe, args, on_line, on_start=None, env=None):
+            for line in (self.TILE_LINE, "[Tile] t.abt covered=4/4",
+                         "[Rust] Progress: 1/1", self.RUN_LINE):
+                on_line(line)
+            return 0
+
+        job = {"output_path": os.path.join(tempfile.gettempdir(), "t.abt"),
+               "size_px": 4, "sources": []}
+        with mock.patch.object(ta, "preflight_ingest_jobs"), \
+             mock.patch.object(ta, "run_converter_streaming",
+                               side_effect=fake_runner):
+            result = worker._run_ingest("/bin/conv", [job], ("convert",),
+                                        "Converting tiles")
+        self.assertEqual(result["tiles"], {"t.abt": (4, 4)})
+        self.assertFalse([ln for ln in logs if ln.startswith("[Rust] tile ")])
+        self.assertIn(self.RUN_LINE, logs)
+        self.assertIn("[Rust] Progress: 1/1", logs)
+
+    def test_with_the_real_converter(self):
+        exe = _find_real_converter()
+        if not exe:
+            self.skipTest("aether_converter not provided via "
+                          "AETHER_BIN_DIR or PATH")
+        from _real_gdal import HAVE_GDAL, real_gdal, write_tif
+        if not HAVE_GDAL:
+            self.skipTest("needs the real GDAL")
+        import numpy as np
+        with tempfile.TemporaryDirectory() as root:
+            tif = os.path.join(root, "dem.tif")
+            rows, cols = np.mgrid[0:200, 0:400]
+            with real_gdal():
+                write_tif(tif, {"west": 7.9, "east": 12.1, "south": 45.95,
+                                "north": 48.05}, size=(400, 200),
+                          array=(500.0 + rows + 0.5 * cols
+                                 ).astype(np.float32))
+            expected = _enumerate_tiles(_snap_bbox(
+                {"south": 47.1, "north": 47.9, "west": 8.1, "east": 9.9},
+                [90]), [90])
+            out = os.path.join(root, "out")
+            os.makedirs(out)
+            jobs = [{"output_path": os.path.join(out, t["filename"]),
+                     "format": "r16sint", "ul_lat": t["ul_lat"],
+                     "ul_lon": t["ul_lon"],
+                     "resolution_m": float(t["exact_res_m"]),
+                     "size_px": t["size_px"],
+                     "sources": [{"path": tif, "crs": "EPSG:4326"}]}
+                    for _r, t in expected]
+            self.assertEqual(len(jobs), 2)
+            raw, logs = [], []
+            worker = self._worker()
+            worker.log_line.connect(logs.append)
+            real = ta.run_converter_streaming
+
+            def spy(exe_, args, on_line, **kw):
+                def both(line):
+                    raw.append(line)
+                    on_line(line)
+                return real(exe_, args, both, **kw)
+
+            # The variable present but empty keeps the runner from naming a
+            # diagnostics file, so a converter >= 0.2.8 prints its per-tile
+            # lines on stdout like 0.2.7 does — the filter is what is tested.
+            with mock.patch.object(ta, "run_converter_streaming",
+                                   side_effect=spy), \
+                 mock.patch.object(ta, "get_cache_dir", return_value=root), \
+                 mock.patch.object(mct.tempfile, "gettempdir",
+                                   return_value=root), \
+                 mock.patch.dict(os.environ, {ta.DIAG_ENV: ""}):
+                result = worker._run_ingest(exe, jobs, ("convert",),
+                                            "Converting tiles")
+        tile_lines = [ln for ln in raw if ln.startswith("[Rust] tile ")]
+        self.assertEqual(len(tile_lines), 2, raw)     # one per tile
+        self.assertTrue(any(ln.startswith("[Rust] run:") for ln in raw), raw)
+        self.assertFalse([ln for ln in logs if ln.startswith("[Rust] tile ")])
+        self.assertTrue(any(ln.startswith("[Rust] run:") for ln in logs))
+        self.assertEqual(sorted(result["tiles"]),
+                         sorted(t["filename"] for _r, t in expected))
+        for covered, total in result["tiles"].values():
+            self.assertEqual(covered, total)
 
 
 class TestImageryXyzIsRefused(unittest.TestCase):

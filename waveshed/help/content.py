@@ -89,19 +89,25 @@ GeoTIFF and the layer appears under <b>Waveshed &rarr; Coverage</b>.</li>
 </ol>
 
 <h3>Watching a run</h3>
-<p>Progress is shown in the tab, and every line the engine prints is copied to
-the QGIS <b>Log Messages</b> panel: tag <b>Waveshed</b> for the engine and the
-plugin, <b>Waveshed-Terrain</b> for terrain acquisition (cache hits, tile
-counts, download statistics, warnings). When a run behaves oddly, that panel is
-the first place to look.</p>
+<p>Progress is shown in the tab, and the QGIS <b>Log Messages</b> panel shows
+the engine's key lines and every warning or error it prints: tag
+<b>Waveshed</b> for the engine and the plugin, <b>Waveshed-Terrain</b> for
+terrain acquisition (cache hits, tile counts, download statistics, warnings).
+Everything the engine prints, its internal diagnostics included, also goes to
+a daily file in the terrain cache,
+<code>logs/aether_core-&lt;YYYYMMDD&gt;.log</code> (the panel names it in an
+<code>engine log (full console)</code> line), and the terrain converter's
+diagnostics go to <code>aether_converter-&lt;YYYYMMDD&gt;.log</code> beside it.
+When a run behaves oddly, the panel is the first place to look; for a bug
+report, attach those files as well.</p>
 
 <h3>What the plugin never does</h3>
 <p>All computation happens in the engine binaries. The plugin never warps a
 raster itself, never bundles the engine, and never sends your data anywhere —
 the only network traffic it starts is the engine download, the release
-manifest, elevation tiles from the service you selected, OpenFreeMap building
-tiles when you tick <b>Include buildings (OpenFreeMap)</b>, and the OSM
-Overpass API when you use the Map Converter's <b>Download Buildings...</b>.</p>
+manifest, elevation tiles from the service you selected, and OpenFreeMap
+building tiles when you tick <b>Include buildings (OpenFreeMap)</b> or use the
+Map Converter's <b>Download Buildings...</b>.</p>
 """
 
 # ---------------------------------------------------------------------------
@@ -386,7 +392,13 @@ VRT is usually a mosaic of the files beside it; load it as a layer instead —
 and so are sidecars such as <code>.aux.xml</code>, <code>.ovr</code>,
 <code>.msk</code> and world files). Each folder keeps an <b>index</b> in the
 terrain cache: a file is opened once, then only checked for size and date, so
-a repeat run does not re-read thousands of files. Where files overlap, the
+a repeat run — also in a later QGIS session — does not re-read thousands of
+files. On Windows the first read of a large folder adds a note to its
+progress dialog: Windows Defender scans every file on first open, so
+excluding the folder and the Waveshed terrain cache from real-time scanning
+(Windows Security &rarr; Virus &amp; threat protection &rarr; Exclusions)
+makes that read and later conversions faster. Waveshed itself never queries
+or changes Defender. Where files overlap, the
 <b>finest resolution wins</b> by default (or file name order — see <b>Where
 files overlap:</b>). A file the converter cannot read directly (another
 format, ZSTD/LERC compression, a rotated grid, a scale/offset such as Int16
@@ -401,9 +413,10 @@ route. A service that returns <i>imagery</i> rather than elevation is
 refused outright.</td></tr>
 <tr><td><b>A folder of pre-built <code>.abt</code> tiles</b></td>
 <td>Handed to the engine untouched.</td>
-<td>What the <a href="#map-converter">Map Converter</a> produces. Select it as
-the <b>Local terrain dir:</b> in Settings; it then appears in the DEM
-dropdown as <b>Local: &lt;path&gt;</b>.</td></tr>
+<td>What the <a href="#map-converter">Map Converter</a> produces. Pick it with
+<b>Folder…</b> beside the DEM dropdown, or select it as the <b>Local terrain
+dir:</b> in Settings; either way it appears in the DEM dropdown as
+<b>Local: &lt;path&gt;</b>.</td></tr>
 </table>
 
 <h3>XYZ encoding and zoom</h3>
@@ -459,17 +472,34 @@ shorter range, a nudged site or a narrower sector downloads nothing new.</li>
 <li><code>views/&lt;id&gt;/</code> — the exact tile set one run hands the
 engine, hard-linked from the pool (copied where the filesystem refuses a
 link).</li>
+<li><code>xyz/</code> — the source tiles downloaded from XYZ elevation
+services, as the server sent them, so a later run reads them from disk and
+fetches only what is missing (aether_converter 0.2.8 and later). Before a
+run the disk check counts what a download may add here as <b>raw
+tiles</b>.</li>
+<li><code>logs/</code> — one file per day with everything the engine printed,
+<code>aether_core-&lt;YYYYMMDD&gt;.log</code>, and one with the terrain
+converter's diagnostics, <code>aether_converter-&lt;YYYYMMDD&gt;.log</code>
+(aether_converter 0.2.8 and later). <b>Clear...</b> leaves them alone; files
+older than 14 days are deleted automatically.</li>
 </ul>
 <p>Tiles are named by position and resolution, for example
-<code>tile_N47.50E8.50_30m.abt</code>. A tile that was written short (a killed
+<code>tile_N47.50E8.50_30m.abt</code>. From a terrain folder or file a tile is
+built only for the part the site needs (the site's area plus a 500 m margin);
+such a tile sits in the pool as <code>….abt.part</code> and is extended when a
+later run needs more of it — a 50 km site at 90 m reads about a third of the
+ground a whole-tile build would. A tile that was written short (a killed
 run) or that is missing the buildings its pool identity claims is flagged for
 rebuild and re-made on the next run. Before a run the plugin prices only what is
 genuinely missing, logs a <code>terrain plan:</code> line, and asks for
 confirmation with <b>Large terrain download</b> past ~50 GB (and more insistently
 past ~200 GB).</p>
 <p>The cache never evicts anything. <b>Clear...</b> beside <b>Terrain cache:</b>
-in Settings reports the size and deletes it — that is also how you pick up newer
-OpenFreeMap building data, whose cache identity is deliberately date-free.</p>
+in Settings reports the size and deletes it, including downloaded source
+tiles — that is also how you pick up newer OpenFreeMap building data, whose
+cache identity is deliberately date-free.
+The folder index (per-folder file metadata) is kept unless you tick <b>Also
+clear the folder index (the next scan reads every file again)</b>.</p>
 
 <h3>Missing data degrades to sea level, loudly</h3>
 <p>Ground that a source has no data for is never an error. It becomes
@@ -501,13 +531,26 @@ mentions your area of interest, use a source that covers the full range.</p>
 <p>Tick <b>Include buildings (OpenFreeMap)</b> in the 360&deg; tab to fetch
 OpenStreetMap building footprints and burn them into the terrain surface, so
 they obstruct exactly as terrain does. Buildings are published at zoom 14 only,
-which makes this a sizeable download — it suits small areas; a request over
-about 4096 tiles is refused rather than started. Building tiles pool alongside
-terrain and are reused across runs.</p>
-<p>If buildings were requested but could not be fetched or applied, the run
-continues <i>without</i> them, says so in the log, and flags the tiles for
-rebuild — so the next run retries instead of serving building-free terrain from
-a cache entry that claims to have buildings.</p>
+which makes this a sizeable download: the buildings of every terrain tile the
+run builds (whole tiles, not just the analysis area — a cached tile then holds
+all of its buildings), 32 at a time. The log names the number of building tiles
+and the most they can take on disk; the disk check counts them as <b>building
+tiles</b>. Building tiles are kept in one cache shared with the Map Converter
+and are never fetched twice.</p>
+<p>If the buildings cannot all be downloaded (a server error or timeout after
+the retries, an answer that is not a vector tile) the run <b>stops</b> with the
+reason — it never builds terrain without the buildings you asked for. The
+converter's own report is checked too: a building tile it cannot read, no burn
+reported at all, or buildings read but none drawn also stop the run, and the
+terrain tiles involved are rebuilt by the next run. An area with no buildings
+in OpenStreetMap is not an error: the log warns and the run goes on.</p>
+<p>A prepared <code>.abt</code> folder (Map Converter output) is used as it is:
+its buildings were burned in when it was built. Before the run the plugin reads
+what the Map Converter recorded for the tiles this analysis uses: with the box
+ticked it says when they already contain buildings (nothing is added), and asks
+when some or all of them have none (build them with buildings in the Map
+Converter); unticked, it tells you once when they carry buildings anyway. P2P
+logs the same in one line.</p>
 <p>The Map Converter can also take buildings from a file or folder
 (FlatGeobuf, Shapefile, GeoPackage, GeoJSON, ESRI .gdb); the converter reads
 FlatGeobuf in WGS84 and anything else is converted first.</p>
@@ -573,7 +616,13 @@ already covers every altitude.</p>
 <tr><th>Control</th><th>Meaning</th></tr>
 <tr><td><b>DEM Layer:</b></td><td>The elevation source: any raster layer in the
 project, plus the <b>Local: &lt;path&gt;</b> entry when a <b>Local terrain
-dir:</b> is configured in Settings. The plugin's own coverage and P2P results
+dir:</b> is configured in Settings, and one per folder picked with
+<b>Folder…</b> (the folders come first, the Settings one at the top).
+<b>Folder…</b> beside the list opens a folder browser — in the selected folder,
+else the last one picked — for a folder of DEM files or of pre-built
+<code>.abt</code> tiles; the folder is selected at once and stays in the list
+of both analysis tabs (the last 8 picked, while they exist). The plugin's own
+coverage and P2P results
 are filtered out of the list; terrain the plugin generated is kept, because it
 is elevation data. The grey line below shows <b>Source resolution:</b>, or
 <b>Local directory:</b>, or a warning that the layer looks like
@@ -651,8 +700,9 @@ can run anyway, but the numbers are probably invalid. See
 <a href="#itm">ITM parameters</a>.</li>
 <li><b>Terrain size.</b> The tiles that still have to be built are priced
 against the pool; a large figure asks for confirmation.</li>
-<li><b>Local terrain folder.</b> The folder is read in the background (a
-progress dialog; Cancel stops it). Files that cannot be used — no
+<li><b>Local terrain folder.</b> The selected folder (the Settings one or one
+picked with <b>Folder…</b>) is read in the background (a progress dialog;
+Cancel stops it). Files that cannot be used — no
 coordinate system, no georeferencing, truncated, a picture (RGB/hillshade,
 colour table), or 8-bit values that are probably not elevation — are listed
 in ONE prompt, <b>Skip N unusable file(s) and continue?</b>, default
@@ -664,8 +714,9 @@ footprint, whatever its CRS. A pre-built <code>.abt</code> folder built at a
 different resolution, or without the buildings you asked for, raises it
 too.</li>
 <li><b>Per job:</b> prepare terrain &rarr; write the job JSON &rarr; run
-<code>aether_core</code> (its wedge progress drives the bar and every line
-lands in the log) &rarr; run <code>aether_export</code> to a GeoTIFF &rarr;
+<code>aether_core</code> (its wedge progress drives the bar; its key lines
+reach the Log Messages panel, every line the engine log file) &rarr; run
+<code>aether_export</code> to a GeoTIFF &rarr;
 load the layer.</li>
 </ol>
 <p><b>Stop</b> cancels: the engine process and its children are killed, and the
@@ -781,8 +832,9 @@ from north; only meaningful for a directional asset.</li>
 </ul>
 
 <h3>Analysis</h3>
-<p><b>DEM Layer:</b> (a raster layer in the project — this tab has no
-<b>Local:</b> terrain-directory entry), <b>Resolution:</b>, <b>Backend:</b>,
+<p><b>DEM Layer:</b> with <b>Folder…</b> (the same list as in the 360&deg;
+tab: raster layers, the Settings <b>Local:</b> terrain folder and the folders
+picked with <b>Folder…</b> in either tab), <b>Resolution:</b>, <b>Backend:</b>,
 <b>Output Dir:</b> with <b>Browse</b>, and <b>Earth Radius Mode:</b>. The same
 meanings as in the <a href="#site-analysis">360&deg; tab</a>; this tab remembers
 its own output folder, separately from the 360&deg; tab.</p>
@@ -992,17 +1044,34 @@ when a coarser file then beats a finer one). Remembered per folder.</li>
 <li><b>Add Buildings...</b> — building footprints from a file (FGB, SHP, GPKG,
 GeoJSON) or a folder of <code>.fgb</code> parts or an ESRI <code>.gdb</code>.
 Anything that is not FlatGeobuf in WGS84 is converted first.</li>
-<li><b>Download Buildings...</b> — fetch OpenStreetMap building footprints
-for the row's extent through the Overpass API
-(<code>overpass-api.de</code>), as a deferred entry that is downloaded when
-the conversion runs. Set an extent first — without one the download is
-skipped.</li>
+<li><b>Download Buildings...</b> — OpenStreetMap building footprints for the
+row's extent, as a deferred entry downloaded when the conversion runs:
+OpenFreeMap vector tiles (zoom 14), the same source and cache as Site
+Analysis's <b>Include buildings</b>, fetched in parallel next to the terrain
+download (a large extent is tens of thousands of tiles). Only the tiles the
+output tiles to build need are fetched, and tiles already downloaded are
+reused. If they cannot all be downloaded (server error, timeout, an answer
+that is not a vector tile, or no data at all) the conversion stops with the
+reason — it never writes terrain without the buildings you asked for. The
+converter's report is checked per batch (a tile it cannot read, no burn
+reported) and over the run (buildings read but none drawn on any tile). The
+row needs an extent (Draw Extent / Extent from Layer) over the terrain; Convert
+refuses without one.</li>
 <li><b>Inspect .abt...</b> — load a folder of existing <code>.abt</code> tiles
 back into QGIS as a terrain layer, under <b>Waveshed &rarr; Terrain</b>. Useful
-for checking a build before running an analysis over it.</li>
+for checking a build before running an analysis over it. A small dialog lists
+the resolutions in the folder with their tile counts, size in MB and how much
+of the folder each covers; the coarsest resolution that covers the folder is
+preselected, and you may tick others (where they overlap, the finest is
+shown). Only the ticked tiles are read — and only the rows the preview needs,
+at most 8,192 pixels across — in the background with a progress dialog and
+<b>Cancel</b>; the dialog warns, with the expected read volume, when the
+chosen tiles hold more than 2 GB. The preview GeoTIFF carries overviews, so
+QGIS draws it at once.</li>
 </ul>
-<p>The table shows <b>Type</b>, <b>Source</b>, <b>CRS</b>, <b>Native Res</b>,
-<b>Target Res</b> and <b>Extent</b>. Every raster row needs an extent: select
+<p>The table shows <b>Type</b>, <b>Source</b>, <b>CRS</b>, <b>Native Res</b>
+and <b>Extent</b>; the output resolutions are the check boxes below the table.
+Every raster row needs an extent: select
 one or more rows (Ctrl/Shift-click) and use <b>Draw Extent for Layer</b> (drag
 a rectangle on the map) or <b>Extent from Layer</b> (a loaded layer's bounds;
 for folder rows also <b>Whole folder (all files)</b>). <b>Apply Extent to
@@ -1015,35 +1084,78 @@ row(s).</p>
 <ul>
 <li><b>Output .abt Resolutions</b> — <b>Generate tiles at:</b> with a checkbox
 per resolution (<b>2m</b>, <b>5m</b>, <b>10m</b>, <b>30m</b>, <b>90m</b>,
-<b>250m</b>; 30 m ticked by default). Each checkbox's tooltip states the tile
-extent in degrees and the tile size in pixels. Several may be ticked at
-once.</li>
+<b>250m</b>; 30 m ticked until the first row is added). Each checkbox's
+tooltip states the tile extent in degrees and the tile size in pixels. Several
+may be ticked at once.</li>
+<li><b>Auto</b> (right after the boxes) ticks what the stack calls for: the
+finest native resolution of the terrain rows (folder, file, XYZ or map
+service; building rows do not count), snapped up to the next tile resolution
+— a source up to 10 % coarser still counts as that resolution, so 2 m gives
+2 m, 4.8 m gives 5 m and 25 m gives 30 m — plus the 30 m and 90 m rings of
+Site Analysis' adaptive profile where they are coarser. That is one fine
+resolution for the whole stack: a 2 m folder beside a 4.8 m XYZ service gives
+2 m, 30 m and 90 m, so a 2 m tile exists everywhere and an analysis never
+falls back to a 5 m one — and no 5 m or 10 m tiles are built that no profile
+uses. Without a terrain row of known resolution it is 30 m. The boxes follow
+the stack by themselves — whenever a row is added or removed or an extent is
+set — until you tick one by hand; <b>Auto</b> applies the rule again and turns
+that back on. Its tooltip shows what the rule gives for the current stack, and
+the log names what was ticked and why (<i>output resolutions: auto 2 m, 30 m,
+90 m (finest source 2.0 m; …)</i>). With a fine source over a small area
+beside a coarse one over a large area, the fine resolution covers the whole
+combined extent — the estimate line shows what that costs.</li>
 <li><b>Rebuild existing tiles</b> — tiles are normally skipped when a file of
 the same name already exists. The output folder records what each tile was
 built from (<code>.waveshed_tiles.json</code>), so a tile whose source files
-were added, changed or removed is rebuilt anyway. Tick this to force a rebuild
+were added, changed or removed is rebuilt anyway. It also records which
+buildings each tile carries, so Site Analysis and P2P can say so when they use
+the folder as prepared terrain. Tick this to force a rebuild
 of everything — needed for tiles built by an older version, from a rendered
 service, or after changing an export setting.</li>
+<li><b>Keep pool tiles</b> (off by default) — terrain downloaded from an XYZ
+service is first written to the shared terrain pool (the cache Site Analysis
+reads), then converted. That copy only pays off when Site Analysis later runs
+from the same XYZ source over the area; otherwise it doubles the disk use.
+With the box off, the pool tiles a conversion downloaded are deleted once it
+has finished successfully (after <b>Cancel</b> or a failure they are kept, so
+the next run can reuse them). Pool tiles that were there before, and the
+downloaded source tiles that make a rerun free, are never deleted.</li>
 <li><b>Output:</b> — the target directory; the placeholder is the terrain cache
 root. <b>Browse...</b> to pick another.</li>
 <li>The estimate line reports <code>.abt tiles: N | Est. disk: X MB (Y GB)</code>
 and turns orange past 50 GB and red past 200 GB. It prices only what will
-actually be built.</li>
+actually be built. Below it, one line per drive shows what the run needs there
+against the free space; the pool tiles count even with <b>Keep pool tiles</b>
+off (they exist while the run runs) — the line then says <i>(pool tiles
+removed at the end)</i>. It is worked out in the background, so the boxes
+answer at once: the line says <i>Estimating tiles and disk space…</i> until it
+is ready, and a quick series of changes is estimated once, after the last. It
+follows the resolution boxes, <b>Rebuild existing tiles</b>, <b>Keep pool
+tiles</b>, rows added or removed and extents set.</li>
 </ul>
 <p><b>Convert</b> starts the run, <b>Cancel</b> stops it, and the converter's
 own output is streamed into the log box at the bottom. The progress bar covers
 the whole run, weighted by the work each step really does (rendered service
 tiles, downloaded source tiles, converted output tiles), and keeps moving
 through download retry passes. The status line shows the step, the retry pass
-(<i>pass 2/3</i>), tiles done of total, MB/s, errors and an ETA — and says so
-when no tile has finished for a while (a server backing off).</p>
+(<i>pass 2/3</i>, or <i>repair pass 2/4</i> when only coarse-filled source
+tiles are re-fetched), tiles done of total, MB/s, errors and an ETA — and says so
+when no tile has finished for a while (a server backing off). While a batch
+with buildings decodes its building tiles, the line says so (<i>decoding
+building tiles 12,000/20,808</i>) and the bar moves with it. When nothing has
+reported progress for 30 seconds the ETA shows <i>ETA &mdash;</i> instead of
+guessing.</p>
 
 <h3>The plan cross-check</h3>
 <p>Before every conversion the worker runs <code>aether_converter plan</code>
 over the same area and resolutions and compares the engine's tile grid with the
 plugin's own enumeration. Any difference — or an engine too old to have the
 <code>plan</code> subcommand — aborts the run rather than producing tiles the
-two sides disagree about. The tile naming and geometry are the same as Site
+two sides disagree about. With <code>aether_converter</code> 0.2.9 or later
+both sides snap the area onto the tile grid with the same rounding, so an
+edge on a grid line (or within rounding of one) no longer adds a row or
+column of tiles lying wholly outside the area; with older converters both
+keep the old grid. The tile naming and geometry are the same as Site
 Analysis uses, so a folder built here can be handed straight to an analysis as
 a terrain directory.</p>
 
@@ -1095,14 +1207,17 @@ engine</a>.</p>
 <tr><th>Setting</th><th>Default</th><th>Meaning</th></tr>
 <tr><td><b>Local terrain dir:</b></td><td>(empty)</td><td>A directory of DEM
 files, or of pre-built <code>.abt</code> tiles. When set it appears in both
-analysis tabs' DEM dropdown as <b>Local: &lt;path&gt;</b>. Selected, it is the
-<i>only</i> source — whatever it does not cover is computed over 0 m.</td></tr>
+analysis tabs' DEM dropdown as <b>Local: &lt;path&gt;</b>, at the top; the
+folders picked with <b>Folder…</b> beside the dropdown follow it. Selected, it
+is the <i>only</i> source — whatever it does not cover is computed over
+0 m.</td></tr>
 <tr><td><b>Where files overlap:</b></td><td>finest resolution wins</td>
 <td>Which file of the local terrain dir wins where two files overlap: the
 finest resolution, or file name order. Stored per folder.</td></tr>
 <tr><td><b>Terrain cache:</b></td><td><code>~/.aether/cache</code></td>
-<td>Where the tile pool and the per-run views live. <b>Clear...</b> reports how
-many entries and how many megabytes would go, then deletes them.</td></tr>
+<td>Where the tile pool, the per-run views and the downloaded source tiles
+live. <b>Clear...</b> reports how many entries and how many megabytes would
+go, then deletes them, including downloaded source tiles.</td></tr>
 <tr><td><b>Max VRAM budget (GB):</b></td><td>Auto (range 1&ndash;256)</td>
 <td>Auto sends nothing and the engine sizes the budget itself (on Apple Silicon
 that is the GPU memory macOS allows). A number is sent with coverage jobs as
@@ -1115,7 +1230,10 @@ version stay as they are; set the box back to Auto to hand the choice to the
 engine.</td></tr>
 <tr><td><b>Download connections:</b></td><td>256 (range 16&ndash;1024)</td>
 <td>Parallel HTTP connections the terrain downloader uses. Lower it on a
-connection that objects to the rate; retries automatically use half.</td></tr>
+connection that objects to the rate. Retries use the same number (the
+downloader backs off by itself when the server objects); source tiles that
+were only filled from coarser data are repaired in one pass that fetches just
+those tiles.</td></tr>
 </table>
 
 <h3>Data sources</h3>
@@ -1722,22 +1840,14 @@ listed by Mapzen (incl. SRTM, GMTED, NED, and national datasets)</td>
 <tr><td>OpenFreeMap building footprints</td>
 <td>&copy; OpenStreetMap contributors, &copy; OpenMapTiles,
 &copy; OpenFreeMap</td><td>ODbL</td></tr>
-<tr><td>OpenStreetMap via the Overpass API (Map Converter's
-<b>Download Buildings...</b>)</td>
-<td>&copy; OpenStreetMap contributors</td><td>ODbL</td></tr>
-<tr><td>Copernicus DEM</td><td>Contains modified Copernicus data</td>
-<td>Copernicus licence</td></tr>
-<tr><td>swissALTI3D / swissALTIRegio</td><td>&copy; swisstopo</td>
-<td>Swiss Open Government Data</td></tr>
 </table>
 <p>Further detail:
 <a href="https://github.com/tilezen/joerd/blob/master/docs/attribution.md">Mapzen
-attribution</a>, <a href="https://openfreemap.org">openfreemap.org</a>,
-<a href="https://spacedata.copernicus.eu">spacedata.copernicus.eu</a>,
-<a href="https://www.swisstopo.admin.ch">swisstopo.admin.ch</a>.</p>
-<p>Any elevation or building data you add yourself stays under whatever licence
-you obtained it under; the plugin neither adds nor removes obligations
-there.</p>
+attribution</a>, <a href="https://openfreemap.org">openfreemap.org</a>.</p>
+<p>Any elevation or building data you add yourself — a folder of national
+survey tiles, a Copernicus GeoTIFF, a WMS layer — stays under whatever licence
+you obtained it under; the plugin neither adds nor removes obligations there,
+and does not credit it for you.</p>
 """
 
 

@@ -257,7 +257,7 @@ class TestCoversTheUI:
         "Antenna Patterns", "Save As", "Angle (deg)", "Gain (0-1)",
         # Map converter
         "Layer Stack (highest priority on top)", "Rebuild existing tiles",
-        "Inspect .abt...", "Download Buildings...",
+        "Keep pool tiles", "Inspect .abt...", "Download Buildings...",
         # Settings
         "Download Binaries", "Auto-detect", "Show machine fingerprint",
         "Check for updates", "Check for engine updates when QGIS starts",

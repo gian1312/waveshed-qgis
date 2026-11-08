@@ -6,8 +6,12 @@ particular — which is not satisfied by a licence file covering the plugin's ow
 code. This module is the single place those credits live, so the UI and the
 packaged documentation cannot drift apart.
 
-Only sources the plugin can actually request are listed. Nothing here describes
-the Aether engine, which ships under its own EULA.
+Only sources the plugin itself requests are listed — the Terrarium terrain
+tiles of the live download and the OpenFreeMap building tiles. Data the user
+brings into QGIS (a swisstopo folder, a Copernicus GeoTIFF, a WMS) stays under
+the licence they obtained it under and is not credited here: the plugin never
+fetched it. Nothing here describes the Aether engine, which ships under its own
+EULA.
 """
 
 from __future__ import annotations
@@ -24,10 +28,11 @@ class DataSource(NamedTuple):
     url: str
 
 
-#: Elevation and building sources reachable from the plugin.
+#: Elevation and building sources the plugin fetches itself.
 #:
-#: Terrain entries cover the XYZ providers offered for the live download; the
-#: building entry covers :mod:`waveshed.core.openfreemap`.
+#: The terrain entry covers the XYZ provider of the live download; the
+#: building entry covers :mod:`waveshed.core.openfreemap`. Nothing else: a
+#: dataset the user adds in QGIS is theirs to credit.
 DATA_SOURCES: List[DataSource] = [
     DataSource(
         name="Mapzen / Terrarium terrain tiles",
@@ -45,18 +50,6 @@ DATA_SOURCES: List[DataSource] = [
         ),
         licence="ODbL",
         url="https://openfreemap.org",
-    ),
-    DataSource(
-        name="Copernicus DEM",
-        credit="Contains modified Copernicus data",
-        licence="Copernicus licence",
-        url="https://spacedata.copernicus.eu",
-    ),
-    DataSource(
-        name="swissALTI3D / swissALTIRegio",
-        credit="© swisstopo",
-        licence="Swiss Open Government Data",
-        url="https://www.swisstopo.admin.ch",
     ),
 ]
 

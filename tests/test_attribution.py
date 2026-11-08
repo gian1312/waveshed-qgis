@@ -39,8 +39,16 @@ class TestDataSources(unittest.TestCase):
         names = " ".join(s.name for s in DATA_SOURCES).lower()
         self.assertIn("terrarium", names)     # live elevation download
         self.assertIn("openfreemap", names)   # buildings
-        self.assertIn("copernicus", names)
-        self.assertIn("swissalti", names)
+
+    def test_only_what_the_plugin_fetches_itself(self):
+        # Exactly the two datasets the plugin downloads on the user's behalf.
+        # Data the user brings into QGIS (a swisstopo folder, a Copernicus
+        # GeoTIFF) is theirs to credit — the plugin never requested it, and
+        # listing it here would credit a dataset most runs never touch.
+        self.assertEqual(len(DATA_SOURCES), 2)
+        text = attribution_text().lower()
+        for user_supplied in ("swisstopo", "swissalti", "copernicus"):
+            self.assertNotIn(user_supplied, text)
 
     def test_no_source_we_do_not_actually_fetch(self):
         # The web app credits Microsoft Global ML Building Footprints while

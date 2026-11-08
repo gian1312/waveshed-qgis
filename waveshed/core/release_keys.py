@@ -26,6 +26,8 @@ be installed. ``package.py --release`` refuses to build a public ZIP in that
 state.
 """
 
+from __future__ import annotations
+
 MANIFEST_PUBLIC_KEYS: tuple[str, ...] = (
     "e83d72d8ca4437e58078ab2db42abaa38309ba00712038effff7432560bc6cb8",
 )

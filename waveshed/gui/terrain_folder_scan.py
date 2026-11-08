@@ -6,19 +6,28 @@ Shared by Site Analysis (Run) and the Map Converter (Add Folder / Convert):
   :class:`FolderScanThread` while a progress dialog keeps the GUI live, and
   can run more work on the index in that same thread (the coverage check) —
   nothing that opens files ever runs on the GUI thread (2,500 files took
-  84 s of frozen UI through the old BuildVRT check).
+  84 s of frozen UI through the old BuildVRT check). On Windows, when the
+  bulk read of a cold scan starts (:data:`COLD_SCAN_NOTE_MIN_FILES` or more
+  files), the dialog adds ONE note — :data:`COLD_SCAN_NOTE`, Defender and
+  the exclusions the user may set — logged once per folder. Nothing here
+  queries or changes Windows Defender; off Windows there is no note at all.
 * :func:`confirm_problem_files` is the ONE pre-flight prompt: every file
   that cannot be used, with its reason, "Skip N unusable files and
   continue?", default Cancel. Skipped files are logged.
 * :func:`ask_crs_for_files` (Map Converter) — CRS-less files never inherit
   another file's CRS silently; the user assigns one (the folder's detected
   CRS offered as the suggestion), per file or for all, or skips them.
+* :func:`run_task` runs other folder work the same way — its own
+  :class:`TaskThread` behind the same cancellable progress dialog (the Map
+  Converter's Inspect .abt: the header index, then the mosaic).
 """
 
 from __future__ import annotations
 
+import sys
+import textwrap
 from collections import Counter
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 from qgis.PyQt.QtCore import QThread, Qt, pyqtSignal
 from qgis.PyQt.QtWidgets import QInputDialog, QMessageBox, QProgressDialog
@@ -72,8 +81,152 @@ class FolderScanThread(QThread):
             self.scan_err.emit(self.error)
 
 
+class TaskThread(QThread):
+    """Run *work(progress, should_cancel)* off the GUI thread — the scan's
+    machinery for other folder work. *progress(done, total, text)* drives
+    the dialog; *should_cancel()* is True once Cancel was pressed. The
+    result is :attr:`result`; a failure's text :attr:`error`."""
+
+    progress = pyqtSignal(int, int, str)
+
+    def __init__(self, work: Callable[[Callable[[int, int, str], Any],
+                                       Callable[[], bool]], Any],
+                 parent: Any = None) -> None:
+        super().__init__(parent)
+        self._work = work
+        self._cancel = False
+        self.result: Any = None
+        self.error: Optional[str] = None
+
+    def cancel(self) -> None:
+        self._cancel = True
+
+    def cancelled(self) -> bool:
+        return self._cancel
+
+    def run(self) -> None:  # noqa: D401 — Qt override
+        try:
+            self.result = self._work(self.progress.emit, self.cancelled)
+        except Exception as exc:  # noqa: BLE001 — reported to the caller
+            self.error = str(exc) or type(exc).__name__
+
+
+def _progress_dialog(parent: Any, title: str) -> Any:
+    """The cancellable, window-modal progress dialog of a folder task
+    (shown after 0.5 s; closed by the caller)."""
+    dlg = QProgressDialog(f"{title}…", "Cancel", 0, 0, parent)
+    dlg.setWindowTitle("Waveshed")
+    dlg.setWindowModality(Qt.WindowModality.WindowModal)
+    dlg.setMinimumDuration(500)
+    dlg.setAutoClose(False)
+    dlg.setAutoReset(False)
+    return dlg
+
+
+def _run_behind(thread: Any, dlg: Any) -> None:
+    """Start *thread* and keep the GUI live (a local event loop) until it
+    has finished; Cancel on *dlg* asks the thread to stop."""
+    from qgis.PyQt.QtCore import QEventLoop
+
+    loop = QEventLoop()
+    thread.finished.connect(loop.quit)
+    dlg.canceled.connect(thread.cancel)
+    thread.start()
+    if thread.isRunning():
+        loop.exec()
+    thread.wait()
+    dlg.close()
+
+
+def run_task(parent: Any, title: str,
+             work: Callable[[Callable[[int, int, str], Any],
+                             Callable[[], bool]], Any]) -> Any:
+    """Run *work(progress, should_cancel)* in a :class:`TaskThread` behind
+    the cancellable progress dialog (*title*; ``progress(done, total,
+    text)`` sets ``text: done / total`` under it, a busy bar while *total*
+    is 0). Returns what *work* returned — None when it stopped for Cancel —
+    and raises a failure as RuntimeError, like :func:`scan_folder`."""
+    thread = TaskThread(work, parent)
+    dlg = _progress_dialog(parent, title)
+
+    def on_progress(done: int, total: int, text: str) -> None:
+        dlg.setLabelText(f"{title}…\n{text}"
+                         + (f": {done:,} / {total:,}" if total else ""))
+        dlg.setMaximum(max(total, 0))
+        dlg.setValue(min(done, total) if total else 0)
+
+    thread.progress.connect(on_progress)
+    _run_behind(thread, dlg)
+    if thread.error is not None:
+        raise RuntimeError(thread.error)
+    return thread.result
+
+
 _PHASES = {"listing": "Listing files", "checking": "Checking for changes",
-           "reading": "Reading new or changed files", "done": "Done"}
+           "reading": "Reading new or changed files",
+           "indexing": "Building the index", "done": "Done"}
+
+# ---------------------------------------------------------------------------
+# The cold-scan note (Windows only). Real-time protection scans every file
+# the first time it is opened: 2-5 ms per file on a typical laptop, ~86 ms
+# measured on the owner's machine (58 s of a 60 s cold scan of 43,650
+# files). The plugin only SAYS so, in the progress dialog of the bulk read —
+# it never queries or changes Defender (owner decision 2026-10-23: the
+# exclusion offer, its status queries and its administrator prompt are gone).
+# ---------------------------------------------------------------------------
+
+#: A bulk read ("reading" phase of a refresh: the converter probe's list or
+#: the in-process probes) of at least this many files gets the note. At the
+#: typical 2-5 ms Defender adds per first open that is 2-5 s of the scan
+#: (~86 s on the owner's machine) — below it the dialog is gone before the
+#: note could be read.
+COLD_SCAN_NOTE_MIN_FILES = 1000
+
+#: The note: one line of the dialog (wrapped there) and of the log.
+COLD_SCAN_NOTE = (
+    "Windows Defender scans every file on first open. For large folders, "
+    "exclude this folder and the Waveshed terrain cache from real-time "
+    "scanning (Windows Security → Virus & threat protection → "
+    "Exclusions).")
+
+#: Width the note is wrapped to in the progress dialog (one unwrapped line
+#: would stretch it across the screen).
+_NOTE_WIDTH = 72
+
+#: ``terrain_index.folder_key`` of every folder whose note was logged in
+#: this session (logged once per folder).
+_NOTE_LOGGED: Set[str] = set()
+
+
+def _is_windows() -> bool:
+    """The note's one gate: ``sys.platform`` (as
+    ``terrain_adapter._is_windows``)."""
+    return sys.platform == "win32"
+
+
+def cold_scan_note(total: int, phase: str) -> str:
+    """:data:`COLD_SCAN_NOTE` for a progress tick that starts (or continues)
+    the bulk read — *phase* "reading" — of *total* >=
+    :data:`COLD_SCAN_NOTE_MIN_FILES` files on Windows; "" otherwise (always
+    "" off Windows)."""
+    if (not _is_windows() or phase != "reading"
+            or total < COLD_SCAN_NOTE_MIN_FILES):
+        return ""
+    return COLD_SCAN_NOTE
+
+
+def _log_cold_scan_note(folder: str) -> None:
+    """The note in the log, once per folder per session (Info)."""
+    key = terrain_index.folder_key(folder)
+    if key in _NOTE_LOGGED:
+        return
+    _NOTE_LOGGED.add(key)
+    try:
+        from ..core.terrain_adapter import get_cache_dir
+        cache = f"; terrain cache: {get_cache_dir()}"
+    except Exception:  # noqa: BLE001 — the note goes out without the path
+        cache = ""
+    _log(f"{COLD_SCAN_NOTE} (folder: {folder}{cache})")
 
 
 def scan_folder(parent: Any, folder: str,
@@ -85,41 +238,45 @@ def scan_folder(parent: Any, folder: str,
     Returns ``{"index", "stats", "extra"}`` (``extra`` = *after(index)*,
     computed in the worker thread too), or None when the user cancelled.
     A failure is raised as RuntimeError. *refresh* False runs only *after*
-    (e.g. the coverage check right after a scan).
+    (e.g. the coverage check right after a scan). On Windows the dialog
+    carries :data:`COLD_SCAN_NOTE` from the first tick of a bulk read of
+    :data:`COLD_SCAN_NOTE_MIN_FILES` or more files to the end of the scan
+    (:func:`cold_scan_note`).
     """
-    from qgis.PyQt.QtCore import QEventLoop
-
     thread = FolderScanThread(folder, after, parent, refresh=refresh)
-    dlg = QProgressDialog(f"{title}…", "Cancel", 0, 0, parent)
-    dlg.setWindowTitle("Waveshed")
-    dlg.setWindowModality(Qt.WindowModality.WindowModal)
-    dlg.setMinimumDuration(500)
-    dlg.setAutoClose(False)
-    dlg.setAutoReset(False)
+    dlg = _progress_dialog(parent, title)
+    note = ""
 
     def on_progress(done: int, total: int, phase: str) -> None:
+        nonlocal note
+        if not note:
+            note = cold_scan_note(total, phase)
+            if note:
+                _log_cold_scan_note(folder)
         dlg.setLabelText(f"{title}…\n{_PHASES.get(phase, phase)}"
-                         + (f": {done:,} / {total:,}" if total else ""))
+                         + (f": {done:,} / {total:,}" if total else "")
+                         + (f"\n\n{textwrap.fill(note, _NOTE_WIDTH)}"
+                            if note else ""))
         dlg.setMaximum(max(total, 0))
         dlg.setValue(min(done, total) if total else 0)
 
-    loop = QEventLoop()
     thread.progress.connect(on_progress)
-    thread.finished.connect(loop.quit)
-    dlg.canceled.connect(thread.cancel)
-    thread.start()
-    if thread.isRunning():
-        loop.exec()
-    thread.wait()
-    dlg.close()
+    _run_behind(thread, dlg)
     if thread.error is not None:
         raise RuntimeError(thread.error)
     result = thread.result
+    # The finished thread lives on under its Qt parent: it must not keep
+    # what *after* returned (Site Analysis: the run's TerrainPrep, ~27 MB
+    # for 43,650 files) beyond this call.
+    thread.result = None
+    thread._after = None
     if result is not None and result["stats"] is not None:
         st = result["stats"]
         _log(f"terrain folder index {folder}: {st.files} file(s) — {st.new} "
              f"new, {st.changed} changed, {st.removed} removed, "
-             f"{st.unchanged} unchanged; {st.total_s:.1f}s")
+             f"{st.unchanged} unchanged; {st.total_s:.1f}s"
+             + (" (headers read by aether_converter probe)"
+                if getattr(st, "probe_engine", "") == "converter" else ""))
     return result
 
 

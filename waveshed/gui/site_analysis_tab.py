@@ -14,11 +14,10 @@ from __future__ import annotations
 
 import dataclasses
 import os
-import platform
 import re
 import subprocess
 from datetime import datetime
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from qgis.PyQt.QtCore import QThread, pyqtSignal, Qt
 from qgis.PyQt.QtWidgets import (
@@ -61,12 +60,12 @@ from ..core.asset_manager import compute_erp, list_assets, load_asset
 from ..core.attribution import source_credit
 from ..core.binary_manager import engine_error_hint, find_binary
 from ..core import api_key
+from ..core import engine_log
 from ..core import terrain_adapter
 
 # Hide console windows on Windows.
-_SUBPROCESS_FLAGS = (
-    subprocess.CREATE_NO_WINDOW if platform.system() == "Windows" else 0
-)
+#: The engine launch flags (no console window on Windows), one definition.
+_SUBPROCESS_FLAGS = terrain_adapter._SUBPROCESS_FLAGS
 from ..core.job_builder import (
     INVALID,
     MIN_ANTENNA_AGL_M,
@@ -79,6 +78,7 @@ from ..core.job_builder import (
     write_job_file,
 )
 from ..core.layer_utils import dem_layer_warning, hide_from_dem_picker
+from ..core import output_estimate
 from ..core.output_estimate import output_space_problem
 from ..core.result_loader import (
     GROUP_COVERAGE,
@@ -87,21 +87,29 @@ from ..core.result_loader import (
 )
 from ..core.binary_manager import binaries_warning
 from ..core.terrain_adapter import (
+    XYZ_CACHE_DIRNAME,
+    TerrainPrep,
     analysis_bbox,
+    build_terrain_prep,
     buildings_identity,
+    get_cache_dir,
     get_source_resolution_info,
     is_abt_tile_dir,
     prepare_terrain,
     prepare_terrain_profile,
+    prepared_buildings,
     reset_terrain_warnings,
+    run_region_union,
     select_abt_tiles,
     terrain_coverage_warning,
     terrain_plan,
     terrain_plan_profile,
     terrain_size_warning,
 )
+from ..core import abt_index
 from ..core import range_profile as rp
 from ..core import terrain_index
+from . import terrain_dirs
 from . import terrain_folder_scan
 from .engine_notices import show_run_error
 from .height_inputs import MIN_AMSL_M, bind_height_mode
@@ -111,19 +119,252 @@ from .range_profile_dialog import RangeProfileDialog
 
 TAG = "Waveshed"
 
+#: Prepared folders whose "carries buildings although unticked" notice was
+#: shown this session (normalised paths).
+_BUILDINGS_NOTICE_FOLDERS: set = set()
+
+#: The status tip / message-bar hint of "Include buildings" on a prepared
+#: .abt folder.
+_PREPARED_BUILDINGS_HINT = (
+    "The terrain is a prepared .abt folder: buildings are baked into its "
+    "tiles when the Map Converter builds them — 'Include buildings' cannot "
+    "add or remove them here.")
+
 
 def _log_terrain_plan(cached: int, missing: int, download_mb: int,
-                      cached_mb: int) -> None:
+                      cached_mb: int, partial: int = 0,
+                      build_deg2: float = 0.0, tile_deg2: float = 0.0,
+                      source_files: Optional[int] = None,
+                      source_mb: Optional[int] = None,
+                      raw_mb: int = 0, buildings_mb: int = 0) -> None:
     """Record what the run will reuse vs build, before it starts.
 
     Without this the log jumps straight to per-tile work and there is no way
     to tell a cache that is working from one that is silently rebuilding.
+    A file source builds only the region of a tile a site needs (a partial
+    pool tile): *partial* of the *missing* tiles are such builds, reading
+    *build_deg2* of their *tile_deg2* deg²; *source_files* / *source_mb* (when
+    the folder index priced them) are the files those regions read.
+    *raw_mb*: the most the XYZ download adds to the raw source-tile cache;
+    *buildings_mb*: the most the OpenFreeMap building tiles of those builds
+    add to the building store.
     """
-    QgsMessageLog.logMessage(
-        f"terrain plan: {cached + missing} tile(s) needed — {cached} pooled "
-        f"(~{cached_mb} MB reused), {missing} to build (~{download_mb} MB)",
-        TAG, Qgis.MessageLevel.Info,
-    )
+    msg = (f"terrain plan: {cached + missing} tile(s) needed — {cached} pooled "
+           f"(~{cached_mb} MB reused), {missing} to build (~{download_mb} MB)")
+    if raw_mb:
+        msg += f" + up to ~{raw_mb} MB of downloaded source tiles cached"
+    if buildings_mb:
+        msg += f" + up to ~{buildings_mb} MB of building tiles"
+    if partial:
+        msg += (f"; {partial} of them partial — {build_deg2:.3f} deg² to "
+                f"build of {tile_deg2:.3f} deg² of tiles")
+    if source_files is not None:
+        msg += (f"; reading {source_files} source file(s), "
+                f"~{source_mb or 0} MB")
+    QgsMessageLog.logMessage(msg, TAG, Qgis.MessageLevel.Info)
+
+def _plan_jobs(unique: List[CoverageParams], plan_source: str,
+               plan_buildings: Optional[str],
+               region_union: Dict[str, List[Dict[str, float]]],
+               source_infos: Any = None) -> Dict[str, Any]:
+    """The pre-run terrain estimate over a run's distinct jobs, priced as
+    the worker will build them: per tile the job's region (a file source
+    builds only that part of a pool tile) together with the run's
+    *region_union*. *source_infos* (the folder index — never read on the GUI
+    thread) also checks fingerprints and prices the files the regions read
+    (``terrain_adapter.terrain_plan``)."""
+    out: Dict[str, Any] = {
+        "download_mb": 0, "raw_mb": 0, "buildings_mb": 0, "cached_mb": 0,
+        "tiles_cached": 0, "tiles_missing": 0, "tiles_partial": 0,
+        "build_deg2": 0.0, "tile_deg2": 0.0, "source_files": None,
+        "source_mb": None}
+    for params in unique:
+        if params.range_profile:
+            plan = terrain_plan_profile(
+                plan_source, params.tx_lat, params.tx_lon,
+                params.range_profile, params.az_start, params.az_end,
+                plan_buildings,
+                band_buildings=params.range_profile_buildings,
+                output_res_m=params.resolution_m,
+                source_infos=source_infos,
+                region_union=region_union,
+            )
+        else:
+            plan = terrain_plan(
+                plan_source, params.tx_lat, params.tx_lon,
+                params.max_range_km, params.resolution_m,
+                params.az_start, params.az_end,
+                plan_buildings if all(params.range_profile_buildings or [True])
+                else None,
+                source_infos=source_infos,
+                region_union=region_union,
+            )
+        out["download_mb"] += plan["download_mb"]
+        out["raw_mb"] += plan.get("raw_mb", 0)
+        out["buildings_mb"] += plan.get("buildings_mb", 0)
+        out["cached_mb"] += plan["total_mb"] - plan["download_mb"]
+        for k in ("tiles_cached", "tiles_missing", "tiles_partial",
+                  "build_deg2", "tile_deg2"):
+            out[k] += plan.get(k, 0)
+        for k in ("source_files", "source_mb"):
+            if plan.get(k) is not None:
+                out[k] = (out[k] or 0) + plan[k]
+    return out
+
+
+def _disk_refusal(jobs: List[Tuple[CoverageParams, str]],
+                  pool_mb: int, output_dir: str,
+                  cache_dir: Optional[str] = None,
+                  free_of: Any = None, raw_mb: int = 0,
+                  buildings_mb: int = 0) -> Optional[str]:
+    """The refusal text when a run's writes do not fit, else None: the
+    coverage rasters (``output_estimate.engine_output_bytes``) on the output
+    drive, the pool tiles :func:`terrain_adapter.terrain_plan` prices
+    (*pool_mb*, its ``download_mb``), the raw source tiles their XYZ
+    download caches (*raw_mb*, its ``raw_mb`` — "raw tiles" in
+    ``<cache>/xyz``) and the OpenFreeMap building tiles they fetch
+    (*buildings_mb*, its ``buildings_mb`` — "building tiles", an upper
+    bound) on the cache drive — summed when they share a drive, refused
+    when the need exceeds free − 2 GB (``output_estimate.drive_needs``).
+    *free_of* (tests) replaces the free-space probe."""
+    rasters = [(name, p.model, p.max_range_km, p.resolution_m, p.az_start,
+                p.az_end) for p, name in jobs]
+    raster_bytes = sum(output_estimate.engine_output_bytes(*r[1:])
+                       for r in rasters)
+    cache_root = cache_dir or get_cache_dir()
+    items = [("coverage rasters", output_dir, raster_bytes),
+             ("terrain pool", cache_root,
+              max(0, int(pool_mb)) * 1024 * 1024)]
+    if int(raw_mb or 0) > 0:
+        items.append(("raw tiles",
+                      os.path.join(cache_root, XYZ_CACHE_DIRNAME),
+                      int(raw_mb) * 1024 * 1024))
+    if int(buildings_mb or 0) > 0:
+        # THE building store lives in the cache's pool directory.
+        items.append(("building tiles", cache_root,
+                      int(buildings_mb) * 1024 * 1024))
+    kw = {"free_of": free_of} if free_of is not None else {}
+    needs = output_estimate.drive_needs(items, **kw)
+    short = output_estimate.short_drives(needs)
+    if not short:
+        return None
+    text = output_estimate.refusal_text(short, "this analysis")
+    out_drive = needs[0]
+    if out_drive in short and rasters and out_drive.free is not None:
+        # The raster is usually what does not fit: name a resolution that
+        # would (the biggest job at a coarser pixel, the rest unchanged).
+        sizes = [(output_estimate.engine_output_bytes(*r[1:]), r)
+                 for r in rasters]
+        biggest, (label, model, rng, res, a0, a1) = max(sizes,
+                                                        key=lambda x: x[0])
+        budget = (out_drive.free - output_estimate.DISK_RESERVE_BYTES
+                  - (out_drive.need - biggest))
+        fit = output_estimate.coarsest_fitting_resolution(
+            model, rng, budget, VALID_RESOLUTIONS, a0, a1)
+        if fit is not None and fit != res:
+            text += (f"\n\nAt {rng:g} km, {fit} m pixels would fit for "
+                     f"{label}.")
+    return text
+
+
+#: ``_plan_jobs``' totals for a pre-built ``.abt`` folder: nothing to build.
+_PREBUILT_TOTALS: Dict[str, Any] = {
+    "download_mb": 0, "raw_mb": 0, "buildings_mb": 0, "cached_mb": 0,
+    "tiles_cached": 0, "tiles_missing": 0, "tiles_partial": 0,
+    "build_deg2": 0.0, "tile_deg2": 0.0, "source_files": None,
+    "source_mb": None}
+
+
+def _abt_job_selections(terrain_dir: str,
+                        unique: List[CoverageParams]) -> List[Any]:
+    """Each distinct job's pre-built tile selection, with the bands the
+    worker's terrain step passes (``select_abt_tiles`` is memoised, so the
+    worker reuses these). Off the GUI thread."""
+    out = []
+    for p in unique:
+        bands = p.range_profile or [(p.max_range_km * 1000.0, p.resolution_m)]
+        out.append(select_abt_tiles(terrain_dir, p.tx_lat, p.tx_lon,
+                                    list(bands), p.az_start, p.az_end))
+    return out
+
+
+def _prebuilt_checks(terrain_dir: str, unique: List[CoverageParams],
+                     ) -> Tuple[Optional[List[Any]], List[str], Any]:
+    """A pre-built ``.abt`` folder's part of :func:`_terrain_dir_checks`:
+    ``(every job's tile selection or None, substitution lines, buildings of
+    the chosen tiles or None)`` — each step logged and skipped on failure
+    (a pre-check never blocks a run)."""
+    sels: Optional[List[Any]] = None
+    subs: List[str] = []
+    bstate = None
+    try:
+        sels = _abt_job_selections(terrain_dir, unique)
+    except Exception as exc:  # noqa: BLE001 — a pre-check never blocks
+        QgsMessageLog.logMessage(
+            f"pre-built terrain selection skipped: {exc}", TAG,
+            Qgis.MessageLevel.Warning)
+    for sel in sels or ():
+        subs.extend(x for x in sel.substitutions if x not in subs)
+    if sels is not None:
+        try:
+            bstate = prepared_buildings(
+                terrain_dir, [pth for sel in sels for pth in sel.paths])
+        except Exception as exc:  # noqa: BLE001 — never blocks a run
+            QgsMessageLog.logMessage(
+                f"pre-built terrain buildings check skipped: {exc}", TAG,
+                Qgis.MessageLevel.Warning)
+    return sels, subs, bstate
+
+
+def _terrain_dir_checks(terrain_dir: str, union: Dict[str, float],
+                        res_m: Optional[float],
+                        unique: List[CoverageParams], prebuilt: bool,
+                        plan_source: str, plan_buildings: Optional[str],
+                        region_union: Dict[str, List[Dict[str, float]]],
+                        ) -> Tuple[Optional[str], Optional[Dict[str, Any]],
+                                   List[str], Any, Optional[TerrainPrep]]:
+    """The terrain-folder pre-check, in the coverage check's worker thread:
+    ``(coverage warning, priced totals or None, substitution lines,
+    buildings of the chosen tiles or None, the run's TerrainPrep or None)``.
+
+    Raster folder: the run's ONE preparation of the folder
+    (``terrain_adapter.build_terrain_prep``: the source infos in overlap
+    order and one FootprintIndex, over the index check the Run click just
+    made), from which the coverage warning and the totals are computed —
+    and which the worker's terrain step uses instead of reading the folder
+    again. None when the folder cannot be read so (no usable file, an
+    unanswered problem file): the coverage check reads the index on its
+    own, an estimate never blocks a run, and the worker's own read says
+    what is wrong. Pre-built ``.abt`` folder: every
+    job's tile selection (headers through the folder's header index — the
+    GUI thread never opens a tile), whose uncovered cells the coverage
+    warning names and whose coarser-than-needed substitutions the GUI asks
+    about, and what the Map Converter recorded about the buildings of
+    exactly those tiles (``terrain_adapter.prepared_buildings`` — the
+    buildings dialogs)."""
+    sels: Optional[List[Any]] = None
+    subs: List[str] = []
+    bstate = None
+    prep: Optional[TerrainPrep] = None
+    if prebuilt:
+        sels, subs, bstate = _prebuilt_checks(terrain_dir, unique)
+    else:
+        try:
+            prep = build_terrain_prep(terrain_dir)
+        except Exception:  # noqa: BLE001 — a pre-check never blocks a run
+            prep = None
+    # Buildings of a pre-built folder are the buildings dialogs' business
+    # (they read what the tiles carry); the coverage warning stays coverage.
+    cov = terrain_coverage_warning(
+        terrain_dir, union, resolution_m=res_m, abt_selections=sels,
+        infos=prep.infos if prep is not None else None)
+    priced = None
+    if prep is not None:
+        priced = _plan_jobs(unique, plan_source, plan_buildings, region_union,
+                            (prep.infos, False, prep.index))
+        prep.coverage, prep.plan = cov, priced
+    return cov, priced, subs, bstate, prep
+
 
 # Column definitions -- identical for both LOS and LOSS modes.
 # Freq / ERP come from the selected asset, not from separate table columns.
@@ -173,17 +414,11 @@ _ALT_COLUMNS = ["Altitude (m)", "Reference"]
 # ---------------------------------------------------------------------------
 
 def _kill_proc(proc: subprocess.Popen) -> None:
-    """Kill a subprocess and all its children (Windows-safe)."""
-    if proc.poll() is not None:
-        return
-    if platform.system() == "Windows":
-        subprocess.run(
-            ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
-            capture_output=True,
-            creationflags=_SUBPROCESS_FLAGS,
-        )
-    else:
-        proc.terminate()
+    """Stop's kill, on the GUI thread — never blocks:
+    ``terrain_adapter.kill_engine_process`` (POSIX SIGTERM; Windows
+    TerminateProcess on the handle + a fire-and-forget ``taskkill /T`` for
+    children)."""
+    terrain_adapter.kill_engine_process(proc)
 
 
 class _SiteAnalysisWorker(QThread):
@@ -202,6 +437,7 @@ class _SiteAnalysisWorker(QThread):
         terrain_dir: str = "",
         parent: Optional[QWidget] = None,
         osm_buildings: bool = False,
+        terrain_prep: Optional[TerrainPrep] = None,
     ) -> None:
         super().__init__(parent)
         self.jobs = jobs
@@ -209,6 +445,10 @@ class _SiteAnalysisWorker(QThread):
         self.output_dir = output_dir
         self.terrain_dir = terrain_dir
         self.osm_buildings = osm_buildings
+        #: The run's preparation of *terrain_dir* (``_terrain_dir_checks``),
+        #: shared by every job while it is current — None: each job reads
+        #: the folder itself (as the torture runner's worker does).
+        self.terrain_prep = terrain_prep
         self._canceled = False
         self._proc: Optional[subprocess.Popen] = None
 
@@ -216,6 +456,17 @@ class _SiteAnalysisWorker(QThread):
         self._canceled = True
         if self._proc is not None:
             _kill_proc(self._proc)
+
+    def _register_proc(self, proc: subprocess.Popen) -> None:
+        """Terrain on_start hook: expose each engine process to cancel().
+
+        A cancel() that landed after the last poll but before this launch
+        found no process to kill, so the process is killed here instead —
+        otherwise it would run to the end behind a pressed Stop.
+        """
+        self._proc = proc
+        if self._canceled:
+            _kill_proc(proc)
 
     def _parse_wedge_progress(self, line: str) -> Optional[int]:
         """Extract percentage from lines like ``Wedge 120/360``."""
@@ -247,6 +498,20 @@ class _SiteAnalysisWorker(QThread):
                                          for p, _ in self.jobs}):
                 _bm.check_engine_for_job(res, range_profile=profiled)
 
+            # Once per run: QGIS's own resident memory, beside the
+            # converters' peak lines (owner's run 2026-11-07: 31 GB, the
+            # converters ~3 GB each, ~20 GB attributed to nothing).
+            from ..core import process_memory
+            mem_line = process_memory.memory_line()
+            if mem_line:
+                QgsMessageLog.logMessage(mem_line, TAG, Qgis.MessageLevel.Info)
+
+            # The jobs are prepared one after the other, but a tile several
+            # of them share must be built ONCE, for all of them: every
+            # region each job needs, per tile (file sources build only those
+            # regions — terrain_adapter.resolve_pool_tile).
+            region_union = run_region_union([p for p, _ in self.jobs])
+
             for job_idx, (params, display_name) in enumerate(self.jobs):
                 if self._canceled:
                     return
@@ -265,37 +530,56 @@ class _SiteAnalysisWorker(QThread):
                 self.progress.emit(_job_progress(5))
 
                 from ..core import binary_manager as bm
-                if params.range_profile:
-                    # Adaptive / custom: each band's tiles at its own step.
-                    abt_dir = prepare_terrain_profile(
-                        dem_layer=self.dem_layer,
-                        tx_lat=params.tx_lat,
-                        tx_lon=params.tx_lon,
-                        bands=params.range_profile,
-                        binary_manager=bm,
-                        terrain_dir=self.terrain_dir or None,
-                        az_start=params.az_start,
-                        az_end=params.az_end,
-                        osm_buildings=self.osm_buildings,
-                        band_buildings=params.range_profile_buildings,
-                        buildings_notes=params.range_profile_buildings_notes,
-                    )
-                else:
-                    abt_dir = prepare_terrain(
-                        dem_layer=self.dem_layer,
-                        tx_lat=params.tx_lat,
-                        tx_lon=params.tx_lon,
-                        max_range_km=params.max_range_km,
-                        resolution_m=params.resolution_m,
-                        binary_manager=bm,
-                        terrain_dir=self.terrain_dir or None,
-                        az_start=params.az_start,
-                        az_end=params.az_end,
-                        # A Custom site whose range ends inside the first band
-                        # carries that band's flag (_build_jobs).
-                        osm_buildings=self.osm_buildings and all(
-                            params.range_profile_buildings or [True]),
-                    )
+                # Stop must reach the terrain step: the flag is polled per
+                # tile / band / output line, and every engine process it
+                # starts (download, ingest) is handed to cancel() to kill —
+                # the ingest prints progress only every 10 tiles.
+                try:
+                    if params.range_profile:
+                        # Adaptive / custom: each band's tiles at its own step.
+                        abt_dir = prepare_terrain_profile(
+                            dem_layer=self.dem_layer,
+                            tx_lat=params.tx_lat,
+                            tx_lon=params.tx_lon,
+                            bands=params.range_profile,
+                            binary_manager=bm,
+                            terrain_dir=self.terrain_dir or None,
+                            az_start=params.az_start,
+                            az_end=params.az_end,
+                            osm_buildings=self.osm_buildings,
+                            band_buildings=params.range_profile_buildings,
+                            buildings_notes=(
+                                params.range_profile_buildings_notes),
+                            should_cancel=lambda: self._canceled,
+                            on_start=self._register_proc,
+                            output_res_m=params.resolution_m,
+                            region_union=region_union,
+                            terrain_prep=self.terrain_prep,
+                        )
+                    else:
+                        abt_dir = prepare_terrain(
+                            dem_layer=self.dem_layer,
+                            tx_lat=params.tx_lat,
+                            tx_lon=params.tx_lon,
+                            max_range_km=params.max_range_km,
+                            resolution_m=params.resolution_m,
+                            binary_manager=bm,
+                            terrain_dir=self.terrain_dir or None,
+                            az_start=params.az_start,
+                            az_end=params.az_end,
+                            # A Custom site whose range ends inside the first
+                            # band carries that band's flag (_build_jobs).
+                            osm_buildings=self.osm_buildings and all(
+                                params.range_profile_buildings or [True]),
+                            should_cancel=lambda: self._canceled,
+                            on_start=self._register_proc,
+                            region_union=region_union,
+                            terrain_prep=self.terrain_prep,
+                        )
+                except terrain_adapter.ConverterCancelled:
+                    return
+                finally:
+                    self._proc = None
 
                 if self._canceled:
                     return
@@ -327,8 +611,16 @@ class _SiteAnalysisWorker(QThread):
                 api_key.apply_license_env(env)
 
                 # Streams through the one shared subprocess runner
-                # (terrain_adapter.run_converter_streaming).
+                # (terrain_adapter.run_converter_streaming). Every line of
+                # aether_core's console goes to today's engine log file; the
+                # QGIS Log Messages panel (AETHER tag) gets the ones a user
+                # reads — engine_log.is_diagnostic keeps the solver dump, the
+                # polar sample and the profiling table out of it.
                 stderr_lines: list[str] = []
+                elog = engine_log.EngineLog(
+                    display_name,
+                    lambda text: QgsMessageLog.logMessage(
+                        text, TAG, Qgis.MessageLevel.Info))
 
                 def on_start(proc) -> None:
                     self._proc = proc  # expose for kill
@@ -337,10 +629,7 @@ class _SiteAnalysisWorker(QThread):
                     if self._canceled:
                         raise terrain_adapter.ConverterCancelled()
                     stderr_lines.append(line)
-                    # Surface aether_core's own log (it writes its [Core]
-                    # tile-grid / bounds diagnostics to stdout) in the QGIS
-                    # Log Messages panel under the AETHER tag.
-                    QgsMessageLog.logMessage(line, TAG, Qgis.MessageLevel.Info)
+                    elog.line(line)
                     pct = self._parse_wedge_progress(line)
                     if pct is not None:
                         self.progress.emit(_job_progress(20 + int(pct * 0.6)))
@@ -353,6 +642,7 @@ class _SiteAnalysisWorker(QThread):
                     return
                 finally:
                     self._proc = None
+                    elog.close()
                 if self._canceled:
                     # cancel() killed the process directly — rc is the kill
                     # signal, not an engine failure. End quietly.
@@ -423,6 +713,10 @@ class _SiteAnalysisWorker(QThread):
 
         except Exception as exc:
             self.finished_err.emit(str(exc))
+        finally:
+            # However the run ends: the finished worker stays on the tab,
+            # its terrain preparation (~27 MB for 43,650 files) does not.
+            self.terrain_prep = None
 
 
 # ---------------------------------------------------------------------------
@@ -675,10 +969,15 @@ class SiteAnalysisTab(QWidget):
         group = QGroupBox("Analysis Parameters")
         layout = QFormLayout(group)
 
-        # DEM Layer
+        # DEM Layer, with "Folder…" to pick a local terrain folder.
+        dem_row = QHBoxLayout()
         self.combo_dem = QComboBox()
         self.combo_dem.currentIndexChanged.connect(self._on_dem_changed)
-        layout.addRow("DEM Layer:", self.combo_dem)
+        dem_row.addWidget(self.combo_dem, stretch=1)
+        self.btn_dem_folder = QPushButton(terrain_dirs.FOLDER_BUTTON_TEXT)
+        self.btn_dem_folder.setToolTip(terrain_dirs.FOLDER_BUTTON_TOOLTIP)
+        dem_row.addWidget(self.btn_dem_folder)
+        layout.addRow("DEM Layer:", dem_row)
 
         # Source info (read-only)
         self.lbl_dem_info = QLabel("")
@@ -761,7 +1060,12 @@ class SiteAnalysisTab(QWidget):
             "Download OpenStreetMap building footprints and treat them as part "
             "of the terrain.\n\n"
             "Buildings are only published at zoom 14, so this adds a sizeable "
-            "download and is limited to smaller analysis areas.\n\n"
+            "download — the buildings of every terrain tile the run builds, "
+            "fetched once and reused. If they cannot all be downloaded the "
+            "run stops with the reason; it never builds terrain without "
+            "them.\n\n"
+            "A prepared .abt terrain folder keeps the buildings it was built "
+            "with: this box cannot add them there.\n\n"
             "With Adaptive / Custom resolution this is the master switch: "
             f"Adaptive skips buildings on bands of {rp.BUILDINGS_SKIP_STEP_M} m "
             "and coarser; Custom sets them per band (same default). Unchecked, "
@@ -769,7 +1073,7 @@ class SiteAnalysisTab(QWidget):
             + source_credit("OpenFreeMap")
         )
         layout.addRow("Buildings:", self.chk_buildings)
-        self.chk_buildings.toggled.connect(lambda _on: self._refresh_res_profile())
+        self.chk_buildings.toggled.connect(self._on_buildings_toggled)
 
         # Compute Backend
         self.combo_backend = QComboBox()
@@ -874,14 +1178,13 @@ class SiteAnalysisTab(QWidget):
         self.btn_add_alt.clicked.connect(self._on_add_altitude)
         self.btn_remove_alt.clicked.connect(self._on_remove_altitude)
         self.btn_browse_dir.clicked.connect(self._on_browse_dir)
+        self.btn_dem_folder.clicked.connect(self._on_pick_terrain_dir)
         self.btn_run.clicked.connect(self._on_run)
         self.btn_stop.clicked.connect(self._on_stop)
 
     # ==================================================================
     # Populate raster layers
     # ==================================================================
-
-    _LOCAL_DIR_PREFIX = "Local: "
 
     @staticmethod
     def _dem_entry_key(entry) -> str:
@@ -899,12 +1202,14 @@ class SiteAnalysisTab(QWidget):
             return self._dem_entry_key(self._dem_layers[idx])
         return None
 
-    def _populate_raster_layers(self) -> None:
-        """Fill the DEM combo with raster layers + local terrain dir from settings.
+    def _populate_raster_layers(self, select_dir: str = "") -> None:
+        """Fill the DEM combo: the local terrain folders (Settings → Local
+        terrain dir, then the folders picked with "Folder…" —
+        ``terrain_dirs.combo_folders``), then the project's raster layers.
 
         Preserves the current selection across refills so a live update (a
         layer added or removed in the project) does not reset the user's
-        choice.
+        choice; *select_dir* (a folder just picked) is selected instead.
         """
         prev_key = self._current_dem_key()
 
@@ -912,12 +1217,7 @@ class SiteAnalysisTab(QWidget):
         self.combo_dem.clear()
         self._dem_layers: list = []  # QgsRasterLayer or str (path)
 
-        # Add local terrain directory from settings (if configured).
-        from qgis.core import QgsSettings as _QS
-        terrain_dir = _QS().value("waveshed/terrain_dir", "").strip()
-        if terrain_dir and os.path.isdir(terrain_dir):
-            self.combo_dem.addItem(f"{self._LOCAL_DIR_PREFIX}{terrain_dir}")
-            self._dem_layers.append(terrain_dir)
+        terrain_dirs.add_folder_entries(self.combo_dem, self._dem_layers)
 
         for layer in QgsProject.instance().mapLayers().values():
             # Skip our own result rasters (coverage/P2P) — they are never valid
@@ -927,8 +1227,12 @@ class SiteAnalysisTab(QWidget):
                 self.combo_dem.addItem(layer.name())
                 self._dem_layers.append(layer)
 
-        # Restore the previous selection if it still exists.
-        if prev_key is not None:
+        # Select the folder just picked, else restore the previous selection
+        # if it still exists.
+        picked = terrain_dirs.folder_index(self._dem_layers, select_dir)
+        if picked >= 0:
+            self.combo_dem.setCurrentIndex(picked)
+        elif prev_key is not None:
             for i, entry in enumerate(self._dem_layers):
                 if self._dem_entry_key(entry) == prev_key:
                     self.combo_dem.setCurrentIndex(i)
@@ -939,6 +1243,15 @@ class SiteAnalysisTab(QWidget):
     def _on_project_layers_changed(self, *args) -> None:
         """Repopulate the DEM combo when project layers are added/removed."""
         self._populate_raster_layers()
+
+    def _on_pick_terrain_dir(self) -> None:
+        """"Folder…": pick a local terrain folder in the file browser. It is
+        selected at once and listed in both tabs' DEM combo from now on;
+        Cancel changes nothing."""
+        path = terrain_dirs.ask_terrain_dir(self, self._selected_terrain_dir())
+        if path:
+            self._populate_raster_layers(select_dir=path)
+            terrain_dirs.announce_pick(self._dialog, self)
 
     def _selected_dem_layer(self) -> Optional[QgsRasterLayer]:
         idx = self.combo_dem.currentIndex()
@@ -1852,12 +2165,11 @@ class SiteAnalysisTab(QWidget):
               params.az_start, params.az_end) for params, name in jobs],
             output_dir,
         )
-        # A warning, never a hard stop (owner, 2026-10-13): the estimate is an
-        # upper bound for LOS / ITM, and the user may free space meanwhile.
-        if problem and QMessageBox.warning(
-            self,
-            "Not enough disk space for the result" if blocking else "Very large result",
-            problem,
+        # A large result that fits is a question; one that does not fit is
+        # refused below, together with the terrain pool on its drive
+        # (_disk_refusal, 2026-10-21 — it used to be "Run anyway?").
+        if problem and not blocking and QMessageBox.warning(
+            self, "Very large result", problem,
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No,
         ) != QMessageBox.StandardButton.Yes:
@@ -1868,16 +2180,17 @@ class SiteAnalysisTab(QWidget):
         # so dedupe on the parameters the cache key is built from — otherwise
         # the estimate would multiply by the number of altitudes.
         seen: set = set()
-        total_mb = 0
-        cached_mb = 0
-        tiles_cached = 0
-        tiles_missing = 0
+        unique: List[CoverageParams] = []
         union: Optional[dict] = None
         # Price against the tile pool, not the whole set: terrain that is
-        # already on disk must not be announced as a download.
+        # already on disk must not be announced as a download. A file source
+        # builds only the region of a tile each site needs (partial pool
+        # tiles), for every job of the run at once — the estimate prices the
+        # same regions (run_region_union, as the worker passes it).
         plan_source = terrain_dir or (dem_layer.source() if dem_layer else "")
         plan_buildings = buildings_identity(
             osm_buildings=self.chk_buildings.isChecked())
+        region_union = run_region_union([p for p, _ in jobs])
         for params, _name in jobs:
             key = (params.tx_lat, params.tx_lon, params.max_range_km,
                    params.resolution_m, params.az_start, params.az_end,
@@ -1886,25 +2199,7 @@ class SiteAnalysisTab(QWidget):
             if key in seen:
                 continue
             seen.add(key)
-            if params.range_profile:
-                plan = terrain_plan_profile(
-                    plan_source, params.tx_lat, params.tx_lon,
-                    params.range_profile, params.az_start, params.az_end,
-                    plan_buildings,
-                    band_buildings=params.range_profile_buildings,
-                )
-            else:
-                plan = terrain_plan(
-                    plan_source, params.tx_lat, params.tx_lon,
-                    params.max_range_km, params.resolution_m,
-                    params.az_start, params.az_end,
-                    plan_buildings if all(params.range_profile_buildings or [True])
-                    else None,
-                )
-            total_mb += plan["download_mb"]
-            cached_mb += plan["total_mb"] - plan["download_mb"]
-            tiles_cached += plan["tiles_cached"]
-            tiles_missing += plan["tiles_missing"]
+            unique.append(params)
             bb = analysis_bbox(params.tx_lat, params.tx_lon,
                                params.max_range_km, params.az_start,
                                params.az_end)
@@ -1916,15 +2211,35 @@ class SiteAnalysisTab(QWidget):
                 union["east"] = max(union["east"], bb["east"])
                 union["west"] = min(union["west"], bb["west"])
 
+        # A pre-built .abt folder is asked about ONCE on the GUI thread (a
+        # memoised listing); its headers, the tile selection and the checks
+        # run in the coverage check's worker thread below — the selection is
+        # memoised, so the worker's terrain step reuses it.
+        prebuilt = bool(terrain_dir) and is_abt_tile_dir(terrain_dir)
+        if prebuilt:
+            # Used as it is — nothing to build, nothing to price.
+            abt_index.expire(terrain_dir)   # this run: one fresh look
+            totals = dict(_PREBUILT_TOTALS)
+        else:
+            totals = _plan_jobs(unique, plan_source, plan_buildings,
+                                region_union)
+
         # A local terrain directory that does not reach across the analysis
         # area is a mistake worth stopping for: it is the only source once
-        # selected, so whatever it misses is computed over 0 m sea level.
+        # selected, so whatever it misses has no terrain (a raster folder:
+        # built as 0 m sea level; a pre-built folder: NODATA to the engine).
+        abt_subs: List[str] = []
+        abt_buildings = None
+        # The run's ONE preparation of a raster folder (index check, source
+        # infos, FootprintIndex) — made by the coverage check, handed to
+        # the worker.
+        terrain_prep: Optional[TerrainPrep] = None
         if terrain_dir and union is not None:
             # A raster folder is read through its footprint index, in a
             # worker thread (it used to be opened file by file on the GUI
             # thread: 84 s frozen for 2,500 files). Files that cannot be
             # used are listed in ONE prompt — skip them, or cancel (default).
-            raster_folder = not is_abt_tile_dir(terrain_dir)
+            raster_folder = not prebuilt
             if raster_folder:
                 try:
                     scan = terrain_folder_scan.scan_folder(self, terrain_dir)
@@ -1946,19 +2261,30 @@ class SiteAnalysisTab(QWidget):
             # raised here or it becomes a silently wrong result. Off the GUI
             # thread too: per-file footprints over the whole folder.
             res_m = jobs[0][0].resolution_m if jobs else None
-            osm = self.chk_buildings.isChecked()
             try:
+                # The same worker thread prepares a raster folder ONCE for
+                # the run — source infos in overlap order + one
+                # FootprintIndex over the index check just made, priced and
+                # coverage-checked from it, then handed to the worker
+                # (TerrainPrep: no second index check, source-info build or
+                # FootprintIndex there) — or chooses every job's pre-built
+                # tiles and reads what their buildings records say (a
+                # pre-built folder); one modal progress dialog, the GUI
+                # stays live.
                 checked = terrain_folder_scan.scan_folder(
                     self, terrain_dir, refresh=False,
                     title="Checking terrain coverage",
-                    after=lambda _idx: terrain_coverage_warning(
-                        terrain_dir, union, resolution_m=res_m,
-                        osm_buildings=osm))
+                    after=lambda _idx: _terrain_dir_checks(
+                        terrain_dir, union, res_m, unique, prebuilt,
+                        plan_source, plan_buildings, region_union))
             except RuntimeError:
                 checked = {"extra": None}
             if checked is None:
                 return
-            cov = checked["extra"]
+            cov, priced, abt_subs, abt_buildings, terrain_prep = (
+                checked["extra"] or (None, None, [], None, None))
+            if priced is not None:
+                totals = priced
             if cov and QMessageBox.warning(
                 self, "Incomplete terrain coverage", cov + "\n\nRun anyway?",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
@@ -1967,16 +2293,11 @@ class SiteAnalysisTab(QWidget):
                 return
 
         # Pre-built .abt folder: the plugin chooses the tile per footprint for
-        # the step it needs (the engine never picks). Where the folder lacks
-        # that resolution, say so before running — no silent substitution.
-        if terrain_dir and is_abt_tile_dir(terrain_dir):
-            subs: List[str] = []
-            for params, _name in jobs:
-                bands = params.range_profile or [
-                    (params.max_range_km * 1000.0, params.resolution_m)]
-                sel = select_abt_tiles(terrain_dir, params.tx_lat, params.tx_lon,
-                                       list(bands), params.az_start, params.az_end)
-                subs.extend(x for x in sel.substitutions if x not in subs)
+        # the step it needs (the engine never picks). Where the folder has
+        # only a COARSER resolution than the ground needs, say so before
+        # running — no silent substitution (finer ones are only logged).
+        if prebuilt:
+            subs = list(abt_subs or [])
             if subs:
                 shown = "\n".join(f"  • {x}" for x in subs[:12])
                 more = f"\n  … and {len(subs) - 12} more" if len(subs) > 12 else ""
@@ -1991,9 +2312,40 @@ class SiteAnalysisTab(QWidget):
                     QMessageBox.StandardButton.No,
                 ) != QMessageBox.StandardButton.Yes:
                     return
+            # Buildings are baked into prepared tiles: say what the chosen
+            # tiles carry before the run (the box cannot change it).
+            if not self._confirm_prepared_buildings(terrain_dir,
+                                                    abt_buildings):
+                return
 
-        _log_terrain_plan(tiles_cached, tiles_missing, total_mb, cached_mb)
-        warn = terrain_size_warning(total_mb, cached_mb)
+        total_mb = totals["download_mb"]
+        cached_mb = totals["cached_mb"]
+        raw_mb = totals.get("raw_mb", 0)
+        buildings_mb = totals.get("buildings_mb", 0)
+        if prebuilt:
+            QgsMessageLog.logMessage(
+                "terrain plan: pre-built folder — nothing to build",
+                TAG, Qgis.MessageLevel.Info)
+        else:
+            _log_terrain_plan(totals["tiles_cached"], totals["tiles_missing"],
+                              total_mb, cached_mb, totals["tiles_partial"],
+                              totals["build_deg2"], totals["tile_deg2"],
+                              totals["source_files"], totals["source_mb"],
+                              raw_mb=raw_mb, buildings_mb=buildings_mb)
+
+        # ---- Disk: coverage rasters + pool tiles still to build + the raw
+        # source tiles an XYZ download caches, per drive (2 GB kept free) —
+        # refused instead of failing with ENOSPC hours into the run. A
+        # pre-built .abt folder adds nothing to the pool.
+        refusal = _disk_refusal(
+            jobs, 0 if prebuilt else total_mb, output_dir,
+            raw_mb=0 if prebuilt else raw_mb,
+            buildings_mb=0 if prebuilt else buildings_mb)
+        if refusal:
+            QgsMessageLog.logMessage(refusal, TAG, Qgis.MessageLevel.Warning)
+            QMessageBox.critical(self, "Not enough disk space", refusal)
+            return
+        warn = None if prebuilt else terrain_size_warning(total_mb, cached_mb)
         if warn is not None:
             msg, strong = warn
             default = (
@@ -2007,7 +2359,94 @@ class SiteAnalysisTab(QWidget):
                 return
 
         # ---- Launch worker ----
+        self._launch_worker(jobs, dem_layer, output_dir,
+                            terrain_prep=terrain_prep)
+
+    def _confirm_prepared_buildings(self, terrain_dir: str,
+                                    state: Any) -> bool:
+        """The buildings of a pre-built folder's chosen tiles (*state*: a
+        ``terrain_adapter.PreparedBuildings`` from the Map Converter's
+        record, or None) against "Include buildings" — a prepared tile keeps
+        the buildings it was built with, the box cannot add or remove them.
+        Ticked: all → information ("nothing is added", run); none / mixed →
+        a warning, Yes runs anyway; unknown → one log line. Unticked and
+        some tiles carry buildings → information, once per folder per
+        session. False = the user said No."""
+        if state is None:
+            return True
+        yes, no = (QMessageBox.StandardButton.Yes,
+                   QMessageBox.StandardButton.No)
+        counts = state.counts()
+        if self.chk_buildings.isChecked():
+            if state.state == terrain_adapter.PREPARED_ALL:
+                QMessageBox.information(
+                    self, "Buildings already in the terrain",
+                    "This prepared terrain already contains buildings; "
+                    f"nothing is added.\n\n{terrain_dir}\n({counts})")
+                return True
+            if state.state == terrain_adapter.PREPARED_NONE:
+                return QMessageBox.warning(
+                    self, "Prepared terrain without buildings",
+                    f"The prepared terrain in:\n{terrain_dir}\n\nhas no "
+                    f"buildings in the tiles this analysis uses ({counts})."
+                    "\n\n'Include buildings' cannot add them to a prepared "
+                    "folder — build it with buildings in the Map Converter "
+                    "(Download Buildings…).\n\nRun anyway, without "
+                    "buildings?", yes | no, no) == yes
+            if state.state == terrain_adapter.PREPARED_MIXED:
+                return QMessageBox.warning(
+                    self, "Prepared terrain partly without buildings",
+                    f"Of the tiles this analysis uses from:\n{terrain_dir}"
+                    f"\n\n{counts}.\n\n'Include buildings' cannot add "
+                    "buildings to a prepared folder — rebuild it with "
+                    "buildings in the Map Converter.\n\nRun anyway?",
+                    yes | no, no) == yes
+            QgsMessageLog.logMessage(
+                f"buildings: whether the prepared terrain in {terrain_dir} "
+                f"carries buildings is not recorded ({counts}; no Map "
+                f"Converter record) — 'Include buildings' adds nothing to a "
+                f"prepared folder", TAG, Qgis.MessageLevel.Warning)
+            return True
+        key = os.path.normcase(os.path.abspath(terrain_dir))
+        if state.with_buildings and key not in _BUILDINGS_NOTICE_FOLDERS:
+            _BUILDINGS_NOTICE_FOLDERS.add(key)
+            QMessageBox.information(
+                self, "Terrain carries buildings",
+                f"The prepared terrain in:\n{terrain_dir}\n\ncarries "
+                f"buildings ({counts}) although 'Include buildings' is "
+                "unticked — they are part of its tiles and stay in the "
+                "result.")
+        return True
+
+    def _on_buildings_toggled(self, _on: bool) -> None:
+        """"Include buildings" changed: the band profile follows; on a
+        pre-built ``.abt`` folder a hint says the box cannot change its
+        tiles (the status tip keeps saying it)."""
+        self._refresh_res_profile()
+        terrain_dir = self._selected_terrain_dir()
+        try:
+            prepared = bool(terrain_dir) and is_abt_tile_dir(terrain_dir)
+        except Exception:  # noqa: BLE001 — a hint never fails the toggle
+            prepared = False
+        tip = (_PREPARED_BUILDINGS_HINT if prepared else "")
+        self.chk_buildings.setStatusTip(tip)
+        if prepared:
+            try:
+                self.iface.messageBar().pushMessage(
+                    "Waveshed", tip, Qgis.MessageLevel.Info, 8)
+            except Exception:  # noqa: BLE001 — no bar (tests, headless)
+                pass
+
+    def _launch_worker(
+        self, jobs: List[Tuple[CoverageParams, str]],
+        dem_layer: QgsRasterLayer, output_dir: str,
+        terrain_prep: Optional[TerrainPrep] = None,
+    ) -> None:
+        """Put the tab in run mode and start the worker for *jobs*
+        (*terrain_prep*: the run's preparation of the terrain folder, see
+        ``_terrain_dir_checks``)."""
         self.btn_run.setEnabled(False)
+        self.btn_stop.setEnabled(True)
         self.btn_stop.setVisible(True)
         self.progress_bar.setVisible(True)
         self.progress_bar.setValue(0)
@@ -2015,25 +2454,47 @@ class SiteAnalysisTab(QWidget):
         self.status_label.setText("Starting...")
 
         terrain_dir = self._selected_terrain_dir() or ""
-        self._worker = _SiteAnalysisWorker(
+        self._worker = worker = _SiteAnalysisWorker(
             jobs, dem_layer, output_dir, terrain_dir, self,
             osm_buildings=self.chk_buildings.isChecked(),
+            terrain_prep=terrain_prep,
         )
-        self._worker.progress.connect(self.progress_bar.setValue)
-        self._worker.status.connect(self._on_status)
-        self._worker.finished_ok.connect(self._on_finished_ok)
-        self._worker.finished_err.connect(self._on_finished_err)
-        self._worker.start()
+        worker.progress.connect(self.progress_bar.setValue)
+        worker.status.connect(self._on_status)
+        worker.finished_ok.connect(self._on_finished_ok)
+        worker.finished_err.connect(self._on_finished_err)
+        # However the run ends (a stopped one emits neither signal above),
+        # the UI comes back only once the thread has really ended.
+        worker.finished.connect(lambda: self._on_worker_finished(worker))
+        worker.start()
 
     def _on_stop(self) -> None:
-        """Stop a running analysis."""
+        """Stop a running analysis — without blocking the GUI thread.
+
+        cancel() kills the engine process the worker waits on (terrain
+        download, ingest or aether_core); the run UI is reset only when the
+        thread has ended (``_on_worker_finished``). Resetting it here, while
+        the worker was still unwinding, re-enabled Run and let a second run
+        overlap the first on the same pool, view dir and temp names.
+        """
         if self._worker and self._worker.isRunning():
+            self.btn_stop.setEnabled(False)
             self.status_label.setText("Stopping...")
             self._worker.cancel()
-            self._worker.wait(5000)
-        self._reset_run_ui()
+        else:
+            self._reset_run_ui()
+
+    def _on_worker_finished(self, worker: _SiteAnalysisWorker) -> None:
+        """QThread.finished of *worker*: done, failed or stopped — it is over.
+
+        A late signal of an older worker must not reset a newer run's UI.
+        """
+        if worker is self._worker:
+            self._reset_run_ui()
 
     def _reset_run_ui(self) -> None:
+        # Idempotent: finished_ok / finished_err reset first, then the
+        # thread's finished signal resets again.
         self.btn_run.setEnabled(True)
         self.btn_stop.setVisible(False)
         self.progress_bar.setVisible(False)
@@ -2106,9 +2567,14 @@ class SiteAnalysisTab(QWidget):
     # ==================================================================
 
     def cancel_worker(self) -> None:
-        """Cancel a running worker and clean up map visuals."""
+        """Cancel a running worker and clean up map visuals.
+
+        The dialog is closing, so this one waits (bounded) for the run to
+        end. Run is still re-enabled only by ``_on_worker_finished`` — never
+        while the thread is alive, also when the wait times out.
+        """
         if self._worker and self._worker.isRunning():
-            self._worker.cancel()
+            self._on_stop()
             self._worker.wait(5000)
         # Remove site markers from the canvas.
         self._sites_rb.reset()

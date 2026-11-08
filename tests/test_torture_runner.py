@@ -786,6 +786,27 @@ def test_cross_tab_passes_when_fill_only_adds():
     assert ok and "fill only adds" in why
 
 
+def test_cross_tab_compares_only_the_ground_the_run_needs(monkeypatch):
+    """A file source pools only the site's part of a tile (a partial pool
+    tile, 0 m fill outside it): outside the analysis box the tabs may
+    differ, inside it they may not."""
+    import numpy as np
+    plugin = _grids_env({"/x/mc": [[100, 200], [300, 400]],
+                         "/x/sa": [[100, 0], [300, 0]]})
+    def left(header, shape, bbox):
+        mask = np.zeros(shape, dtype=bool)
+        mask[:, 0] = True
+        return mask
+    monkeypatch.setattr(tr, "_bbox_mask", left)
+    ok, why = tr._cross_tab_contract("/x/mc", "/x/sa", plugin)
+    assert not ok and "disagree" in why
+    ok, why = tr._cross_tab_contract("/x/mc", "/x/sa", plugin, bbox={})
+    assert ok, why
+    plugin = _grids_env({"/x/mc": [[100, 200]], "/x/sa": [[140, 0]]})
+    ok, why = tr._cross_tab_contract("/x/mc", "/x/sa", plugin, bbox={})
+    assert not ok and "disagree" in why
+
+
 def test_stack_follows_needs_both_halves_of_the_priority_contract():
     void = tr.CONVERTER_VOID_COUNTS
     plugin = _grids_env({
@@ -1372,3 +1393,29 @@ def test_stall_report_says_when_nothing_was_said():
 def test_synthesized_timeout_still_never_counts_as_a_refusal():
     state = tr._run_worker(_HungWorker(), timeout=3)
     assert any(state["err"].startswith(c) for c in tr._SYNTHESIZED_COMPLAINTS)
+
+
+# ---------------------------------------------------------------------------
+# Tier B's plugin grid is the WORKER's grid — gated on the converter version
+# ---------------------------------------------------------------------------
+
+def test_plugin_enumeration_is_gated_on_the_converter_version(monkeypatch):
+    """The imported snap and enumeration, gated by the plugin's own
+    ``_converter_snaps_with_epsilon``: from 0.2.9 the owner's bbox loses its
+    69th 2 m column (2,438 tiles), older or unknown converters keep it
+    (2,463) — so tier B compares each converter with the grid the Map
+    Converter worker would cross-check it against."""
+    from waveshed.core import binary_manager
+    owner = {"south": 45.7161, "north": 48.1913, "west": 4.9482, "east": 11.6466}
+    res = [2, 5, 10, 30, 90]
+    counts = {}
+    for version in ("0.2.9", "0.3.0", "0.2.8", "0.2.7", None):
+        monkeypatch.setattr(binary_manager, "probe_converter_version",
+                            lambda exe, v=version: v)
+        snapped, names = tr._plugin_enumeration(owner, res, Path("/x/aether_converter"))
+        counts[version] = len(names)
+        assert snapped["east"] == (11.7 if version in ("0.2.9", "0.3.0")
+                                   else 11.700000000000001)
+    assert counts == {"0.2.9": 2438, "0.3.0": 2438, "0.2.8": 2463,
+                      "0.2.7": 2463, None: 2463}
+    assert len(tr._plugin_enumeration(owner, res)[1]) == 2463   # no converter

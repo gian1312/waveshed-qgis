@@ -550,3 +550,34 @@ class TestWriteRevocationFile(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestBinariesFoundAnnouncedOnce(unittest.TestCase):
+    """``discover_binary_dir`` says "Binaries found in …" once per directory
+    and session — the lookup runs before every engine launch and progress
+    poll, and one line per call put sixty of them into an hour's log."""
+
+    def setUp(self):
+        bm._announced_dirs.clear()
+        self.addCleanup(bm._announced_dirs.clear)
+
+    def test_one_line_per_directory(self):
+        with tempfile.TemporaryDirectory() as d:
+            for name in bm.REQUIRED_BINARIES:
+                path = os.path.join(d, bm._binary_name(name))
+                with open(path, "w") as fh:
+                    fh.write("")
+                os.chmod(path, 0o755)
+            logged = []
+            with mock.patch.dict(os.environ, {"AETHER_BIN_DIR": d}), \
+                    mock.patch.object(bm.QgsMessageLog, "logMessage",
+                                      side_effect=lambda *a, **k: logged.append(a[0])), \
+                    mock.patch.object(bm, "QgsSettings") as settings:
+                settings.return_value.value.return_value = None
+                self.assertEqual(bm.discover_binary_dir(), d)
+                self.assertEqual(bm.discover_binary_dir(), d)
+                self.assertEqual(
+                    bm.find_binary("aether_core"),
+                    os.path.join(d, bm._binary_name("aether_core")))
+            self.assertEqual([m for m in logged if "Binaries found" in m],
+                             [f"Binaries found in {d}"])

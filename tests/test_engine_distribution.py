@@ -16,6 +16,7 @@ import os
 import shutil
 import stat
 import subprocess
+import sys
 import tempfile
 import unittest
 import zipfile
@@ -405,13 +406,85 @@ class TestMacosPreparation(unittest.TestCase):
 
     def test_probe_prepares_the_dir_before_launching(self):
         order = []
-        with mock.patch.object(bm, "prepare_engine_dir",
-                               side_effect=lambda d: order.append("prep")), \
+        with mock.patch.object(bm.platform, "system", return_value="Darwin"), \
+                mock.patch.object(bm, "discover_binary_dir", return_value="/x"), \
+                mock.patch.object(bm, "prepare_engine_dir",
+                                  side_effect=lambda d: order.append(("prep", d))), \
                 mock.patch.object(bm.subprocess, "run",
                                   side_effect=lambda *a, **k: order.append("run") or
                                   mock.Mock(returncode=0, stdout="aether_core 0.4.8\n")):
             self.assertEqual(bm.probe_engine_version("/x"), "0.4.8")
-        self.assertEqual(order, ["prep", "run"])
+        self.assertEqual(order, [("prep", "/x"), "run"])
+
+    def test_a_binary_outside_the_engine_dir_is_probed_as_it_is(self):
+        """macOS: only THE engine directory (discover_binary_dir) is prepared.
+        A converter found on PATH — Homebrew, a cargo target dir — is probed
+        untouched: `xattr -cr` would run over that whole directory."""
+        bm._VERSION_CACHE.clear()
+        self.addCleanup(bm._VERSION_CACHE.clear)
+        ok = mock.Mock(returncode=0, stdout="aether_converter 0.2.7\n", stderr="")
+        with tempfile.TemporaryDirectory() as root:
+            engine = os.path.join(root, "engine")
+            brew = os.path.join(root, "homebrew", "bin")
+            exes = {}
+            for d in (engine, brew):
+                os.makedirs(d)
+                exes[d] = os.path.join(d, "aether_converter")
+                with open(exes[d], "w") as fh:
+                    fh.write("x")
+            for engine_dir in (engine, None):
+                with self.subTest(engine_dir=engine_dir):
+                    bm._VERSION_CACHE.clear()
+                    with mock.patch.object(bm.platform, "system", return_value="Darwin"), \
+                            mock.patch.object(bm, "discover_binary_dir",
+                                              return_value=engine_dir), \
+                            mock.patch.object(bm, "prepare_engine_dir") as prep, \
+                            mock.patch.object(bm.subprocess, "run", return_value=ok) as run:
+                        self.assertEqual(bm.probe_converter_version(exes[brew]), "0.2.7")
+                        bm.probe_engine_version(brew)
+                    prep.assert_not_called()
+                    self.assertEqual(run.call_args_list[0].args[0],
+                                     [exes[brew], "--version"], "probed all the same")
+            # The engine directory itself still is prepared (also as a path
+            # spelled differently).
+            with mock.patch.object(bm.platform, "system", return_value="Darwin"), \
+                    mock.patch.object(bm, "discover_binary_dir", return_value=engine),\
+                    mock.patch.object(bm, "prepare_engine_dir") as prep, \
+                    mock.patch.object(bm.subprocess, "run", return_value=ok):
+                bm.probe_converter_version(
+                    os.path.join(root, "engine", ".", "aether_converter"))
+            prep.assert_called_once()
+            self.assertTrue(bm._same_dir(prep.call_args.args[0], engine))
+
+    def test_engine_launches_open_no_console_window_on_windows(self):
+        """QGIS is a GUI process: a console program it starts gets a console
+        window of its own unless told not to — every ``--version`` probe
+        flashed one. All binary_manager launches (the probe, the staged
+        engine's ``--version``, ``--fingerprint``) pass CREATE_NO_WINDOW on
+        Windows (``sys.platform``) and close stdin; 0 elsewhere."""
+        bm._VERSION_CACHE.clear()
+        self.addCleanup(bm._VERSION_CACHE.clear)
+        def run(argv, **kw):
+            name = os.path.basename(argv[0])
+            out = ("ab" * 32 if argv[-1] == "--fingerprint"
+                   else f"{name} {'0.2.7' if name == 'aether_converter' else '0.4.8'}")
+            return mock.Mock(returncode=0, stdout=out + "\n", stderr="")
+        for plat, flags in (("win32", 0x08000000), ("linux", 0), ("darwin", 0)):
+            with self.subTest(plat), tempfile.TemporaryDirectory() as d:
+                bm._VERSION_CACHE.clear()
+                with mock.patch.object(sys, "platform", plat), \
+                        mock.patch.object(bm.platform, "system", return_value="Linux"), \
+                        mock.patch.object(bm, "find_binary",
+                                          return_value=os.path.join(d, "aether_core")), \
+                        mock.patch.object(bm.subprocess, "run", side_effect=run) as spy:
+                    self.assertEqual(bm.probe_converter_version(
+                        os.path.join(d, "aether_converter")), "0.2.7")
+                    bm._verify_staged_version(d, "0.4.8")
+                    self.assertEqual(bm.read_machine_fingerprint(), "ab" * 32)
+                self.assertEqual(len(spy.call_args_list), 3)
+                for call in spy.call_args_list:
+                    self.assertEqual(call.kwargs.get("creationflags"), flags, call)
+                    self.assertIs(call.kwargs.get("stdin"), subprocess.DEVNULL, call)
 
     def test_probe_failures_are_logged_not_silent(self):
         cases = [

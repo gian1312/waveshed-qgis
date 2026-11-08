@@ -22,12 +22,12 @@ GDAL is QGIS's own (``osgeo``) — never a pip dependency.
 
 from __future__ import annotations
 
-import hashlib
 import os
 import shutil
 import tempfile
 from typing import Callable, List, Optional, Tuple
 
+from . import hashes
 from .terrain_adapter import source_fingerprint
 
 #: Directory name (under the system temp dir) holding cached conversions.
@@ -177,7 +177,7 @@ def _fgb_cache_name(src_path: str, src_crs: str = "",
     """
     basename = os.path.splitext(os.path.basename(src_path))[0]
     ident = f"{source_fingerprint(src_path)}|{src_crs}|{layer_name}"
-    digest = hashlib.md5(ident.encode("utf-8")).hexdigest()[:12]
+    digest = hashes.md5(ident.encode("utf-8")).hexdigest()[:12]
     return f"{basename}_{digest}.fgb"
 
 

@@ -17,6 +17,7 @@ import platform
 import shutil
 import stat
 import subprocess
+import sys
 import tempfile
 import zipfile
 from dataclasses import dataclass
@@ -38,6 +39,19 @@ TAG = "Waveshed"  # QgsMessageLog tag
 REQUIRED_BINARIES = ("aether_core", "aether_converter", "aether_export")
 
 _EXE_SUFFIX = ".exe" if platform.system() == "Windows" else ""
+
+#: ``creationflags`` value that starts a console program without a console
+#: window (Windows' CREATE_NO_WINDOW; the constant exists on Windows only).
+_CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+
+
+def _no_window_flags() -> int:
+    """``creationflags`` of an engine launch from QGIS (a GUI process):
+    CREATE_NO_WINDOW on Windows — else every ``--version`` probe flashes a
+    console window — 0 elsewhere. Gated on ``sys.platform``, the plugin's
+    Windows gate (``terrain_adapter._is_windows``)."""
+    return _CREATE_NO_WINDOW if sys.platform == "win32" else 0
+
 
 #: URL of the release manifest served by waveshed.io.
 MANIFEST_URL = "https://waveshed.io/releases/latest.json"
@@ -113,6 +127,11 @@ def _plugin_bin_dir() -> str:
     return os.path.join(plugin_dir, "bin")
 
 
+#: Directories this session has already announced with "Binaries found in …"
+#: (see :func:`discover_binary_dir`).
+_announced_dirs: set = set()
+
+
 def discover_binary_dir() -> Optional[str]:
     """Find the directory containing all AETHER binaries.
 
@@ -142,11 +161,16 @@ def discover_binary_dir() -> Optional[str]:
 
     for candidate in candidates:
         if candidate and os.path.isdir(candidate) and _dir_has_all_binaries(candidate):
-            QgsMessageLog.logMessage(
-                f"Binaries found in {candidate}",
-                TAG,
-                Qgis.MessageLevel.Info,
-            )
+            # Once per directory and session: the lookup runs before every
+            # engine launch and progress poll, and a line per call buried
+            # the owner's log under sixty "Binaries found" lines in an hour.
+            if candidate not in _announced_dirs:
+                _announced_dirs.add(candidate)
+                QgsMessageLog.logMessage(
+                    f"Binaries found in {candidate}",
+                    TAG,
+                    Qgis.MessageLevel.Info,
+                )
             return candidate
 
     return None
@@ -404,6 +428,7 @@ def read_machine_fingerprint(timeout: float = 10.0) -> str:
         result = subprocess.run(
             [exe, "--fingerprint"],
             capture_output=True, text=True, timeout=timeout, check=False,
+            stdin=subprocess.DEVNULL, creationflags=_no_window_flags(),
         )
     except subprocess.TimeoutExpired as exc:
         raise RuntimeError(
@@ -1010,6 +1035,7 @@ def _verify_staged_version(staging: str, expected: str) -> None:
         result = subprocess.run(
             [exe, "--version"], capture_output=True, text=True,
             timeout=15, check=False,
+            stdin=subprocess.DEVNULL, creationflags=_no_window_flags(),
         )
     except (OSError, subprocess.SubprocessError) as exc:
         raise RuntimeError(
@@ -1267,6 +1293,56 @@ def _clear_quarantine(target_dir: str, files: list) -> None:
 #: GPU path (aether-tools docs/CONTRACT.md §1.5, capability gates).
 COARSE_RESOLUTION_MIN_ENGINE = "0.4.3"
 
+#: First aether_converter whose download job accepts ``repair_source_tiles``
+#: (patch only the listed source tiles into the EXISTING output .abt files).
+#: The field is additive: an older converter parses the job, ignores it and
+#: re-downloads every listed output tile whole, so the plugin gates on the
+#: binary's own ``--version`` instead of sending it blind.
+CONVERTER_REPAIR_MIN_VERSION = "0.2.6"
+
+#: First aether_converter with the ``probe`` subcommand (``aether-probe/1``,
+#: CONTRACT §1.2a): the folder index reads new/changed GeoTIFF headers through
+#: it (``terrain_index.probe_converter``); older or unknown → in-process probes.
+CONVERTER_PROBE_MIN_VERSION = "0.2.7"
+
+#: First aether_converter whose download job takes ``buildings_pbf_ready`` /
+#: ``buildings_pbf_wait_s`` (toolkit CONTRACT changelog 45, §9b): it reads
+#: ``buildings_pbf_dir`` only at its buildings post-pass, after waiting for a
+#: marker file there, so Site Analysis fetches the building tiles WHILE the
+#: terrain downloads. An older build ignores both fields and burns whatever
+#: the directory holds when its terrain is done — gate, never send blind.
+CONVERTER_BUILDINGS_READY_MIN_VERSION = "0.2.10"
+
+#: First aether_converter that prints ``[Tile] <name> voids=<n>`` for every
+#: tile it writes (toolkit CONTRACT changelog 46; <n> = samples at or below
+#: the -5000-count validity floor): a download's non-repair pass after its
+#: building burn, an ingest after its void fill. The plugin
+#: records the count per pool tile (``terrain_adapter``, the pool's
+#: ``voids`` records) instead of reading every tile for voids when it builds
+#: a Site Analysis view; an older build prints no such line — the counts
+#: stay unknown and the view scans as before.
+CONVERTER_TILE_VOIDS_MIN_VERSION = "0.2.11"
+
+#: First aether_converter whose INGEST job takes ``buildings_pbf_ready`` /
+#: ``buildings_pbf_wait_s`` (toolkit CONTRACT item 48): it starts its terrain
+#: work at once and decodes ``buildings_pbf_dir`` when the marker file
+#: appears there, holding finished tiles in memory until then, so Site
+#: Analysis's file / folder / rendered routes and the Map Converter's ingest
+#: batches launch WHILE the building tiles are fetched. An older build
+#: ignores both fields and decodes the directory when it starts — half
+#: filled — so gate, never send blind.
+CONVERTER_INGEST_BUILDINGS_READY_MIN_VERSION = "0.2.12"
+
+#: First aether_converter that takes ``buildings_pbf_list`` (toolkit CONTRACT
+#: changelog 51) on a download job and an ingest BATCH job: the absolute
+#: path of a text file naming the building tiles, one ``{z}_{x}_{y}.pbf``
+#: per line, read straight from ``buildings_pbf_dir`` (THE store) — so no
+#: per-batch view is linked (the owner's run of 2026-11-05: 23.8 s and
+#: 24.7 s linking 21,012 and 20,703 tiles on NTFS). The file is the ready
+#: signal too (waited for like the marker). An older build does not know
+#: the field — gate, never send blind.
+CONVERTER_BUILDINGS_LIST_MIN_VERSION = "0.2.14"
+
 #: What an engine older than :data:`COARSE_RESOLUTION_MIN_ENGINE` accepts.
 LEGACY_ENGINE_RESOLUTIONS = (2, 5, 10, 30)
 
@@ -1275,17 +1351,18 @@ class EngineTooOldError(RuntimeError):
     """The installed engine cannot run this job; the message says what to do."""
 
 
-def parse_engine_version(output: str) -> Optional[str]:
-    """Extract the semver from ``aether_core --version`` output, else ``None``.
+def parse_engine_version(output: str, name: str = "aether_core") -> Optional[str]:
+    """Extract the semver from ``<name> --version`` output, else ``None``.
 
-    The contract line is ``aether_core <semver>``. Anything else — clap's
-    "unexpected argument" from a build too old to know the flag, an empty
-    stdout, a crash banner — reads as *unknown*, which callers must treat as
-    the oldest known engine, never as the newest.
+    The contract line is ``<name> <semver>`` (aether-tools CONTRACT §1.5; every
+    binary answers it). Anything else — clap's "unexpected argument" from a
+    build too old to know the flag, an empty stdout, a crash banner — reads as
+    *unknown*, which callers must treat as the oldest known build, never as
+    the newest.
     """
     for line in (output or "").splitlines():
         parts = line.strip().split()
-        if len(parts) == 2 and parts[0] == "aether_core":
+        if len(parts) == 2 and parts[0] == name:
             candidate = parts[1].lstrip("v")
             if re.fullmatch(r"\d+(\.\d+)+", candidate):
                 return candidate
@@ -1325,33 +1402,117 @@ def _exe_identity(exe: str) -> Optional[Tuple[str, int, int]]:
 def probe_engine_version(binary_dir: str, timeout: float = 5.0) -> Optional[str]:
     """``aether_core --version`` of the engine in *binary_dir*, or ``None``.
 
-    Prepares the directory first on macOS (:func:`prepare_engine_dir`), so a
-    quarantined copy is fixed before it is launched. Never raises. A binary
-    that already answered this session is not launched again
-    (:data:`_VERSION_CACHE`).
+    On macOS the engine directory (:func:`discover_binary_dir`) is prepared
+    first (:func:`prepare_engine_dir`), so a quarantined copy is fixed before
+    it is launched; any other directory is left as it is (see
+    :func:`_probe_exe_version`). Never raises. A binary that already
+    answered this session is not launched again (:data:`_VERSION_CACHE`).
     """
     exe = os.path.join(binary_dir, _binary_name("aether_core"))
+    return _probe_exe_version(exe, "aether_core", binary_dir, timeout)
+
+
+def probe_converter_version(exe: str, timeout: float = 5.0) -> Optional[str]:
+    """``aether_converter --version`` of the binary at *exe*, or ``None``.
+
+    Same probe and session cache as :func:`probe_engine_version` (keyed by the
+    binary's identity, failures not cached) — and the same rule: only the
+    engine directory is prepared, never the directory a converter found on
+    PATH lives in. Never raises.
+    """
+    return _probe_exe_version(exe, "aether_converter",
+                              os.path.dirname(exe), timeout)
+
+
+def _is_engine_dir(directory: str) -> bool:
+    """True when *directory* is THE engine directory, the one
+    :func:`discover_binary_dir` resolves (Settings, ``AETHER_BIN_DIR``, …) —
+    the only directory a probe prepares."""
+    engine = discover_binary_dir()
+    return bool(directory and engine and _same_dir(directory, engine))
+
+
+def converter_supports_repair(exe: str) -> bool:
+    """Whether the converter at *exe* honours ``repair_source_tiles``.
+
+    Unknown (no answer, unparsable) is treated as the oldest build: False.
+    """
+    version = probe_converter_version(exe)
+    return (version is not None
+            and compare_versions(version, CONVERTER_REPAIR_MIN_VERSION) >= 0)
+
+
+def converter_supports_buildings_ready(exe: str) -> bool:
+    """Whether the converter at *exe* waits for ``buildings_pbf_ready``
+    (``--version`` >= :data:`CONVERTER_BUILDINGS_READY_MIN_VERSION`, the
+    cached probe). Unknown is the oldest build: False."""
+    version = probe_converter_version(exe)
+    return (version is not None
+            and compare_versions(
+                version, CONVERTER_BUILDINGS_READY_MIN_VERSION) >= 0)
+
+
+def converter_supports_ingest_buildings_ready(exe: str) -> bool:
+    """Whether the converter at *exe* waits for ``buildings_pbf_ready`` in
+    an INGEST job (``--version`` >=
+    :data:`CONVERTER_INGEST_BUILDINGS_READY_MIN_VERSION`, the cached probe).
+    Unknown is the oldest build: False."""
+    version = probe_converter_version(exe)
+    return (version is not None
+            and compare_versions(
+                version, CONVERTER_INGEST_BUILDINGS_READY_MIN_VERSION) >= 0)
+
+
+def converter_supports_buildings_list(exe: str) -> bool:
+    """Whether the converter at *exe* reads ``buildings_pbf_list``
+    (``--version`` >= :data:`CONVERTER_BUILDINGS_LIST_MIN_VERSION`, the
+    cached probe). Unknown is the oldest build: False."""
+    version = probe_converter_version(exe)
+    return (version is not None
+            and compare_versions(
+                version, CONVERTER_BUILDINGS_LIST_MIN_VERSION) >= 0)
+
+
+def converter_supports_tile_voids(exe: str) -> bool:
+    """Whether the converter at *exe* prints ``[Tile] <name> voids=<n>``
+    per written tile (``--version`` >=
+    :data:`CONVERTER_TILE_VOIDS_MIN_VERSION`, the cached probe). Unknown is
+    the oldest build: False."""
+    version = probe_converter_version(exe)
+    return (version is not None
+            and compare_versions(
+                version, CONVERTER_TILE_VOIDS_MIN_VERSION) >= 0)
+
+
+def _probe_exe_version(exe: str, name: str, binary_dir: str,
+                       timeout: float) -> Optional[str]:
     identity = _exe_identity(exe)
     if identity is not None and identity in _VERSION_CACHE:
         return _VERSION_CACHE[identity]
-    prepare_engine_dir(binary_dir)
+    # macOS: clear the quarantine of the ENGINE directory only. A binary
+    # found elsewhere (PATH: Homebrew, a cargo target dir) is launched as
+    # it is — `xattr -cr` would strip every file there of its attributes.
+    if (binary_dir and platform.system() == "Darwin"
+            and _is_engine_dir(binary_dir)):
+        prepare_engine_dir(binary_dir)
     try:
         result = subprocess.run(
             [exe, "--version"],
             capture_output=True, text=True, timeout=timeout, check=False,
+            stdin=subprocess.DEVNULL, creationflags=_no_window_flags(),
         )
     except subprocess.TimeoutExpired:
         # A fresh .exe is often still being scanned by antivirus on its first
         # launches; say so instead of silently reporting "unknown".
         QgsMessageLog.logMessage(
-            f"aether_core --version did not answer within {timeout:g} s ({exe}); "
-            "the engine version is reported as unknown for now.",
+            f"{name} --version did not answer within {timeout:g} s ({exe}); "
+            "the version is reported as unknown for now.",
             TAG, Qgis.MessageLevel.Warning,
         )
         return None
     except Exception as exc:  # noqa: BLE001 — a probe must never take the run down
         QgsMessageLog.logMessage(
-            f"aether_core --version could not be started ({exe}): {exc}",
+            f"{name} --version could not be started ({exe}): {exc}",
             TAG, Qgis.MessageLevel.Warning,
         )
         return None
@@ -1360,15 +1521,15 @@ def probe_engine_version(binary_dir: str, timeout: float = 5.0) -> Optional[str]
                                  force=result.returncode < 0)
         detail = (result.stderr or result.stdout or "").strip()[:300]
         QgsMessageLog.logMessage(
-            f"aether_core --version failed (exit {result.returncode})"
+            f"{name} --version failed (exit {result.returncode})"
             f"{': ' + detail if detail else ''}.{hint}",
             TAG, Qgis.MessageLevel.Warning,
         )
         return None
-    version = parse_engine_version(result.stdout)
+    version = parse_engine_version(result.stdout, name)
     if version is None:
         QgsMessageLog.logMessage(
-            f"aether_core --version gave no version line: {(result.stdout or '').strip()[:200]!r}",
+            f"{name} --version gave no version line: {(result.stdout or '').strip()[:200]!r}",
             TAG, Qgis.MessageLevel.Warning,
         )
     elif identity is not None:

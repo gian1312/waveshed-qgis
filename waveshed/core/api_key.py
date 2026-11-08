@@ -37,10 +37,17 @@ class ApiKeyError(Exception):
 # Constants
 # ---------------------------------------------------------------------------
 
-#: Where users obtain a key (the "Get API Key" button). Built by
-#: ``site_links`` so the preview flag lives in one place.
+#: Where users obtain a key, as static text (messages, help). Built by
+#: ``site_links`` so the site's preview flag lives in one place; the "Get API
+#: Key" button opens :func:`get_api_key_page_url` instead.
 GET_API_KEY_URL = site_links.GET_KEY_URL
 _GET_KEY_HINT = f"Get a key at {GET_API_KEY_URL}"
+
+
+def get_api_key_page_url() -> str:
+    """The key generator page a button opens: the plain page once waveshed.io
+    serves it publicly, the preview URL until then (``site_links.page_url``)."""
+    return site_links.page_url("/get-key")
 
 #: Accepted decoded payload lengths (bytes): licence format v3 only.
 KEY_PAYLOAD_LENGTHS = (188,)

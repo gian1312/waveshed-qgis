@@ -436,7 +436,7 @@ class TestPerTileInvalidation(_Folder):
     def _run(self):
         built = []
 
-        def fake_run_converter(exe, job_file):
+        def fake_run_converter(exe, job_file, **_kw):
             with open(job_file) as fh:
                 jobs = json.load(fh)
             for job in jobs:
@@ -446,10 +446,14 @@ class TestPerTileInvalidation(_Folder):
 
         bm = mock.Mock()
         bm.find_binary.return_value = "aether_converter"
+        # 25 km: each of the four 0.5 deg tiles is built for the part this
+        # site needs (a partial pool tile), and that part reaches into every
+        # file below — a file outside a tile's region does not feed it and
+        # cannot make it stale (10 km stopped just short of b_fine.tif).
         with mock.patch.object(ta, "_run_converter",
                                side_effect=fake_run_converter):
             ta.reset_terrain_warnings()
-            ta.prepare_terrain(None, 47.0, 8.0, 10.0, 30, bm,
+            ta.prepare_terrain(None, 47.0, 8.0, 25.0, 30, bm,
                                terrain_dir=self.dem)
         return sorted(built)
 
@@ -583,8 +587,9 @@ class TestDegradedDownloadTiles(unittest.TestCase):
         with tempfile.TemporaryDirectory() as pool:
             out, calls, log = self._group(pool, [bad1, bad2], max_passes=2)
             self.assertTrue(out)
-            # Retried alone, at reduced connections.
-            self.assertEqual(calls[1], (["tile_west.abt"], 128))
+            # Retried alone (no repair support → whole output tile), at the
+            # configured connections: the plugin no longer halves them.
+            self.assertEqual(calls[1], (["tile_west.abt"], 256))
             # Kept for this run, flagged for the next one.
             self.assertTrue(os.path.exists(os.path.join(pool, "tile_west.abt")))
             self.assertFalse(ta._tile_ready(pool, "tile_west.abt"))
@@ -624,6 +629,158 @@ class TestDegradedDownloadTiles(unittest.TestCase):
             self.assertTrue(out)
             self.assertGreater(len(calls), 1)
             self.assertFalse(ta._tile_ready(pool, "tile_west.abt"))
+
+    # -- no halving, degraded-only repair pass (owner-approved, 2026-10) ----
+
+    def _group_r(self, pool, passes, max_passes=4, repair_supported=True,
+                 holes=lambda path, n: False):
+        """Like ``_group`` but the fake pass records the repair field, and
+        *holes(path, passes_so_far)* decides the hole scan."""
+        calls = []
+
+        def run_pass(specs, conn, zoom, repair_source_tiles=None):
+            calls.append({"specs": [s["filename"] for s in specs],
+                          "conn": conn, "repair": repair_source_tiles})
+            for s in specs:
+                _write_pool_abt(os.path.join(pool, s["filename"]))
+            return (0,) + passes[min(len(calls), len(passes)) - 1]
+
+        logged = []
+        with mock.patch.object(ta, "_log", side_effect=logged.append), \
+             mock.patch.object(ta, "_abt_has_holes",
+                               side_effect=lambda p: holes(p, len(calls))), \
+             mock.patch.object(ta, "_abt_has_zero_fill", return_value=False):
+            out = ta._download_zoom_group(pool, self.SPECS, 12, 256,
+                                          max_passes, run_pass, lambda: True,
+                                          repair_supported=repair_supported)
+        return out, calls, "\n".join(logged)
+
+    def test_gap_retries_never_halve_the_connections(self):
+        # A west tile that keeps a hole: every pass at the configured 256.
+        gap = (99, 100, ["[Stats] Tiles: 99/100 OK"])
+        with tempfile.TemporaryDirectory() as pool:
+            out, calls, log = self._group_r(
+                pool, [gap], max_passes=4,
+                holes=lambda p, n: p.endswith("tile_west.abt"))
+        self.assertEqual([c["conn"] for c in calls], [256, 256, 256, 256])
+        self.assertTrue(all(c["repair"] is None for c in calls))
+        self.assertEqual(calls[1]["specs"], ["tile_west.abt"])
+        self.assertIn("still failed after 4 pass(es)", log)
+
+    def test_degraded_only_runs_one_repair_pass_with_exactly_those_tiles(self):
+        x, y = self._xyz(47.2, 7.7, 12)
+        x2, y2 = self._xyz(47.3, 7.6, 12)          # also in the west tile
+        first = (98, 100, self._lines(98, 100, [(x, y), (x2, y2), (x, y)]))
+        fixed = (2, 2, self._lines(2, 2, []))
+        with tempfile.TemporaryDirectory() as pool:
+            out, calls, log = self._group_r(pool, [first, fixed])
+            self.assertTrue(out)
+            self.assertTrue(ta._tile_ready(pool, "tile_west.abt"))
+            self.assertTrue(ta._tile_ready(pool, "tile_east.abt"))
+        self.assertEqual(len(calls), 2)
+        self.assertIsNone(calls[0]["repair"])
+        self.assertEqual(calls[1]["repair"],
+                         sorted({(12, x, y), (12, x2, y2)}))
+        # The output tiles the degraded tiles sit in — not the clean one.
+        self.assertEqual(calls[1]["specs"], ["tile_west.abt"])
+        self.assertEqual(calls[1]["conn"], 256)
+        self.assertIn("repair pass 2/4", log)
+        self.assertIn("patching 2 source tile(s) into 1 existing output", log)
+        self.assertIn("repair_source_tiles", log)
+
+    def test_still_degraded_after_the_repair_pass_is_flagged_not_retried(self):
+        x, y = self._xyz(47.2, 7.7, 12)
+        first = (99, 100, self._lines(99, 100, [(x, y)]))
+        again = (0, 1, self._lines(0, 1, [(x, y)]))
+        with tempfile.TemporaryDirectory() as pool:
+            out, calls, log = self._group_r(pool, [first, again], max_passes=4)
+            self.assertTrue(out)
+            # One repair pass, then stop — not the remaining two passes.
+            self.assertEqual(len(calls), 2)
+            self.assertTrue(os.path.exists(os.path.join(pool, "tile_west.abt")))
+            self.assertTrue(os.path.exists(
+                os.path.join(pool, "tile_west.abt" + ta._REBUILD_SUFFIX)))
+            self.assertFalse(ta._tile_ready(pool, "tile_west.abt"))
+            self.assertTrue(ta._tile_ready(pool, "tile_east.abt"))
+        self.assertIn("1 terrain tile(s) were filled from coarser data (z11)", log)
+
+    def test_a_silent_repair_shortfall_still_counts_as_degraded(self):
+        # The repair pass fetched 0 of 1 and printed no [Degraded] line: the
+        # coarse fill is still there (no hole) — flagged, never "complete",
+        # and never the total-failure branch that drops the whole group.
+        x, y = self._xyz(47.2, 7.7, 12)
+        first = (99, 100, self._lines(99, 100, [(x, y)]))
+        silent = (0, 1, ["[Stats] Tiles: 0/1 OK"])
+        with tempfile.TemporaryDirectory() as pool:
+            out, calls, log = self._group_r(pool, [first, silent])
+            self.assertTrue(out)
+            self.assertEqual(len(calls), 2)
+            self.assertFalse(ta._tile_ready(pool, "tile_west.abt"))
+            self.assertTrue(ta._tile_ready(pool, "tile_east.abt"))
+        self.assertNotIn("flat 0 m terrain", log)
+        self.assertIn("filled from coarser data", log)
+
+    def test_degraded_plus_gap_takes_the_whole_tile_path(self):
+        x, y = self._xyz(47.2, 7.7, 12)
+        first = (98, 100, self._lines(98, 100, [(x, y)]))
+        done = (100, 100, self._lines(100, 100, []))
+        with tempfile.TemporaryDirectory() as pool:
+            out, calls, _log = self._group_r(
+                pool, [first, done],
+                holes=lambda p, n: n == 1 and p.endswith("tile_east.abt"))
+            self.assertTrue(out)
+        self.assertEqual(len(calls), 2)
+        self.assertIsNone(calls[1]["repair"])
+        self.assertEqual(sorted(calls[1]["specs"]),
+                         ["tile_east.abt", "tile_west.abt"])
+        self.assertEqual(calls[1]["conn"], 256)
+
+    def test_old_converter_falls_back_to_whole_tiles_without_halving(self):
+        x, y = self._xyz(47.2, 7.7, 12)
+        bad = (99, 100, self._lines(99, 100, [(x, y)]))
+        asked = []
+
+        def supported():
+            asked.append(1)
+            return False
+        with tempfile.TemporaryDirectory() as pool:
+            out, calls, log = self._group_r(pool, [bad], max_passes=3,
+                                            repair_supported=supported)
+            self.assertTrue(out)
+            self.assertFalse(ta._tile_ready(pool, "tile_west.abt"))
+        self.assertEqual(len(calls), 3)
+        self.assertEqual([c["conn"] for c in calls], [256, 256, 256])
+        self.assertTrue(all(c["repair"] is None for c in calls))
+        self.assertEqual(calls[1]["specs"], ["tile_west.abt"])
+        self.assertIn("fallback", log)
+        self.assertIn(">= 0.2.6", log)
+        self.assertTrue(asked)
+
+    def test_a_failed_repair_pass_rewrites_the_tiles_whole(self):
+        x, y = self._xyz(47.2, 7.7, 12)
+        calls = []
+
+        def run_pass(specs, conn, zoom, repair_source_tiles=None):
+            calls.append(repair_source_tiles)
+            for s in specs:
+                _write_pool_abt(os.path.join(pool, s["filename"]))
+            if len(calls) == 1:
+                return 0, 99, 100, self._lines(99, 100, [(x, y)])
+            if len(calls) == 2:
+                return 1, -1, -1, ["Error: boom"]
+            return 0, 4, 4, ["[Stats] Tiles: 4/4 OK"]
+
+        with tempfile.TemporaryDirectory() as pool, \
+                mock.patch.object(ta, "_log"), \
+                mock.patch.object(ta, "_abt_has_holes", return_value=False), \
+                mock.patch.object(ta, "_abt_has_zero_fill", return_value=False):
+            out = ta._download_zoom_group(pool, self.SPECS, 12, 256, 4,
+                                          run_pass, lambda: True,
+                                          repair_supported=True)
+            self.assertTrue(out)
+            self.assertTrue(ta._tile_ready(pool, "tile_east.abt"))
+            self.assertTrue(ta._tile_ready(pool, "tile_west.abt"))
+        self.assertEqual(calls, [None, [(12, x, y)], None])
 
     def test_everything_degraded_is_not_a_total_failure(self):
         # ok=0 used to mean "nothing arrived → drop every tile"; coarse fill

@@ -10,13 +10,8 @@ for scripting, batch execution, and model-builder integration.
 from __future__ import annotations
 
 import os
-import platform
 import re
 import subprocess
-
-_SUBPROCESS_FLAGS = (
-    subprocess.CREATE_NO_WINDOW if platform.system() == "Windows" else 0
-)
 from typing import Any, Dict
 
 from qgis.core import (
@@ -47,6 +42,9 @@ from ..core.result_loader import (
 from ..core.terrain_adapter import prepare_terrain
 from ..core import api_key
 from ..core import binary_manager as bm
+
+#: The engine launch flags (no console window on Windows), one definition.
+_SUBPROCESS_FLAGS = terrain_adapter._SUBPROCESS_FLAGS
 
 
 class CoverageAlgorithm(QgsProcessingAlgorithm):
@@ -256,7 +254,11 @@ class CoverageAlgorithm(QgsProcessingAlgorithm):
                 feedback=feedback,
                 # Terrain occupies the 5-15 % stretch of this algorithm's bar.
                 progress_span=(5.0, 15.0),
+                # Cancel reaches the terrain step too (per tile / output line).
+                should_cancel=feedback.isCanceled,
             )
+        except terrain_adapter.ConverterCancelled:
+            return {}
         except Exception as exc:
             raise QgsProcessingException(
                 f"Terrain preparation failed: {exc}"

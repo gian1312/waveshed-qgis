@@ -18,7 +18,6 @@ from __future__ import annotations
 import csv
 import math
 import os
-import platform
 import re
 import subprocess
 import tempfile
@@ -54,7 +53,6 @@ from qgis.core import (
     QgsPointXY,
     QgsProject,
     QgsRasterLayer,
-    QgsSettings,
     QgsWkbTypes,
 )
 from qgis.gui import QgsRubberBand
@@ -65,6 +63,7 @@ from ..core.binary_manager import (
     find_binary,
 )
 from ..core import api_key
+from ..core import engine_log
 from ..core import terrain_adapter
 from ..core.asset_manager import compute_erp, list_assets
 from ..core.job_builder import (
@@ -93,27 +92,51 @@ from .height_inputs import MIN_AMSL_M, bind_height_mode
 from .output_dir import P2P_OUTPUT_DIR_KEY, bind_output_dir, save_output_dir
 from .map_tools import activate_point_capture
 from .plotting import XYPlotWidget
+from . import terrain_dirs
 from . import terrain_folder_scan
 
 TAG = "Waveshed"
 
-_SUBPROCESS_FLAGS = (
-    subprocess.CREATE_NO_WINDOW if platform.system() == "Windows" else 0
-)
+#: What the prepared tiles of a link carry, per
+#: ``terrain_adapter.prepared_buildings`` state (P2P has no buildings box:
+#: the link runs over whatever its prepared tiles were built with).
+_PREPARED_BUILDINGS_TEXT = {
+    terrain_adapter.PREPARED_ALL: "carry buildings — the link is computed "
+                                  "over them",
+    terrain_adapter.PREPARED_NONE: "carry no buildings",
+    terrain_adapter.PREPARED_MIXED: "carry buildings only in part — the "
+                                    "link sees them where they are",
+    terrain_adapter.PREPARED_UNKNOWN: "have no record of their buildings "
+                                      "(not built by the Map Converter, or by "
+                                      "an older version) — whatever is baked "
+                                      "into them is used",
+}
+
+
+def _log_prepared_buildings(terrain_dir: str, selection: Any) -> None:
+    """ONE log line: what the Map Converter recorded about the buildings of
+    the prepared tiles this link uses (*selection*: its
+    ``select_abt_tiles``) — the read Site Analysis's dialogs use
+    (``terrain_adapter.prepared_buildings``)."""
+    try:
+        state = terrain_adapter.prepared_buildings(terrain_dir,
+                                                   selection.paths)
+    except Exception as exc:  # noqa: BLE001 — a note never stops a run
+        QgsMessageLog.logMessage(f"P2P terrain: buildings check skipped: "
+                                 f"{exc}", TAG, Qgis.MessageLevel.Warning)
+        return
+    QgsMessageLog.logMessage(
+        f"P2P terrain: the prepared tiles of {terrain_dir} "
+        f"{_PREPARED_BUILDINGS_TEXT[state.state]} ({state.counts()})",
+        TAG, Qgis.MessageLevel.Info)
 
 
 def _kill_proc(proc: subprocess.Popen) -> None:
-    """Kill a subprocess and all its children (Windows-safe)."""
-    if proc.poll() is not None:
-        return
-    if platform.system() == "Windows":
-        subprocess.run(
-            ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
-            capture_output=True,
-            creationflags=_SUBPROCESS_FLAGS,
-        )
-    else:
-        proc.terminate()
+    """Stop's kill, on the GUI thread — never blocks:
+    ``terrain_adapter.kill_engine_process`` (POSIX SIGTERM; Windows
+    TerminateProcess on the handle + a fire-and-forget ``taskkill /T`` for
+    children)."""
+    terrain_adapter.kill_engine_process(proc)
 
 
 # ---------------------------------------------------------------------------
@@ -501,7 +524,7 @@ class _P2PWorker(QThread):
         super().__init__(parent)
         self.params = params
         self.dem_layer = dem_layer
-        #: The Settings terrain folder ("Local: …" in the DEM list), else "".
+        #: The local terrain folder ("Local: …" in the DEM list), else "".
         self.terrain_dir = terrain_dir
         self.output_dir = output_dir
         self.batch_file = batch_file
@@ -512,6 +535,17 @@ class _P2PWorker(QThread):
         self._canceled = True
         if self._proc is not None:
             _kill_proc(self._proc)
+
+    def _register_proc(self, proc: subprocess.Popen) -> None:
+        """Terrain on_start hook: expose each engine process to cancel().
+
+        A cancel() that landed after the last poll but before this launch
+        found no process to kill, so the process is killed here instead —
+        otherwise it would run to the end behind a pressed Stop.
+        """
+        self._proc = proc
+        if self._canceled:
+            _kill_proc(proc)
 
     def _parse_p2p_progress(self, line: str) -> Optional[int]:
         """Extract percentage from P2P progress lines."""
@@ -548,15 +582,26 @@ class _P2PWorker(QThread):
             from ..core.terrain_adapter import prepare_terrain
 
             bm.check_engine_for_job(params.resolution_m)
-            abt_dir = prepare_terrain(
-                dem_layer=self.dem_layer,
-                tx_lat=centre_lat,
-                tx_lon=centre_lon,
-                max_range_km=terrain_radius_km,
-                resolution_m=params.resolution_m,
-                binary_manager=bm,
-                terrain_dir=self.terrain_dir or None,
-            )
+            # Stop must reach the terrain step: the flag is polled per tile /
+            # output line, and every engine process it starts (download,
+            # ingest) is handed to cancel() to kill — the ingest prints
+            # progress only every 10 tiles.
+            try:
+                abt_dir = prepare_terrain(
+                    dem_layer=self.dem_layer,
+                    tx_lat=centre_lat,
+                    tx_lon=centre_lon,
+                    max_range_km=terrain_radius_km,
+                    resolution_m=params.resolution_m,
+                    binary_manager=bm,
+                    terrain_dir=self.terrain_dir or None,
+                    should_cancel=lambda: self._canceled,
+                    on_start=self._register_proc,
+                )
+            except terrain_adapter.ConverterCancelled:
+                return
+            finally:
+                self._proc = None
 
             if self._canceled:
                 return
@@ -596,8 +641,15 @@ class _P2PWorker(QThread):
             api_key.apply_license_env(env)
 
             # Streams through the one shared subprocess runner
-            # (terrain_adapter.run_converter_streaming).
+            # (terrain_adapter.run_converter_streaming). Every line of
+            # aether_core's console goes to today's engine log file; the
+            # QGIS Log Messages panel (AETHER tag) gets the ones a user
+            # reads (engine_log.is_diagnostic).
             output_lines: list[str] = []
+            elog = engine_log.EngineLog(
+                "point-to-point",
+                lambda text: QgsMessageLog.logMessage(
+                    text, TAG, Qgis.MessageLevel.Info))
 
             def on_start(proc) -> None:
                 self._proc = proc
@@ -606,9 +658,7 @@ class _P2PWorker(QThread):
                 if self._canceled:
                     raise terrain_adapter.ConverterCancelled()
                 output_lines.append(line)
-                # Surface aether_core's own stdout log in the QGIS Log
-                # Messages panel under the AETHER tag.
-                QgsMessageLog.logMessage(line, TAG, Qgis.MessageLevel.Info)
+                elog.line(line)
                 pct = self._parse_p2p_progress(line)
                 if pct is not None:
                     self.progress.emit(25 + int(pct * 0.70))
@@ -621,6 +671,7 @@ class _P2PWorker(QThread):
                 return
             finally:
                 self._proc = None
+                elog.close()
             if self._canceled:
                 # cancel() killed the process directly — rc is the kill
                 # signal, not an engine failure. End quietly.
@@ -813,10 +864,13 @@ class P2PTab(QWidget):
     def cancel_worker(self) -> None:
         """Cancel any running worker thread.  Called by the parent dialog.
 
-        Also resets all rubber bands from the map canvas.
+        Also resets all rubber bands from the map canvas. The dialog is
+        closing, so this one waits (bounded) for the run to end; Run is still
+        re-enabled only by ``_on_worker_finished`` — never while the thread
+        is alive, also when the wait times out.
         """
         if self._worker is not None and self._worker.isRunning():
-            self._worker.cancel()
+            self._on_stop()
             self._worker.wait(5000)
 
         self._reset_rubber_bands()
@@ -1074,10 +1128,14 @@ class P2PTab(QWidget):
         group = QGroupBox("Analysis")
         layout = QFormLayout(group)
 
-        # DEM Layer + Resolution on one row
+        # DEM Layer (+ "Folder…" to pick a local terrain folder) and
+        # Resolution on one row
         dem_row = QHBoxLayout()
         self.combo_dem = QComboBox()
         dem_row.addWidget(self.combo_dem, stretch=1)
+        self.btn_dem_folder = QPushButton(terrain_dirs.FOLDER_BUTTON_TEXT)
+        self.btn_dem_folder.setToolTip(terrain_dirs.FOLDER_BUTTON_TOOLTIP)
+        dem_row.addWidget(self.btn_dem_folder)
         dem_row.addWidget(QLabel("Resolution:"))
         self.combo_resolution = QComboBox()
         self.combo_resolution.addItems([str(r) for r in VALID_RESOLUTIONS])
@@ -1126,6 +1184,8 @@ class P2PTab(QWidget):
 
         # Browse button
         self.btn_browse_dir.clicked.connect(self._on_browse_dir)
+        # "Folder…" beside the DEM combo
+        self.btn_dem_folder.clicked.connect(self._on_pick_terrain_dir)
 
         # Update rubber bands when coordinates change
         self.spin_a_lat.valueChanged.connect(self._update_visuals)
@@ -1137,11 +1197,15 @@ class P2PTab(QWidget):
     # Populate raster layers
     # ------------------------------------------------------------------
 
-    def _populate_raster_layers(self) -> None:
-        """Fill the DEM combo with raster layers from the current project.
+    def _populate_raster_layers(self, select_dir: str = "") -> None:
+        """Fill the DEM combo: the local terrain folders, as in the 360° tab
+        (Settings → Local terrain dir, then the folders picked with
+        "Folder…" — ``terrain_dirs.combo_folders``), then the project's
+        raster layers.
 
         Preserves the current selection across refills so a live update (a
-        layer added or removed) does not reset the user's choice.
+        layer added or removed) does not reset the user's choice;
+        *select_dir* (a folder just picked) is selected instead.
         """
         idx = self.combo_dem.currentIndex()
         prev_id = None
@@ -1151,26 +1215,22 @@ class P2PTab(QWidget):
         self.combo_dem.blockSignals(True)
         self.combo_dem.clear()
         self._dem_layers: list = []  # QgsRasterLayer or str (folder path)
-        # The terrain folder from Settings, as in the 360° tab — P2P used to
-        # list project layers only, so the folder could never be chosen here.
-        terrain_dir = str(QgsSettings().value("waveshed/terrain_dir", "") or "").strip()
-        if terrain_dir and os.path.isdir(terrain_dir):
-            self.combo_dem.addItem(f"{self._LOCAL_DIR_PREFIX}{terrain_dir}")
-            self._dem_layers.append(terrain_dir)
+        terrain_dirs.add_folder_entries(self.combo_dem, self._dem_layers)
         for layer in QgsProject.instance().mapLayers().values():
             # Skip our own result rasters (coverage/P2P); keep terrain we made.
             if isinstance(layer, QgsRasterLayer) and not hide_from_dem_picker(layer):
                 self.combo_dem.addItem(layer.name())
                 self._dem_layers.append(layer)
 
-        if prev_id is not None:
+        picked = terrain_dirs.folder_index(self._dem_layers, select_dir)
+        if picked >= 0:
+            self.combo_dem.setCurrentIndex(picked)
+        elif prev_id is not None:
             for i, entry in enumerate(self._dem_layers):
                 if self._dem_key(entry) == prev_id:
                     self.combo_dem.setCurrentIndex(i)
                     break
         self.combo_dem.blockSignals(False)
-
-    _LOCAL_DIR_PREFIX = "Local: "
 
     @staticmethod
     def _dem_key(entry) -> Optional[str]:
@@ -1186,9 +1246,18 @@ class P2PTab(QWidget):
         """Repopulate the DEM combo when project layers are added/removed."""
         self._populate_raster_layers()
 
+    def _on_pick_terrain_dir(self) -> None:
+        """"Folder…": pick a local terrain folder in the file browser. It is
+        selected at once and listed in both tabs' DEM combo from now on;
+        Cancel changes nothing."""
+        path = terrain_dirs.ask_terrain_dir(self, self._selected_terrain_dir())
+        if path:
+            self._populate_raster_layers(select_dir=path)
+            terrain_dirs.announce_pick(self._parent_dialog, self)
+
     def _selected_dem_layer(self) -> Optional[QgsRasterLayer]:
-        """Return the currently selected DEM layer, or None (also when the
-        Settings terrain folder is selected — see :meth:`_selected_terrain_dir`)."""
+        """Return the currently selected DEM layer, or None (also when a
+        local terrain folder is selected — see :meth:`_selected_terrain_dir`)."""
         idx = self.combo_dem.currentIndex()
         if 0 <= idx < len(self._dem_layers):
             entry = self._dem_layers[idx]
@@ -1196,7 +1265,8 @@ class P2PTab(QWidget):
         return None
 
     def _selected_terrain_dir(self) -> str:
-        """The Settings terrain folder when it is the selected DEM entry, else ""."""
+        """The local terrain folder (the Settings one or one picked with
+        "Folder…") when it is the selected DEM entry, else ""."""
         idx = self.combo_dem.currentIndex()
         if 0 <= idx < len(self._dem_layers):
             entry = self._dem_layers[idx]
@@ -1411,6 +1481,7 @@ class P2PTab(QWidget):
                 QMessageBox.StandardButton.No) == QMessageBox.StandardButton.Yes
         sel = select_abt_tiles(terrain_dir, c_lat, c_lon,
                                [(range_km * 1000.0, params.resolution_m)])
+        _log_prepared_buildings(terrain_dir, sel)
         if not sel.substitutions:
             return True
         shown = "\n".join(f"  • {x}" for x in sel.substitutions[:12])
@@ -1570,8 +1641,17 @@ class P2PTab(QWidget):
             ) != QMessageBox.StandardButton.Yes:
                 return
 
+        self._launch_worker(params, dem_layer, output_dir, batch_file,
+                            terrain_dir)
+
+    def _launch_worker(
+        self, params: P2PParams, dem_layer: Optional[QgsRasterLayer],
+        output_dir: str, batch_file: str, terrain_dir: str,
+    ) -> None:
+        """Put the tab in run mode and start the worker."""
         # Switch to running state.
         self.btn_run.setEnabled(False)
+        self.btn_stop.setEnabled(True)
         self.btn_stop.setVisible(True)
         self.btn_view_plots.setVisible(False)
         self.progress_bar.setVisible(True)
@@ -1582,24 +1662,46 @@ class P2PTab(QWidget):
         self._last_output_name = params.output_name
         self._last_output_dir = None  # reset until success
 
-        self._worker = _P2PWorker(
+        self._worker = worker = _P2PWorker(
             params, dem_layer, output_dir, batch_file, self,
             terrain_dir=terrain_dir,
         )
-        self._worker.progress.connect(self.progress_bar.setValue)
-        self._worker.status.connect(self._on_status)
-        self._worker.finished_ok.connect(self._on_finished_ok)
-        self._worker.finished_err.connect(self._on_finished_err)
-        self._worker.start()
+        worker.progress.connect(self.progress_bar.setValue)
+        worker.status.connect(self._on_status)
+        worker.finished_ok.connect(self._on_finished_ok)
+        worker.finished_err.connect(self._on_finished_err)
+        # However the run ends (a stopped one emits neither signal above),
+        # the UI comes back only once the thread has really ended.
+        worker.finished.connect(lambda: self._on_worker_finished(worker))
+        worker.start()
 
     def _on_stop(self) -> None:
+        """Stop a running analysis — without blocking the GUI thread.
+
+        cancel() kills the engine process the worker waits on (terrain
+        download, ingest or aether_core); the run UI is reset only when the
+        thread has ended (``_on_worker_finished``). Resetting it here, while
+        the worker was still unwinding, re-enabled Run and let a second run
+        overlap the first.
+        """
         if self._worker and self._worker.isRunning():
+            self.btn_stop.setEnabled(False)
             self.result_area.append("Stopping...")
             self._worker.cancel()
-            self._worker.wait(5000)
-        self._reset_run_ui()
+        else:
+            self._reset_run_ui()
+
+    def _on_worker_finished(self, worker: _P2PWorker) -> None:
+        """QThread.finished of *worker*: done, failed or stopped — it is over.
+
+        A late signal of an older worker must not reset a newer run's UI.
+        """
+        if worker is self._worker:
+            self._reset_run_ui()
 
     def _reset_run_ui(self) -> None:
+        # Idempotent: finished_ok / finished_err reset first, then the
+        # thread's finished signal resets again.
         self.btn_run.setEnabled(True)
         self.btn_stop.setVisible(False)
         self.progress_bar.setVisible(False)

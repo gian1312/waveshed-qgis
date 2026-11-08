@@ -103,5 +103,91 @@ class CheckEngineForJob(unittest.TestCase):
         self.assertTrue(issubclass(bm.EngineTooOldError, RuntimeError))
 
 
+class ConverterRepairCapability(unittest.TestCase):
+    """``repair_source_tiles`` is gated on ``aether_converter --version``."""
+
+    def test_parse_converter_line(self):
+        self.assertEqual(
+            bm.parse_engine_version("aether_converter 0.2.6\n", "aether_converter"),
+            "0.2.6")
+        self.assertIsNone(
+            bm.parse_engine_version("aether_core 0.2.6", "aether_converter"))
+
+    def test_gate(self):
+        for version, expected in (("0.2.5", False), ("0.2.6", True),
+                                  ("0.3.0", True), (None, False)):
+            with mock.patch.object(bm, "probe_converter_version",
+                                   return_value=version):
+                self.assertIs(bm.converter_supports_repair("/x/aether_converter"),
+                              expected, version)
+        self.assertEqual(bm.CONVERTER_REPAIR_MIN_VERSION, "0.2.6")
+
+    def test_probe_runs_the_converter_and_reads_its_line(self):
+        bm._VERSION_CACHE.clear()
+        self.addCleanup(bm._VERSION_CACHE.clear)
+        ok = mock.Mock(returncode=0, stdout="aether_converter 0.2.6\n", stderr="")
+        with mock.patch.object(bm, "prepare_engine_dir"), \
+                mock.patch.object(bm.subprocess, "run", return_value=ok) as run:
+            self.assertEqual(bm.probe_converter_version("/x/aether_converter"),
+                             "0.2.6")
+        self.assertEqual(run.call_args[0][0], ["/x/aether_converter", "--version"])
+
+
+class ConverterTileVoidsCapability(unittest.TestCase):
+    """``[Tile] <name> voids=<n>`` is expected from ``aether_converter
+    --version`` >= 0.2.11 only (toolkit CONTRACT changelog 46)."""
+
+    def test_gate(self):
+        for version, expected in (("0.2.10", False), ("0.2.11", True),
+                                  ("0.2.12", True), ("0.3.0", True),
+                                  ("0.2.9", False), (None, False)):
+            with mock.patch.object(bm, "probe_converter_version",
+                                   return_value=version) as probe:
+                self.assertIs(
+                    bm.converter_supports_tile_voids("/x/aether_converter"),
+                    expected, version)
+            probe.assert_called_once_with("/x/aether_converter")
+        self.assertEqual(bm.CONVERTER_TILE_VOIDS_MIN_VERSION, "0.2.11")
+
+
+class ConverterBuildingsReadyCapability(unittest.TestCase):
+    """``buildings_pbf_ready`` / ``buildings_pbf_wait_s`` are sent to a
+    DOWNLOAD job from ``aether_converter --version`` >= 0.2.10 only
+    (toolkit CONTRACT changelog 45), to an INGEST job from >= 0.2.12 only
+    (CONTRACT item 48): an older build ignores them and reads the building
+    directory as it finds it."""
+
+    def _gate(self, fn, cases):
+        for version, expected in cases:
+            with mock.patch.object(bm, "probe_converter_version",
+                                   return_value=version) as probe:
+                self.assertIs(fn("/x/aether_converter"), expected, version)
+            probe.assert_called_once_with("/x/aether_converter")
+
+    def test_download_gate(self):
+        self._gate(bm.converter_supports_buildings_ready,
+                   (("0.2.9", False), ("0.2.10", True), ("0.2.11", True),
+                    ("0.3.0", True), (None, False)))
+        self.assertEqual(bm.CONVERTER_BUILDINGS_READY_MIN_VERSION, "0.2.10")
+
+    def test_ingest_gate(self):
+        self._gate(bm.converter_supports_ingest_buildings_ready,
+                   (("0.2.10", False), ("0.2.11", False), ("0.2.12", True),
+                    ("0.2.13", True), ("0.3.0", True), ("0.1.99", False),
+                    (None, False)))
+        self.assertEqual(bm.CONVERTER_INGEST_BUILDINGS_READY_MIN_VERSION,
+                         "0.2.12")
+
+    def test_list_gate(self):
+        # buildings_pbf_list (toolkit CONTRACT changelog 51): download and
+        # ingest batch jobs from 0.2.14 only — an older build does not know
+        # the field.
+        self._gate(bm.converter_supports_buildings_list,
+                   (("0.2.12", False), ("0.2.13", False), ("0.2.14", True),
+                    ("0.2.15", True), ("0.3.0", True), ("0.1.99", False),
+                    (None, False)))
+        self.assertEqual(bm.CONVERTER_BUILDINGS_LIST_MIN_VERSION, "0.2.14")
+
+
 if __name__ == "__main__":
     unittest.main()

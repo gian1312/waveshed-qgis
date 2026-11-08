@@ -254,6 +254,19 @@ class AetherMainDialog(QDialog):
         if callable(clear):
             clear()
 
+    def terrain_dir_picked_in(self, tab) -> None:
+        """One tab picked a terrain folder ("Folder…") — list it in the other
+        tab's DEM combo too.
+
+        The recent folders are shared (``terrain_dirs``); without this the
+        other combo showed the pick only at its next refill (a project layer
+        change, the next open). The other tab keeps its selection.
+        """
+        other = self.p2p_tab if tab is self.site_tab else self.site_tab
+        refill = getattr(other, "_populate_raster_layers", None)
+        if callable(refill):
+            refill()
+
     def confirm_unsaved_settings(self, revalidate: bool = True) -> bool:
         """Ask before unsaved Settings edits are lost. True = go ahead.
 

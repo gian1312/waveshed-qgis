@@ -15,10 +15,13 @@ from ONE index per folder instead of opening every file on every run:
   X/Y (native units and metres), data type, band count, compression,
   geotransform shape (rotated / flipped), scale/offset and nodata;
 * refreshed incrementally: unchanged files cost one ``stat`` (threaded — a
-  stat on the Windows mount is ~3 ms), new or changed files are probed with
-  GDAL in a thread pool (GDAL releases the GIL for I/O, measured ~7x on 8
-  threads), removed files drop out. Never call :meth:`FolderIndex.refresh`
-  on the GUI thread — the GUI runs it in ``gui/terrain_folder_scan``.
+  stat on the Windows mount is ~3 ms), new or changed plain GeoTIFFs are
+  probed by ONE ``aether_converter probe`` run (native, parallel; entries
+  built from its header facts, CRS work batched per EPSG code), everything
+  else — and every GeoTIFF the probe does not vouch for — with GDAL in a
+  thread pool (GDAL releases the GIL for I/O, measured ~7x on 8 threads),
+  removed files drop out. Never call :meth:`FolderIndex.refresh` on the GUI
+  thread — the GUI runs it in ``gui/terrain_folder_scan``.
 
 Pure GDAL/OSR (no QGIS objects), so it is thread-safe and testable without a
 QGIS instance.
@@ -26,12 +29,16 @@ QGIS instance.
 
 from __future__ import annotations
 
-import hashlib
+import contextlib
+import gc
+import itertools
 import json
 import math
 import os
 import re
 import struct
+import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -41,10 +48,28 @@ from typing import Any, Callable, Dict, Iterable, List, NamedTuple, Optional, Tu
 import numpy as np
 from osgeo import gdal
 
+from . import hashes
+
 try:
     from osgeo import osr
 except ImportError:  # the unit-test stub of osgeo has no osr; tests that
     osr = None       # exercise the index swap the real package in
+
+#: No console window for the probe on Windows. ``sys.platform``, the gate of
+#: every Windows path (as ``terrain_adapter._is_windows``, which cannot be
+#: imported here — it imports this module); evaluated once, at import.
+_SUBPROCESS_FLAGS = (
+    getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+    if sys.platform == "win32" else 0
+)
+
+
+def _log(msg: str) -> None:
+    try:
+        from qgis.core import Qgis, QgsMessageLog
+        QgsMessageLog.logMessage(msg, "Waveshed-Terrain", Qgis.MessageLevel.Info)
+    except Exception:  # noqa: BLE001 — logging never breaks a scan
+        pass
 
 #: Bump when the stored layout changes (the whole index is dropped).
 INDEX_SCHEMA = "ti1"
@@ -141,6 +166,13 @@ class RefreshStats(NamedTuple):
     probe_s: float
     total_s: float
     reused: bool = False
+    #: "converter" when ``aether_converter probe`` read the new/changed
+    #: GeoTIFFs, "" when only the in-process probes ran.
+    probe_engine: str = ""
+    #: Mean cost of opening one NEW file, ms — the converter probe's own
+    #: average (its ``[Probe] … open X ms avg`` line, also in the probe log
+    #: line); None when no probe ran.
+    open_ms: Optional[float] = None
 
 
 # ---------------------------------------------------------------------------
@@ -407,8 +439,6 @@ def _geo_fields(gt: Tuple[float, ...], xsize: int, ysize: int,
     *crs*; None when the CRS cannot be transformed to WGS84 there."""
     corners = _corners(gt, xsize, ysize)
     native = _bounds(corners)
-    px_x = math.hypot(gt[1], gt[4])
-    px_y = math.hypot(gt[2], gt[5])
     if crs["crs_authid"] == "EPSG:4326":
         ring = _densify_ring(corners, 4)
         wgs_bbox = dict(native)
@@ -421,9 +451,22 @@ def _geo_fields(gt: Tuple[float, ...], xsize: int, ysize: int,
         if len(ring) < len(corners) * 4 or len(dense) < 4:
             return None
         wgs_bbox = _bounds(dense + ring)
-    clat = (wgs_bbox["north"] + wgs_bbox["south"]) / 2.0
-    unit = _crs_unit(crs["crs_wkt"], crs["geographic"])
-    if crs["geographic"]:
+    return _geo_result(gt, native, wgs_bbox, ring,
+                       _crs_unit(crs["crs_wkt"], crs["geographic"]),
+                       crs["geographic"])
+
+
+def _geo_result(gt: Tuple[float, ...], native: Dict[str, float],
+                wgs_bbox: Dict[str, float], ring: Iterable[Tuple[float, float]],
+                unit: float, geographic: bool,
+                footprint: Optional[List[List[float]]] = None) -> Dict[str, Any]:
+    """The geometry fields of an entry (shared by :func:`_geo_fields` and the
+    batched :func:`_geo_fields_many`, so both compute them identically;
+    *footprint*: the ring already rounded by :func:`_round7`)."""
+    px_x = math.hypot(gt[1], gt[4])
+    px_y = math.hypot(gt[2], gt[5])
+    if geographic:
+        clat = (wgs_bbox["north"] + wgs_bbox["south"]) / 2.0
         deg = math.degrees(unit)
         px_x_m = px_x * deg * _M_PER_DEG_LON_EQ * max(math.cos(math.radians(clat)), 0.01)
         px_y_m = px_y * deg * _M_PER_DEG_LAT
@@ -432,7 +475,8 @@ def _geo_fields(gt: Tuple[float, ...], xsize: int, ysize: int,
     return {
         "native_bounds": native,
         "wgs84_bounds": wgs_bbox,
-        "footprint": [[round(x, 7), round(y, 7)] for x, y in ring],
+        "footprint": (footprint if footprint is not None else
+                      [[round(x, 7), round(y, 7)] for x, y in ring]),
         "px_x": px_x, "px_y": px_y,
         "px_x_m": px_x_m, "px_y_m": px_y_m,
         "px_m": math.sqrt(max(px_x_m, 1e-9) * max(px_y_m, 1e-9)),
@@ -447,6 +491,15 @@ def _stat(path: str) -> Optional[Tuple[int, int]]:
     except OSError:
         return None
     return int(st.st_size), int(st.st_mtime_ns)
+
+
+def dir_mtime_ns(folder: str) -> Optional[int]:
+    """The folder's own mtime (ns) — changes when an entry directly in it is
+    added, removed or renamed; None when it cannot be stat'ed."""
+    try:
+        return int(os.stat(folder).st_mtime_ns)
+    except OSError:
+        return None
 
 
 def archive_of(path: str) -> Optional[str]:
@@ -600,6 +653,18 @@ def _epsg_crs(code: int) -> Optional[Dict[str, Any]]:
     return cache[code]
 
 
+def _has_sidecar(path: str, siblings: Optional[set]) -> bool:
+    """True when a sidecar that can override CRS, georeferencing, nodata or
+    scale sits next to *path* (looked up in *siblings*, the scan's lower-cased
+    listing, when given)."""
+    stem = os.path.splitext(path)[0]
+    for suffix in _SIDECAR_SUFFIXES:
+        for cand in (path + suffix, stem + suffix):
+            if (cand.lower() in siblings) if siblings is not None else os.path.exists(cand):
+                return True
+    return False
+
+
 def probe_geotiff_fast(path: str, siblings: Optional[set] = None,
                        file_size: Optional[int] = None) -> Optional[Dict[str, Any]]:
     """The index entry for an ordinary GeoTIFF without GDAL, or None when the
@@ -608,11 +673,8 @@ def probe_geotiff_fast(path: str, siblings: Optional[set] = None,
     there instead of with a disk call each."""
     if path.startswith("/vsi") or _ext(path) not in (".tif", ".tiff"):
         return None
-    stem = os.path.splitext(path)[0]
-    for suffix in _SIDECAR_SUFFIXES:
-        for cand in (path + suffix, stem + suffix):
-            if (cand.lower() in siblings) if siblings is not None else os.path.exists(cand):
-                return None
+    if _has_sidecar(path, siblings):
+        return None
     try:
         with open(path, "rb") as raw_fh:
             fh = _HeadReader(raw_fh)
@@ -727,6 +789,13 @@ def probe_geotiff_fast(path: str, siblings: Optional[set] = None,
     entry.update(geo)
     return entry
 
+#: ``reason`` of a file whose pixels are not all there — GDAL's bottom-right
+#: block read failed (probe_file, + GDAL's message) or the converter probe's
+#: ``last_chunk_end`` lies past the file / is null (entries_from_probe, + what
+#: the probe saw). One text, so both paths classify and word it alike.
+TRUNCATED_REASON = "truncated or corrupt — its pixels cannot be read"
+
+
 def probe_file(path: str, siblings: Optional[set] = None,
                st: Optional[Tuple[int, int]] = None) -> Dict[str, Any]:
     """Everything the index records about one raster (see module doc).
@@ -822,8 +891,8 @@ def probe_file(path: str, siblings: Optional[set] = None,
             data = None
         if data is None or gdal.GetLastErrorType() >= gdal.CE_Failure:
             msg = gdal.GetLastErrorMsg().strip()
-            entry["reason"] = ("truncated or corrupt — its pixels cannot be "
-                               "read" + (f" ({msg[:100]})" if msg else ""))
+            entry["reason"] = (TRUNCATED_REASON
+                               + (f" ({msg[:100]})" if msg else ""))
             return entry
         srs = _parse_srs(ds.GetProjection() or "")
         ds = band = None
@@ -845,6 +914,453 @@ def probe_file(path: str, siblings: Optional[set] = None,
         return entry
     finally:
         gdal.PopErrorHandler()
+
+
+# ---------------------------------------------------------------------------
+# Converter probe (``aether_converter probe``, schema aether-probe/1)
+#
+# The in-process probes above are GIL-bound Python per file (43,650 swissALTI3D
+# tiles: 84 s). ``aether_converter probe`` (>= 0.2.7, aether-tools CONTRACT
+# §1.2a) reads the same header facts natively, in parallel, one JSON line per
+# file; every fact of an ``ok: true`` line equals GDAL's value. Entries are
+# built from those facts exactly as probe_geotiff_fast builds them: CRS once
+# per EPSG code, the WGS84 footprint of ALL files in that CRS in one batched
+# TransformPoints (see _geo_fields_many). The probe reads no sidecar, so
+# files with a sidecar never go to it. Truncation as GDAL's bottom-right block
+# read judges it: ``last_chunk_end`` (toolkit changelog 35 — the end of that
+# block) past the file size, or null, gives the entry GDAL gives a truncated
+# file (readable False, TRUNCATED_REASON, no CRS/geometry); a line without the
+# field (a converter built before it) cannot vouch for compressed pixels, so
+# such files go to GDAL; an uncompressed file shorter than its pixels goes to
+# GDAL as before. ``ok: false`` lines, unknown codecs/types, CRS-less files and
+# anything else this mapping does not vouch for go through probe_file
+# unchanged.
+# ---------------------------------------------------------------------------
+
+#: The ``schema`` of every probe line.
+PROBE_SCHEMA = "aether-probe/1"
+#: Fewer new/changed GeoTIFFs than this are read in-process: launching the
+#: converter (an AV-scanned exe on Windows) costs more than it saves.
+PROBE_MIN_FILES = 64
+#: Probe dtype -> (GDAL type name, bytes per sample). i8/u64/i64 are left to
+#: GDAL (its Int8 / 64-bit nodata handling differs by version).
+_PROBE_DTYPES = {"u8": ("Byte", 1), "u16": ("UInt16", 2), "i16": ("Int16", 2),
+                 "u32": ("UInt32", 4), "i32": ("Int32", 4),
+                 "f32": ("Float32", 4), "f64": ("Float64", 8)}
+_PROBE_NODATA = {"nan": float("nan"), "inf": float("inf"),
+                 "-inf": float("-inf")}
+#: ``[Probe] N files, K ok, S s, open X ms avg, read Y ms avg`` (stderr).
+_PROBE_SUMMARY = re.compile(
+    r"\[Probe\]\s+(\d+) files, (\d+) ok, ([0-9.]+)s, "
+    r"open ([0-9.]+) ms avg, read ([0-9.]+) ms avg")
+#: WGS84 bounds tolerance (degrees, ~2 mm) within which a file's 16-point
+#: footprint ring stands in for the 80-point edge sampling of _geo_fields:
+#: with ring samples h = 1/4 edge apart, the edge's true extreme lies within
+#: |Δ²|/8 of the ring's (Δ² = the ring's largest second difference), and the
+#: 80-point extreme lies between the two. Files above it get the 80 points.
+_RING_BBOX_EPS_DEG = 2e-8
+
+
+class ProbeRun(NamedTuple):
+    """One ``aether_converter probe`` run."""
+    facts: Dict[str, Dict[str, Any]]   # path -> its line (ok or not)
+    files: int                         # paths listed
+    elapsed_s: float
+    open_ms: Optional[float]           # the probe's own averages (stderr)
+    read_ms: Optional[float]
+    returncode: Optional[int]
+    cancelled: bool
+    error: str = ""
+
+
+@contextlib.contextmanager
+def _no_gc():
+    """Cyclic GC paused while tens of thousands of small dicts/lists are
+    built (it re-scans them on every few hundred allocations: building the
+    footprints of 43,650 files took 3x longer with it on). Reference counting
+    still frees everything; the previous state is restored."""
+    was = gc.isenabled()
+    gc.disable()
+    try:
+        yield
+    finally:
+        if was:
+            gc.enable()
+
+
+def probe_converter() -> Optional[str]:
+    """The ``aether_converter`` that has ``probe`` (``--version`` >=
+    ``binary_manager.CONVERTER_PROBE_MIN_VERSION``), or None — absent, older
+    or unknown means the in-process probes, unchanged. Never raises."""
+    try:
+        from . import binary_manager as bm   # deferred: QGIS imports
+        exe = bm.find_binary("aether_converter")
+        version = bm.probe_converter_version(exe)
+        if version is None or bm.compare_versions(
+                version, bm.CONVERTER_PROBE_MIN_VERSION) < 0:
+            return None
+        return exe
+    except Exception:  # noqa: BLE001 — no converter: in-process probes
+        return None
+
+
+def _probe_candidate(path: str, siblings: Optional[set]) -> bool:
+    """True when *path* goes to the converter probe: a plain .tif/.tiff with
+    no sidecar (the probe reads none), listable on one UTF-8 line."""
+    if path.startswith("/vsi") or _ext(path) not in (".tif", ".tiff"):
+        return False
+    if "\n" in path or "\r" in path or not path.strip():
+        return False
+    try:
+        path.encode("utf-8")
+    except UnicodeEncodeError:
+        return False
+    return not _has_sidecar(path, siblings)
+
+
+def _probe_command(exe: str, list_path: str) -> List[str]:
+    return [exe, "probe", "--list", list_path]
+
+
+def _kill(proc: Any) -> None:
+    try:
+        proc.kill()
+    except Exception:  # noqa: BLE001 — already gone
+        pass
+
+
+def run_probe(exe: str, paths: List[str],
+              progress: Optional[Callable[[int, int], None]] = None,
+              should_cancel: Optional[Callable[[], bool]] = None) -> ProbeRun:
+    """Run ``aether_converter probe --list`` ONCE over *paths*.
+
+    Lines arrive in list order and are parsed as they come (overlapping the
+    converter's own I/O). *progress(done, total)* every 256 lines. Cancel:
+    *should_cancel* is polled every 0.1 s by a watcher that kills the process;
+    the lines read until then are kept (``cancelled`` True). A line whose
+    ``path`` is not the listed one, or that does not parse, is dropped (the
+    caller probes that file in-process). Never raises."""
+    t0 = time.perf_counter()
+    facts: Dict[str, Dict[str, Any]] = {}
+    rc: Optional[int] = None
+    err_text = ""
+    error = ""
+    cancelled = False
+    n = len(paths)
+    fd, list_path = tempfile.mkstemp(prefix="waveshed_probe_", suffix=".txt")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write("\n".join(paths) + "\n")
+        # stderr to a file: one summary line, but a panic must not fill a
+        # pipe nobody reads while stdout is being drained.
+        with tempfile.TemporaryFile() as err:
+            proc = subprocess.Popen(
+                _probe_command(exe, list_path),
+                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=err,
+                text=True, encoding="utf-8", errors="replace", bufsize=1,
+                creationflags=_SUBPROCESS_FLAGS)
+            stop = threading.Event()
+            hit = threading.Event()
+
+            def watch() -> None:
+                while not stop.wait(0.1):
+                    if should_cancel is not None and should_cancel():
+                        hit.set()
+                        _kill(proc)
+                        return
+
+            watcher = threading.Thread(target=watch, name="probe-cancel",
+                                       daemon=True)
+            watcher.start()
+            try:
+                i = 0
+                loads = json.loads
+                with _no_gc():
+                    for line in proc.stdout:
+                        if i < n:
+                            try:
+                                f = loads(line)
+                            except ValueError:
+                                f = None
+                            if isinstance(f, dict) and f.get("path") == paths[i]:
+                                facts[paths[i]] = f
+                        i += 1
+                        if progress is not None and i % 256 == 0:
+                            progress(min(i, n), n)
+                rc = proc.wait()
+            finally:
+                stop.set()
+                if proc.poll() is None:
+                    _kill(proc)
+                    proc.wait()
+                watcher.join()
+            cancelled = hit.is_set() or bool(
+                should_cancel is not None and should_cancel())
+            err.seek(0)
+            err_text = err.read().decode("utf-8", "replace")
+    except Exception as exc:  # noqa: BLE001 — the in-process probes take over
+        error = f"{type(exc).__name__}: {exc}"
+    finally:
+        try:
+            os.remove(list_path)
+        except OSError:
+            pass
+    m = _PROBE_SUMMARY.search(err_text)
+    if not error and rc not in (0, None) and not cancelled:
+        error = f"exit {rc}: " + (err_text.strip().splitlines() or [""])[-1][:200]
+    return ProbeRun(facts=facts, files=n, elapsed_s=time.perf_counter() - t0,
+                    open_ms=float(m.group(4)) if m else None,
+                    read_ms=float(m.group(5)) if m else None,
+                    returncode=rc, cancelled=cancelled, error=error)
+
+
+def _probe_base(f: Dict[str, Any]
+                ) -> Optional[Tuple[Dict[str, Any], int, Tuple[float, ...], int, int]]:
+    """``(entry without CRS/geometry, epsg, geotransform, xsize, ysize)`` of one
+    probe line — the fields probe_geotiff_fast records for that file — or None
+    when the line is not one this shortcut vouches for (GDAL decides)."""
+    if f.get("ok") is not True or f.get("schema") != PROBE_SCHEMA:
+        return None
+    try:
+        code = f["epsg"]
+        if type(code) is not int or code <= 0 or code == 32767:
+            return None
+        dt = _PROBE_DTYPES.get(f["dtype"])
+        comp = _TIFF_COMPRESSION.get(f["compression"]["code"])
+        if dt is None or comp is None or f["bands"] != 1 or f.get("proj") is not None:
+            return None
+        w, h = int(f["width"]), int(f["height"])
+        gt = tuple(map(float, f["geotransform"]))
+        if (w <= 0 or h <= 0 or len(gt) != 6
+                or not math.isfinite(sum(gt))      # NaN/inf anywhere
+                or gt == (0.0, 1.0, 0.0, 0.0, 0.0, 1.0)):   # GDAL: "no geotransform"
+            return None
+        if comp == "":
+            # Uncompressed blocks have fixed sizes: a file shorter than its
+            # pixels is cut off (or sparse) — GDAL's block read judges it.
+            size = f.get("size")
+            if f.get("tiled"):
+                tw, th = int(f["tile_w"]), int(f["tile_h"])
+                need = -(-w // tw) * -(-h // th) * tw * th * dt[1]
+            else:
+                need = w * h * dt[1]
+            if type(size) is not int or size < need:
+                return None
+        # Where the pixel data ends (the bottom-right block GDAL reads):
+        # past the file or unreadable = truncated, GDAL's verdict.
+        cut = ""
+        if "last_chunk_end" in f:
+            end, size = f["last_chunk_end"], f.get("size")
+            if type(size) is not int:
+                return None
+            if end is None:
+                cut = "its block offsets cannot be read"
+            elif type(end) is not int or end < 0:
+                return None
+            elif end > size:
+                cut = f"its pixel data ends at byte {end:,}, the file has {size:,}"
+        elif comp != "":
+            return None     # a pre-changelog-35 converter: GDAL judges
+        nodata = f.get("nodata")
+        if isinstance(nodata, str):
+            if nodata not in _PROBE_NODATA:
+                return None
+            nodata = _PROBE_NODATA[nodata]
+        elif nodata is not None:
+            nodata = float(nodata)
+        scale = f.get("scale")
+        scale = 1.0 if scale in (None, 0) else float(scale)
+        offset = f.get("offset")
+        offset = 0.0 if offset is None else float(offset)
+    except (KeyError, TypeError, ValueError, AttributeError):
+        return None
+    entry: Dict[str, Any] = {
+        "probe": PROBE_VERSION, "readable": True, "reason": "", "driver": "GTiff",
+        "bands": 1, "xsize": w, "ysize": h, "dtype": dt[0],
+        "compression": comp, "nbits": "", "scale": scale, "offset": offset,
+        "nodata": nodata, "geotransform": list(gt),
+        "rotated": bool(gt[2] != 0.0 or gt[4] != 0.0),
+        "flipped": bool(gt[1] < 0.0 or gt[5] > 0.0),
+    }
+    if cut:
+        entry["readable"] = False
+        entry["reason"] = f"{TRUNCATED_REASON} ({cut})"
+    return entry, code, gt, w, h
+
+
+def _densify_np(cx: np.ndarray, cy: np.ndarray, per_edge: int
+                ) -> Tuple[np.ndarray, np.ndarray]:
+    """:func:`_densify_ring` for many rings at once (rows of 4 corners) —
+    the same float operations in the same order, so the same points."""
+    f = np.arange(per_edge, dtype=np.float64) / per_edge
+    nx, ny = np.roll(cx, -1, axis=1), np.roll(cy, -1, axis=1)
+    rx = cx[:, :, None] + (nx - cx)[:, :, None] * f
+    ry = cy[:, :, None] + (ny - cy)[:, :, None] * f
+    return rx.reshape(len(cx), -1), ry.reshape(len(cy), -1)
+
+
+def _transform_np(ct: Any, xs: np.ndarray, ys: np.ndarray
+                  ) -> Tuple[np.ndarray, np.ndarray]:
+    """ONE batched TransformPoints of every point (non-finite = failed).
+    Each distinct point is transformed once — neighbouring tiles of a grid
+    share corners and edges (43,650 swissALTI3D rings: 698k points, 307k
+    distinct) — and the same input gives the same output."""
+    c = np.empty(xs.size, dtype=np.complex128)
+    c.real, c.imag = xs.ravel(), ys.ravel()
+    uniq, inv = np.unique(c, return_inverse=True)
+    pts = np.column_stack([uniq.real, uniq.imag])
+    try:
+        res = ct.TransformPoints(pts)
+    except Exception:  # noqa: BLE001 — bindings without numpy input
+        res = ct.TransformPoints(pts.tolist())
+    width = len(res[0]) if len(res) else 3
+    out = np.fromiter(itertools.chain.from_iterable(res), dtype=np.float64,
+                      count=width * len(res)).reshape(len(pts), width)
+    inv = inv.reshape(-1)
+    return out[inv, 0].reshape(xs.shape), out[inv, 1].reshape(xs.shape)
+
+
+def _round7(a: np.ndarray) -> np.ndarray:
+    """``round(x, 7)`` of every element, exactly as Python rounds: numpy's
+    scaled rounding, redone with :func:`round` for the values whose scaled
+    fraction lies within 1e-6 of a tie (the only ones it can get wrong)."""
+    out = np.round(a, 7)
+    with np.errstate(invalid="ignore"):
+        frac = np.abs(np.modf(a * 1e7)[0])
+        risky = np.nonzero(np.abs(frac - 0.5) < 1e-6)[0] if a.ndim == 1 else \
+            np.nonzero((np.abs(frac - 0.5) < 1e-6).reshape(-1))[0]
+    if risky.size:
+        flat, src = out.reshape(-1), a.reshape(-1)
+        for i in risky.tolist():
+            flat[i] = round(float(src[i]), 7)
+    return out
+
+
+def _geo_fields_many(items: List[Tuple[Tuple[float, ...], int, int]],
+                     crs: Dict[str, Any]) -> List[Optional[Dict[str, Any]]]:
+    """:func:`_geo_fields` of many rasters in ONE CRS (``(gt, xsize, ysize)``
+    each), with one batched TransformPoints for every file's 16-point
+    footprint ring — not one call per file — plus one for the 80-point edge
+    sampling of the files whose ring cannot stand in for it
+    (:data:`_RING_BBOX_EPS_DEG`). Ring, footprint, native bounds and pixel
+    sizes are identical to :func:`_geo_fields`; WGS84 bounds identical, or
+    within that tolerance."""
+    n = len(items)
+    if n == 0:
+        return []
+    gt = np.array([it[0] for it in items], dtype=np.float64)
+    xs = np.array([it[1] for it in items], dtype=np.float64)
+    ys = np.array([it[2] for it in items], dtype=np.float64)
+    zero = np.zeros(n)
+    px = np.stack([zero, xs, xs, zero], axis=1)
+    py = np.stack([zero, zero, ys, ys], axis=1)
+    cx = gt[:, 0:1] + gt[:, 1:2] * px + gt[:, 2:3] * py      # _corners
+    cy = gt[:, 3:4] + gt[:, 4:5] * px + gt[:, 5:6] * py
+    rx, ry = _densify_np(cx, cy, 4)
+    ok = np.ones(n, dtype=bool)
+    single: List[int] = []           # rows computed file by file instead
+    if crs["crs_authid"] == "EPSG:4326":
+        lon, lat = rx, ry
+        west, east = cx.min(axis=1), cx.max(axis=1)
+        south, north = cy.min(axis=1), cy.max(axis=1)
+    else:
+        ct = _transform(crs["crs_wkt"])
+        if ct is None:
+            return [None] * n
+        try:
+            lon, lat = _transform_np(ct, rx, ry)
+        except Exception:  # noqa: BLE001 — file by file, as _geo_fields does
+            return [_geo_fields(tuple(it[0]), it[1], it[2], crs) for it in items]
+        ok = (np.isfinite(lon) & np.isfinite(lat)).all(axis=1)
+        west, east = lon.min(axis=1), lon.max(axis=1)
+        south, north = lat.min(axis=1), lat.max(axis=1)
+        # Edge samples s0..s4 (4 ring points + the next corner) per edge.
+        idx = np.array([[e * 4 + j for j in range(4)] + [((e + 1) % 4) * 4]
+                        for e in range(4)])
+        with np.errstate(invalid="ignore"):
+            bound = np.zeros(n)
+            for v in (lon, lat):
+                s = v[:, idx]
+                d2 = np.abs(s[:, :, :-2] - 2.0 * s[:, :, 1:-1] + s[:, :, 2:])
+                bound = np.maximum(bound, d2.reshape(n, -1).max(axis=1) / 8.0)
+        dense_rows = np.nonzero(ok & ~(bound <= _RING_BBOX_EPS_DEG))[0]
+        dlon = None
+        if dense_rows.size:
+            dx, dy = _densify_np(cx[dense_rows], cy[dense_rows], 20)
+            try:
+                dlon, dlat = _transform_np(ct, dx, dy)
+            except Exception:  # noqa: BLE001 — file by file, as _geo_fields
+                single = dense_rows.tolist()
+        if dlon is not None:
+            fin = np.isfinite(dlon) & np.isfinite(dlat)
+            ok[dense_rows] &= fin.sum(axis=1) >= 4
+            # Ring points are among the dense ones (same inputs), so this is
+            # _bounds(dense + ring).
+            west[dense_rows] = np.minimum(
+                np.where(fin, dlon, np.inf).min(axis=1), west[dense_rows])
+            east[dense_rows] = np.maximum(
+                np.where(fin, dlon, -np.inf).max(axis=1), east[dense_rows])
+            south[dense_rows] = np.minimum(
+                np.where(fin, dlat, np.inf).min(axis=1), south[dense_rows])
+            north[dense_rows] = np.maximum(
+                np.where(fin, dlat, -np.inf).max(axis=1), north[dense_rows])
+    unit = _crs_unit(crs["crs_wkt"], crs["geographic"])
+    geographic = crs["geographic"]
+    is_wgs = crs["crs_authid"] == "EPSG:4326"
+    cxl, cyl = cx.tolist(), cy.tolist()
+    with np.errstate(invalid="ignore"):
+        fps = np.stack([_round7(lon), _round7(lat)], axis=-1).tolist()
+    wl, el, sl, nl = west.tolist(), east.tolist(), south.tolist(), north.tolist()
+    okl = ok.tolist()
+    single_set = set(single)
+    out: List[Optional[Dict[str, Any]]] = []
+    for i in range(n):
+        if i in single_set:
+            out.append(_geo_fields(tuple(items[i][0]), items[i][1],
+                                   items[i][2], crs))
+            continue
+        if not okl[i]:
+            out.append(None)
+            continue
+        cxi, cyi = cxl[i], cyl[i]
+        native = {"west": min(cxi), "east": max(cxi),
+                  "south": min(cyi), "north": max(cyi)}
+        wgs = (dict(native) if is_wgs else
+               {"west": wl[i], "east": el[i], "south": sl[i], "north": nl[i]})
+        out.append(_geo_result(items[i][0], native, wgs, (), unit,
+                               geographic, footprint=fps[i]))
+    return out
+
+
+def entries_from_probe(facts: Dict[str, Dict[str, Any]]
+                       ) -> Dict[str, Dict[str, Any]]:
+    """Index entries (without size/mtime) for the probe lines in *facts* that
+    the shortcut covers — the entry probe_geotiff_fast / the GDAL probe gives
+    the same file. Files missing from the result go through probe_file."""
+    with _no_gc():
+        groups: Dict[int, List[Tuple[str, Dict[str, Any], Tuple[float, ...], int, int]]] = {}
+        out: Dict[str, Dict[str, Any]] = {}
+        for path, f in facts.items():
+            base = _probe_base(f)
+            if base is not None:
+                entry, code, gt, w, h = base
+                if not entry["readable"]:
+                    # Truncated: GDAL's probe stops there too, before CRS.
+                    out[path] = entry
+                    continue
+                groups.setdefault(code, []).append((path, entry, gt, w, h))
+        for code, members in groups.items():
+            crs = _epsg_crs(code)
+            if crs is None:
+                continue
+            geos = _geo_fields_many([(m[2], m[3], m[4]) for m in members], crs)
+            for (path, entry, _gt, _w, _h), geo in zip(members, geos):
+                if geo is None:
+                    continue
+                entry.update(crs)
+                entry.update(geo)
+                out[path] = entry
+        return out
 
 
 def crs_is_usable(crs_text: str) -> bool:
@@ -958,13 +1474,18 @@ def _norm_folder(folder: str) -> str:
 
 
 def folder_key(folder: str) -> str:
-    return hashlib.md5(_norm_folder(folder).encode("utf-8"),
-                       usedforsecurity=False).hexdigest()
+    return hashes.md5(_norm_folder(folder).encode("utf-8")).hexdigest()
+
+
+def index_dir() -> str:
+    """``<cache>/index`` — where every folder's index file lives
+    (``terrain_adapter.clear_index`` empties it)."""
+    from .terrain_adapter import get_cache_dir  # deferred: circular import
+    return os.path.join(get_cache_dir(), "index")
 
 
 def index_path(folder: str) -> str:
-    from .terrain_adapter import get_cache_dir  # deferred: circular import
-    return os.path.join(get_cache_dir(), "index", folder_key(folder) + ".json")
+    return os.path.join(index_dir(), folder_key(folder) + ".json")
 
 
 #: Long per-file strings that are the same for every file in one CRS.
@@ -980,6 +1501,13 @@ class FolderIndex:
         self.archives: Dict[str, Dict[str, Any]] = {}
         self.refreshed_at = 0.0
         self.last_stats: Optional[RefreshStats] = None
+        #: Bumped whenever a refresh changes :attr:`entries` (new, changed or
+        #: removed files) — with :attr:`dir_mtime_ns` the signature a
+        #: run's ``terrain_adapter.TerrainPrep`` is checked against.
+        self.generation = 0
+        #: The folder's own mtime read right before the listing of the last
+        #: completed refresh (None: no refresh yet, or not stat-able).
+        self.dir_mtime_ns: Optional[int] = None
         self.lock = threading.RLock()
         self._loaded = False
 
@@ -993,9 +1521,17 @@ class FolderIndex:
                 doc = json.load(fh)
         except (OSError, ValueError):
             return
+        stored = doc.get("folder") or ""
         if (doc.get("schema") != INDEX_SCHEMA
-                or _norm_folder(doc.get("folder", "")) != _norm_folder(self.folder)):
+                or _norm_folder(stored) != _norm_folder(self.folder)):
             return
+        # The entries are keyed by full paths in the spelling the index was
+        # saved with. On Windows another spelling of the same folder (letter
+        # case: normcase gives both one index) would list every file under
+        # new keys — all "new", the whole folder probed again — so the
+        # listing keeps the stored spelling.
+        if stored != self.folder:
+            self.folder = stored
         # CRS strings are stored once per distinct CRS (a 40k-file folder
         # is one or two CRSs; inline WKT was ~1.5 KB per file).
         table = doc.get("crs") or {}
@@ -1035,12 +1571,22 @@ class FolderIndex:
             text = json.dumps(doc, separators=(",", ":"))
             with os.fdopen(fd, "w", encoding="utf-8") as fh:
                 fh.write(text)
-            os.replace(tmp, path)
-        except OSError:
+            # Windows refuses the rename while another process holds either
+            # file open (Defender scanning the index just written, a second
+            # QGIS reading it) and lets go a moment later — retried like
+            # every pool tile.
+            from .terrain_adapter import replace_with_retry  # deferred: circular
+            replace_with_retry(tmp, path)
+        except OSError as exc:
             try:
                 os.remove(tmp)
             except OSError:
                 pass
+            # Never silent: an index that is not saved costs the next
+            # session a read of every file again.
+            _log(f"folder index {self.folder}: could not be saved to {path} "
+                 f"({exc}) — the next session reads every new or changed "
+                 "file again")
 
     # -- refresh -----------------------------------------------------------
     def refresh(self, progress: Optional[Callable[[int, int, str], None]] = None,
@@ -1067,6 +1613,9 @@ class FolderIndex:
                         pass
 
             tick(0, 0, "listing")
+            # Before the listing: an entry added or removed while it runs
+            # leaves the folder's mtime different from this value.
+            folder_mtime = dir_mtime_ns(self.folder)
             files, archives, stats, names = _walk_stat(self.folder, workers)
             check()
             tick(len(stats), len(stats), "checking")
@@ -1105,24 +1654,55 @@ class FolderIndex:
                 else:
                     unchanged += 1
             removed = [p for p in self.entries if p not in wanted]
+            if to_probe or removed:
+                # Before the entries change — also when Cancel stops the
+                # probe half-way (what was read is kept).
+                self.generation += 1
             for p in removed:
                 del self.entries[p]
             check()
 
             t1 = time.perf_counter()
+            engine = ""
+            open_ms: Optional[float] = None
+            rest = to_probe
             if to_probe:
                 to_probe.sort()
+                rest = to_probe
+                cands = [p for p in to_probe if _probe_candidate(p, names)]
+                exe = probe_converter() if len(cands) >= PROBE_MIN_FILES else None
+                if exe is not None:
+                    got, open_ms, cancelled = self._probe_with_converter(
+                        exe, cands, wanted, tick, should_cancel)
+                    for p, ent in got.items():
+                        self.entries[p] = ent
+                    if cancelled:
+                        self.archives.update(new_archives)
+                        self.save()
+                        raise ScanCancelled()
+                    if got:
+                        engine = "converter"
+                        rest = [p for p in to_probe if p not in got]
+                if rest:
+                    # The bulk read starts (the GUI's cold-scan note keys on
+                    # this tick, not on the first finished file).
+                    tick(0, len(rest), "reading")
                 with ThreadPoolExecutor(max_workers=workers) as ex:
                     probe = lambda path: probe_file(path, names, wanted[path])  # noqa: E731
-                    for i, (p, ent) in enumerate(zip(to_probe,
-                                                     ex.map(probe, to_probe))):
+                    for i, (p, ent) in enumerate(zip(rest,
+                                                     ex.map(probe, rest))):
                         st = wanted[p]
                         ent["size"], ent["mtime_ns"] = st
                         self.entries[p] = ent
                         if i % 25 == 0:
-                            tick(i, len(to_probe), "reading")
+                            tick(i, len(rest), "reading")
                             if should_cancel is not None and should_cancel():
-                                ex.shutdown(wait=False, cancel_futures=True)
+                                try:
+                                    ex.shutdown(wait=False, cancel_futures=True)
+                                except TypeError:
+                                    # Python 3.8 has no cancel_futures: the
+                                    # pending probes finish (slower, correct).
+                                    ex.shutdown(wait=True)
                                 # Keep what was probed: the next refresh
                                 # only probes the rest.
                                 self.archives.update(new_archives)
@@ -1133,13 +1713,54 @@ class FolderIndex:
             if to_probe or removed or not os.path.exists(index_path(self.folder)):
                 self.save()
             tick(len(to_probe), len(to_probe), "done")
+            self.dir_mtime_ns = folder_mtime
             self.refreshed_at = time.time()
             self.last_stats = RefreshStats(
                 files=len(wanted), new=new, changed=changed,
                 removed=len(removed), unchanged=unchanged,
                 stat_s=t_stat, probe_s=t_probe,
-                total_s=time.perf_counter() - t0)
+                total_s=time.perf_counter() - t0,
+                probe_engine=engine, open_ms=open_ms)
             return self.last_stats
+
+    def _probe_with_converter(self, exe: str, paths: List[str],
+                              wanted: Dict[str, Tuple[int, int]],
+                              tick: Callable[[int, int, str], None],
+                              should_cancel: Optional[Callable[[], bool]],
+                              ) -> Tuple[Dict[str, Dict[str, Any]],
+                                         Optional[float], bool]:
+        """``(entries, mean open ms, cancelled)`` for *paths* from ONE
+        ``aether_converter probe`` run (see :func:`run_probe`). Only files
+        whose probe line matches the scan's size+mtime and that
+        :func:`entries_from_probe` covers get an entry; the caller probes the
+        rest in-process. On cancel the lines read so far still become
+        entries (the next refresh probes only the rest)."""
+        # The bulk read starts: the probe's own ticks come every 256 lines.
+        tick(0, len(paths), "reading")
+        run = run_probe(exe, paths,
+                        progress=lambda d, t: tick(d, t, "reading"),
+                        should_cancel=should_cancel)
+        if run.error:
+            _log(f"folder index {self.folder}: converter probe failed "
+                 f"({run.error}) — reading the files in-process")
+        tick(len(paths), len(paths), "indexing")
+        t_build = time.perf_counter()
+        # A file that changed between the listing and the probe goes to the
+        # in-process probe (the entry is bound to the listing's size+mtime).
+        facts = {p: f for p, f in run.facts.items()
+                 if (f.get("size"), f.get("mtime_ns")) == wanted.get(p)}
+        got = entries_from_probe(facts)
+        for p, ent in got.items():
+            ent["size"], ent["mtime_ns"] = wanted[p]
+        t_build = time.perf_counter() - t_build
+        open_txt = f"{run.open_ms:.2f}" if run.open_ms is not None else "?"
+        read_txt = f"{run.read_ms:.2f}" if run.read_ms is not None else "?"
+        _log(f"folder index {self.folder} probe: {len(run.facts)} files in "
+             f"{run.elapsed_s:.1f} s (open {open_txt} ms, read {read_txt} ms "
+             f"avg), entries built in {t_build:.2f} s; "
+             f"{len(paths) - len(got)} left to the in-process probe"
+             + (" — cancelled" if run.cancelled else ""))
+        return got, run.open_ms, run.cancelled
 
     # -- queries -----------------------------------------------------------
     def paths(self) -> List[str]:
@@ -1191,6 +1812,8 @@ def forget_indexes() -> None:
     """Drop every in-memory index (tests; a cache-dir change)."""
     with _INDEXES_LOCK:
         _INDEXES.clear()
+    with _VOID_LOCK:
+        _VOID_CACHE.clear()
 
 
 # ---------------------------------------------------------------------------
@@ -1294,6 +1917,8 @@ def entry_info(path: str, entry: Dict[str, Any]) -> Dict[str, Any]:
         "rotated": bool(entry.get("rotated") or entry.get("flipped")),
         "nodata": entry.get("nodata"),
         "fp": f"{entry.get('size')}:{entry.get('mtime_ns')}",
+        # Lazily known (ensure_void_flags): None until a run needed it.
+        "has_voids": entry.get("has_voids"),
     }
 
 
@@ -1351,6 +1976,8 @@ def source_infos(folder: str, mode: str,
                 skipped.append((p, prob[0], prob[1]))
             continue
         infos.append(entry_info(p, e))
+    for info in infos:
+        info["index_folder"] = index.folder     # ensure_void_flags keeps here
     return order_infos(infos, mode), skipped
 
 
@@ -1510,6 +2137,197 @@ def coverage(infos: List[Dict[str, Any]], bbox: Dict[str, float],
                 * (N - S) * _M_PER_DEG_LAT) / 1e6
     return Coverage(covered, frac, gap_bbox, data_bbox, len(touching),
                     frac * area_km2)
+
+
+# ---------------------------------------------------------------------------
+# No-data pixels (lazy, per file: the Map Converter's XYZ skip rule)
+# ---------------------------------------------------------------------------
+
+#: A sample at or below this elevation (metres, after scale/offset) is no-data
+#: to the converter: its samplers drop half-metre counts <= -5000, i.e.
+#: -2500 m (ingest.rs sample_cell / mean_valid; abt.MIN_VALID_ELEV_M) — so
+#: -9999 is a void even without a GDAL_NODATA tag. Half a count of margin: a
+#: value that rounds into the floor is one too.
+VOID_FLOOR_M = -2499.75
+#: Pixels per read of :func:`scan_voids` (bounds the RAM of a big file).
+VOID_CHUNK_PX = 1 << 22
+
+#: (path, size:mtime) -> flag, for files without a folder index (single-file
+#: layers) and as a session shortcut; cleared by forget_indexes().
+_VOID_CACHE: Dict[Tuple[str, Optional[str]], bool] = {}
+_VOID_LOCK = threading.Lock()
+
+
+def _chunk_has_void(a: np.ndarray, nodata: Optional[float], scale: float,
+                    offset: float) -> bool:
+    if a.size == 0:
+        return False
+    if a.dtype.kind == "f" and not np.isfinite(a).all():
+        return True                               # NaN / inf
+    if scale == 0:
+        floor_hit = offset <= VOID_FLOOR_M         # every sample is offset
+    elif scale > 0:
+        thr = (VOID_FLOOR_M - offset) / scale
+        floor_hit = bool((a <= thr).any())
+    else:
+        thr = (VOID_FLOOR_M - offset) / scale
+        floor_hit = bool((a >= thr).any())
+    if floor_hit:
+        return True
+    if nodata is None or math.isnan(nodata):
+        return False                              # NaN nodata: seen above
+    return bool((a == nodata).any())
+
+
+def _first_band(path: str) -> Tuple[Any, Any]:
+    """``(dataset, band 1)`` of *path*, or ``(None, None)``."""
+    try:
+        ds = gdal.Open(path, gdal.GA_ReadOnly)
+    except Exception:  # noqa: BLE001 — exceptions mode on in the host
+        ds = None
+    band = ds.GetRasterBand(1) if ds is not None else None
+    return (ds, band) if band is not None else (None, None)
+
+
+def scan_voids(path: str, should_cancel: Optional[Callable[[], bool]] = None
+               ) -> Optional[bool]:
+    """True when the raster at *path* holds ANY sample the converter reads as
+    no-data — its declared nodata value, NaN/inf, or an elevation at or below
+    :data:`VOID_FLOOR_M` (after scale/offset) —, False when it holds none,
+    None when it cannot be read. First band (usable files have one), read in
+    chunks of ``VOID_CHUNK_PX``; stops at the first void.
+    :class:`ScanCancelled` once *should_cancel()* is true."""
+    try:
+        gdal.PushErrorHandler("CPLQuietErrorHandler")
+    except Exception:  # noqa: BLE001 — no usable GDAL: nothing is known
+        return None
+    try:
+        ds, band = _first_band(path)
+        if band is None:
+            return None
+        nodata = band.GetNoDataValue()
+        scale, offset = band.GetScale(), band.GetOffset()
+        scale = 1.0 if scale is None else float(scale)
+        offset = 0.0 if offset is None else float(offset)
+        xs, ys = ds.RasterXSize, ds.RasterYSize
+        rows = max(1, VOID_CHUNK_PX // max(xs, 1))
+        for y0 in range(0, ys, rows):
+            if should_cancel is not None and should_cancel():
+                raise ScanCancelled()
+            a = band.ReadAsArray(0, y0, xs, min(rows, ys - y0))
+            if a is None or _chunk_has_void(a, nodata, scale, offset):
+                return None if a is None else True
+        return False
+    except ScanCancelled:
+        raise
+    except Exception:  # noqa: BLE001 — unknown = not void-free, no error
+        return None
+    finally:
+        gdal.PopErrorHandler()
+
+
+VoidKey = Tuple[str, Optional[str]]
+
+
+def _unknown_void_groups(infos: List[Dict[str, Any]]
+                         ) -> Dict[VoidKey, List[Dict[str, Any]]]:
+    """``{(path, size:mtime): [infos]}`` whose flag nothing knows yet (the
+    session cache fills the rest in on the way)."""
+    groups: Dict[VoidKey, List[Dict[str, Any]]] = {}
+    for info in infos:
+        if info.get("has_voids") is not None:
+            continue
+        key = (info["path"], info.get("fp"))
+        with _VOID_LOCK:
+            known = _VOID_CACHE.get(key)
+        if known is not None:
+            info["has_voids"] = known
+        else:
+            groups.setdefault(key, []).append(info)
+    return groups
+
+
+def _read_void_flags(keys: List[VoidKey],
+                     should_cancel: Optional[Callable[[], bool]],
+                     workers: int,
+                     done: Dict[VoidKey, Optional[bool]]) -> None:
+    """:func:`scan_voids` of every key's path in a pool, into *done*;
+    :class:`ScanCancelled` (pending reads dropped) once *should_cancel()*."""
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        futures = [ex.submit(scan_voids, path, should_cancel)
+                   for path, _fp in keys]
+        try:
+            for key, fut in zip(keys, futures):
+                done[key] = fut.result()
+                if should_cancel is not None and should_cancel():
+                    raise ScanCancelled()
+        except BaseException:
+            for fut in futures:
+                fut.cancel()
+            raise
+
+
+def ensure_void_flags(infos: List[Dict[str, Any]],
+                      should_cancel: Optional[Callable[[], bool]] = None,
+                      log: Optional[Callable[[str], None]] = None,
+                      workers: int = SCAN_WORKERS) -> int:
+    """Fill ``info["has_voids"]`` (:func:`scan_voids`) on every info of
+    *infos* whose flag is not known yet; returns how many files were read.
+
+    Lazy and once: a folder file's flag is kept in its index entry (saved
+    with the index; a changed file is re-probed and so loses it), any other
+    file's for the session. Read in the scan's thread pool — call it off the
+    GUI thread; :class:`ScanCancelled` once *should_cancel()* is true (what
+    was read is kept). A file that cannot be read stays None (= not known to
+    be void-free). *log* gets one line: count, time, how many have voids."""
+    groups = _unknown_void_groups(infos)
+    if not groups:
+        return 0
+    t0 = time.perf_counter()
+    keys = sorted(groups, key=lambda k: (k[0], str(k[1])))
+    done: Dict[VoidKey, Optional[bool]] = {}
+    try:
+        _read_void_flags(keys, should_cancel, workers, done)
+    finally:
+        _keep_void_flags(groups, done)
+    if log is not None:
+        voids = sum(1 for v in done.values() if v)
+        unknown = sum(1 for v in done.values() if v is None)
+        log(f"  checking {len(keys):,} file(s) for no-data pixels: "
+            f"{time.perf_counter() - t0:.1f} s — {voids:,} with no-data"
+            + (f", {unknown:,} unreadable" if unknown else ""))
+    return len(keys)
+
+
+def _keep_void_flags(groups: Dict[VoidKey, List[Dict[str, Any]]],
+                     done: Dict[VoidKey, Optional[bool]]) -> None:
+    """Set the computed flags on the infos, the session cache and — bound to
+    the same size+mtime — the folder index entries (saved once per index)."""
+    folders: Dict[str, List[Tuple[Dict[str, Any], bool]]] = {}
+    for key, flag in done.items():
+        if flag is None:
+            continue
+        with _VOID_LOCK:
+            _VOID_CACHE[key] = flag
+        for info in groups[key]:
+            info["has_voids"] = flag
+            folder = info.get("index_folder")
+            if folder:
+                folders.setdefault(folder, []).append((info, flag))
+    for folder, pairs in folders.items():
+        index = get_index(folder)
+        with index.lock:
+            index.load()
+            changed = False
+            for info, flag in pairs:
+                entry = index.entries.get(info["path"])
+                if (entry is not None and entry.get("has_voids") != flag
+                        and f"{entry.get('size')}:{entry.get('mtime_ns')}"
+                        == info.get("fp")):
+                    entry["has_voids"] = flag
+                    changed = True
+            if changed:
+                index.save()
 
 
 # ---------------------------------------------------------------------------

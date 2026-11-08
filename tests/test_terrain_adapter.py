@@ -678,36 +678,45 @@ class TestDownloadCompleteness(unittest.TestCase):
 class TestBuildingsCacheIdentity(unittest.TestCase):
     """A pool keyed "with buildings" must never hold building-free tiles."""
 
-    def test_failed_building_download_flags_the_tiles_for_rebuild(self):
-        # Buildings are part of the pool identity, so if the download fails
-        # and we build plain terrain anyway, the pool lies about its contents.
-        # Left reusable, the next run would reuse those tiles, skip the
-        # download entirely and produce building-free coverage in silence.
+    def test_a_failed_building_fetch_ends_the_run_and_pools_nothing(self):
+        # 2026-10-23: the fetch is strict (core/osm_buildings). It used to
+        # log "continuing without buildings" and build plain terrain under
+        # the buildings identity (flagged for rebuild); now nothing is built
+        # and the run says why — and the next run tries again.
         from waveshed.core import openfreemap
 
         layer = mock.Mock()
         layer.source.return_value = _XYZ_SOURCE
-        fetched = []
+        fetches, downloads = [], []
 
-        def fake_download(source, pool, bbox, res, subtiles, bm,
-                          pbf_dir=None, progress_cb=None, **_kw):
-            fetched.append(len(subtiles))
-            for t in subtiles:
-                _write_pool_abt(os.path.join(pool, t["filename"]))
-            return ta.DownloadOutcome(True)
+        def fail(*_a, **_kw):
+            fetches.append(1)
+            raise openfreemap.FetchFailed(
+                "3 of 40 building tiles missing — tile 14_8580_5737.pbf: "
+                "HTTP 503 Service Unavailable (after 4 attempts)",
+                missing=3, total=40, cause="14_8580_5737.pbf: HTTP 503")
 
         with tempfile.TemporaryDirectory() as root:
             with mock.patch.object(ta, "get_cache_dir", return_value=root), \
-                 mock.patch.object(openfreemap, "download_building_tiles",
-                                   side_effect=RuntimeError("503 from OFM")), \
+                 mock.patch.object(openfreemap, "resolve_tile_template_strict",
+                                   return_value="http://x/{z}/{x}/{y}.pbf"), \
+                 mock.patch.object(openfreemap, "fetch_building_tiles",
+                                   side_effect=fail), \
                  mock.patch.object(ta, "_try_rust_download",
-                                   side_effect=fake_download):
-                ta.prepare_terrain(layer, 47.4, 8.5, 30.0, 30, mock.Mock(),
-                                   osm_buildings=True)
-                # Second run must not reuse the building-free tiles.
-                ta.prepare_terrain(layer, 47.4, 8.5, 30.0, 30, mock.Mock(),
-                                   osm_buildings=True)
-        self.assertEqual(len(fetched), 2, "building-free tiles were reused")
+                                   side_effect=lambda *a, **k:
+                                   downloads.append(1)):
+                for _run in range(2):
+                    with self.assertRaises(RuntimeError) as cm:
+                        ta.prepare_terrain(layer, 47.4, 8.5, 30.0, 30,
+                                           mock.Mock(), osm_buildings=True)
+                    self.assertIn("Buildings download failed", str(cm.exception))
+                    self.assertIn("HTTP 503", str(cm.exception))
+                pool = ta._pool_dir(_XYZ_SOURCE,
+                                    ta.buildings_identity(osm_buildings=True))
+                pooled = [n for n in os.listdir(pool) if n.endswith(".abt")]
+        self.assertEqual(len(fetches), 2, "the second run reused something")
+        self.assertEqual(downloads, [], "terrain was built without buildings")
+        self.assertEqual(pooled, [])
 
 
 class TestSectorBboxMatchesAetherCore(unittest.TestCase):
@@ -899,6 +908,32 @@ class TestDownloadGapDetection(unittest.TestCase):
                 fh.write(b"not an abt file")
             self.assertFalse(ta._abt_has_zero_fill(p))
             self.assertFalse(ta._abt_has_holes(p))
+
+    def test_holes_then_zero_fill_read_the_tile_once(self):
+        # The download's gap check asks both of one tile: ONE read (each
+        # used to read the whole tile — 44 GB twice on the owner's band).
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "t.abt")
+            q = os.path.join(d, "u.abt")
+            _write_abt(p, size=128, zero_block=(64, 64, 64))
+            _write_abt(q, size=128, zero_block=(0, 0, 64), fill_value=-9999)
+            with mock.patch.object(ta, "_abt_block_flags",
+                                   wraps=ta._abt_block_flags) as read:
+                self.assertFalse(ta._abt_has_holes(p))
+                self.assertTrue(ta._abt_has_zero_fill(p))
+                self.assertEqual(read.call_count, 1)
+                # Taken on use, kept for that file only.
+                self.assertTrue(ta._abt_has_zero_fill(p))
+                self.assertEqual(read.call_count, 2)
+                self.assertTrue(ta._abt_has_holes(q))    # keeps q's False
+                self.assertTrue(ta._abt_has_zero_fill(p))     # p's own answer
+                self.assertEqual(read.call_count, 4)
+                # A rewritten tile is read again, never answered from the
+                # read before (that one kept p's "no holes").
+                _write_abt(p, size=256, zero_block=(0, 0, 128),
+                           fill_value=-9999)
+                self.assertTrue(ta._abt_has_holes(p))
+                self.assertEqual(read.call_count, 5)
 
 
 @unittest.skipUnless(_HAVE_NUMPY, "numpy not available")
@@ -1697,54 +1732,9 @@ class TestTotalDownloadFailureIsDistinct(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# Buildings download result (B6)
+# Buildings fetch result (B6): tests/test_sa_osm_buildings.py (the strict
+# fetch, 2026-10-23 — what it delivered decides what the download carries)
 # ---------------------------------------------------------------------------
-
-class TestBuildingDownloadResultIsChecked(unittest.TestCase):
-    """A zero-tile buildings fetch used to pass for a successful one.
-
-    The (ok, missing) return was discarded, so buildings_missing stayed False,
-    the tiles were pooled under a buildings-keyed identity — and every later
-    run hit that cache and quietly produced building-free terrain.
-    """
-
-    def _prepare(self, download_result):
-        from waveshed.core import openfreemap as ofm
-
-        layer = mock.Mock()
-        layer.source.return_value = _XYZ_SOURCE
-
-        logged = []
-        with tempfile.TemporaryDirectory() as root:
-            with mock.patch.object(ta, "get_cache_dir", return_value=root), \
-                 mock.patch.object(ta, "_log", side_effect=logged.append), \
-                 mock.patch.object(ta, "_try_rust_download",
-                                   return_value=ta.DownloadOutcome(True)), \
-                 mock.patch.object(ofm, "download_building_tiles",
-                                   return_value=download_result), \
-                 mock.patch.object(ofm, "tiles_for_bbox",
-                                   return_value=[(14, 8000, 5000)]):
-                buildings = ta.buildings_identity(osm_buildings=True)
-                pool = ta._pool_dir(_XYZ_SOURCE, buildings)
-                ta.prepare_terrain(layer, 47.4, 8.5, 5.0, 30, mock.Mock(),
-                                   osm_buildings=True)
-                flags = sorted(n for n in os.listdir(pool)
-                               if n.endswith(".rebuild"))
-        return logged, flags
-
-    def test_zero_tiles_fetched_is_a_failed_buildings_run(self):
-        logged, flags = self._prepare((0, 42))
-        text = "\n".join(logged)
-        self.assertIn("no building tiles could be fetched", text)
-        self.assertIn("buildings were requested but unavailable", text)
-        # Nothing may stay pooled under an identity that claims buildings.
-        self.assertTrue(flags, "no tile was flagged for rebuild")
-
-    def test_a_successful_fetch_leaves_the_tiles_pooled(self):
-        logged, flags = self._prepare((17, 3))
-        text = "\n".join(logged)
-        self.assertNotIn("no building tiles could be fetched", text)
-        self.assertEqual(flags, [])
 
 
 # ---------------------------------------------------------------------------
@@ -2113,7 +2103,7 @@ class TestPrepareTerrainSourcesJobs(unittest.TestCase):
         bm.find_binary.return_value = "aether_converter"
         captured = []
 
-        def fake_run_converter(exe, job_file):
+        def fake_run_converter(exe, job_file, **_kw):
             with open(job_file) as fh:
                 captured.extend(json.load(fh))
 
@@ -2164,7 +2154,7 @@ class TestPrepareTerrainSourcesJobs(unittest.TestCase):
         bm.find_binary.return_value = "aether_converter"
         captured = []
 
-        def fake_run_converter(exe, job_file):
+        def fake_run_converter(exe, job_file, **_kw):
             with open(job_file) as fh:
                 captured.extend(json.load(fh))
 
@@ -2303,6 +2293,19 @@ class _FakeStreamProc:
 class TestRunConverterStreaming(unittest.TestCase):
     """The ONE subprocess runner: streaming, exit code, cancel."""
 
+    def setUp(self):
+        # Every launch sets AETHER_DIAG_FILE under the cache: a private one.
+        self._tmp = tempfile.TemporaryDirectory(prefix="ws_run_")
+        self._patches = [mock.patch.object(ta, "get_cache_dir", return_value=self._tmp.name),
+                         mock.patch.object(ta, "_diag_announced", None)]
+        for p in self._patches:
+            p.start()
+
+    def tearDown(self):
+        for p in reversed(self._patches):
+            p.stop()
+        self._tmp.cleanup()
+
     def test_streams_nonempty_lines_and_returns_exit_code(self):
         seen = []
         started = []
@@ -2334,13 +2337,332 @@ class TestRunConverterStreaming(unittest.TestCase):
         self.assertTrue(_FakeStreamProc.last.terminated)
 
     def test_env_is_forwarded(self):
+        """*env* reaches the child key for key — plus AETHER_DIAG_FILE unless
+        it names one itself (then its own value wins)."""
         with tempfile.TemporaryDirectory() as d:
             cfg = os.path.join(d, "c.json")
             open(cfg, "w").close()
             with mock.patch.object(ta.subprocess, "Popen", _FakeStreamProc):
                 ta.run_converter_streaming("/bin/core", ["--config", cfg],
                                            lambda _l: None, env={"A": "1"})
-        self.assertEqual(_FakeStreamProc.last.kwargs.get("env"), {"A": "1"})
+                self.assertEqual(_FakeStreamProc.last.kwargs.get("env"),
+                                 {"A": "1", "AETHER_DIAG_FILE": ta.diag_file_path()})
+                ta.run_converter_streaming("/bin/core", ["--config", cfg],
+                                           lambda _l: None,
+                                           env={"A": "1", "AETHER_DIAG_FILE": "own.log"})
+        self.assertEqual(_FakeStreamProc.last.kwargs.get("env"),
+                         {"A": "1", "AETHER_DIAG_FILE": "own.log"})
+
+
+class TestOneWindowsGate(unittest.TestCase):
+    """Every Windows path of the engine-launching modules is gated on
+    ``sys.platform`` (``terrain_adapter._is_windows``) — a test that flips it
+    reaches them; ``platform.system()`` (which it does not flip) is gone
+    from them. The import-time launch flags are one value everywhere."""
+
+    MODULES = ("core/terrain_adapter.py", "core/terrain_index.py",
+               "gui/map_converter_tab.py", "gui/site_analysis_tab.py",
+               "gui/p2p_tab.py", "algorithms/coverage.py")
+
+    def test_the_gate_follows_sys_platform(self):
+        for plat, windows in (("win32", True), ("linux", False),
+                              ("darwin", False), ("cygwin", False)):
+            with self.subTest(plat), mock.patch.object(sys, "platform", plat):
+                self.assertIs(ta._is_windows(), windows)
+                self.assertEqual(ta._no_window_flags(),
+                                 0x08000000 if windows else 0)
+
+    def test_one_launch_flag_value(self):
+        from waveshed.algorithms import coverage
+        from waveshed.core import terrain_index
+        import waveshed.gui.map_converter_tab as mct
+        import waveshed.gui.site_analysis_tab as sat
+        want = 0x08000000 if sys.platform == "win32" else 0
+        for mod in (ta, terrain_index, mct, sat, coverage):
+            self.assertEqual(mod._SUBPROCESS_FLAGS, want, mod.__name__)
+
+    def test_no_platform_system_gate_is_left(self):
+        pkg = os.path.dirname(os.path.dirname(os.path.abspath(ta.__file__)))
+        for rel in self.MODULES:
+            with open(os.path.join(pkg, rel), encoding="utf-8") as fh:
+                self.assertNotIn("platform.system()", fh.read(), rel)
+
+
+class TestConverterDiagnosticsFile(unittest.TestCase):
+    """``AETHER_DIAG_FILE`` (toolkit changelog 37): every engine child gets
+    today's ``<cache>/logs/aether_converter-<YYYYmmdd>.log`` unless its
+    environment already names one; the first launch of the session creates
+    the directory, rotates it (14 days, only our files) and logs the path
+    once; a directory that cannot be made or listed is logged once and
+    never fails a launch."""
+
+    #: The child prints what it got (the real Popen path, no stand-in).
+    CHILD = ("import os; print('diag=' + str(os.environ.get('AETHER_DIAG_FILE'))); "
+             "print('mark=' + str(os.environ.get('WS_DIAG_MARK')))")
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory(prefix="ws_diag_")
+        self.cache = self._tmp.name
+        self.logs = []
+        # The runner decodes the child's output as UTF-8; a Python child on
+        # Windows writes a pipe in the ANSI code page unless told otherwise,
+        # so a temp path with a non-ASCII user name would not compare.
+        self._patches = [mock.patch.dict(os.environ, {"PYTHONIOENCODING": "utf-8"}),
+                         mock.patch.object(ta, "get_cache_dir", return_value=self.cache),
+                         mock.patch.object(ta, "_diag_announced", None),
+                         mock.patch.object(ta, "_log", side_effect=self.logs.append)]
+        for p in self._patches:
+            p.start()
+
+    def tearDown(self):
+        for p in reversed(self._patches):
+            p.stop()
+        self._tmp.cleanup()
+
+    def today(self):
+        return os.path.join(self.cache, "logs",
+                            f"aether_converter-{time.strftime('%Y%m%d')}.log")
+
+    def run_child(self, env=None):
+        seen = []
+        if env is not None:
+            env = dict(env, PYTHONIOENCODING="utf-8")
+        rc = ta.run_converter_streaming(sys.executable, ["-c", self.CHILD],
+                                        seen.append, env=env)
+        self.assertEqual(rc, 0, seen)
+        return dict(line.split("=", 1) for line in seen)
+
+    def announced(self):
+        return [m for m in self.logs if m.startswith("converter diagnostics: ")]
+
+    def test_the_child_gets_todays_file_and_the_path_is_logged_once(self):
+        with mock.patch.dict(os.environ, {"WS_DIAG_MARK": "inherited"}):
+            os.environ.pop("AETHER_DIAG_FILE", None)
+            got = self.run_child()
+            again = self.run_child()
+        self.assertEqual(got, {"diag": self.today(), "mark": "inherited"},
+                         "env=None: this process's environment + the file")
+        self.assertEqual(again, got)
+        self.assertEqual(ta.diag_file_path(), self.today())
+        self.assertTrue(os.path.isdir(os.path.dirname(self.today())))
+        self.assertEqual(self.announced(), [f"converter diagnostics: {self.today()}"])
+        # A caller's env (aether_core's licence injection) is kept, key for key.
+        with mock.patch.object(ta.subprocess, "Popen", _FakeStreamProc):
+            ta.run_converter_streaming("/bin/core", ["x"], lambda _l: None,
+                                       env={"A": "1"})
+        self.assertEqual(_FakeStreamProc.last.kwargs["env"],
+                         {"A": "1", "AETHER_DIAG_FILE": self.today()})
+        self.assertEqual(len(self.announced()), 1, "once per session")
+
+    def test_an_explicit_value_wins(self):
+        mine = os.path.join(self.cache, "mine.log")
+        env = dict(os.environ, AETHER_DIAG_FILE=mine, WS_DIAG_MARK="given")
+        self.assertEqual(self.run_child(env), {"diag": mine, "mark": "given"})
+        with mock.patch.dict(os.environ, {"AETHER_DIAG_FILE": mine}):
+            with mock.patch.object(ta.subprocess, "Popen", _FakeStreamProc):
+                ta.run_converter_streaming("/bin/conv", ["x"], lambda _l: None)
+            self.assertIsNone(_FakeStreamProc.last.kwargs["env"],
+                              "inherits this process's own AETHER_DIAG_FILE")
+            self.assertEqual(self.run_child()["diag"], mine)
+        self.assertFalse(os.path.exists(os.path.join(self.cache, "logs")))
+        self.assertEqual(self.announced(), [])
+
+    def test_rotation_deletes_only_old_diagnostics_files_in_that_directory(self):
+        logs = os.path.join(self.cache, "logs")
+        os.makedirs(os.path.join(logs, "sub"))
+        now = time.time()
+
+        def put(path, age_days):
+            with open(path, "w") as fh:
+                fh.write("x\n")
+            os.utime(path, (now - age_days * 86400, now - age_days * 86400))
+            return path
+        old = put(os.path.join(logs, "aether_converter-20260901.log"), 15)
+        recent = put(os.path.join(logs, "aether_converter-20261009.log"), 13)
+        kept = [recent,
+                put(os.path.join(logs, "notes.txt"), 40),                       # not ours
+                put(os.path.join(logs, "aether_converter-latest.log"), 40),     # not our name
+                put(os.path.join(logs, "sub", "aether_converter-20260101.log"), 40),  # deeper
+                put(os.path.join(self.cache, "aether_converter-20260101.log"), 40)]   # outside
+        self.assertEqual(ta.DIAG_KEEP_DAYS, 14)
+        with mock.patch.object(ta.subprocess, "Popen", _FakeStreamProc):
+            ta.run_converter_streaming("/bin/conv", ["x"], lambda _l: None)
+            self.assertFalse(os.path.exists(old))
+            for path in kept:
+                self.assertTrue(os.path.exists(path), path)
+            # Only at the first launch of the session: a later one rotates nothing.
+            late = put(os.path.join(logs, "aether_converter-20260902.log"), 20)
+            ta.run_converter_streaming("/bin/conv", ["x"], lambda _l: None)
+            self.assertTrue(os.path.exists(late))
+
+    def test_a_directory_that_cannot_be_made_or_listed_is_logged_once_and_never_raises(self):
+        with open(os.path.join(self.cache, "logs"), "w") as fh:   # a FILE where the dir goes
+            fh.write("not a directory")
+        with mock.patch.object(ta.subprocess, "Popen", _FakeStreamProc):
+            for _ in range(3):
+                self.assertEqual(ta.run_converter_streaming("/bin/conv", ["x"],
+                                                            lambda _l: None), 3)
+                self.assertIsNone(_FakeStreamProc.last.kwargs["env"], "env left as it was")
+                ta.run_converter_streaming("/bin/conv", ["x"], lambda _l: None,
+                                           env={"A": "1"})
+                self.assertEqual(_FakeStreamProc.last.kwargs["env"], {"A": "1"})
+        failed = [m for m in self.logs if m.startswith("converter diagnostics: no file (")]
+        self.assertEqual(len(failed), 1, self.logs)
+        self.assertIn(os.path.join(self.cache, "logs"), failed[0])
+        # A directory that cannot be LISTED: rotation says so once, the
+        # launch goes on with the file set.
+        os.remove(os.path.join(self.cache, "logs"))
+        self.logs.clear()
+        real_listdir = os.listdir
+
+        def listdir(path):
+            if path == os.path.join(self.cache, "logs"):
+                raise PermissionError(13, "Permission denied", path)
+            return real_listdir(path)
+        with mock.patch.object(ta.os, "listdir", side_effect=listdir), \
+             mock.patch.object(ta.subprocess, "Popen", _FakeStreamProc):
+            for _ in range(2):
+                ta.run_converter_streaming("/bin/conv", ["x"], lambda _l: None)
+                self.assertEqual(_FakeStreamProc.last.kwargs["env"]["AETHER_DIAG_FILE"],
+                                 self.today())
+        self.assertEqual(len([m for m in self.logs if "not rotated" in m]), 1, self.logs)
+        self.assertEqual(self.announced()[-1], f"converter diagnostics: {self.today()}")
+
+
+#: A stand-in converter for _run_converter: a 0.2.7 converter prints its
+#: per-tile timing lines on stdout; *rc* is its exit code.
+_DIAG_CONVERTER = r'''
+import sys
+for line in (
+    "[Rust] tile tile_N47.00E8.00_2m.abt: 12 sources, header 0.1s (open 85.9 ms, read 0.2 ms avg), sample 1.2s",
+    "[Tile] tile_N47.00E8.00_2m.abt covered=100/100",
+    "[Rust] Progress: 1/2",
+    "[Rust] tiles: 2 queued",
+    "[Warn] Failed to apply buildings: missing.pbf",
+    "[Rust] tile tile_N47.10E8.00_2m.abt: 9 sources, header 0.1s (open 1.0 ms, read 0.2 ms avg), sample 1.1s",
+    "[Tile] tile_N47.10E8.00_2m.abt covered=90/100",
+    "[Rust] Progress: 2/2",
+):
+    print(line)
+sys.exit(int(sys.argv[sys.argv.index("--rc") + 1]))
+'''
+
+
+class TestRunConverterDropsTileDiagnostics(unittest.TestCase):
+    """``_run_converter`` never logs the per-tile ``[Rust] tile …`` lines
+    (a 0.2.7 converter still prints them; 920 in one run) and keeps the
+    ``[Tile] covered=`` lines for the callers without logging them (one per
+    output tile, as the Map Converter does) — every other line passes
+    through, and the returned lines carry everything but the diagnostics."""
+
+    PASSED = ["[Tile] tile_N47.00E8.00_2m.abt covered=100/100", "[Rust] Progress: 1/2",
+              "[Rust] tiles: 2 queued", "[Warn] Failed to apply buildings: missing.pbf",
+              "[Tile] tile_N47.10E8.00_2m.abt covered=90/100", "[Rust] Progress: 2/2"]
+
+    def run_fake(self, rc=0, should_cancel=None):
+        real = ta.run_converter_streaming
+        logs = []
+        with tempfile.TemporaryDirectory() as d:
+            script = os.path.join(d, "conv.py")
+            with open(script, "w") as fh:
+                fh.write(_DIAG_CONVERTER)
+            job = os.path.join(d, "job.json")
+            with open(job, "w") as fh:
+                fh.write("[]")
+
+            def runner(exe, args, on_line, on_start=None, env=None):
+                # The real runner, the stand-in converter behind it.
+                return real(sys.executable, [script, *args, "--rc", str(rc)],
+                            on_line, on_start=on_start, env=env)
+            with mock.patch.object(ta, "run_converter_streaming", side_effect=runner), \
+                 mock.patch.object(ta, "get_cache_dir", return_value=d), \
+                 mock.patch.object(ta, "_diag_announced", None), \
+                 mock.patch.object(ta, "_log", side_effect=logs.append):
+                try:
+                    return ta._run_converter("aether_converter", job,
+                                             should_cancel=should_cancel), logs
+                except RuntimeError as exc:
+                    return exc, logs
+
+    def test_tile_lines_are_dropped_the_rest_pass_through(self):
+        polled = []
+        lines, logs = self.run_fake(should_cancel=lambda: polled.append(1) and False)
+        self.assertEqual(lines, self.PASSED)
+        self.assertEqual([m for m in logs if m.startswith("    ")],
+                         [f"    {line}" for line in self.PASSED
+                          if ta.parse_tile_line(line) is None],
+                         "the [Tile] lines are read, not shown")
+        self.assertFalse(any("[Rust] tile " in m for m in logs), logs)
+        self.assertEqual(len(polled), 8, "cancel is still polled on every line")
+        self.assertEqual(ta.parse_tile_line(lines[0]),
+                         ("tile_N47.00E8.00_2m.abt", 100, 100))
+
+    def test_the_error_tail_has_no_tile_lines(self):
+        exc, _logs = self.run_fake(rc=3)
+        self.assertIsInstance(exc, RuntimeError)
+        self.assertEqual(str(exc), "converter failed (3):\n" + "\n".join(self.PASSED))
+
+
+class TestClearIndex(unittest.TestCase):
+    """Settings → Clear Terrain Cache keeps the folder index unless asked:
+    ``clear_cache`` never touches ``<cache>/index``; ``clear_index`` deletes
+    exactly the ``<md5>.json`` files there and drops the in-memory indexes,
+    so the next scan reads every file again."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory(prefix="ws_idx_")
+        self.cache = self._tmp.name
+        self._patches = [mock.patch.object(ta, "get_cache_dir", return_value=self.cache),
+                         mock.patch.object(ta, "_log")]
+        for p in self._patches:
+            p.start()
+
+    def tearDown(self):
+        for p in reversed(self._patches):
+            p.stop()
+        ta.terrain_index.forget_indexes()
+        self._tmp.cleanup()
+
+    def put(self, *parts, data=b"{}"):
+        path = os.path.join(self.cache, *parts)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "wb") as fh:
+            fh.write(data)
+        return path
+
+    def test_only_the_folder_index_files_go_and_the_memory_forgets(self):
+        idx_dir = os.path.join(self.cache, "index")
+        self.assertEqual(ta.terrain_index.index_dir(), idx_dir)
+        folder = os.path.join(self.cache, "dem")
+        os.makedirs(folder)
+        a = ta.terrain_index.index_path(folder)
+        self.assertEqual(os.path.dirname(a), idx_dir)
+        self.put("index", os.path.basename(a), data=b"x" * 1000)
+        b = self.put("index", "0123456789abcdef0123456789abcdef.json", data=b"y" * 24)
+        kept = [self.put("index", "notes.json"),                  # not an md5 name
+                self.put("index", ".idx_tmp123"),                 # a save in flight
+                self.put("index", "0123456789abcdef0123456789abcdef.txt"),
+                self.put("pool", "0" * 32, "tile_N47.00E8.00_30m.abt"),
+                self.put("0" * 32 + ".json")]                     # outside index/
+        os.makedirs(os.path.join(idx_dir, "f" * 32 + ".json"))   # a directory
+        self.assertEqual(ta.index_files(), sorted([a, b]))
+        # The cache clear keeps the index.
+        ta.clear_cache()
+        self.assertEqual(ta.index_files(), sorted([a, b]))
+        before = ta.terrain_index.get_index(folder)
+        self.assertEqual(ta.clear_index(), (2, 1024))
+        self.assertEqual(ta.index_files(), [])
+        for path in (a, b):
+            self.assertFalse(os.path.exists(path), path)
+        for path in kept[:3] + kept[4:]:
+            self.assertTrue(os.path.exists(path), path)
+        self.assertTrue(os.path.isdir(os.path.join(idx_dir, "f" * 32 + ".json")))
+        self.assertIsNot(ta.terrain_index.get_index(folder), before,
+                         "the in-memory index is forgotten too")
+
+    def test_no_index_directory_is_nothing_to_do(self):
+        self.assertEqual(ta.index_files(), [])
+        self.assertEqual(ta.clear_index(), (0, 0))
 
 
 class TestDownloadProgressParsing(unittest.TestCase):
@@ -2774,7 +3096,7 @@ class _PrepareWithBuildings:
             with open(dest, "wb") as fh:
                 fh.write(b"\0" * 8)
 
-        def fake_run_converter(exe, job_file):
+        def fake_run_converter(exe, job_file, **_kw):
             with open(job_file) as fh:
                 jobs.extend(json.load(fh))
             for job in jobs:
@@ -2794,8 +3116,11 @@ class _PrepareWithBuildings:
                                side_effect=fake_run_converter):
             view = ta.prepare_terrain(layer, 47.4, 8.5, 5.0, 30, bm,
                                       buildings_file=buildings_file)
-        # The pool the run really used, straight off the jobs it wrote.
-        pool = os.path.dirname(jobs[0]["output_path"]) if jobs else None
+        # The pool the run really used, straight off the jobs it wrote: the
+        # converter writes into a scratch dir INSIDE the pool, renamed into
+        # place after (a pool tile is replaced, never rewritten in place).
+        pool = (os.path.dirname(os.path.dirname(jobs[0]["output_path"]))
+                if jobs else None)
         return {"jobs": jobs, "log": "\n".join(logged), "resolved": resolved,
                 "view": view, "pool": pool}
 
@@ -3373,6 +3698,7 @@ class TestPreparedViewDirRecorder(unittest.TestCase):
              mock.patch.object(ta, "classify_raster_layer",
                                return_value="dem"), \
              mock.patch.object(ta, "_tile_ready", return_value=True), \
+             mock.patch.object(ta, "_listed_tile_ready", return_value=True), \
              mock.patch.object(ta, "_sync_view", return_value=[]):
             out = ta.prepare_terrain(self._layer(), 46.945, 7.41, 1.0, 30,
                                      mock.Mock())

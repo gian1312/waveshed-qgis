@@ -183,11 +183,59 @@ class TestWorkProgress(unittest.TestCase):
             clock.t = float(i)
             m.set_done("a", i * 10)
         eta_live = m.eta_s()
-        clock.t = 35.0                       # 30 s without a finished tile
-        self.assertGreater(m.eta_s(), eta_live * 5)
-        self.assertIn("no tile finished for 30 s", m.label())
+        clock.t = 29.0                       # 24 s without a finished tile
+        self.assertGreater(m.eta_s(), eta_live * 4)
+        self.assertIn("no tile finished for 24 s", m.label())
+        self.assertIn("ETA ", m.label())
+        self.assertNotIn(rp.ETA_UNKNOWN, m.label())
         m.set_done("a", 60)
         self.assertNotIn("no tile finished", m.label())
+
+    def test_thirty_seconds_without_progress_blank_the_eta(self):
+        # The owner saw "days": minutes of silence (a repair pass being
+        # prepared, a building decode) stretched the rate without bound.
+        # From ETA_BLANK_S on, no ETA is extrapolated at all.
+        clock = _Clock()
+        m = rp.RunProgress(clock)
+        m.set_work("a", 1000)
+        for i in range(1, 6):
+            clock.t = float(i)
+            m.set_done("a", i * 10)
+        self.assertEqual(m.ETA_BLANK_S, 30.0)
+        clock.t = 5.0 + 29.9
+        self.assertIsNotNone(m.eta_s())
+        self.assertFalse(m.eta_stalled())
+        clock.t = 5.0 + 30.0                 # 30 s: no slot reported
+        self.assertIsNone(m.eta_s())
+        self.assertTrue(m.eta_stalled())
+        label = m.label()
+        self.assertTrue(label.endswith(" · ETA —"), label)
+        self.assertIn("no tile finished for 30 s", label)
+        self.assertEqual(label.count("ETA"), 1)
+        clock.t = 5.0 + 3 * 3600.0           # hours later: still no guess
+        self.assertTrue(m.label().endswith("ETA —"), m.label())
+        self.assertNotIn(" h ", m.label())
+        # A slot reports again: the ETA is measured again at once.
+        m.set_done("a", 60)
+        self.assertFalse(m.eta_stalled())
+        self.assertNotIn(rp.ETA_UNKNOWN, m.label())
+        # Concurrent activities: once, at the end of the label.
+        m.set_activity("a", "Converting band 2/4", {"done": 1, "total": 9})
+        clock.t += 31.0
+        self.assertTrue(m.label().endswith(" · ETA —"), m.label())
+        self.assertEqual(m.label().count("ETA"), 1)
+        # Stopped (done / cancelled): no ETA, not even a blank one.
+        m.stop("Cancelled.")
+        self.assertEqual(m.label(), "Cancelled.")
+
+    def test_no_eta_dash_before_anything_was_measured(self):
+        clock = _Clock()
+        m = rp.RunProgress(clock)
+        m.set_work("a", 100)
+        m.set_phase("Preparing layers")
+        clock.t = 120.0                      # nothing reported yet at all
+        self.assertFalse(m.eta_stalled())
+        self.assertEqual(m.label(), "Preparing layers")
 
     def test_label(self):
         clock = _Clock()
@@ -345,6 +393,159 @@ class TestRetryPassesKeepTheBarMoving(unittest.TestCase):
         self.assertEqual(est, events[0]["total_units"])
 
 
+class TestDegradedRepairPass(unittest.TestCase):
+    """The real ``_try_rust_download`` against a mocked converter: pass 1
+    reports two degraded source tiles and no gaps; a converter that knows
+    ``repair_source_tiles`` gets ONE repair pass over exactly those tiles,
+    an older one gets the whole-tile re-run — neither at halved connections.
+    The job JSON is read as the converter would read it."""
+
+    def _run(self, converter_version, sink=None):
+        tiles = mct._enumerate_tiles(
+            mct._snap_bbox({"south": 47.1, "north": 47.25, "west": 8.1,
+                            "east": 8.35}, [2]), [2])
+        subtiles = [t for _r, t in tiles]
+        (zoom, specs), = ta._download_specs_by_zoom(_XYZ, subtiles).items()
+        s0 = specs[0]
+        n = 2.0 ** zoom
+        import math
+        lat = s0["ul_lat"] - 0.001
+        x0 = int((s0["ul_lon"] + 0.001 + 180.0) / 360.0 * n)
+        y0 = int((1 - math.asinh(math.tan(math.radians(lat))) / math.pi)
+                 / 2 * n)
+        bad = [(zoom, x0, y0), (zoom, x0 + 1, y0)]
+        hit = ta._specs_hit_by_degraded(
+            specs, [ta.DegradedTile(z, x, y, "", None) for z, x, y in bad])
+        total1 = ta._source_tile_count(specs, zoom)
+        jobs = []
+
+        def fake_once(exe, job_file, on_line=None, **_kw):
+            import json
+            with open(job_file) as fh:
+                job = json.load(fh)
+            jobs.append(job)
+            if len(jobs) == 1:
+                total = total1
+                out = [f"[Download] z={zoom} tiles=1x{total}={total} (~1MB) "
+                       f"connections=256"]
+                out += _converter_pass_lines(total)
+                out += [f"[Degraded] z={z} x={x} y={y} reason=timeout "
+                        f"filled_from=z{zoom - 1}" for z, x, y in bad]
+                out.append(f"[Stats] DEGRADED: 2 of {total} source tile(s) "
+                           f"filled from coarser zooms after a failed fetch")
+                out.append(f"[Stats] Tiles: {total - 2}/{total} OK")
+            else:
+                total = (len(job["repair_source_tiles"])
+                         if "repair_source_tiles" in job
+                         else ta._source_tile_count(job["tiles"], zoom))
+                out = [f"[Download] z={zoom} tiles=1x{total}={total} (~1MB) "
+                       f"connections=256"]
+                out += _converter_pass_lines(total)
+                out.append(f"[Stats] Tiles: {total}/{total} OK")
+            for line in out:
+                if on_line:
+                    on_line(line)
+            return 0, out
+
+        fracs = []
+
+        class Cb:
+            def __call__(self, frac, label):
+                fracs.append((frac, label))
+
+        cb = Cb()
+        if sink is not None:
+            cb.download_event = sink
+        bm = mock.Mock()
+        bm.find_binary.return_value = "aether_converter"
+        from waveshed.core import binary_manager
+        with tempfile.TemporaryDirectory() as pool:
+            for t in subtiles:
+                _write_abt(os.path.join(pool, t["filename"]))
+            with mock.patch.object(ta, "_run_converter_download_once",
+                                   side_effect=fake_once), \
+                 mock.patch.object(ta, "_abt_has_holes", return_value=False), \
+                 mock.patch.object(ta, "_abt_has_zero_fill",
+                                   return_value=False), \
+                 mock.patch.object(ta, "_get_download_max_passes",
+                                   return_value=4), \
+                 mock.patch.object(ta, "_get_download_connections",
+                                   return_value=256), \
+                 mock.patch.object(binary_manager, "probe_converter_version",
+                                   return_value=converter_version):
+                ok = ta._try_rust_download(_XYZ, pool, {}, 2, subtiles, bm,
+                                           progress_cb=cb)
+        return ok, jobs, fracs, bad, hit, specs
+
+    def test_repair_job_shape(self):
+        ok, jobs, _f, bad, hit, specs = self._run("0.2.6")
+        self.assertTrue(ok)
+        self.assertEqual(len(jobs), 2)
+        self.assertNotIn("repair_source_tiles", jobs[0])
+        self.assertEqual(jobs[1]["repair_source_tiles"],
+                         [list(t) for t in sorted(bad)])
+        self.assertEqual({t["filename"] for t in jobs[1]["tiles"]}, hit)
+        self.assertLess(len(hit), len(specs))
+        self.assertEqual(jobs[1]["tiles"],
+                         [s for s in specs if s["filename"] in hit])
+        self.assertEqual([j["max_connections"] for j in jobs], [256, 256])
+        self.assertEqual(jobs[1]["zoom"], jobs[0]["zoom"])
+
+    def test_old_converter_gets_whole_tiles_without_the_field(self):
+        ok, jobs, _f, _bad, hit, _specs = self._run("0.2.5")
+        self.assertTrue(ok)
+        self.assertEqual(len(jobs), 2)
+        self.assertNotIn("repair_source_tiles", jobs[1])
+        self.assertEqual({t["filename"] for t in jobs[1]["tiles"]}, hit)
+        self.assertEqual([j["max_connections"] for j in jobs], [256, 256])
+
+    def test_unknown_converter_version_is_the_old_one(self):
+        _ok, jobs, _f, _b, _h, _s = self._run(None)
+        self.assertNotIn("repair_source_tiles", jobs[1])
+
+    def test_progress_monotonic_and_advancing_through_the_repair_pass(self):
+        events = []
+        ok, jobs, fracs, bad, _hit, _specs = self._run("0.2.6", events.append)
+        self.assertTrue(ok)
+        values = [f for f, _l in fracs]
+        self.assertEqual(values, sorted(values), "the bar went backwards")
+        self.assertEqual(values[-1], 1.0)
+        first_repair = next(i for i, (_f, label) in enumerate(fracs)
+                            if "repair pass 2/4" in label)
+        self.assertLess(max(values[:first_repair]), 1.0)
+        repair = [f for f, label in fracs
+                  if "repair pass 2/4" in label and "source tiles" in label
+                  and not label.endswith(" 0/2 source tiles")]
+        self.assertEqual(len(repair), 2)            # 1/2 and 2/2
+        self.assertTrue(repair[1] > repair[0] > values[first_repair - 1])
+        # The repair pass ADDS exactly its source tiles to the total.
+        totals = [e["total_units"] for e in events]
+        before = max(e["total_units"] for e in events if e["pass"] == 1)
+        rep = [e for e in events if e.get("repair")]
+        self.assertTrue(rep)
+        self.assertTrue(all(e["pass"] == 2 and e["pass_total"] == 2
+                            for e in rep), rep)
+        self.assertEqual(max(totals), before + len(bad))
+        self.assertEqual(events[-1]["done_units"], events[-1]["total_units"])
+
+    def test_the_run_label_says_repair_pass(self):
+        model = rp.RunProgress()
+        key = ("download", 0, 2)
+        model.set_work(key, 1)
+        sink = mct._DownloadProgressSink(model, key, 2, 1, 1)
+        labels, fracs = [], []
+
+        def tap(info):
+            sink.download_event(info)
+            labels.append(model.label())
+            fracs.append(model.fraction())
+        self._run("0.2.6", tap)
+        self.assertTrue(any("(repair pass 2/4)" in lb and "/2 source tiles" in lb
+                            for lb in labels), labels[-5:])
+        self.assertEqual(fracs, sorted(fracs))
+        self.assertEqual(model.fraction(), 1.0)
+
+
 class TestMapConverterDownloadDrivesTheRunModel(unittest.TestCase):
 
     def test_sink_events_reach_the_model_slot(self):
@@ -377,11 +578,11 @@ class TestMapConverterDownloadDrivesTheRunModel(unittest.TestCase):
                                       progress_model=model)
         self.assertEqual(seen, sorted(seen))
         self.assertGreater(seen[0], 0.0)
-        # Both resolutions downloaded, convert still outstanding.
-        self.assertEqual(model.work(("download", 0, 30)), 100)
-        self.assertEqual(model.work(("download", 0, 90)), 100)
+        # One slot per (entry, zoom): 90 m needs z11 here, 30 m z12.
+        self.assertEqual(model.work(("download", 0, 11)), 100)
+        self.assertEqual(model.work(("download", 0, 12)), 100)
         self.assertLess(model.fraction(), 1.0)
-        self.assertIn("Downloading terrain 90 m [2/2] z12", model.label())
+        self.assertIn("Downloading terrain z12 (30 m) [2/2]", model.label())
         model.finish(("convert",))
         self.assertEqual(model.fraction(), 1.0)
 
@@ -390,12 +591,358 @@ class TestMapConverterDownloadDrivesTheRunModel(unittest.TestCase):
         expected = mct._enumerate_tiles(
             mct._snap_bbox({"south": 47.1, "north": 47.4, "west": 8.1,
                             "east": 8.4}, [30]), [30])
-        model.set_work(("download", 0, 30), 500)
+        model.set_work(("download", 0, 12), 500)      # 30 m: z12 here
         with mock.patch.object(ta, "ensure_pool_tiles",
                                return_value={}):
             mct._download_xyz_entries([{"uri": "u", "extent": None}],
                                       expected, progress_model=model)
         self.assertEqual(model.fraction(), 1.0)
+
+
+class TestConcurrentSlotsCreepApart(unittest.TestCase):
+    """Phase 2 and a download report into their own slots in turn (the Map
+    Converter runs them at the same time): each slot creeps towards its own
+    next report at its own rate; nothing is reset or counted twice."""
+
+    def test_two_slots_in_turn(self):
+        clock = _Clock()
+        m = rp.WorkProgress(clock)
+        m.set_work("dl", 1000)
+        m.set_work("cv", 1000)
+        shown = []
+        for i in range(1, 11):          # dl: 20 u/s, cv: 5 u/s, interleaved
+            clock.t = float(i)
+            m.set_done("dl", i * 20, ceiling=(i + 1) * 20)
+            shown.append(m.shown())
+            clock.t = i + 0.5
+            m.set_done("cv", i * 5, ceiling=(i + 1) * 5)
+            shown.append(m.shown())
+        clock.t = 10.9                   # both creep towards their ceilings
+        shown.append(m.shown())
+        self.assertGreater(m.fraction(), (200 + 50) / 2000 - 1e-9)
+        self.assertEqual(shown, sorted(shown))
+        clock.t = 60.0                   # ...never past them
+        capped = m.shown()
+        self.assertAlmostEqual(capped, (220 + 55) / 2000, places=6)
+        # The confirming reports: nothing shown twice.
+        m.set_done("dl", 220, ceiling=240)
+        m.set_done("cv", 55, ceiling=60)
+        self.assertAlmostEqual(m.fraction(), (220 + 55) / 2000, places=6)
+        self.assertGreaterEqual(m.shown(), capped)
+
+    def test_each_slot_creeps_at_its_own_rate(self):
+        clock = _Clock()
+        m = rp.WorkProgress(clock)
+        m.set_work("fast", 10_000)
+        m.set_work("slow", 10_000)
+        for i in range(1, 6):
+            clock.t = float(i)
+            m.set_done("fast", i * 100, ceiling=i * 100 + 1000)
+            m.set_done("slow", i * 1, ceiling=i * 1 + 1)   # 1 unit of room
+        base = m.fraction()
+        clock.t = 6.0                    # one second of creep each
+        gained = (m.shown() - base) * 20_000 / (1 - base)
+        # fast: ~100 units at its own rate, slow: its 1 unit of room — the
+        # slow slot reporting last must not stop the fast one creeping.
+        self.assertGreater(gained, 90)
+        self.assertLess(gained, 115)
+
+
+class TestActivitiesLabel(unittest.TestCase):
+
+    def test_concurrent_activities_are_named_together(self):
+        clock = _Clock()
+        m = rp.RunProgress(clock)
+        m.set_work("cv", 100)
+        m.set_work("dl", 100)
+        m.set_phase("Converting tiles from local files")
+        m.set_activity("cv", "Converting tiles from local files",
+                       {"done": 0, "total": 531, "unit": "tiles"})
+        m.set_activity("dl", "Downloading terrain z15 (2, 5 m)",
+                       {"done": 12345, "total": 193978,
+                        "unit": "source tiles", "mbps": 25.1})
+        self.assertEqual(
+            m.label(),
+            "Converting tiles from local files: 0/531 tiles; "
+            "Downloading terrain z15 (2, 5 m): 12,345/193,978 source "
+            "tiles, 25.1 MB/s")
+        m.set_activity("cv", "Converting tiles from local files",
+                       {"done": 120})
+        self.assertTrue(m.label().startswith(
+            "Converting tiles from local files: 120/531 tiles; "
+            "Downloading terrain z15"))          # start order kept
+        self.assertEqual(m.activities(),
+                         ["Converting tiles from local files",
+                          "Downloading terrain z15 (2, 5 m)"])
+        m.end_activity("cv")
+        self.assertTrue(m.label().startswith("Downloading terrain z15"))
+        m.end_activity("dl")
+        self.assertEqual(m.label(), "Converting tiles from local files")
+        m.set_activity("dl", "Downloading terrain z12 (30 m)")
+        m.stop("Cancelled.")
+        self.assertEqual(m.label(), "Cancelled.")
+        self.assertEqual(m.activities(), [])
+
+    def test_eta_and_stall_note_once_at_the_end(self):
+        clock = _Clock()
+        m = rp.RunProgress(clock)
+        m.set_work("a", 100)
+        m.set_work("b", 100)
+        m.set_activity("a", "A", {"done": 1, "total": 2})
+        m.set_activity("b", "B")
+        for i in range(1, 5):
+            clock.t = float(i)
+            m.set_done("a", i * 10)
+        label = m.label()
+        self.assertTrue(label.startswith("A: 1/2 tiles; B · ETA"), label)
+        self.assertEqual(label.count("ETA"), 1)
+        clock.t = 40.0
+        self.assertIn(" · no tile finished for 36 s", m.label())
+
+    def test_a_step_counter_is_named_first(self):
+        m = rp.RunProgress(_Clock())
+        m.set_work("b", 10)
+        m.set_activity("b", "Converting band 2/4",
+                       {"step": "decoding building tiles", "done": 12000,
+                        "total": 20808})
+        self.assertEqual(m.label(), "Converting band 2/4: decoding building "
+                                    "tiles 12,000/20,808")
+        m.set_phase("Converting band 2/4", {"step": "decoding building "
+                                            "tiles", "done": 1000,
+                                            "total": 2500})
+        m.end_activity("b")
+        self.assertEqual(m.label(), "Converting band 2/4: decoding building "
+                                    "tiles 1,000/2,500")
+
+    def test_a_step_without_a_counter_is_named(self):
+        # A batch whose converter waits for its building tiles
+        # (aether_converter >= 0.2.12): the step alone, no counter.
+        m = rp.RunProgress(_Clock())
+        m.set_work("b", 10)
+        m.set_activity("b", "Converting band 2/4",
+                       {"step": "waiting for building tiles"}, reset=True)
+        self.assertEqual(m.label(),
+                         "Converting band 2/4: waiting for building tiles")
+        m.set_activity("b", "Converting band 2/4",
+                       {"done": 3, "total": 9, "unit": "tiles"}, reset=True)
+        self.assertEqual(m.label(), "Converting band 2/4: 3/9 tiles")
+        m.end_activity("b")
+        m.set_phase("Converting tiles from local files",
+                    {"step": "waiting for building tiles"})
+        self.assertEqual(m.label(), "Converting tiles from local files: "
+                                    "waiting for building tiles")
+
+
+# ---------------------------------------------------------------------------
+# The building-tile decode of an ingest batch (toolkit 0.2.9)
+# ---------------------------------------------------------------------------
+
+#: The lines aether_converter 0.2.9 prints while it decodes a batch's
+#: buildings_pbf_dir (every 1,000 tiles, then the end), before its first
+#: `Progress:` line — as the toolkit change specifies them.
+_DECODE_DIR = '[Rust] Decoding building tiles in "/c/views/0f3a" (once for ' \
+              'the run)...'
+
+
+def _decode(n, m):
+    return f"[Rust] Decoding building tiles: {n}/{m}"
+
+
+def _decoded(m, b, s):
+    return f"[Rust] Building tiles decoded: {m} tile(s), {b} building(s) " \
+           f"in {s:.1f} s"
+
+
+_INFO = ("[Info] buildings_pbf_dir: 3 tile(s), 3 building(s) (3 after "
+         "dedup), 3 drawn, 30 pixel(s) raised")
+
+
+class TestBuildingDecodeParsers(unittest.TestCase):
+
+    def test_decode_progress_line(self):
+        self.assertEqual(rp.parse_building_decode(_decode(12000, 20808)),
+                         (12000, 20808))
+        self.assertEqual(rp.parse_building_decode(
+            "[Rust] Decoding building tiles: 12,000/20,808"), (12000, 20808))
+        # The directory line (0.2.7 / 0.2.8 too) carries no counter.
+        self.assertIsNone(rp.parse_building_decode(_DECODE_DIR))
+        self.assertIsNone(rp.parse_building_decode("[Rust] Progress: 10/30"))
+
+    def test_decode_end_line(self):
+        self.assertEqual(rp.parse_buildings_decoded(
+            _decoded(20808, 1234567, 83.4)), (20808, 1234567, 83.4))
+        self.assertEqual(rp.parse_buildings_decoded(
+            "[Rust] Building tiles decoded: 2,500 tile(s), 7,800 "
+            "building(s) in 5.0 s"), (2500, 7800, 5.0))
+        self.assertIsNone(rp.parse_buildings_decoded(_decode(1000, 2500)))
+        self.assertIsNone(rp.parse_buildings_decoded(_INFO))
+        # Neither line is an ingest progress line.
+        for line in (_decode(1000, 2500), _decoded(2500, 7, 1.0)):
+            self.assertIsNone(rp.parse_ingest_progress(line), line)
+
+    def test_next_decode_report(self):
+        self.assertEqual(rp.BUILDING_DECODE_STEP, 1000)
+        self.assertEqual(rp.next_decode_report(0, 20808), 1000)
+        self.assertEqual(rp.next_decode_report(12000, 20808), 13000)
+        self.assertEqual(rp.next_decode_report(20000, 20808), 20808)
+        self.assertEqual(rp.next_decode_report(500, 800), 800)
+
+
+class TestBuildingDecodeThroughTheWorker(unittest.TestCase):
+    """The new lines fed through a fake converter into the shipped
+    ``_MapConverterWorker._run_ingest``: the label names the decode, the
+    batch's slot moves through its decode share (and creeps between the
+    lines), the ETA is blanked after 30 s without a report."""
+
+    SLOT = ("convert", 7)
+    PHASE = "Converting band 2/4"
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = self._tmp.name
+        self.clock = _Clock()
+        self.model = rp.RunProgress(self.clock)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def jobs(self, n=30, pbf=True):
+        pbf_dir = os.path.join(self.root, "pbf")
+        os.makedirs(pbf_dir, exist_ok=True)
+        jobs = []
+        for i in range(n):
+            job = {"output_path": os.path.join(self.root, "out",
+                                               f"t{i}.abt"),
+                   "size_px": 256}
+            if pbf:
+                job["buildings_pbf_dir"] = pbf_dir
+            jobs.append(job)
+        return jobs
+
+    def run_ingest(self, script, jobs):
+        """*script*: ``(t, line)`` fed in order (a callable *line* is a
+        probe, run at time *t* between two lines). Returns the snapshots
+        ``(line, fraction, shown, label)`` taken after each line and the
+        status texts."""
+        worker = mct._MapConverterWorker([], os.path.join(self.root, "out"),
+                                         [30], [],
+                                         progress_model=self.model)
+        status, seen = [], []
+        worker.status.connect(status.append)
+        model = self.model
+
+        def fake(exe, args, on_line, on_start=None, env=None):
+            for t, line in script:
+                self.clock.t = t
+                if callable(line):
+                    line()
+                    continue
+                on_line(line)
+                seen.append((line, model.fraction(), model.shown(),
+                             model.label()))
+            return 0
+
+        with mock.patch.object(ta, "run_converter_streaming",
+                               side_effect=fake):
+            worker._run_ingest("conv", jobs, self.SLOT, self.PHASE,
+                               activity=self.SLOT, batch=7)
+        return seen, status
+
+    def ingest_lines(self, t0, n, pbf=True):
+        out = []
+        for k in range(1, n + 1):
+            if pbf:
+                out.append((t0 + k * 0.1, _INFO))
+            if k % 10 == 0 or k == n:
+                out.append((t0 + k * 0.1, f"[Rust] Progress: {k}/{n}"))
+        return out
+
+    def test_the_decode_is_the_first_share_of_the_batch(self):
+        probes = {}
+
+        def probe(name):
+            return lambda: probes.__setitem__(
+                name, (self.model.fraction(), self.model.shown()))
+
+        script = [(1.0, _DECODE_DIR), (2.0, _decode(1000, 2500)),
+                  (4.0, _decode(2000, 2500)), (4.5, probe("creep")),
+                  (6.0, _decoded(2500, 7800, 5.0))]
+        script += self.ingest_lines(7.0, 30)
+        seen, status = self.run_ingest(script, self.jobs())
+        by_line = {line: (f, label) for line, f, _s, label in seen}
+        share = rp.BUILDING_DECODE_SHARE
+        f, label = by_line[_decode(1000, 2500)]
+        self.assertAlmostEqual(f, share * 1000 / 2500, places=9)
+        self.assertEqual(label.split(" · ")[0], "Converting band 2/4: "
+                         "decoding building tiles 1,000/2,500")
+        f, label = by_line[_decode(2000, 2500)]
+        self.assertAlmostEqual(f, share * 2000 / 2500, places=9)
+        self.assertTrue(label.startswith("Converting band 2/4: decoding "
+                                         "building tiles 2,000/2,500"), label)
+        # Between two decode lines the bar creeps — never past the next one.
+        f, shown = probes["creep"]
+        self.assertGreater(shown, f)
+        self.assertLessEqual(shown, share + 1e-9)
+        f, label = by_line[_decoded(2500, 7800, 5.0)]
+        self.assertAlmostEqual(f, share, places=9)
+        self.assertTrue(label.startswith("Converting band 2/4: 0/30 tiles"),
+                        label)
+        f, label = by_line["[Rust] Progress: 10/30"]
+        self.assertAlmostEqual(f, share + (1 - share) / 3, places=9)
+        self.assertTrue(label.startswith("Converting band 2/4: 10/30 tiles"),
+                        label)
+        self.assertNotIn("decoding", label)
+        fracs = [f for _l, f, _s, _lb in seen]
+        self.assertEqual(fracs, sorted(fracs))
+        self.assertEqual(self.model.fraction(), 1.0)
+        self.assertIn("Decoding building tiles 1,000/2,500", status)
+        self.assertIn("Decoding building tiles 2,000/2,500", status)
+        self.assertIn("Converting tile 30/30", status)
+
+    def test_a_long_decode_blanks_the_eta(self):
+        script = [(2.0, _decode(1000, 20808)), (4.0, _decode(2000, 20808)),
+                  (6.0, _decode(3000, 20808))]
+        stalled = {}
+
+        def at(name):
+            return lambda: stalled.__setitem__(name, self.model.label())
+
+        script += [(20.0, at("quiet 14 s")), (36.0, at("quiet 30 s")),
+                   (4000.0, at("quiet 66 min")),
+                   (4001.0, _decode(4000, 20808)),
+                   (4001.5, at("reported again"))]
+        script += [(4002.0, _decoded(20808, 99, 4000.0))]
+        script += self.ingest_lines(4003.0, 30)
+        self.run_ingest(script, self.jobs())
+        self.assertIn("ETA ", stalled["quiet 14 s"])
+        self.assertNotIn(rp.ETA_UNKNOWN, stalled["quiet 14 s"])
+        for name in ("quiet 30 s", "quiet 66 min"):
+            self.assertTrue(stalled[name].endswith(" · ETA —"),
+                            stalled[name])
+            self.assertTrue(stalled[name].startswith(
+                "Converting band 2/4: decoding building tiles 3,000/20,808"),
+                stalled[name])
+        self.assertNotIn(rp.ETA_UNKNOWN, stalled["reported again"])
+
+    def test_a_converter_without_decode_lines_jumps_the_share(self):
+        # 0.2.7 / 0.2.8: only the directory line, then the tiles.
+        script = [(1.0, _DECODE_DIR)] + self.ingest_lines(2.0, 30)
+        seen, status = self.run_ingest(script, self.jobs())
+        labels = [label for _l, _f, _s, label in seen]
+        self.assertFalse([lb for lb in labels if "decoding" in lb], labels)
+        f = next(f for line, f, _s, _lb in seen
+                 if line == "[Rust] Progress: 10/30")
+        share = rp.BUILDING_DECODE_SHARE
+        self.assertAlmostEqual(f, share + (1 - share) / 3, places=9)
+        self.assertEqual(self.model.fraction(), 1.0)
+        self.assertFalse([s for s in status if s.startswith("Decoding")])
+
+    def test_a_batch_without_buildings_has_no_decode_share(self):
+        seen, _status = self.run_ingest(self.ingest_lines(1.0, 30, pbf=False),
+                                        self.jobs(pbf=False))
+        f = next(f for line, f, _s, _lb in seen
+                 if line == "[Rust] Progress: 10/30")
+        self.assertAlmostEqual(f, 1 / 3, places=9)
 
 
 # ---------------------------------------------------------------------------

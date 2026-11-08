@@ -48,8 +48,9 @@ ADAPTIVE_FAR_STEP_M = 90
 #: Bands stepping at this or coarser skip buildings by default (Adaptive always,
 #: Custom unless the user ticks the band). OpenFreeMap buildings come at z14
 #: only, so a far 90 m band fetched thousands of building tiles (3844 for a
-#: 12-50 km ring, most of a 44 s run, close to openfreemap.MAX_TILES) to burn a
-#: few tens of thousands of pixels a 90 m ray step barely samples.
+#: 12-50 km ring, most of a 44 s run — and a band builds whole pool tiles,
+#: with all their buildings) to burn a few tens of thousands of pixels a
+#: 90 m ray step barely samples.
 BUILDINGS_SKIP_STEP_M = 90
 
 #: aether_core accepts at most this many bands.

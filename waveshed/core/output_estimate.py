@@ -21,7 +21,7 @@ from __future__ import annotations
 import math
 import os
 import shutil
-from typing import Iterable, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterable, List, NamedTuple, Optional, Tuple
 
 from .job_builder import VALID_RESOLUTIONS
 
@@ -120,9 +120,11 @@ def output_space_problem(
     ``(None, False)`` when there is nothing to say.
 
     *jobs* are ``(label, model, max_range_km, resolution_m, az_start, az_end)``.
-    ``blocking`` means the disk cannot hold the engine output; the caller still
-    only warns (the owner wants a warning, never a hard stop). A non-blocking
-    message is a large output that still fits.
+    ``blocking`` means the disk cannot hold the engine output (Site Analysis
+    then refuses the run through :func:`drive_needs` / :func:`refusal_text`,
+    which add the terrain pool on its drive — 2026-10-21; before, this was a
+    "Run anyway?" warning). A non-blocking message is a large output that
+    still fits.
     """
     sizes = [(label, model, rng, res, engine_output_bytes(model, rng, res, a0, a1))
              for label, model, rng, res, a0, a1 in jobs]
@@ -157,3 +159,115 @@ def output_space_problem(
                 f"about {format_bytes(total)} on disk{free_txt}, plus the GeoTIFF "
                 f"exported from it.\n\n{detail}\n\n{why}\n\nRun anyway?", False)
     return None, False
+
+
+# ---------------------------------------------------------------------------
+# Per-drive disk need (Map Converter, Site Analysis): refuse instead of ENOSPC
+# ---------------------------------------------------------------------------
+
+#: A run is refused when its need on a drive exceeds that drive's free space
+#: minus this reserve (QGIS, the OS, the converter's in-flight temp tile, the
+#: GeoTIFF export all need room too).
+DISK_RESERVE_BYTES = 2 * 1024 ** 3
+
+
+class DriveNeed(NamedTuple):
+    """What one run writes to one drive (volume)."""
+    drive: str                  # display name: "C:" / the mount point
+    labels: Tuple[str, ...]     # what goes there ("output tiles", ...)
+    paths: Tuple[str, ...]      # the directories, first seen first
+    need: int                   # bytes
+    free: Optional[int]         # bytes; None = could not be measured
+
+    @property
+    def short(self) -> bool:
+        """need > free − :data:`DISK_RESERVE_BYTES` (unknown free: never)."""
+        return self.free is not None and self.need > self.free - DISK_RESERVE_BYTES
+
+
+def _existing_parent(path: str) -> Optional[str]:
+    probe = os.path.abspath(path or ".")
+    while not os.path.exists(probe):
+        parent = os.path.dirname(probe)
+        if parent == probe:
+            return None
+        probe = parent
+    return probe
+
+
+def volume_of(path: str) -> Tuple[Any, str]:
+    """``(key, display name)`` of the volume holding *path* (its nearest
+    existing parent): the drive letter / UNC share on Windows, the device
+    and its mount point elsewhere. Paths on one volume share one key."""
+    probe = _existing_parent(path)
+    if probe is None:
+        absolute = os.path.abspath(path or ".")
+        return ("?", absolute), absolute
+    if os.name == "nt":
+        drive = os.path.splitdrive(probe)[0].upper() or probe
+        return drive, drive
+    try:
+        dev = os.stat(probe).st_dev
+    except OSError:
+        return ("?", probe), probe
+    mount = probe
+    while not os.path.ismount(mount):
+        parent = os.path.dirname(mount)
+        if parent == mount:
+            break
+        mount = parent
+    return dev, mount
+
+
+def drive_needs(items: Iterable[Tuple[str, str, int]],
+                free_of: Optional[Callable[[str], Optional[int]]] = None,
+                volume: Optional[Callable[[str], Tuple[Any, str]]] = None,
+                ) -> List[DriveNeed]:
+    """Group ``(label, directory, bytes)`` *items* per drive and measure each
+    drive's free space once (``shutil.disk_usage`` via :func:`free_bytes`;
+    *free_of* / *volume* replace the probes). Items with 0 bytes still name
+    their drive (need 0 there); order = first seen."""
+    free_of = free_of or free_bytes
+    volume = volume or volume_of
+    groups: Dict[Any, Dict[str, Any]] = {}
+    for label, path, need in items:
+        key, name = volume(path)
+        g = groups.setdefault(key, {"drive": name, "labels": [], "paths": [],
+                                    "need": 0, "probe": path})
+        if label not in g["labels"]:
+            g["labels"].append(label)
+        if path not in g["paths"]:
+            g["paths"].append(path)
+        g["need"] += max(0, int(need))
+    return [DriveNeed(g["drive"], tuple(g["labels"]), tuple(g["paths"]),
+                      g["need"], free_of(g["probe"]))
+            for g in groups.values()]
+
+
+def short_drives(needs: Iterable[DriveNeed]) -> List[DriveNeed]:
+    """The drives a run cannot fit on (:attr:`DriveNeed.short`)."""
+    return [d for d in needs if d.short]
+
+
+def format_gb(n: Optional[float]) -> str:
+    """``12.3 GB`` (``0.06 GB`` below 10 GB); ``?`` when unknown."""
+    if n is None:
+        return "?"
+    gb = n / 1024 ** 3
+    return f"{gb:,.2f} GB" if gb < 10 else f"{gb:,.1f} GB"
+
+
+def format_drive_need(d: DriveNeed) -> str:
+    """``C: need 12.3 GB / free 40.1 GB (output tiles, terrain pool)``."""
+    return (f"{d.drive} need {format_gb(d.need)} / free {format_gb(d.free)}"
+            f" ({', '.join(d.labels)})")
+
+
+def refusal_text(short: List[DriveNeed], what: str = "this run") -> str:
+    """The message a refused run shows: per short drive the same numbers as
+    the estimate label, and what to do."""
+    lines = "\n".join(f"  {format_drive_need(d)}" for d in short)
+    return (f"Not enough disk space for {what}:\n\n{lines}\n\n"
+            f"{format_gb(DISK_RESERVE_BYTES)} is kept free on every drive. "
+            f"Free disk space, choose another output folder or a smaller "
+            f"area / fewer resolutions, then run again.")

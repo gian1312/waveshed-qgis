@@ -16,27 +16,53 @@ Also supports a local terrain directory of GeoTIFF/DEM files (path 2).
 
 from __future__ import annotations
 
-import hashlib
+import errno
+import heapq
 import json
 import math
 import os
-import platform
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
+import threading
 import time
+import types
 import urllib.parse
-from typing import Any, Dict, List, NamedTuple, Optional, Sequence, Tuple
+from typing import (Any, Callable, Dict, Iterable, List, NamedTuple, Optional,
+                    Sequence, Tuple)
 
 from osgeo import gdal
 
-from . import run_progress, terrain_index
+from . import abt_index, hashes, run_progress, terrain_index
+from .job_builder import VALID_RESOLUTIONS
 from .layer_utils import classify_raster_layer
 
-_SUBPROCESS_FLAGS = (
-    subprocess.CREATE_NO_WINDOW if platform.system() == "Windows" else 0
-)
+
+def _is_windows() -> bool:
+    """THE Windows gate of the plugin: ``sys.platform`` (also
+    ``gui/terrain_folder_scan._is_windows``), so a test that flips
+    ``sys.platform`` reaches every Windows path it gates."""
+    return sys.platform == "win32"
+
+
+#: ``creationflags`` value that starts a console program without a console
+#: window (Windows' CREATE_NO_WINDOW; the constant exists on Windows only).
+_CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+
+
+def _no_window_flags() -> int:
+    """``creationflags`` of a launch from QGIS: CREATE_NO_WINDOW on Windows
+    (else a console window flashes up for every engine start), 0 elsewhere
+    (POSIX ``Popen`` refuses anything else)."""
+    return _CREATE_NO_WINDOW if _is_windows() else 0
+
+
+#: ``creationflags`` of every engine launch — evaluated once, at import, so a
+#: test that flips ``sys.platform`` never hands a POSIX ``Popen`` a Windows
+#: flag.
+_SUBPROCESS_FLAGS = _no_window_flags()
 
 
 def _log(msg: str) -> None:
@@ -67,6 +93,9 @@ def reset_terrain_warnings() -> None:
     _warned_render_gap_sources.clear()
     # A run sees every folder change made before it started: the folder
     # indexes are re-checked (stat) once per run, then shared by its jobs.
+    # (A Site Analysis run whose TerrainPrep is current made that check at
+    # the Run click and reads no index after this; a stale one's read
+    # re-checks because of it.)
     terrain_index.expire_all()
 
 
@@ -92,15 +121,30 @@ def get_cache_dir() -> str:
 # A cache entry directory is named by _cache_key, i.e. an md5 hex digest.
 _CACHE_ENTRY_RE = re.compile(r"^[0-9a-f]{32}$")
 
+#: The raw source-tile cache under the cache root (``<cache>/xyz``): every
+#: XYZ download job names it as ``cache_dir`` (toolkit CONTRACT changelog
+#: 38, aether_converter >= 0.2.8; older converters ignore the field). The
+#: converter owns its layout — ``<service_key>/z<zoom>/x<x>_y<yblock>.pack``
+#: packs of the fetched PNG/WebP bytes plus ``<service_key>/service.json`` —
+#: and the plugin never reads it; it only creates the directory, prices its
+#: growth (:func:`raw_tile_bytes`) and deletes it with the cache.
+XYZ_CACHE_DIRNAME = "xyz"
+
+
+def xyz_cache_dir() -> str:
+    """Absolute path of the raw source-tile cache, ``<cache>/xyz``."""
+    return os.path.join(get_cache_dir(), XYZ_CACHE_DIRNAME)
+
 
 def cache_entries() -> List[str]:
     """Absolute paths of the terrain cache entries under the cache root.
 
     Only md5-named directories — the shape ``_cache_key`` produces — count as
-    ours. The cache root is user-configurable (QgsSettings
-    "waveshed/cache_dir") and may well be a directory holding other things, so
-    nothing else is ever reported here, and therefore nothing else can be
-    deleted by ``clear_cache``.
+    ours, plus exactly one more: the raw source-tile cache ``<cache>/xyz``
+    (:func:`xyz_cache_dir`, last), when it exists. The cache root is
+    user-configurable (QgsSettings "waveshed/cache_dir") and may well be a
+    directory holding other things, so nothing else is ever reported here,
+    and therefore nothing else can be deleted by ``clear_cache``.
     """
     root = get_cache_dir()
     entries: List[str] = []
@@ -116,6 +160,9 @@ def cache_entries() -> List[str]:
                     entries.append(path)
         except OSError:
             continue
+    raw = os.path.join(root, XYZ_CACHE_DIRNAME)
+    if os.path.isdir(raw):
+        entries.append(raw)
     return entries
 
 
@@ -137,11 +184,16 @@ def cache_size_bytes() -> int:
 
 
 def clear_cache() -> Tuple[int, int]:
-    """Delete every terrain cache entry. Returns ``(entries removed, bytes freed)``.
+    """Delete every terrain cache entry (:func:`cache_entries` — the cached
+    terrain sets and the downloaded source tiles, ``<cache>/xyz``). Returns
+    ``(entries removed, bytes freed)``.
 
     The cache has no eviction of any kind, so this is the only way to reclaim
     the space — and the only way to pick up republished OpenFreeMap building
-    data, whose cache token is deliberately date-free.
+    data, whose cache token is deliberately date-free (and, with the source
+    tiles gone, republished elevation tiles). The folder index
+    (``<cache>/index``, per-folder file metadata) is NOT terrain and is kept:
+    :func:`clear_index` removes it.
     """
     removed = 0
     freed = 0
@@ -158,6 +210,49 @@ def clear_cache() -> Tuple[int, int]:
     return removed, freed
 
 
+#: A folder index file: ``<md5(folder)>.json`` (``terrain_index.index_path``)
+#: or a pre-built folder's header index ``abt-<md5(folder)>.json``
+#: (``abt_index.index_path``).
+_INDEX_FILE_RE = re.compile(r"^(?:abt-)?[0-9a-f]{32}\.json$")
+
+
+def index_files() -> List[str]:
+    """Absolute paths of the folder-index files (``<cache>/index/<md5>.json``,
+    see ``terrain_index``, and the ``.abt`` header indexes
+    ``abt-<md5>.json``, see ``abt_index``). Only those names count — the
+    cache root may hold other things (see :func:`cache_entries`)."""
+    root = terrain_index.index_dir()
+    try:
+        names = sorted(os.listdir(root))
+    except OSError:
+        return []
+    return [os.path.join(root, n) for n in names
+            if _INDEX_FILE_RE.match(n) and os.path.isfile(os.path.join(root, n))]
+
+
+def clear_index() -> Tuple[int, int]:
+    """Delete every folder index (:func:`index_files`) and drop the indexes
+    held in memory, so the next scan of each folder reads every file again.
+    Returns ``(files removed, bytes freed)``. (A scan running at that moment
+    writes its own folder's index again when it finishes.)"""
+    removed = 0
+    freed = 0
+    for path in index_files():
+        try:
+            size = os.path.getsize(path)
+            os.remove(path)
+        except OSError as exc:  # noqa: PERF203 — report and keep going
+            _log(f"  index clear: could not remove {path} ({exc})")
+            continue
+        removed += 1
+        freed += size
+    terrain_index.forget_indexes()
+    abt_index.forget()
+    _log(f"  index clear: removed {removed} folder index file(s), "
+         f"freed {freed / 1e6:.0f} MB")
+    return removed, freed
+
+
 def _get_download_connections() -> int:
     from qgis.core import QgsSettings
     return int(QgsSettings().value("waveshed/download_connections", 256))
@@ -167,9 +262,12 @@ def _get_download_max_passes() -> int:
     """Max download attempts (initial + retries) when tiles fail.
 
     Default 4: the first pass downloads everything; each retry re-fetches ONLY
-    the sub-tiles that ended up with a gap, at half the connections, so retries
-    are cheap (not a full re-download). Set to 1 via QgsSettings
-    ("waveshed/download_max_passes") to disable retries.
+    the output tiles that ended up with a gap (whole), at the configured
+    connections — the converter backs off by itself, so the plugin does not
+    stack a second backoff on top. Degraded-only source tiles get ONE repair
+    pass instead (``repair_source_tiles``, converter >= 0.2.6) that patches
+    just those source tiles into the existing output tiles. Set to 1 via
+    QgsSettings ("waveshed/download_max_passes") to disable retries.
     """
     from qgis.core import QgsSettings
     try:
@@ -816,7 +914,9 @@ def _tile_center_lat(tile: Dict[str, Any]) -> float:
 
 
 def _cache_key(source: str, subtiles: List[Dict[str, Any]], resolution_m: int,
-               buildings: Optional[str] = None) -> str:
+               buildings: Optional[str] = None,
+               regions: Optional[Dict[str, Optional[Dict[str, float]]]] = None,
+               ) -> str:
     """Hash identifying one .abt terrain cache.
 
     Keyed on the *tile set*, not on the request that produced it.  Tile names
@@ -841,25 +941,41 @@ def _cache_key(source: str, subtiles: List[Dict[str, Any]], resolution_m: int,
     ``zmin=``/``interpretation=`` spelled differently) kept the pool and moved
     the view to a fresh directory — the view identity moving underneath a
     pool that did not.
+
+    *regions* ``{tile name: region bbox or None}`` — the part of each tile
+    the run needs when it is served from a partial pool tile (see
+    :func:`resolve_pool_tile`). Every non-None region is hashed in, so a view
+    linked to a ``.part`` built for one region is never served to a run that
+    needs another; whole-tile runs (no region anywhere) keep their key.
     """
     names = ",".join(sorted(t["filename"] for t in subtiles))
     key = (f"{_schema_for(source)}|{source_identity(source)}|{names}"
            f"|{resolution_m}")
     if buildings:
         key += f"|{source_fingerprint(buildings)}"
-    return hashlib.md5(key.encode()).hexdigest()
+    parts = sorted(
+        f"{name}@{r['west']!r},{r['south']!r},{r['east']!r},{r['north']!r}"
+        for name, r in (regions or {}).items() if r is not None)
+    if parts:
+        key += "|regions=" + hashes.md5(
+            ";".join(parts).encode()).hexdigest()
+    return hashes.md5(key.encode()).hexdigest()
 
 
 def _view_dir(source: str, subtiles: List[Dict[str, Any]],
-              resolution_m: int, buildings: Optional[str] = None) -> str:
+              resolution_m: int, buildings: Optional[str] = None,
+              regions: Optional[Dict[str, Optional[Dict[str, float]]]] = None,
+              ) -> str:
     """Absolute view directory for one run — the directory the engine reads.
 
     The counterpart of :func:`_pool_dir`, and the ONE place the view path is
     assembled, so no caller can compute it a second time and land somewhere
     else (see :func:`get_cache_dir` on why a second computation could move).
+    *regions*: see :func:`_cache_key`.
     """
     return os.path.join(get_cache_dir(), _VIEW_DIRNAME,
-                        _cache_key(source, subtiles, resolution_m, buildings))
+                        _cache_key(source, subtiles, resolution_m, buildings,
+                                   regions))
 
 
 # ---------------------------------------------------------------------------
@@ -892,11 +1008,27 @@ _VIEW_DIRNAME = "views"
 # matches .abt.
 _REBUILD_SUFFIX = ".rebuild"
 
+# A file-built pool tile built for only PART of its extent (the region one
+# run needed — see :func:`resolve_pool_tile`) is pooled as ``<name>.part``
+# (``tile_….abt.part``), never under its canonical ``.abt`` name: everything
+# that lists or reads pool tiles by name or by ``*.abt`` (abt.list_tiles,
+# list_abt_tiles, the view prune, _tile_ready, _listed_tile_ready, the
+# engine's read_dir) therefore sees "no tile" there. Its sidecar
+# ``<name>.part.json`` records which regions are real terrain and is bound
+# to the ``.part`` file's size + mtime.
+_PART_SUFFIX = ".part"
+_PART_META_SUFFIX = ".part.json"
+
 
 def _finish_view(pool_dir: str, view_dir: str, names: List[str],
-                 t0: float) -> None:
-    """Link this run's tiles into its view directory and log the outcome."""
-    gone = _sync_view(pool_dir, view_dir, names)
+                 t0: float,
+                 tiles: Optional[Dict[str, Tuple[Dict[str, Any],
+                                                 Optional[Dict[str, float]]]]
+                        ] = None,
+                 voids: Optional[Dict[str, Optional[int]]] = None) -> None:
+    """Link this run's tiles into its view directory and log the outcome
+    (*tiles*, *voids*: see :func:`_sync_view`)."""
+    gone = _sync_view(pool_dir, view_dir, names, tiles=tiles, voids=voids)
     if gone:
         _log(f"  WARNING: {len(gone)} of {len(names)} tile(s) could not be "
              f"provided (first: {gone[0]}) — coverage will have holes there")
@@ -913,7 +1045,7 @@ def _pool_dir(source: str, buildings: Optional[str] = None) -> str:
     if buildings:
         key += f"|{source_fingerprint(buildings)}"
     return os.path.join(get_cache_dir(), _POOL_DIRNAME,
-                        hashlib.md5(key.encode()).hexdigest())
+                        hashes.md5(key.encode()).hexdigest())
 
 
 def _tile_is_whole(path: str) -> bool:
@@ -938,6 +1070,59 @@ def _tile_ready(pool_dir: str, name: str) -> bool:
     if os.path.exists(os.path.join(pool_dir, name + _REBUILD_SUFFIX)):
         return False
     return _tile_is_whole(os.path.join(pool_dir, name))
+
+
+def _abt_whole_bytes(size_px: int) -> int:
+    """Bytes of a whole ``.abt`` tile of *size_px*: the header plus
+    ``size × stride``, rows padded to 256 bytes as the converter writes
+    them (the stride :func:`_tile_is_whole` reads from the header)."""
+    from . import abt
+    return abt.HEADER_SIZE + size_px * ((size_px * 2 + 255) & ~255)
+
+
+def _pool_listing(pool_dir: str) -> Dict[str, Any]:
+    """``{name: os.DirEntry}`` of *pool_dir* — one listing ({} when absent).
+    The entries carry the sizes (free on Windows; stat'ed lazily, once, on
+    the entries asked for elsewhere)."""
+    try:
+        with os.scandir(pool_dir) as it:
+            return {e.name: e for e in it}
+    except OSError:
+        return {}
+
+
+def _listed_tile_whole(listing: Dict[str, Any], spec: Dict[str, Any],
+                       pool_dir: str, name: Optional[str] = None) -> bool:
+    """:func:`_tile_is_whole` from a :func:`_pool_listing`: a file at least
+    header + ``size × stride`` bytes long for the tile *spec* is whole — no
+    header read. Only a file SHORTER than that has its own header read (a
+    killed run's tile, or one of another size under this name: an older
+    extent ladder), so the rule is ``_tile_is_whole``'s for it. *name*
+    (default: the spec's canonical file name) checks another file of the
+    tile by the same rule — its ``.part``."""
+    name = name or spec["filename"]
+    entry = listing.get(name)
+    if entry is None:
+        return False
+    try:
+        if not entry.is_file():
+            return False
+        if entry.stat().st_size >= _abt_whole_bytes(int(spec["size_px"])):
+            return True
+    except (OSError, KeyError, TypeError, ValueError):
+        pass
+    return _tile_is_whole(os.path.join(pool_dir, name))
+
+
+def _listed_tile_ready(listing: Dict[str, Any], spec: Dict[str, Any],
+                       pool_dir: str) -> bool:
+    """:func:`_tile_ready` from a :func:`_pool_listing` — no rebuild flag in
+    the listing and :func:`_listed_tile_whole`. For checking many tiles at
+    once (download estimate, ``ensure_pool_tiles``, the Site Analysis stale
+    check); one file → :func:`_tile_ready`."""
+    if spec["filename"] + _REBUILD_SUFFIX in listing:
+        return False
+    return _listed_tile_whole(listing, spec, pool_dir)
 
 
 def _set_rebuild_flags(pool_dir: str, names: List[str],
@@ -987,34 +1172,223 @@ def _drop_pool_tiles(pool_dir: str, names: List[str]) -> int:
     return dropped
 
 
-def _link_pbf_view(pool_dir: str, view_dir: str, names: List[str]) -> None:
-    """Link this run's building tiles out of the pool into its own directory.
+class PoolRemoval(NamedTuple):
+    """What :func:`remove_pool_tiles` did."""
 
-    Tiles that 404 (no buildings there — normal over water) simply have no
-    file, which is not an error.  Strangers are pruned because the converter
-    decodes every file in the directory for every output tile it writes.
-    """
+    #: ``.abt`` files removed.
+    removed: int
+    #: Bytes those files gave back (a file still hard-linked from a terrain
+    #: view frees nothing).
+    freed_bytes: int
+    #: Removed files still linked elsewhere (a Site Analysis view).
+    linked: int
+
+
+def remove_pool_tiles(pool_dir: str, names: Sequence[str]) -> PoolRemoval:
+    """Remove exactly the pool tiles *names* (``<name>.abt``) with their
+    ``.src`` / ``.rebuild`` sidecars from *pool_dir* — the Map Converter's
+    "Keep pool tiles" off, after a successful run, for the tiles that run
+    downloaded. Nothing else in the pool, and never the raw source-tile
+    cache. A file Windows refuses to delete (held open) stays. The void-count
+    records of the tiles that are gone go with them
+    (:func:`_record_pool_voids`)."""
+    removed = freed = linked = 0
+    gone: List[str] = []
+    for name in names:
+        path = os.path.join(pool_dir, name)
+        try:
+            st = os.stat(path)
+        except OSError:
+            st = None
+            gone.append(name)      # never there
+        try:
+            os.remove(path)
+        except OSError:
+            st = None              # never there, or refused: nothing removed
+        if st is not None:
+            removed += 1
+            gone.append(name)
+            if getattr(st, "st_nlink", 1) > 1:
+                linked += 1
+            else:
+                freed += int(st.st_size)
+        for suffix in (_SOURCE_FP_SUFFIX, _REBUILD_SUFFIX):
+            try:
+                os.remove(path + suffix)
+            except OSError:
+                pass
+    _record_pool_voids(pool_dir, {name: None for name in gone})
+    return PoolRemoval(removed, freed, linked)
+
+
+def osm_buildings_store_dir() -> str:
+    """THE OpenFreeMap building-tile store (``{z}_{x}_{y}.pbf``, z14):
+    ``<cache>/pool/<md5("buildings|openfreemap:z14")>``.
+
+    One store for every consumer — Site Analysis (every source, band and
+    site) and the Map Converter's OSM buildings row — so a tile fetched by
+    one is never fetched again by the other. The tiles are globally
+    addressed, independent of any terrain source. An md5-named directory
+    under the pool, so :func:`cache_entries` lists it and Clear Terrain
+    Cache deletes it with the terrain sets. Engines never read it: each run
+    links the tiles it needs into its own view (the converter decodes every
+    file of the directory it is handed)."""
+    key = f"buildings|{_OSM_BUILDINGS_SOURCE_ID}"
+    return os.path.join(get_cache_dir(), _POOL_DIRNAME,
+                        hashes.md5(key.encode()).hexdigest())
+
+
+def osm_buildings_view_dir(names: Sequence[str],
+                           marker: Optional[str] = None) -> str:
+    """The view directory holding exactly the building tiles *names* (one
+    Map Converter ingest batch): ``<cache>/views/<md5 of the names>``, so a
+    batch over the same tiles reuses its links. *marker*: the view of a
+    converter run launched before its fetch ends (a Site Analysis download
+    or ingest, a Map Converter batch on aether_converter >= 0.2.12), named
+    from the tiles it NEEDS and completed by that marker file
+    (``osm_buildings.ready_view`` / ``complete_view``) — its own key, never
+    a view the sequential path relinks."""
+    key = (f"buildings|{_OSM_BUILDINGS_SOURCE_ID}|"
+           + ",".join(sorted(names)))
+    if marker:
+        key += f"|ready:{marker}"
+    return os.path.join(get_cache_dir(), _VIEW_DIRNAME,
+                        hashes.md5(key.encode()).hexdigest())
+
+
+def osm_buildings_list_dir() -> str:
+    """The directory of the building tile LISTS (aether_converter >= 0.2.14,
+    ``buildings_pbf_list``, toolkit CONTRACT changelog 51):
+    ``<cache>/views/<md5("buildings|openfreemap:z14|lists")>`` — ONE
+    md5-named directory, so :func:`cache_entries` lists it and Clear
+    Terrain Cache deletes it with the views (a list file directly in
+    ``<cache>/views`` would survive the clear: only md5-named DIRECTORIES
+    are cache entries)."""
+    key = f"buildings|{_OSM_BUILDINGS_SOURCE_ID}|lists"
+    return os.path.join(get_cache_dir(), _VIEW_DIRNAME,
+                        hashes.md5(key.encode()).hexdigest())
+
+
+def osm_buildings_list_path(names: Sequence[str]) -> str:
+    """The list file of a converter run burning the building tiles it
+    NEEDS, *names* (``buildings_pbf_list``, aether_converter >= 0.2.14): in
+    :func:`osm_buildings_list_dir`, ``<md5 of the sorted names + "|list">
+    .txt`` — its own key, never the name of a view directory of the same
+    names. It names the tiles with data among them, read straight from THE
+    store (``osm_buildings.ready_list`` / ``complete_list``): no view is
+    linked."""
+    key = (f"buildings|{_OSM_BUILDINGS_SOURCE_ID}|"
+           + ",".join(sorted(names)) + "|list")
+    return os.path.join(osm_buildings_list_dir(),
+                        hashes.md5(key.encode()).hexdigest() + ".txt")
+
+
+def link_pbf_view(store_dir: str, view_dir: str, names: Sequence[str]) -> int:
+    """Make *view_dir* hold exactly *names* out of *store_dir*: strangers
+    removed, missing names hard-linked (copied where the file system has no
+    hard links). ONE listing of the view, no per-tile stat — a Map
+    Converter batch links tens of thousands of tiles. A name the store does
+    not hold raises ``RuntimeError`` naming it (the caller lists only tiles
+    it has just seen there). Returns the number of names in the view.
+
+    Beyond :data:`_LINK_PARALLEL_MIN` names the links are made on
+    :func:`link_threads` threads where that pays (a hard link is a
+    metadata round trip; 2,000 of them went from 12.6 s to 4.4 s on 16
+    threads on the container's network mount) and one after the other on
+    Windows (owner's bench 2026-11-07, 20,000 links on an NTFS HDD: 1
+    thread 2,120/s, 4 → 2,051/s, 8 → 1,698/s, 16 → 1,540/s — NTFS
+    serialises the inserts into one directory, so threads only contend;
+    the 16-thread version linked 21,000 tiles in 24 s where 12 s had done)."""
     os.makedirs(view_dir, exist_ok=True)
     wanted = set(names)
     try:
-        for stale in os.listdir(view_dir):
-            if stale not in wanted:
-                try:
-                    os.remove(os.path.join(view_dir, stale))
-                except OSError:
-                    pass
+        have = set(os.listdir(view_dir))
     except OSError:
-        pass
-    for name in names:
-        src = os.path.join(pool_dir, name)
+        have = set()
+    for stale in have - wanted:
+        try:
+            os.remove(os.path.join(view_dir, stale))
+        except OSError:
+            pass
+
+    def link_one(name: str) -> Optional[str]:
+        """None, or the error text for a tile that could not be provided."""
+        src = os.path.join(store_dir, name)
         dst = os.path.join(view_dir, name)
-        if not os.path.exists(src) or os.path.exists(dst):
-            continue
         try:
             os.link(src, dst)
+            return None
+        except FileExistsError:
+            return None
         except OSError:
+            pass
+        try:
+            shutil.copy2(src, dst)
+        except OSError as exc:
+            return (f"Building tile {name} could not be linked into "
+                    f"{view_dir} ({exc})")
+        return None
+
+    todo = sorted(wanted - have)
+    threads = link_threads()
+    pool = None
+    if len(todo) < _LINK_PARALLEL_MIN or threads <= 1:
+        results = map(link_one, todo)
+    else:
+        from concurrent.futures import ThreadPoolExecutor
+        pool = ThreadPoolExecutor(max_workers=min(threads, len(todo)))
+        results = pool.map(link_one, todo, chunksize=64)
+    try:
+        for err in results:
+            if err is not None:
+                raise RuntimeError(err)
+    finally:
+        if pool is not None:
+            pool.shutdown(wait=True)
+    return len(wanted)
+
+
+#: Threads for :func:`link_pbf_view` where the file system takes them
+#: (network mounts, ext4, APFS): I/O-bound hard links.
+LINK_THREADS = 16
+#: … and on Windows: one. NTFS serialises the inserts into one directory
+#: (owner's bench 2026-11-07, 20,000 links: 2,120/s on one thread, 1,540/s
+#: on sixteen).
+LINK_THREADS_WINDOWS = 1
+#: A/B override: a positive integer of threads for :func:`link_pbf_view`.
+LINK_THREADS_ENV = "WAVESHED_LINK_THREADS"
+#: Below this many links the loop runs inline.
+_LINK_PARALLEL_MIN = 64
+
+
+def link_threads() -> int:
+    """How many threads :func:`link_pbf_view` uses: :data:`LINK_THREADS_ENV`
+    when it holds a positive integer, else :data:`LINK_THREADS_WINDOWS` on
+    Windows, else :data:`LINK_THREADS`."""
+    raw = os.environ.get(LINK_THREADS_ENV, "").strip()
+    if raw.isdigit() and int(raw) > 0:
+        return int(raw)
+    return LINK_THREADS_WINDOWS if _is_windows() else LINK_THREADS
+
+
+def drop_pbf_tiles(names: Sequence[str]) -> None:
+    """Remove building tiles *names* from the store and from every view
+    linking them (``osm_buildings.batch_view`` dirs of both tabs, and the
+    ``_buildings`` dirs older Site Analysis runs left in their views): a
+    tile the converter could not decode must be fetched anew by the next
+    run, and a view keeps a hard link to the old bytes."""
+    targets = [osm_buildings_store_dir()]
+    views_root = os.path.join(get_cache_dir(), _VIEW_DIRNAME)
+    try:
+        for view in os.listdir(views_root):
+            targets.append(os.path.join(views_root, view))
+            targets.append(os.path.join(views_root, view, "_buildings"))
+    except OSError:
+        pass
+    for directory in targets:
+        for name in names:
             try:
-                shutil.copy2(src, dst)
+                os.remove(os.path.join(directory, name))
             except OSError:
                 pass
 
@@ -1081,7 +1455,11 @@ def _fill_view_voids(src: str, dst: str) -> bool:
 
 
 def _sync_view(pool_dir: str, view_dir: str, names: List[str],
-               keep: Optional[Sequence[str]] = None) -> List[str]:
+               keep: Optional[Sequence[str]] = None,
+               tiles: Optional[Dict[str, Tuple[Dict[str, Any],
+                                               Optional[Dict[str, float]]]]
+                      ] = None,
+               voids: Optional[Dict[str, Optional[int]]] = None) -> List[str]:
     """Populate *view_dir* with exactly *names*, linked from the pool.
 
     Hardlinks cost nothing; where the filesystem refuses one (a different
@@ -1090,8 +1468,23 @@ def _sync_view(pool_dir: str, view_dir: str, names: List[str],
     FILLED to 0 m — see :func:`_fill_view_voids`; the pool copy keeps them.
     *keep* names further tiles the view legitimately holds from ANOTHER pool
     (a range profile whose bands differ in buildings): they are not pruned.
-    Returns the names that could not be provided.
+
+    *tiles* ``{name: (spec, region)}`` routes those names through
+    :func:`resolve_pool_tile` (``for_link``): the pool file may be the
+    complete ``<name>`` or a ``<name>.part`` covering *region*, and is linked
+    under the canonical name either way. For such a name a pool source that
+    is missing (or was renamed: a ``.part`` promoted to a whole tile) is never
+    "fresh" — the view copy is dropped and the link re-resolved.
+
+    *voids* ``{name: void samples or None}`` (:func:`_view_voids`: the
+    converter's recorded count of the pool file linked): known 0 → linked
+    without reading the tile; known > 0 → :func:`_fill_view_voids` at once
+    (no scan first); unknown (None, or a name not in it) → scanned
+    (:func:`_tile_has_voids`), then linked or filled — as before. Logs one
+    ``view:`` line (linked from recorded counts, scanned, filled) when it
+    provided any tile. Returns the names that could not be provided.
     """
+    t_sync = time.perf_counter()
     os.makedirs(view_dir, exist_ok=True)
     wanted = set(names) | set(keep or ())
 
@@ -1107,14 +1500,29 @@ def _sync_view(pool_dir: str, view_dir: str, names: List[str],
         pass
 
     unavailable = []
+    linked_known = scanned = filled = 0
+    listing = _pool_listing(pool_dir) if tiles else {}
     for name in names:
-        src = os.path.join(pool_dir, name)
         dst = os.path.join(view_dir, name)
+        resolved = tiles is not None and name in tiles
+        if resolved:
+            spec, region = tiles[name]
+            src: Optional[str] = resolve_pool_tile(
+                pool_dir, spec, region, listing=listing, for_link=True).path
+        else:
+            src = os.path.join(pool_dir, name)
         if _tile_is_whole(dst):
-            try:
-                fresh = os.path.getmtime(dst) >= os.path.getmtime(src)
-            except OSError:
-                fresh = True
+            if src is None:
+                fresh = False
+            else:
+                try:
+                    fresh = (os.path.samefile(dst, src)
+                             or os.path.getmtime(dst) >= os.path.getmtime(src))
+                except OSError:
+                    # A canonical pool tile that vanished keeps the view's
+                    # whole copy (as always); a resolved (.part-backed) link
+                    # whose source is gone or renamed must be re-resolved.
+                    fresh = not resolved
             if fresh:
                 continue
             # The pool tile was rebuilt since this view was made (a filled
@@ -1125,15 +1533,24 @@ def _sync_view(pool_dir: str, view_dir: str, names: List[str],
                 os.remove(dst)      # truncated leftover from a killed run
             except OSError:
                 pass
-        if not _tile_is_whole(src):
+        if src is None or not _tile_is_whole(src):
             unavailable.append(name)
             continue
         # A gapped pool tile (the run crossed the source's coverage edge)
         # must not reach the engine raw: the view gets a 0 m-filled copy —
         # the Site Analysis sea-level contract — while the pool keeps its
-        # voids for the Map Converter.
-        if _tile_has_voids(src):
-            if not _fill_view_voids(src, dst):
+        # voids for the Map Converter. The converter's recorded count says
+        # which tiles have any; only a tile without one is read to find out.
+        count = voids.get(name) if voids else None
+        if count is None:
+            scanned += 1
+            gapped = bool(_tile_has_voids(src))
+        else:
+            gapped = count > 0
+        if gapped:
+            if _fill_view_voids(src, dst):
+                filled += 1
+            else:
                 unavailable.append(name)
             continue
         try:
@@ -1143,6 +1560,13 @@ def _sync_view(pool_dir: str, view_dir: str, names: List[str],
                 shutil.copy2(src, dst)
             except OSError:
                 unavailable.append(name)
+                continue
+        if count is not None:
+            linked_known += 1
+    if linked_known or scanned or filled:
+        _log(f"  view: {linked_known} tile(s) linked from recorded void "
+             f"counts, {scanned} scanned, {filled} filled "
+             f"({time.perf_counter() - t_sync:.1f}s)")
     return unavailable
 
 
@@ -1416,6 +1840,10 @@ def terrain_plan(
     buildings: Optional[str] = None,
     min_range_km: float = 0.0,
     skip_footprints: Optional[set] = None,
+    output_res_m: Optional[float] = None,
+    source_infos: Optional[Tuple[List[Dict[str, Any]], bool,
+                                 Optional[FootprintIndex]]] = None,
+    region_union: Optional[Dict[str, List[Dict[str, float]]]] = None,
 ) -> Dict[str, Any]:
     """What one analysis will actually have to build, given what is pooled.
 
@@ -1426,23 +1854,138 @@ def terrain_plan(
     The pre-run warning used to price the whole tile set every time, so a run
     whose terrain was already on disk still announced tens of gigabytes of
     "download" and trained the user to click through it. Price only the tiles
-    that are genuinely missing.
+    that are genuinely missing — per tile through :func:`resolve_pool_tile`,
+    with the job's region (:func:`tile_regions`), so a ``.part`` that already
+    holds the region is pooled terrain and a miss of a file-source tile is
+    priced as the region it builds: ``tiles_partial`` of the missing tiles
+    are partial builds covering ``build_deg2`` (of ``tile_deg2`` deg² of
+    those tiles). With *source_infos* (``(infos, use_qgis_export, index)``,
+    as :func:`_read_source_once` returns) fingerprints are checked and the
+    files feeding the regions to build are priced too (``source_files``,
+    ``source_mb``); without it (the GUI thread never reads a folder index)
+    those two are None. ``download_mb`` stays the ``.abt`` bytes written: a
+    ``.part`` keeps the whole tile's geometry on disk. ``raw_mb`` (XYZ
+    sources only, else 0) is what downloading the missing tiles may add to
+    the raw source-tile cache (:func:`raw_tile_bytes`, MiB rounded up) — on
+    the cache drive too, on top of ``download_mb``. ``buildings_mb`` (with
+    OpenFreeMap buildings) bounds the building tiles those builds fetch
+    into the store (the z14 tiles of the missing tiles ×
+    ``osm_buildings.TILE_BYTES_ESTIMATE``, the store not listed).
+    *output_res_m* / *region_union*: as for :func:`prepare_terrain`.
+
+    A pre-built ``.abt`` folder (:func:`is_abt_tile_dir`) is used as it is:
+    nothing to build, so everything is 0 (``prebuilt`` True) — it used to be
+    priced as a source to convert ("171 to build (~805 MB)").
     """
     bbox = _compute_sector_bbox(tx_lat, tx_lon, max_range_km, az_start, az_end)
+    if is_abt_tile_dir(source):
+        _log(f"  terrain plan: pre-built folder — nothing to build ({source})")
+        return _prebuilt_plan(bbox)
     subtiles = _compute_subtiles(bbox, resolution_m, tx_lat, tx_lon,
                                  max_range_km, az_start, az_end)
     subtiles = _band_tiles(subtiles, tx_lat, tx_lon, min_range_km, skip_footprints)
     pool = _pool_dir(source, buildings)
-    missing = [t for t in subtiles if not _tile_ready(pool, t["filename"])]
+    infos: Optional[List[Dict[str, Any]]] = None
+    index: Optional[FootprintIndex] = None
+    if source_infos is not None:
+        infos, qgis_export, index = source_infos
+        partial_ok = bool(infos) and not qgis_export
+        if infos and (index is None or index.infos is not infos):
+            index = footprint_index(infos)
+    else:
+        partial_ok = _partial_capable_source(source)
+    regions = tile_regions(subtiles, bbox, resolution_m, output_res_m,
+                           partial_ok)
+    listing = _pool_listing(pool)
+    missing: List[Dict[str, Any]] = []
+    build: Dict[str, Optional[List[Dict[str, float]]]] = {}
+    for t in subtiles:
+        fp_of = ((lambda box, t=t: tile_source_fingerprint(
+            infos, box, t["exact_res_m"], index=index)) if infos else None)
+        verdict = resolve_pool_tile(
+            pool, t, regions[t["filename"]], fp_of=fp_of, listing=listing,
+            extra_regions=(region_union or {}).get(t["filename"]))
+        if not verdict.hit:
+            missing.append(t)
+            build[t["filename"]] = verdict.regions
+    partial = [t for t in missing if build[t["filename"]] is not None]
+    tile_deg2 = sum(_bbox_area(_subtile_bbox(t)) for t in missing)
+    build_deg2 = sum(
+        sum(_bbox_area(r) for r in build[t["filename"]])
+        if build[t["filename"]] is not None else _bbox_area(_subtile_bbox(t))
+        for t in missing)
+    source_files, source_mb = (_price_feeding_files(infos, index, missing,
+                                                    build)
+                               if infos else (None, None))
+    # Only the shared XYZ downloader fetches source tiles (and caches them).
+    raw = raw_tile_bytes(source, missing) if "type=xyz" in source else 0
+    # OpenFreeMap building tiles the builds fetch (prepare_terrain's cover:
+    # the whole missing tiles, a partial build's regions) — an upper bound
+    # like the raw tiles: per extent its z14 rectangle (tiles shared by two
+    # extents count twice), the store not listed (GUI thread; O(1) a tile).
+    bld = 0
+    if missing and buildings and _OSM_BUILDINGS_SOURCE_ID in buildings:
+        from . import openfreemap
+        from . import osm_buildings as osm_b
+        bld = sum(openfreemap.estimate_tile_count(box)
+                  for t in missing
+                  for box in (build[t["filename"]] or [_subtile_bbox(t)])
+                  ) * osm_b.TILE_BYTES_ESTIMATE
     return {
         "bbox": bbox,
         "tiles_total": len(subtiles),
         "tiles_cached": len(subtiles) - len(missing),
         "tiles_missing": len(missing),
+        "tiles_partial": len(partial),
+        "build_deg2": build_deg2,
+        "tile_deg2": tile_deg2,
+        "source_files": source_files,
+        "source_mb": source_mb,
         "download_mb": _estimate_abt_disk_mb(missing),
+        "raw_mb": -(-raw // (1024 * 1024)),
+        "buildings_mb": -(-bld // (1024 * 1024)),
         "total_mb": _estimate_abt_disk_mb(subtiles),
         "footprints": {tile_footprint(t) for t in subtiles},
     }
+
+
+def _prebuilt_plan(bbox: Optional[Dict[str, float]]) -> Dict[str, Any]:
+    """:func:`terrain_plan`'s answer for a pre-built ``.abt`` folder."""
+    plan: Dict[str, Any] = {k: 0 for k in _PLAN_SUM_KEYS}
+    plan.update({"bbox": bbox, "source_files": None, "source_mb": None,
+                 "footprints": set(), "prebuilt": True})
+    return plan
+
+
+def _price_feeding_files(infos: List[Dict[str, Any]],
+                         index: Optional[FootprintIndex],
+                         missing: List[Dict[str, Any]],
+                         build: Dict[str, Optional[List[Dict[str, float]]]],
+                         ) -> Tuple[int, int]:
+    """``(files, MB)`` the builds of *missing* read: the contributors of
+    each tile's regions to build (*build*; None = the whole tile), once
+    each, sized from the folder index's ``size:mtime`` fingerprint."""
+    feeding: Dict[int, Dict[str, Any]] = {}
+    for t in missing:
+        boxes = build[t["filename"]] or [_subtile_bbox(t)]
+        for idx, info, _h in _region_contributors(infos, boxes,
+                                                  t["exact_res_m"],
+                                                  index=index):
+            feeding[idx] = info
+    size = 0
+    for info in feeding.values():
+        try:
+            size += int(str(info.get("fp", "")).split(":")[0])
+        except ValueError:
+            pass
+    return len(feeding), size // (1024 * 1024)
+
+
+#: Summed by :func:`terrain_plan_profile` (``source_*`` stay None unless
+#: every band could price its files).
+_PLAN_SUM_KEYS = ("tiles_total", "tiles_cached", "tiles_missing",
+                  "tiles_partial", "build_deg2", "tile_deg2",
+                  "download_mb", "raw_mb", "buildings_mb", "total_mb")
 
 
 def terrain_plan_profile(
@@ -1454,15 +1997,27 @@ def terrain_plan_profile(
     az_end: float = 360.0,
     buildings: Optional[str] = None,
     band_buildings: Optional[Sequence[bool]] = None,
+    output_res_m: Optional[float] = None,
+    source_infos: Optional[Tuple[List[Dict[str, Any]], bool,
+                                 Optional[FootprintIndex]]] = None,
+    region_union: Optional[Dict[str, List[Dict[str, float]]]] = None,
 ) -> Dict[str, Any]:
     """:func:`terrain_plan` for a range profile — the sum of its bands, each
     narrowed exactly as :func:`prepare_terrain_profile` builds it.
 
     *band_buildings* (one flag per band) prices a band without buildings
     against the building-free pool, as the run will build it; None = every
-    band uses *buildings*."""
-    total: Dict[str, Any] = {"bbox": None, "tiles_total": 0, "tiles_cached": 0,
-                             "tiles_missing": 0, "download_mb": 0, "total_mb": 0}
+    band uses *buildings*. *output_res_m* / *source_infos* /
+    *region_union*: as for :func:`terrain_plan` (a pre-built ``.abt``
+    folder: nothing to build, all 0)."""
+    if is_abt_tile_dir(source):
+        _log(f"  terrain plan: pre-built folder — nothing to build ({source})")
+        return _prebuilt_plan(_compute_sector_bbox(
+            tx_lat, tx_lon, bands[-1][0] / 1000.0, az_start, az_end)
+            if bands else None)
+    total: Dict[str, Any] = {"bbox": None, "source_files": None,
+                             "source_mb": None}
+    total.update({k: 0 for k in _PLAN_SUM_KEYS})
     covered: set = set()
     inner_km = 0.0
     for idx, (until_m, step) in enumerate(bands):
@@ -1470,10 +2025,15 @@ def terrain_plan_profile(
                   else None)
         plan = terrain_plan(source, tx_lat, tx_lon, until_m / 1000.0, step,
                             az_start, az_end, band_b,
-                            min_range_km=inner_km, skip_footprints=covered)
-        for key in ("tiles_total", "tiles_cached", "tiles_missing",
-                    "download_mb", "total_mb"):
-            total[key] += plan[key]
+                            min_range_km=inner_km, skip_footprints=covered,
+                            output_res_m=output_res_m,
+                            source_infos=source_infos,
+                            region_union=region_union)
+        for key in _PLAN_SUM_KEYS:
+            total[key] += plan.get(key, 0)
+        for key in ("source_files", "source_mb"):
+            if plan.get(key) is not None:
+                total[key] = (total[key] or 0) + plan[key]
         total["bbox"] = plan["bbox"]
         covered = covered | plan["footprints"]
         inner_km = until_m / 1000.0
@@ -1481,14 +2041,20 @@ def terrain_plan_profile(
 
 
 def terrain_size_warning(disk_mb: int,
-                         cached_mb: int = 0) -> Optional[Tuple[str, bool]]:
+                         cached_mb: int = 0,
+                         source: Optional[str] = None,
+                         ) -> Optional[Tuple[str, bool]]:
     """Return ``(message, strong)`` when *disk_mb* is big enough to confirm.
 
     *disk_mb* is what still has to be built; *cached_mb* is what is already
     pooled and is mentioned only so the number is not mistaken for the whole
     job.  ``strong`` is True past the 200 GB mark, where the caller should
-    default the confirmation to "No".  Returns ``None`` for unremarkable sizes.
+    default the confirmation to "No".  Returns ``None`` for unremarkable sizes,
+    and for a *source* that is a pre-built ``.abt`` folder (nothing to build).
     """
+    if source and is_abt_tile_dir(source):
+        _log(f"  terrain size: pre-built folder — nothing to build ({source})")
+        return None
     if disk_mb < _SIZE_WARN_MB:
         return None
     strong = disk_mb >= _SIZE_STRONG_WARN_MB
@@ -1608,24 +2174,243 @@ def preflight_ingest_jobs(jobs: List[Dict[str, Any]]) -> None:
     warning, tiles flagged for rebuild, terrain without them — and turning
     that into an abort here would break the contract prepare_terrain
     implements a few hundred lines down.
+
+    Each distinct path is checked once: a folder file feeds every tile it
+    touches (56,691 references to 43,650 files in a 2,610-tile batch), and
+    every output of a batch shares one directory.
+
+    The source checks run on :data:`PREFLIGHT_THREADS` threads: one
+    ``os.path.exists`` is a disk round trip (the stat releases the GIL), and
+    on the owner's HDD, busy with a download beside it, 30,000 of them in a
+    row cost 42 s before Phase 2 of a Map Converter run and 12 s before a
+    band — the whole gap between "Phase 2: converting" and "Launching".
+    The first missing path is reported, as before.
     """
+    seen_dirs: set = set()
+    seen_srcs: set = set()
+    paths: List[str] = []
     for job in jobs:
         out = job.get("output_path")
         if out:
             parent = os.path.dirname(os.path.abspath(out))
-            ensure_engine_dirs(parent)
-            if not os.path.isdir(parent):
-                raise RuntimeError(
-                    f"Terrain output directory is missing and could not be "
-                    f"created: {_missing_path_detail(out)}"
-                )
+            if parent not in seen_dirs:
+                seen_dirs.add(parent)
+                ensure_engine_dirs(parent)
+                if not os.path.isdir(parent):
+                    raise RuntimeError(
+                        f"Terrain output directory is missing and could not "
+                        f"be created: {_missing_path_detail(out)}"
+                    )
         for src in job.get("sources", []):
             path = src.get("path") if isinstance(src, dict) else src
-            if path and not os.path.exists(path):
-                raise RuntimeError(
-                    f"Terrain source vanished before the converter ran: "
-                    f"{_missing_path_detail(path)}"
-                )
+            if not path or path in seen_srcs:
+                continue
+            seen_srcs.add(path)
+            paths.append(path)
+    missing = _first_missing(paths)
+    if missing is not None:
+        raise RuntimeError(
+            f"Terrain source vanished before the converter ran: "
+            f"{_missing_path_detail(missing)}"
+        )
+
+
+#: Threads for :func:`preflight_ingest_jobs`'s existence checks (I/O-bound
+#: stats; 32 keeps a busy HDD's queue full without starving the converter).
+PREFLIGHT_THREADS = 32
+#: Below this many paths the checks run inline — a thread pool costs more
+#: than it saves.
+_PREFLIGHT_PARALLEL_MIN = 64
+
+
+def _first_missing(paths: List[str]) -> Optional[str]:
+    """The first of *paths* (in order) that does not exist, else None —
+    checked in parallel beyond :data:`_PREFLIGHT_PARALLEL_MIN`."""
+    if len(paths) < _PREFLIGHT_PARALLEL_MIN:
+        for path in paths:
+            if not os.path.exists(path):
+                return path
+        return None
+    from concurrent.futures import ThreadPoolExecutor
+    pool = ThreadPoolExecutor(max_workers=min(PREFLIGHT_THREADS, len(paths)))
+    try:
+        for path, ok in zip(paths, pool.map(os.path.exists, paths,
+                                            chunksize=64)):
+            if not ok:
+                return path
+        return None
+    finally:
+        # A miss stops the walk; the remaining stats are dropped, not
+        # awaited (Python < 3.9 has no cancel_futures: it waits — correct,
+        # slower).
+        try:
+            pool.shutdown(wait=False, cancel_futures=True)
+        except TypeError:
+            pool.shutdown(wait=True)
+
+
+#: ``[Tile] <output file name> covered=<covered_px>/<total_px>`` — printed by
+#: a batch ingest (aether_converter >= 0.2.7) once per successfully written
+#: tile, flushed together with (and before) the progress line counting it.
+#: Older converters print nothing: coverage unknown.
+_TILE_LINE_RE = re.compile(r"\[Tile\]\s+(.+?)\s+covered=(\d+)/(\d+)\s*$")
+
+
+def parse_tile_line(line: str) -> Optional[Tuple[str, int, int]]:
+    """``(output file name, covered_px, total_px)`` of an ingest ``[Tile]``
+    line, or None for any other line. ``covered_px`` counts the pixels at
+    least one source supplied a sample for (void fill excluded), so
+    ``covered == total`` means the tile has no hole."""
+    m = _TILE_LINE_RE.search(line or "")
+    if not m:
+        return None
+    return m.group(1), int(m.group(2)), int(m.group(3))
+
+
+#: ``[Tile] <output file name> voids=<n>`` — aether_converter >= 0.2.11
+#: (``binary_manager.CONVERTER_TILE_VOIDS_MIN_VERSION``, toolkit CONTRACT
+#: changelog 46): the samples at or below the ``.abt`` validity floor
+#: (-5000 counts = -2500 m, ``abt.MIN_VALID_ELEV_COUNTS``: the -9999 void
+#: sentinel and anything the engine must not read as ground, deep water
+#: included) in the file as written — the same rule :func:`_tile_has_voids`
+#: applies. A download prints one per tile a NON-repair pass wrote (after
+#: assembly and the building burn; a repair pass prints none), an ingest one
+#: right after the tile's ``covered=`` line (after its void fill, so 0 with
+#: ``void_fill_m``). :data:`_TILE_LINE_RE` never matches it (no ``covered=``).
+_TILE_VOIDS_RE = re.compile(r"\[Tile\]\s+(.+?)\s+voids=(\d+)\s*$")
+
+
+def parse_tile_voids_line(line: str) -> Optional[Tuple[str, int]]:
+    """``(output file name, void samples)`` of a ``[Tile] … voids=`` line,
+    or None for any other line (the ``covered=`` line included)."""
+    m = _TILE_VOIDS_RE.search(line or "")
+    if not m:
+        return None
+    return m.group(1), int(m.group(2))
+
+
+def _parse_tile_voids(lines: Iterable[str]) -> Dict[str, int]:
+    """``{output file name: void samples}`` of every ``voids=`` line in
+    *lines* (a name printed twice: the last one; no lines: {})."""
+    counts: Dict[str, int] = {}
+    try:
+        it = iter(lines or ())
+    except TypeError:
+        return counts
+    for line in it:
+        hit = parse_tile_voids_line(line) if isinstance(line, str) else None
+        if hit is not None:
+            counts[hit[0]] = hit[1]
+    return counts
+
+
+#: The converter's diagnostic lines (per-tile ``[Rust] tile …``, per-strip
+#: ``[Strip …]``) go to a file, not the log panel: ``AETHER_DIAG_FILE``
+#: (toolkit CONTRACT changelog 37, aether_converter >= 0.2.8; an older
+#: converter ignores it and prints them — ``_run_converter`` drops the tile
+#: lines). One file per day, ``<cache>/logs/aether_converter-<YYYYmmdd>.log``.
+#: ``aether_core-<YYYYmmdd>.log`` beside it is the engine's full console
+#: (:mod:`waveshed.core.engine_log`), rotated with the same rule.
+DIAG_ENV = "AETHER_DIAG_FILE"
+#: Diagnostics files older than this (mtime) are deleted.
+DIAG_KEEP_DAYS = 14
+_DIAG_FILE_RE = re.compile(r"^aether_(?:converter|core)-\d{8}\.log$")
+#: What this session announced last: today's path, or "!<dir>" for a
+#: directory that could not be made (each logged once).
+_diag_announced: Optional[str] = None
+
+
+def diag_file_path() -> str:
+    """Today's converter diagnostics file (under :func:`get_cache_dir`)."""
+    return os.path.join(get_cache_dir(), "logs",
+                        f"aether_converter-{time.strftime('%Y%m%d')}.log")
+
+
+def _rotate_diag_files(log_dir: str) -> None:
+    """Delete the diagnostics files in *log_dir* older than
+    :data:`DIAG_KEEP_DAYS` — only ``aether_converter-<date>.log`` (the cache
+    root may hold other things, see :func:`cache_entries`). Never raises."""
+    cutoff = time.time() - DIAG_KEEP_DAYS * 86400
+    try:
+        names = os.listdir(log_dir)
+    except OSError as exc:
+        _log(f"converter diagnostics: old files in {log_dir} not rotated ({exc})")
+        return
+    for name in names:
+        if not _DIAG_FILE_RE.match(name):
+            continue
+        path = os.path.join(log_dir, name)
+        try:
+            if os.path.isfile(path) and os.path.getmtime(path) < cutoff:
+                os.remove(path)
+        except OSError:  # noqa: PERF203 — in use / gone: keep going
+            continue
+
+
+def _with_diag_file(env: Optional[Dict[str, str]]) -> Optional[Dict[str, str]]:
+    """*env* for an engine child with :data:`DIAG_ENV` = today's
+    :func:`diag_file_path` — unless the child's environment (*env*, else
+    this process's) already sets it. The first launch of the session (and
+    of a new day) creates the directory, rotates it and logs the path once;
+    a directory that cannot be made leaves *env* as it is (the converter
+    prints the lines, as before), logged once. Never raises."""
+    global _diag_announced
+    base = os.environ if env is None else env
+    if DIAG_ENV in base:
+        return env
+    log_dir = ""
+    try:
+        path = diag_file_path()
+        log_dir = os.path.dirname(path)
+        os.makedirs(log_dir, exist_ok=True)
+        if _diag_announced != path:
+            _diag_announced = path
+            _rotate_diag_files(log_dir)
+            _log(f"converter diagnostics: {path}")
+        out = dict(base)
+        out[DIAG_ENV] = path
+        return out
+    except Exception as exc:  # noqa: BLE001 — diagnostics never stop a run
+        if _diag_announced != "!" + log_dir:
+            _diag_announced = "!" + log_dir
+            _log(f"converter diagnostics: no file ({log_dir or 'cache dir'}: "
+                 f"{exc}) — the converter prints them")
+        return env
+
+
+class StreamTiming(NamedTuple):
+    """``time.perf_counter()`` stamps of one engine run of
+    :func:`run_converter_streaming` (the download passes' timing lane)."""
+
+    launched: float
+    first_line: Optional[float]
+    last_line: Optional[float]
+    #: The process has exited and been reaped.
+    exited: float
+
+    @property
+    def exit_after_last_line(self) -> Optional[float]:
+        """Seconds from the last line read to the reaped exit (None when
+        the engine printed nothing)."""
+        return (None if self.last_line is None
+                else max(0.0, self.exited - self.last_line))
+
+
+#: Per thread: the :class:`StreamTiming` of its last finished engine run.
+_STREAM_TIMING = threading.local()
+
+
+def last_stream_timing() -> Optional[StreamTiming]:
+    """The :class:`StreamTiming` of the last engine run THIS thread finished
+    through :func:`run_converter_streaming` (None before one, after a run
+    that raised, and after :func:`forget_stream_timing`)."""
+    return getattr(_STREAM_TIMING, "last", None)
+
+
+def forget_stream_timing() -> None:
+    """Drop this thread's :func:`last_stream_timing` (before a run whose
+    timing is wanted, so a stale record is never read for it)."""
+    _STREAM_TIMING.last = None
 
 
 def run_converter_streaming(exe: str, args: List[str], on_line: Any,
@@ -1640,6 +2425,10 @@ def run_converter_streaming(exe: str, args: List[str], on_line: Any,
     exception propagates). *env* replaces the environment when given (e.g.
     aether_core's license injection). Returns the process exit code.
 
+    The child's environment gets ``AETHER_DIAG_FILE`` (the converter's
+    per-tile/per-strip diagnostics file, :func:`_with_diag_file`) unless it
+    already sets one — an explicit value always wins.
+
     Every engine invocation (aether_converter download/ingest, aether_core)
     goes through here so pipe handling, encoding and cancellation exist
     exactly once.
@@ -1647,8 +2436,16 @@ def run_converter_streaming(exe: str, args: List[str], on_line: Any,
     Raises RuntimeError NAMING the missing path when the job/config file the
     arguments point at is not there at launch time — see
     :func:`_assert_job_file_readable`.
+
+    The run's :class:`StreamTiming` (launch, first and last line, reaped
+    exit — ``perf_counter``) is kept per thread for
+    :func:`last_stream_timing` once it has ended normally.
     """
+    _STREAM_TIMING.last = None
     _assert_job_file_readable(args)
+    env = _with_diag_file(env)
+    first: Optional[float] = None
+    last: Optional[float] = None
     with subprocess.Popen(
         [exe, *args],
         stdout=subprocess.PIPE,
@@ -1658,12 +2455,16 @@ def run_converter_streaming(exe: str, args: List[str], on_line: Any,
         env=env,
         creationflags=_SUBPROCESS_FLAGS,
     ) as proc:
+        launched = time.perf_counter()
         if on_start is not None:
             on_start(proc)
         try:
             for line in iter(proc.stdout.readline, ""):
                 line = line.rstrip()
                 if line:
+                    last = time.perf_counter()
+                    if first is None:
+                        first = last
                     on_line(line)
         except ConverterCancelled:
             try:
@@ -1675,7 +2476,51 @@ def run_converter_streaming(exe: str, args: List[str], on_line: Any,
             except Exception:  # noqa: BLE001 — best-effort kill on cancel
                 pass
             raise
+    _STREAM_TIMING.last = StreamTiming(launched, first, last,
+                                       time.perf_counter())
     return proc.returncode
+
+
+def kill_engine_process(proc: Any) -> None:
+    """Stop one engine process at once and return at once — Stop calls this
+    on the GUI thread (the Site Analysis and P2P workers' ``_kill_proc``).
+
+    A process that has ended is left alone. POSIX: ``terminate()`` (SIGTERM),
+    as always. Windows: ``kill()`` — TerminateProcess on the Popen's own
+    handle, immediate, and never another process — then ``taskkill /F /T``
+    for children a launcher may have started, fire-and-forget (output
+    discarded, no console window; the blocking taskkill this replaces froze
+    the GUI 0.1–1 s, more under antivirus). A daemon thread reaps taskkill
+    and holds *proc* until then: Windows does not reuse a process ID while a
+    handle to the process is open, so the PID taskkill gets cannot meanwhile
+    name another process."""
+    if proc.poll() is not None:
+        return
+    if not _is_windows():
+        proc.terminate()
+        return
+    try:
+        proc.kill()
+    except OSError:
+        pass
+    try:
+        taskkill = subprocess.Popen(
+            ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL, creationflags=_no_window_flags())
+    except OSError:
+        return
+    threading.Thread(target=_reap_taskkill, args=(taskkill, proc),
+                     name="waveshed-taskkill", daemon=True).start()
+
+
+def _reap_taskkill(taskkill: Any, _engine: Any) -> None:
+    """Wait for :func:`kill_engine_process`'s taskkill off the GUI thread;
+    *_engine* (its Popen, i.e. its process handle) is held until then."""
+    try:
+        taskkill.wait(timeout=60)
+    except (OSError, subprocess.SubprocessError):
+        pass                        # best effort: nobody waits for it
 
 
 # The converter's download progress line is a PARSED INTERFACE (see
@@ -1835,21 +2680,152 @@ def _download_specs_by_zoom(source: str, subtiles: List[Dict[str, Any]]
     return by_zoom
 
 
-def estimate_pool_download_units(source_uri: str,
-                                 subtiles: List[Dict[str, Any]],
-                                 pool_check: bool = True) -> float:
+#: Bytes one XYZ source tile is taken to occupy in the raw source-tile cache
+#: (:func:`xyz_cache_dir`) when the disk need is priced — an UPPER bound:
+#: the converter's own per-tile figure behind the ``(~N MB)`` of its
+#: ``[Download] z=`` header (download.rs ``tile_size_kb = 200``, a guess
+#: "high" by its own comment). Measured: AWS Terrarium z15, 256 px PNG,
+#: 389 MB / 4,690 tiles = 83 KB a tile (toolkit CONTRACT changelog 36);
+#: 512 px services (Mapterhorn, MapTiler) carry four times the samples.
+XYZ_SOURCE_TILE_BYTES = 200 * 1024
+
+
+class _TileGrid:
+    """Web-mercator tile indices and edges at one zoom, computed as
+    download.rs does (``lon2tx``/``lat2ty`` floor, ``tx2lon``/``ty2lat``;
+    same floats). Row edges are kept: neighbouring specs test the same
+    tile-rows, and the GUI thread prices thousands of tiles per refresh."""
+
+    def __init__(self, zoom: int) -> None:
+        self.n = 2.0 ** zoom
+        self._row_edge: Dict[int, float] = {}
+
+    def lon2tx(self, lon: float) -> int:
+        return int(max(0.0, math.floor((lon + 180.0) / 360.0 * self.n)))
+
+    def lat2ty(self, lat: float) -> int:
+        return int(max(0.0, math.floor(
+            (1.0 - math.asinh(math.tan(math.radians(lat))) / math.pi)
+            / 2.0 * self.n)))
+
+    def tx2lon(self, x: int) -> float:
+        return x / self.n * 360.0 - 180.0
+
+    def ty2lat(self, y: int) -> float:
+        lat = self._row_edge.get(y)
+        if lat is None:
+            lat = self._row_edge[y] = math.degrees(math.atan(math.sinh(
+                math.pi * (1.0 - 2.0 * y / self.n))))
+        return lat
+
+    def touched(self, ul_lat: float, ul_lon: float, span: float,
+                bounds: Tuple[int, int, int, int]
+                ) -> Optional[Tuple[int, int, int, int]]:
+        """``(x_first, x_last, y_first, y_last)`` of the tiles a spec
+        touches (download.rs ``tile_touches_spec``: strict overlap), within
+        the job's rectangle *bounds* ``(x0, x1, y0, y1)``; None for none.
+        Its own range plus one tile of slack per side (the floor rounding)
+        is scanned; the test is separable, so the result is a rectangle."""
+        x0, x1, y0, y1 = bounds
+        xs = [x for x in range(max(self.lon2tx(ul_lon) - 1, x0),
+                               min(self.lon2tx(ul_lon + span) + 1, x1) + 1)
+              if self.tx2lon(x) < ul_lon + span
+              and self.tx2lon(x + 1) > ul_lon]
+        ys = [y for y in range(max(self.lat2ty(ul_lat) - 1, y0),
+                               min(self.lat2ty(ul_lat - span) + 1, y1) + 1)
+              if self.ty2lat(y + 1) < ul_lat
+              and self.ty2lat(y) > ul_lat - span]
+        return (xs[0], xs[-1], ys[0], ys[-1]) if xs and ys else None
+
+
+def _row_union_size(rows: Dict[int, List[Tuple[int, int]]]) -> int:
+    """Cells covered by per-row column intervals ``{row: [(first, last)]}``
+    (inclusive, overlapping or not)."""
+    count = 0
+    for spans in rows.values():
+        spans.sort()
+        lo, hi = spans[0]
+        for a, b in spans[1:]:
+            if a > hi + 1:
+                count += hi - lo + 1
+                lo, hi = a, b
+            else:
+                hi = max(hi, b)
+        count += hi - lo + 1
+    return count
+
+
+def _fetch_tile_count(specs: List[Dict[str, Any]], zoom: int) -> int:
+    """XYZ source tiles one ``download`` pass over *specs* at *zoom* FETCHES:
+    the tiles of the job's bounding rectangle that touch at least one output
+    tile (aether_converter >= 0.2.7, toolkit CONTRACT changelog 30) — the
+    total of its ``[Download] z=`` header. Mirrors download.rs
+    ``tiles_to_fetch`` (:class:`_TileGrid`); the touched tiles of one spec
+    form a rectangle, so the union is counted per tile-row from merged
+    column intervals. :func:`_source_tile_count` is the whole rectangle —
+    what the progress estimate counts before that header arrives."""
+    if not specs:
+        return 0
+    grid = _TileGrid(zoom)
+    geo = [(s["ul_lat"], s["ul_lon"],
+            s["size_px"] * (s["resolution_m"] / 111_111.0)) for s in specs]
+    bounds = (grid.lon2tx(min(lon for _lat, lon, _sp in geo)),
+              grid.lon2tx(max(lon + sp for _lat, lon, sp in geo)),
+              grid.lat2ty(max(lat for lat, _lon, _sp in geo)),
+              grid.lat2ty(min(lat - sp for lat, _lon, sp in geo)))
+    rows: Dict[int, List[Tuple[int, int]]] = {}
+    for ul_lat, ul_lon, span in geo:
+        rect = grid.touched(ul_lat, ul_lon, span, bounds)
+        if rect is not None:
+            for y in range(rect[2], rect[3] + 1):
+                rows.setdefault(y, []).append((rect[0], rect[1]))
+    return _row_union_size(rows)
+
+
+def raw_tile_bytes(source: str, subtiles: List[Dict[str, Any]]) -> int:
+    """Upper bound of the bytes the raw source-tile cache grows by when the
+    download fetches *subtiles* (the output tiles missing from the pool):
+    per zoom group (:func:`_download_specs_by_zoom`, the downloader's own
+    jobs) the source tiles that pass fetches (:func:`_fetch_tile_count`)
+    × :data:`XYZ_SOURCE_TILE_BYTES`. Tiles the cache already holds cost
+    nothing in reality, but the plugin never reads the packs, so they are
+    counted too. 0 for no tiles."""
+    if not subtiles:
+        return 0
+    return XYZ_SOURCE_TILE_BYTES * sum(
+        _fetch_tile_count(specs, z)
+        for z, specs in _download_specs_by_zoom(source, subtiles).items())
+
+
+def estimate_pool_download_units(
+    source_uri: str,
+    subtiles: List[Dict[str, Any]],
+    pool_check: bool = True,
+    should_cancel: Optional[Callable[[], bool]] = None,
+) -> float:
     """Source-tile units ``ensure_pool_tiles`` will report for *subtiles*.
 
     Tiles already in the pool cost nothing; the rest are counted per zoom
     group exactly as the download progress counts them (first pass + tail).
-    *pool_check* stats the pool — call it off the GUI thread; with False the
-    pure-geometry upper bound is returned (every tile missing). Never raises.
+    *pool_check* lists the pool — call it off the GUI thread; with False the
+    pure-geometry upper bound is returned (every tile missing). The check is
+    ONE directory listing with sizes (:func:`_pool_listing`, no header read
+    per tile) under :func:`_tile_ready`'s rule. Never raises, except
+    :class:`ConverterCancelled` once *should_cancel()* is true — polled per
+    tile, so thousands of them must not hold up a Cancel.
     """
     try:
         todo = list(subtiles)
         if pool_check:
             pool_dir = _pool_dir(source_uri)
-            todo = [t for t in todo if not _tile_ready(pool_dir, t["filename"])]
+            listing = _pool_listing(pool_dir)
+            missing = []
+            for t in todo:
+                if should_cancel is not None and should_cancel():
+                    raise ConverterCancelled()
+                if not _listed_tile_ready(listing, t, pool_dir):
+                    missing.append(t)
+            todo = missing
         if not todo:
             return 0.0
         total = 0.0
@@ -1858,8 +2834,35 @@ def estimate_pool_download_units(source_uri: str,
             total += u + max(1.0, math.ceil(
                 DownloadProgressAggregator.TAIL_SHARE * u))
         return total
+    except ConverterCancelled:
+        raise                      # a Cancel is not an estimate failure
     except Exception:  # noqa: BLE001 — an estimate must never fail a run
         return float(len(subtiles))
+
+
+#: Every how many per cent a download pass's ``[Download] N%`` progress line
+#: reaches the log panel (:func:`_run_converter_download_once`).
+DOWNLOAD_PANEL_STEP = 10
+
+#: The panel tag of the current thread (``_PANEL_TAG.tag``): a prefix on
+#: every download line the panel gets while a caller runs several converter
+#: downloads at once (the Map Converter's two lanes per pool, 2026-11-07,
+#: owner: the z14 pass's ``10% (575/5742)`` interleaved with the z15 pass's
+#: ``10% (8113/81127)`` with nothing to tell them apart). Per thread, so
+#: each lane tags its own lines; the raw lines (``lines``, *on_line*) never
+#: carry it. Site Analysis sets none.
+_PANEL_TAG = threading.local()
+
+
+def set_panel_tag(tag: Optional[str]) -> None:
+    """Prefix the panel copy of this thread's download lines with *tag*
+    (e.g. ``"[z14] "``); None or "" removes it."""
+    _PANEL_TAG.tag = tag or ""
+
+
+def panel_tag() -> str:
+    """This thread's panel tag, "" when none is set."""
+    return getattr(_PANEL_TAG, "tag", "") or ""
 
 
 def _run_converter_download_once(
@@ -1880,7 +2883,17 @@ def _run_converter_download_once(
     def handle(line: str) -> None:
         if should_cancel is not None and should_cancel():
             raise ConverterCancelled()
-        _log(f"    {line}")
+        # The converter prints a progress line per percent (100 a pass,
+        # 2,000 in one of the owner's sessions): the panel gets every
+        # DOWNLOAD_PANEL_STEP per cent and the last one; *lines* and
+        # *on_line* (the progress bar, the ETA) still see them all, and a
+        # converter >= 0.2.11 also writes them to its diagnostics file.
+        prog = _parse_download_progress(line)
+        if parse_tile_voids_line(line) is not None:
+            pass        # one per output tile (0.2.11): read, never shown
+        elif (prog is None or prog[0] % DOWNLOAD_PANEL_STEP == 0
+                or prog[1] >= prog[2]):
+            _log(f"    {panel_tag()}{line}")
         lines.append(line)
         if on_line is not None:
             on_line(line)
@@ -1889,6 +2902,10 @@ def _run_converter_download_once(
         converter_exe, ["download", "--job-file", job_file], handle,
         on_start=on_start)
 
+    if rc != 0 and should_cancel is not None and should_cancel():
+        # cancel() killed the process (on_start) before a line reached the
+        # per-line check: the exit code is the kill, not a failure to retry.
+        raise ConverterCancelled()
     if rc != 0:
         text = " ".join(lines).lower()
         if "insufficient disk" in text or "not enough space" in text:
@@ -1899,33 +2916,65 @@ def _run_converter_download_once(
     return rc, lines
 
 
-# Concurrency floor for the halving retry — below this, extra parallelism buys
-# nothing and only risks more dropped connections.
-_MIN_DOWNLOAD_CONNECTIONS = 32
+def _converter_repair_min_version() -> str:
+    from .binary_manager import CONVERTER_REPAIR_MIN_VERSION
+    return CONVERTER_REPAIR_MIN_VERSION
 
 
-def _abt_block_any(path: str, predicate, block: int = 64) -> bool:
-    """True if any *block*×*block* pixel block of the .abt satisfies *predicate*
-    on every pixel. Returns False for a file it cannot open or parse."""
+def _abt_block_flags(path: str, block: int = 64) -> Tuple[bool, bool]:
+    """``(has a fully-VOID block, has a fully-zero block)`` of the .abt's
+    *block*×*block* pixel blocks — ONE read of the file, one min/max pass
+    (10 ms for a 2 m tile against 27 ms for the two predicates). ``(False,
+    False)`` for a file it cannot open or parse."""
     try:
         import numpy as np
+        from . import abt
         with open(path, "rb") as fh:
             head = fh.read(44)
             if len(head) < 44 or head[:4] != b"AETH":
-                return False
+                return False, False
             size = int.from_bytes(head[6:8], "little")
             stride = int.from_bytes(head[42:44], "little")
             body = np.frombuffer(fh.read(), dtype=np.uint8)
         need = size * stride
         if size < block or body.size < need:
-            return False
+            return False, False
         rows = body[:need].reshape(size, stride)
         elev = np.ascontiguousarray(rows[:, : size * 2]).view(np.int16)
         h = (size // block) * block
-        hit = predicate(elev[:h, :h]).reshape(h // block, block, h // block, block)
-        return bool(hit.all(axis=(1, 3)).any())
+        nb = h // block
+        strips = elev[:h, :h].reshape(nb, block, h)
+        top = strips.max(axis=1).reshape(nb, nb, block).max(axis=2)
+        low = strips.min(axis=1).reshape(nb, nb, block).min(axis=2)
+        return (bool((top <= abt.MIN_VALID_ELEV_COUNTS).any()),
+                bool(((low == 0) & (top == 0)).any()))
     except Exception:
+        return False, False
+
+
+#: The answer one :func:`_abt_block_flags` read gave and its caller did not
+#: ask for, kept for the other question on the SAME unchanged file (path,
+#: size, mtime_ns) and taken by it: the gap check asks
+#: :func:`_abt_has_holes` then :func:`_abt_has_zero_fill` of one tile — one
+#: read, where each used to read the whole tile (the owner's 706 × 62 MB
+#: z15 band: 44 GB twice). Per thread.
+_block_scan_memo = threading.local()
+
+
+def _abt_block_answer(path: str, block: int, which: int) -> bool:
+    """Flag *which* (0 holes, 1 zero fill) of :func:`_abt_block_flags`."""
+    try:
+        st = os.stat(path)
+        ident = (os.path.abspath(path), block, st.st_size, st.st_mtime_ns)
+    except OSError:
         return False
+    kept = getattr(_block_scan_memo, "kept", None)
+    _block_scan_memo.kept = None
+    if kept is not None and kept[0] == ident and kept[1] == which:
+        return kept[2]
+    flags = _abt_block_flags(path, block)
+    _block_scan_memo.kept = (ident, 1 - which, flags[1 - which])
+    return flags[which]
 
 
 def _abt_has_zero_fill(path: str, block: int = 64) -> bool:
@@ -1935,9 +2984,10 @@ def _abt_has_zero_fill(path: str, block: int = 64) -> bool:
     0 m marked real, so a zero block is the signature of failure fill from
     such a build. Kept as the honesty backstop (the torture suite calls it);
     genuine sea-level 0 (ocean) also trips it, which is why it only ever
-    flags, never deletes.
+    flags, never deletes. Shares its read with :func:`_abt_has_holes` of
+    the same file (:func:`_abt_block_answer`).
     """
-    return _abt_block_any(path, lambda e: e == 0, block)
+    return _abt_block_answer(path, block, 1)
 
 
 def _abt_has_holes(path: str, block: int = 64) -> bool:
@@ -1948,9 +2998,9 @@ def _abt_has_holes(path: str, block: int = 64) -> bool:
     re-download. Genuine no-coverage voids (past a fixture's edge, ocean in
     a bathymetry-less set) also trip it, but the retry loop is bounded by
     its own pass count, so a legitimately-void tile can't loop forever.
+    Shares its read with :func:`_abt_has_zero_fill` of the same file.
     """
-    from . import abt
-    return _abt_block_any(path, lambda e: e <= abt.MIN_VALID_ELEV_COUNTS, block)
+    return _abt_block_answer(path, block, 0)
 
 
 #: Lines of ``aether_converter download`` output that say WHY a run failed:
@@ -1984,6 +3034,10 @@ class DownloadOutcome(NamedTuple):
 
     ok: bool
     detail: str = ""
+    #: The void-count records of the pool tiles this download wrote (name →
+    #: record, see :data:`TILES_MANIFEST_SCHEMA`; also written into the
+    #: pool's manifest) — None when no pass printed a count.
+    voids: Optional[Dict[str, Dict[str, int]]] = None
 
     def __bool__(self) -> bool:
         return bool(self.ok)
@@ -2144,6 +3198,70 @@ def _binary_has_buildings_support(exe: str) -> Optional[bool]:
     return _BUILDINGS_APPLIED_MARKER.encode() in blob
 
 
+class _PassTiming:
+    """The download's timing lane (2026-10-23): ONE Info line per converter
+    pass, logged when the next pass is about to launch (or, for the last
+    one, when the download ends)::
+
+        timing: z15 pass 1: converter exit +0.3s after its last line;
+        post-pass parse 0.0s, flags 0.0s, degraded/repair plan 228.4s,
+        next launch 0.0s
+
+    — where the time between the converter's last line and the next launch
+    went: the reaped exit (:class:`StreamTiming`), reading the pass's lines
+    (completeness, ``[Degraded]`` mapping, buildings), the rebuild flags /
+    dropped tiles, the gap scan and the repair plan, and the next job's
+    preparation. The owner's run had 3 min 48 s of silence between a
+    degraded z15 pass and its repair pass that no log line explained.
+    ``perf_counter`` only; the line is never parsed.
+
+    :meth:`ended` opens a pass's record (its clock starts at the exit),
+    :meth:`mark` books the time since the previous mark to one step,
+    :meth:`launching` logs the open record (*now* = the next launch, None =
+    no next pass in this download)."""
+
+    STEPS = ("parse", "flags", "plan")
+
+    def __init__(self) -> None:
+        self._rec: Optional[Dict[str, Any]] = None
+
+    def ended(self, zoom: int, pass_no: int, repair: bool,
+              stream: Optional[StreamTiming]) -> None:
+        self.launching(None)
+        start = stream.exited if stream is not None else time.perf_counter()
+        self._rec = {"zoom": zoom, "pass": pass_no, "repair": repair,
+                     "exit": (stream.exit_after_last_line
+                              if stream is not None else None),
+                     "silent": stream is not None and stream.last_line is None,
+                     "mark": start, **{s: 0.0 for s in self.STEPS}}
+
+    def mark(self, step: str) -> None:
+        rec = self._rec
+        if rec is None:
+            return
+        now = time.perf_counter()
+        rec[step] += max(0.0, now - rec["mark"])
+        rec["mark"] = now
+
+    def launching(self, now: Optional[float]) -> None:
+        rec, self._rec = self._rec, None
+        if rec is None:
+            return
+        if rec["exit"] is not None:
+            exit_text = f"+{rec['exit']:.1f}s after its last line"
+        elif rec["silent"]:
+            exit_text = "with no line printed"
+        else:
+            exit_text = "+? after its last line"
+        nxt = ("—" if now is None
+               else f"{max(0.0, now - rec['mark']):.1f}s")
+        kind = "repair pass" if rec["repair"] else "pass"
+        _log(f"  timing: z{rec['zoom']} {kind} {rec['pass']}: converter exit "
+             f"{exit_text}; post-pass parse {rec['parse']:.1f}s, flags "
+             f"{rec['flags']:.1f}s, degraded/repair plan {rec['plan']:.1f}s, "
+             f"next launch {nxt}")
+
+
 def _try_rust_download(
     source: str,
     cache_dir: str,
@@ -2155,12 +3273,39 @@ def _try_rust_download(
     progress_cb: Any = None,
     should_cancel: Any = None,
     on_start: Any = None,
+    burns: Any = None,
+    pbf_ready: Optional[str] = None,
+    pbf_wait_s: Optional[float] = None,
+    pbf_list: Optional[str] = None,
 ) -> DownloadOutcome:
     """Download XYZ tiles via Rust and produce .abt files directly.
 
     *pbf_dir*, when given, is handed to the converter as ``buildings_pbf_dir``
     so buildings are fused during the download instead of forcing the whole run
     onto the QGIS export + ingest path (which is 7-17x slower).
+
+    *pbf_ready* / *pbf_wait_s* (with *pbf_dir*; aether_converter >= 0.2.10,
+    toolkit CONTRACT changelog 45 — the caller gates): every pass carries
+    them as ``buildings_pbf_ready`` / ``buildings_pbf_wait_s``, so the
+    directory may still be filling while the terrain downloads — the
+    converter reads it only at its buildings post-pass, once the marker
+    file is there (``[Buildings] waiting for the building tiles (…)`` /
+    ``… ready after S s``, logged like every line). Repair passes ignore
+    both (their run's post-pass already saw the marker).
+
+    *pbf_list* (with *pbf_dir* = THE store; aether_converter >= 0.2.14,
+    toolkit CONTRACT changelog 51 — the caller gates) instead of
+    *pbf_ready*: every pass carries it as ``buildings_pbf_list`` (+
+    ``buildings_pbf_wait_s``): the converter decodes only the tiles that
+    file names, from the store, and waits for the file as for the marker;
+    repair passes ignore it. Never both (the converter refuses the pair).
+
+    *burns* (an ``osm_buildings.BurnMonitor``, with *pbf_dir*) reads the
+    lines of every pass (one ``[Buildings] … pbf tile(s)`` report owed per
+    pass that exits 0; none by a repair pass); a pass that warned it could
+    not decode building tiles stops the download
+    (``UndecodableBuildings``) — the caller judges the rest
+    (``BurnMonitor.verdict``).
 
     That field is **additive**, so a converter predating it parses the job
     happily, ignores the field, and writes perfectly good building-*free*
@@ -2177,6 +3322,9 @@ def _try_rust_download(
     # them — so a missing engine looked exactly like an unsupported layer, and
     # the run then spent the whole extract on the slow path before anything
     # mentioned it. Say which one it was.
+    if pbf_ready and pbf_list:
+        raise ValueError("buildings_pbf_ready and buildings_pbf_list are "
+                         "exclusive (toolkit CONTRACT changelog 51)")
     if "type=xyz" not in source:
         reason = ("the DEM layer is not an XYZ tile service (only XYZ can "
                   "be fetched directly)")
@@ -2233,6 +3381,11 @@ def _try_rust_download(
     # passed in, and they are written straight into it.
     all_names = [t["filename"] for t in subtiles]
 
+    # The raw source-tile cache (<cache>/xyz, the job's `cache_dir`): shared
+    # by every source and both tabs — the converter keys it by service and
+    # zoom itself. Resolved once per call, like the pool.
+    raw_dir = os.path.abspath(xyz_cache_dir())
+
     def _produced() -> bool:
         return any(_tile_is_whole(os.path.join(cache_dir, n)) for n in all_names)
 
@@ -2245,6 +3398,41 @@ def _try_rust_download(
     # Set by _run_pass; read after the passes to detect an engine that silently
     # ignored buildings_pbf_dir. A list so the closure can write to it.
     buildings_seen: List[bool] = []
+
+    # The void count of every pool tile a pass of this download wrote (name
+    # → record bound to the file as that pass left it; None = unknown): a
+    # NON-repair pass's `[Tile] <name> voids=<n>` lines (aether_converter
+    # >= 0.2.11 — parsed when present, nothing waits for them); a repair
+    # pass rewrites its tiles and prints none, so they are unknown again, as
+    # is every tile of a pass without a line for it. Recorded in the pool's
+    # manifest once the download ends (_settle_voids), checked against the
+    # file again first.
+    voids_seen: Dict[str, Optional[Dict[str, int]]] = {}
+    voids_settled: List[Dict[str, Dict[str, int]]] = []
+
+    def _note_voids(specs: List[Dict[str, Any]], lines: List[str],
+                    repair: bool) -> None:
+        counts = {} if repair else _parse_tile_voids(lines)
+        for s in specs:
+            name = s["filename"]
+            n = counts.get(name)
+            voids_seen[name] = (None if n is None else _voids_record(
+                os.path.join(cache_dir, name), n))
+
+    def _settle_voids() -> Dict[str, Dict[str, int]]:
+        """Record this download's counts in the pool (once): a record whose
+        file changed since its pass (another writer) or is gone (dropped
+        after a failure) is dropped instead."""
+        if not voids_settled:
+            final: Dict[str, Optional[Dict[str, int]]] = {}
+            for name, rec in voids_seen.items():
+                if rec is not None and _voids_record(
+                        os.path.join(cache_dir, name), rec["voids"]) != rec:
+                    rec = None
+                final[name] = rec
+            _record_pool_voids(cache_dir, final)
+            voids_settled.append({n: r for n, r in final.items() if r})
+        return voids_settled[0]
 
     # Aggregated download progress across zoom groups and retry passes, for
     # callers that want a live bar: progress_cb(frac_0_to_1, label). A
@@ -2260,6 +3448,9 @@ def _try_rust_download(
     sink = getattr(progress_cb, "download_event", None)
     max_passes_for_info = _get_download_max_passes()
     passes_run: Dict[int, int] = {}
+    # The timing lane: one line per pass (_PassTiming), passes per zoom.
+    timing = _PassTiming()
+    timing_passes: Dict[int, int] = {}
 
     def _emit(gi: int, zoom: int, label: str, extra: Optional[Dict] = None
               ) -> None:
@@ -2272,8 +3463,15 @@ def _try_rust_download(
                 info.update(extra)
             sink(info)
 
-    def _run_pass(specs: List[Dict[str, Any]], conn: int, zoom: int):
+    def _run_pass(specs: List[Dict[str, Any]], conn: int, zoom: int,
+                  repair_source_tiles: Optional[List[Tuple[int, int, int]]]
+                  = None):
         """Write + run one download pass for *specs* at *conn* connections.
+
+        *repair_source_tiles*, when given, makes it a repair pass: the job
+        carries ``repair_source_tiles: [[z, x, y], ...]`` and the converter
+        fetches only those source tiles and patches them into the existing
+        output .abt files of *specs* (CONVERTER_REPAIR_MIN_VERSION).
 
         Returns ``(returncode, ok_tiles, total_tiles, lines)`` — the output
         lines ride along because they are the only place the *reason* for a
@@ -2284,8 +3482,10 @@ def _try_rust_download(
         # re-make both here, a statement away from the launch, because the
         # converter writes its output .abt straight into `output_dir` and a
         # directory that went missing in between is what "os error 3" is.
+        # The raw tile cache is made here too (first download of a cache).
         ensure_engine_dirs(os.path.abspath(cache_dir),
                            os.path.dirname(os.path.abspath(job_file)),
+                           raw_dir,
                            os.path.abspath(pbf_dir) if pbf_dir else None)
         job = {
             "url_template": url_template,
@@ -2294,11 +3494,36 @@ def _try_rust_download(
             "tiles": specs,
             "zoom": zoom,
             "max_connections": conn,
+            # Raw source-tile cache (toolkit CONTRACT changelog 38,
+            # aether_converter >= 0.2.8; older builds ignore the field): the
+            # converter keeps every fetched XYZ tile's raw PNG/WebP bytes
+            # there — real server answers only (200 bodies, 404 "no tile";
+            # never a degraded or failed tile) — and later jobs read those
+            # instead of the network, fetching only the missing ones. Its
+            # `[Download] cache: <hits> of <n> source tiles from cache` line
+            # is logged like every other line, never parsed; a cached tile
+            # counts as fetched in progress and [Stats], and every .abt byte
+            # is the same. Every pass (first, retry, repair) carries it.
+            "cache_dir": raw_dir,
         }
         # Omitted entirely when unset, so an older converter sees exactly the
         # job shape it sees today.
         if pbf_dir:
             job["buildings_pbf_dir"] = os.path.abspath(pbf_dir)
+            if pbf_ready or pbf_list:
+                # Every pass: a later zoom group's first pass may launch
+                # before the marker / the list exists (an earlier group
+                # failed before its post-pass) — it must wait, never burn a
+                # directory still being filled.
+                if pbf_list:
+                    job["buildings_pbf_list"] = os.path.abspath(pbf_list)
+                else:
+                    job["buildings_pbf_ready"] = pbf_ready
+                if pbf_wait_s is not None:      # absent: the converter's 1800
+                    job["buildings_pbf_wait_s"] = pbf_wait_s
+        if repair_source_tiles:
+            job["repair_source_tiles"] = [[int(z), int(x), int(y)]
+                                          for z, x, y in repair_source_tiles]
         with open(job_file, "w") as fh:
             json.dump(job, fh)
 
@@ -2307,19 +3532,29 @@ def _try_rust_download(
             group_idx = zoom_order.index(zoom)
             pass_no = passes_run.get(zoom, 0) + 1
             passes_run[zoom] = pass_no
-            aggregator.pass_start(group_idx, pass_no,
-                                  _source_tile_count(specs, zoom))
-            tag = (f"z{zoom}" if pass_no == 1
-                   else f"z{zoom}, pass {pass_no}/{max_passes_for_info}")
+            # A repair pass's work is the source tiles it was asked to
+            # patch; the converter's header line confirms (or corrects) it.
+            aggregator.pass_start(
+                group_idx, pass_no,
+                len(repair_source_tiles) if repair_source_tiles
+                else _source_tile_count(specs, zoom))
+            kind = {"repair": True} if repair_source_tiles else {}
+            if repair_source_tiles:
+                tag = (f"z{zoom}, repair pass "
+                       f"{pass_no}/{max_passes_for_info}")
+            else:
+                tag = (f"z{zoom}" if pass_no == 1
+                       else f"z{zoom}, pass {pass_no}/{max_passes_for_info}")
             _emit(group_idx, zoom, f"Downloading terrain ({tag})",
-                  {"event": "pass_start"})
+                  {"event": "pass_start", **kind})
 
             def on_line(line: str) -> None:
                 header = run_progress.parse_download_header(line)
                 if header is not None:
                     aggregator.pass_total(group_idx, header[1])
                     _emit(group_idx, zoom, f"Downloading terrain ({tag}): "
-                          f"0/{header[1]} source tiles", {"event": "header"})
+                          f"0/{header[1]} source tiles",
+                          {"event": "header", **kind})
                     return
                 parsed = run_progress.parse_download_line(line)
                 if parsed:
@@ -2330,8 +3565,14 @@ def _try_rust_download(
                           f"{parsed.done}/{parsed.total} source tiles",
                           {"event": "progress", "mbps": parsed.mbps,
                            "errors": parsed.errors,
-                           "in_flight": parsed.in_flight})
+                           "in_flight": parsed.in_flight, **kind})
 
+        timing_passes[zoom] = timing_passes.get(zoom, 0) + 1
+        # The previous pass's timing line: its "next launch" ends here.
+        timing.launching(time.perf_counter())
+        forget_stream_timing()
+        for s in specs:                 # rewritten from here on: unknown
+            voids_seen[s["filename"]] = None
         try:
             rc, lines = _run_converter_download_once(
                 converter_exe, job_file, on_line=on_line,
@@ -2339,9 +3580,24 @@ def _try_rust_download(
         finally:
             if progress_cb is not None:
                 aggregator.pass_end(group_idx)
+        timing.ended(zoom, timing_passes[zoom], bool(repair_source_tiles),
+                     last_stream_timing())
+        _note_voids(specs, lines, bool(repair_source_tiles))
         if pbf_dir and rc == 0:
             buildings_seen.append(_buildings_were_applied(lines))
+        if pbf_dir and burns is not None:
+            # The post-pass burns after the terrain is written, so there is
+            # nothing to save by a kill mid-pass: the pass's lines are read
+            # once it has ended, and a decode warning stops the download.
+            burns.begin(0 if repair_source_tiles else 1, what="download")
+            for ln in lines:
+                burns.feed(ln)
+            burns.end(ok=(rc == 0))
+            if burns.batch_bad:
+                from .osm_buildings import UndecodableBuildings
+                raise UndecodableBuildings()
         ok, total = _parse_download_completeness(lines)
+        timing.mark("parse")
         return rc, ok, total, lines
 
     max_passes = max_passes_for_info
@@ -2382,7 +3638,23 @@ def _try_rust_download(
         if supported is None:
             _log(f"  could not read {converter_exe} to check for "
                  "buildings-on-download; assuming it is supported")
-        _log("  buildings fused during download (buildings_pbf_dir)")
+        _log("  buildings fused during download (buildings_pbf_dir"
+             + (f"; the converter waits for {pbf_list}" if pbf_list
+                else f"; the converter waits for {pbf_ready} there"
+                if pbf_ready else "") + ")")
+
+    # Asked lazily (it launches the converter once, then is cached): only a
+    # group with degraded-only tiles needs to know.
+    repair_answer: List[bool] = []
+
+    def _repair_supported() -> bool:
+        if not repair_answer:
+            from .binary_manager import converter_supports_repair
+            try:
+                repair_answer.append(bool(converter_supports_repair(converter_exe)))
+            except Exception:  # noqa: BLE001 — a probe must never fail a run
+                repair_answer.append(False)
+        return repair_answer[0]
 
     try:
         ok_all = True
@@ -2390,7 +3662,8 @@ def _try_rust_download(
         for zoom in sorted(by_zoom):
             group = _download_zoom_group(
                 cache_dir, by_zoom[zoom], zoom, base_conn, max_passes,
-                _run_pass, _produced)
+                _run_pass, _produced, repair_supported=_repair_supported,
+                timing=timing)
             if progress_cb is not None:
                 gi = zoom_order.index(zoom)
                 aggregator.group_end(gi)
@@ -2406,13 +3679,21 @@ def _try_rust_download(
         # that printed nothing still produced buildings; a *non*-supporting
         # one never got this far, because the gate refused the fast path
         # before any download ran.
-        if pbf_dir and buildings_seen and not any(buildings_seen):
+        if (pbf_dir and burns is None and buildings_seen
+                and not any(buildings_seen)):
             _log("  note: no '[Buildings]' line in the converter output, but "
                  "the engine has the feature — buildings were applied. Report "
                  "this if the result is missing buildings.")
 
-        return DownloadOutcome(ok_all, "\n".join(reasons))
+        return DownloadOutcome(ok_all, "\n".join(reasons),
+                               _settle_voids() or None)
     finally:
+        # The last pass's timing line: no next launch in this download.
+        timing.launching(None)
+        # A download that raised (Stop, a fetch failure, disk) still
+        # records what its passes counted for the tiles left as they wrote
+        # them (once: a return above settled already).
+        _settle_voids()
         try:
             os.remove(job_file)
         except OSError:
@@ -2427,30 +3708,80 @@ def _download_zoom_group(
     max_passes: int,
     _run_pass: Any,
     _produced: Any,
+    repair_supported: Any = None,
+    timing: Optional[_PassTiming] = None,
 ) -> DownloadOutcome:
-    """Download one homogeneous-zoom group, with the halving retry.
+    """Download one homogeneous-zoom group, with gap-repair retry passes.
+
+    *repair_supported* (a callable, asked only when needed, or a bool) says
+    whether the converter honours ``repair_source_tiles``; absent → False.
+    *timing* (the download's :class:`_PassTiming`, whose passes *_run_pass*
+    opens) gets the post-pass steps booked: reading the lines, the rebuild
+    flags / dropped tiles, the gap scan and the repair plan.
 
     A failure carries the engine's own diagnosis (``DownloadOutcome.detail``)
     and leaves NOTHING of this group in the pool — see :func:`_drop_pool_tiles`.
     """
     all_names = [s["filename"] for s in tile_specs]
+    # Every pass uses the configured connections. The converter runs its own
+    # adaptive connection window under max_connections as the ceiling; the
+    # old per-pass halving here stacked a second backoff on top of it (one bad
+    # tile → 128, 64, 32 connections on a healthy link).
     conn = base_conn
+    if timing is None:
+        timing = _PassTiming()          # no pass is ever opened: books nothing
 
-    # First pass downloads everything. On failure, re-download ONLY the sub-tiles
-    # that actually ended up with a gap, and HALVE the connections each pass:
-    # the failures are connection drops on the largest tiles under high
-    # parallelism, so backing off lets them through. The converter cannot retry
-    # individual XYZ tiles (it rewrites a whole .abt), so a gapped sub-tile is
-    # the smallest unit we can re-fetch. An incomplete result is marked so it is
-    # not reused as a valid cache — the next run re-downloads it.
+    def _can_repair() -> bool:
+        if callable(repair_supported):
+            return bool(repair_supported())
+        return bool(repair_supported)
+
+    # First pass downloads everything. Output tiles with a gap (hole, never
+    # written) are re-downloaded WHOLE in further passes — a hole is a source
+    # tile that never arrived. Output tiles whose only problem is degraded
+    # source tiles (coarse-filled, no hole) get ONE repair pass when the
+    # converter supports it: only those source tiles are fetched and patched
+    # into the existing .abt (``repair_source_tiles``); an older converter
+    # re-downloads those output tiles whole instead. An incomplete result is
+    # marked so it is not reused as a valid cache — the next run re-downloads
+    # it.
     try:
         specs = tile_specs
+        repair: Optional[List[DegradedTile]] = None   # next pass repairs these
+        repaired = False                               # the one repair pass ran
         for attempt in range(1, max_passes + 1):
             t = time.perf_counter()
-            rc, ok, total, lines = _run_pass(specs, conn, zoom)
+            was_repair = repair
+            repair = None
+            if was_repair:
+                rc, ok, total, lines = _run_pass(
+                    specs, conn, zoom, repair_source_tiles=sorted(
+                        {(d.z, d.x, d.y) for d in was_repair}))
+            else:
+                rc, ok, total, lines = _run_pass(specs, conn, zoom)
             elapsed = time.perf_counter() - t
+            if rc != 0 and was_repair:
+                # The patch state of the repaired tiles is unknown, so they
+                # are rewritten whole if a pass is left, dropped otherwise.
+                # The rest of the group was complete and stays.
+                detail = _download_failure_detail(lines)
+                timing.mark("parse")
+                _log(f"  Rust download repair pass failed (exit {rc}) at "
+                     f"z={zoom}" + (f":\n    {detail}" if detail else ""))
+                if attempt < max_passes:
+                    _log(f"  re-downloading the {len(specs)} repaired output "
+                         f"tile(s) whole @ {conn} connections (pass "
+                         f"{attempt + 1}/{max_passes})")
+                    timing.mark("plan")
+                    continue
+                gone = _drop_pool_tiles(cache_dir,
+                                        [s["filename"] for s in specs])
+                timing.mark("flags")
+                _log(f"    {gone} unusable tile(s) removed from the pool")
+                return DownloadOutcome(False, detail or f"exit {rc}")
             if rc != 0:
                 detail = _download_failure_detail(lines)
+                timing.mark("parse")
                 _log(f"  Rust download failed (exit {rc}) at z={zoom}"
                      + (f":\n    {detail}" if detail else ""))
                 # The engine pads every output tile to full size BEFORE it
@@ -2458,12 +3789,14 @@ def _download_zoom_group(
                 # terrain is sitting in the pool right now. Leave it and the
                 # next run reports a cache hit over flat sea.
                 gone = _drop_pool_tiles(cache_dir, all_names)
+                timing.mark("flags")
                 _log(f"    {gone} unusable tile(s) removed from the pool")
                 return DownloadOutcome(False, detail or f"exit {rc}")
             if total < 0:
                 # Older converter without completeness stats — trust exit 0.
                 _log(f"  Rust download z={zoom}: {elapsed:.1f}s")
                 _set_rebuild_flags(cache_dir, all_names)
+                timing.mark("flags")
                 return DownloadOutcome(_produced())
             # Degraded source tiles (failed, filled from a coarser zoom) are
             # not counted in `ok`, so a pass with any of them never takes the
@@ -2471,15 +3804,25 @@ def _download_zoom_group(
             # they are added to the affected set explicitly.
             degraded = _parse_degraded(lines)
             n_degraded = max(len(degraded), _parse_degraded_count(lines))
+            no_data = _parse_download_no_data(lines)
+            if (was_repair and not degraded
+                    and ok < total - no_data):
+                # A repair pass that could not fetch some of its tiles leaves
+                # the coarse fill in place (no hole to find), whether or not
+                # it re-announced them: the asked-for tiles are still degraded.
+                degraded = list(was_repair)
+                n_degraded = max(n_degraded, total - no_data - ok)
             degraded_names = _specs_hit_by_degraded(specs, degraded)
+            timing.mark("parse")
             if ok >= total and not n_degraded:
                 _log(f"  Rust download z={zoom}: {elapsed:.1f}s, "
                      f"{ok}/{total} source tiles (XYZ) OK "
-                     f"→ {len(specs)} output tile(s) @ {conn} conn")
+                     f"→ {len(specs)} output tile(s) @ {conn} conn"
+                     + (" (repair pass)" if was_repair else ""))
                 _set_rebuild_flags(cache_dir, all_names)
+                timing.mark("flags")
                 return DownloadOutcome(True)
 
-            no_data = _parse_download_no_data(lines)
             if total - ok == no_data and not n_degraded:
                 # Every miss is the service answering HTTP 404 — "no tile
                 # here". That is data, not failure: a bounded source (a local
@@ -2495,6 +3838,7 @@ def _download_zoom_group(
                      f"→ {len(specs)} output tile(s), voids where the service "
                      f"has nothing")
                 _set_rebuild_flags(cache_dir, all_names)
+                timing.mark("flags")
                 return DownloadOutcome(True)
 
             if ok == 0 and no_data == 0 and not n_degraded:
@@ -2520,6 +3864,7 @@ def _download_zoom_group(
                 # one that exits non-zero, and a flagged tile is still linked
                 # into a run and still read straight off the pool.
                 gone = _drop_pool_tiles(cache_dir, all_names)
+                timing.mark("flags")
                 _log(f"    {gone} flat 0 m tile(s) removed from the pool")
                 detail = _download_failure_detail(lines)
                 return DownloadOutcome(
@@ -2531,13 +3876,45 @@ def _download_zoom_group(
             # (VOID blocks from the current converter, zero blocks from an
             # older one), and ones never written at all — the block scans
             # cannot see the latter, reporting False for an unopenable file.
+            # Those are GAPPED (re-downloaded whole); degraded ones are
+            # affected too but may only need their source tiles patched.
+            #
+            # A hole is a source tile that failed WITHOUT a coarser fill, and
+            # `[Stats] Tiles: ok/total` counts a degraded tile as not OK — so
+            # only `missing - n_degraded` misses can have left one. None
+            # (degraded-only): no tile is read — the owner's z15 band read
+            # all 706 tiles of 62 MB twice (44 GB from an HDD, 159-252 s,
+            # "degraded/repair plan" in the timing line) to find nothing
+            # behind one timed-out tile the converter had filled from z14.
+            # Else the converter does not say WHICH output tiles they hit
+            # (download.rs prints only the first failure of a class —
+            # `[Download] first timeout: z/x/y`, none for HTTP errors or 404
+            # — and its `[Strip …] … FAILED` lines carry no coordinates), so
+            # every tile THIS pass wrote is read, once: tiles of the group
+            # outside *specs* were left clean by an earlier pass and not
+            # touched since.
+            hard = max(0, missing - n_degraded)
+            if hard:
+                _log(f"  gap scan: reading {len(specs)} output tile(s) at "
+                     f"z{zoom} — {hard} source tile(s) missing without a "
+                     f"coarser fill"
+                     + (f" ({no_data} of them no-data, HTTP 404)"
+                        if no_data else "")
+                     + "; the converter does not name the output tiles "
+                       "they hit")
             affected = []
-            for s in tile_specs:
+            gapped = []
+            for s in specs:
                 path = os.path.join(cache_dir, s["filename"])
-                if (s["filename"] in degraded_names
-                        or not os.path.exists(path) or _abt_has_holes(path)
-                        or _abt_has_zero_fill(path)):
+                gap = not os.path.exists(path) or bool(hard) and (
+                    _abt_has_holes(path) or _abt_has_zero_fill(path))
+                if gap:
+                    gapped.append(s)
+                if gap or s["filename"] in degraded_names:
                     affected.append(s)
+            # The gap scan (when there is one) reads the pass's tiles: the
+            # plan's usual cost.
+            timing.mark("plan")
             if n_degraded and not degraded_names:
                 _log(f"  note: the engine reported {n_degraded} degraded "
                      f"source tile(s) at z{zoom} but none could be placed on "
@@ -2558,9 +3935,14 @@ def _download_zoom_group(
                      f"tile(s) unavailable but every output tile is intact "
                      f"→ complete")
                 _set_rebuild_flags(cache_dir, all_names)
+                timing.mark("flags")
                 return DownloadOutcome(True)
 
-            if attempt >= max_passes or conn <= _MIN_DOWNLOAD_CONNECTIONS:
+            # Degraded-only: nothing to re-fetch but coarse-filled source
+            # tiles. That gets ONE repair pass; still degraded after it, the
+            # tiles are kept for this run and flagged (below).
+            degraded_only = bool(degraded_names) and not gapped
+            if attempt >= max_passes or (degraded_only and repaired):
                 if no_data > 0:
                     # Part of the remaining gaps is the service answering 404
                     # — permanent sea, not a retryable failure. The user must
@@ -2568,9 +3950,13 @@ def _download_zoom_group(
                     # real failures (the all-404 case warned and returned
                     # complete above).
                     _warn_no_data_tiles(zoom, no_data, total)
+                # Degraded-only tiles have no hole — say "coarser data", not
+                # "gaps", or the log contradicts the degraded warning below.
+                left = ("filled from coarser data" if degraded_only
+                        else "left with gaps")
                 _log(f"  WARNING: {missing} source tile(s) still failed after "
-                     f"{attempt} pass(es); {len(affected)} output tile(s) left "
-                     f"with gaps — using partial terrain and flagging just "
+                     f"{attempt} pass(es); {len(affected)} output tile(s) "
+                     f"{left} — using partial terrain and flagging just "
                      f"those tiles for rebuild.")
                 # Flag only the gapped tiles, so the next run re-fetches those
                 # and keeps the rest. Usable-but-gapped terrain is still worth
@@ -2578,6 +3964,7 @@ def _download_zoom_group(
                 # preparation through the far slower path in this same run.
                 _set_rebuild_flags(cache_dir, all_names,
                                    {s["filename"] for s in affected})
+                timing.mark("flags")
                 if degraded_names:
                     # Kept for THIS run (coarse terrain beats none), flagged
                     # so the next run re-fetches exactly these.
@@ -2585,7 +3972,28 @@ def _download_zoom_group(
                 return DownloadOutcome(_produced(),
                                       _download_failure_detail(lines))
 
-            conn = max(_MIN_DOWNLOAD_CONNECTIONS, conn // 2)
+            if degraded_only and not repaired:
+                repair_specs = [s for s in tile_specs
+                                if s["filename"] in degraded_names]
+                placed = [d for d in degraded
+                          if _specs_hit_by_degraded(repair_specs, [d])]
+                if _can_repair():
+                    timing.mark("plan")
+                    repair, repaired, specs = placed, True, repair_specs
+                    _log(f"  Rust download z={zoom}: only degraded source "
+                         f"tiles left ({len(placed)} filled from coarser "
+                         f"zooms, no gaps) → repair pass "
+                         f"{attempt + 1}/{max_passes}: patching "
+                         f"{len({(d.z, d.x, d.y) for d in placed})} source "
+                         f"tile(s) into {len(repair_specs)} existing output "
+                         f"tile(s) via repair_source_tiles @ {conn} "
+                         f"connections")
+                    continue
+                _log(f"  Rust download z={zoom}: only degraded source tiles "
+                     f"left, but this aether_converter does not report "
+                     f"version >= {_converter_repair_min_version()} "
+                     f"(repair_source_tiles) → fallback: "
+                     f"re-downloading the affected output tile(s) whole")
             specs = affected
             _log(f"  Rust download incomplete ({missing} source tile(s) "
                  f"missing"
@@ -2593,8 +4001,10 @@ def _download_zoom_group(
                     if n_degraded else "")
                  + f"): retrying {len(specs)} affected output tile(s) "
                  f"@ {conn} connections (pass {attempt + 1}/{max_passes})")
+            timing.mark("plan")
         _set_rebuild_flags(cache_dir, all_names,
                            {s["filename"] for s in specs})
+        timing.mark("flags")
         return DownloadOutcome(_produced())
     except ConverterCancelled:
         raise                      # cancellation must reach the caller
@@ -2618,6 +4028,24 @@ class _DefaultBinaryManager:
         return find_binary(name)
 
 
+class PoolTiles(dict):
+    """What :func:`ensure_pool_tiles` returns: ``{filename: absolute pool
+    path}`` — a plain dict to every caller — plus the pool directory and
+    which of the names THIS call downloaded (:attr:`fetched`: missing,
+    short or flagged for rebuild when it started) versus the ones that were
+    in the pool already (:attr:`present`). The Map Converter removes the
+    tiles its run fetched after a successful run unless "Keep pool tiles" is
+    ticked (``remove_pool_tiles``)."""
+
+    def __init__(self, mapping: Optional[Dict[str, str]] = None,
+                 pool_dir: str = "", fetched: Sequence[str] = (),
+                 present: Sequence[str] = ()) -> None:
+        super().__init__(mapping or {})
+        self.pool_dir = pool_dir
+        self.fetched: List[str] = list(fetched)
+        self.present: List[str] = list(present)
+
+
 def ensure_pool_tiles(
     source_uri: str,
     subtiles: List[Dict[str, Any]],
@@ -2626,7 +4054,7 @@ def ensure_pool_tiles(
     progress_cb: Any = None,
     should_cancel: Any = None,
     on_start: Any = None,
-) -> Dict[str, str]:
+) -> PoolTiles:
     """Shared acquisition entry: make the pool hold every tile in *subtiles*.
 
     THE one XYZ downloader for both terrain paths. Uses the same pool cache
@@ -2635,7 +4063,9 @@ def ensure_pool_tiles(
     Map Converter, which keeps this pool shareable between the tabs) and the
     same download machinery (zoom groups, gap-repair retry passes).
 
-    Returns ``{filename: absolute pool path}`` for every requested tile.
+    Returns ``{filename: absolute pool path}`` for every requested tile — a
+    :class:`PoolTiles`, which also names the tiles this call downloaded
+    (``fetched``) and the ones already pooled (``present``).
     Fails loudly: a download that cannot provide the tiles is a RuntimeError
     — there is no render fallback (rendering XYZ through QGIS is exactly the
     aliasing/UI-freeze failure this replaces).
@@ -2649,7 +4079,9 @@ def ensure_pool_tiles(
     os.makedirs(pool_dir, exist_ok=True)
     _log(f"  shared pool: {pool_dir}")
 
-    todo = [t for t in subtiles if not _tile_ready(pool_dir, t["filename"])]
+    listing = _pool_listing(pool_dir)
+    todo = [t for t in subtiles
+            if not _listed_tile_ready(listing, t, pool_dir)]
     if todo:
         outcome = _try_rust_download(source_uri, pool_dir, {}, resolution_m,
                                      todo, binary_manager, pbf_dir=None,
@@ -2672,15 +4104,21 @@ def ensure_pool_tiles(
     else:
         _log(f"  pool HIT — all {len(subtiles)} tile(s) already downloaded")
 
-    mapping: Dict[str, str] = {}
+    fetched = {t["filename"] for t in todo}
+    mapping = PoolTiles(
+        pool_dir=os.path.abspath(pool_dir),
+        fetched=sorted(fetched),
+        present=sorted({t["filename"] for t in subtiles} - fetched))
     missing: List[str] = []
+    if todo:
+        listing = _pool_listing(pool_dir)     # the download wrote tiles
     for t in subtiles:
         path = os.path.join(pool_dir, t["filename"])
         # A tile flagged for rebuild (gap-repair exhausted) still holds
         # usable partial terrain for THIS run — the same policy Site
         # Analysis applies when it links such tiles into its view. Only a
         # missing/short file is a hard failure.
-        if _tile_is_whole(path):
+        if _listed_tile_whole(listing, t, pool_dir):
             mapping[t["filename"]] = os.path.abspath(path)
         else:
             missing.append(t["filename"])
@@ -2976,6 +4414,8 @@ def build_tile_sources(
     tmp_dir: str,
     tag: str,
     output_res_m: float,
+    index: Optional[FootprintIndex] = None,
+    regions: Optional[Sequence[Dict[str, float]]] = None,
 ) -> Tuple[List[Dict[str, Any]], List[str]]:
     """``sources[]`` entries for one tile, from per-file *infos*.
 
@@ -2984,7 +4424,9 @@ def build_tile_sources(
     intersect the tile bbox grown by a per-file halo (below). Files the
     converter cannot read directly are window-copied (tile window + halo,
     clamped to the file) into *tmp_dir*; the created temp paths are returned
-    for cleanup.
+    for cleanup. *index* (a :class:`FootprintIndex` over *infos*) finds the
+    files without a scan of the whole list and reuses the tile's match from
+    :func:`tile_source_fingerprint` (see :func:`_tile_contributors`).
 
     Halo sizing: ``max(4 source px, 0.6 output cells)`` in degrees of
     latitude. The 4-source-px term gives the converter's edge sampling its
@@ -3001,17 +4443,30 @@ def build_tile_sources(
     authids (e.g. ``USER:100000``) are omitted because the toolkit accepts
     only ``EPSG:nnnn`` or a proj string — it then reads the file's own
     GeoKeys, and its error surfaces verbatim if they are unusable.
+
+    *regions* (a partial pool tile, see :func:`resolve_pool_tile`): only the
+    files those regions admit (:func:`_region_contributors`), in priority
+    order — the job keeps the whole tile's geometry, so a cell inside a
+    region samples exactly what a whole build gives it. A materialized
+    window covers the regions plus halo; a ROTATED file keeps the whole
+    tile's window, because its one resampling (``gdal.Warp``) is anchored at
+    the window and a smaller one would move its grid.
     """
     _record_route("sources")
 
     sources: List[Dict[str, Any]] = []
     temps: List[str] = []
-    for idx, info, halo_bbox in _tile_contributors(infos, tile_bbox,
-                                                   output_res_m):
+    contributors = (_region_contributors(infos, regions, output_res_m,
+                                         index=index) if regions
+                    else _tile_contributors(infos, tile_bbox, output_res_m,
+                                            index=index))
+    for idx, info, halo_bbox in contributors:
         path = info["path"]
         reason = (info["materialize"] if "materialize" in info
                   else ("materialize" if _needs_materialization(path) else None))
         if reason:
+            if regions and info.get("rotated"):
+                halo_bbox = _halo_box(info, tile_bbox, output_res_m)
             window_native = _window_in_source_crs(halo_bbox, info)
             window = (_clamp_bbox(window_native, info["native_bounds"])
                       if window_native is not None else None)
@@ -3051,29 +4506,291 @@ def _window_in_source_crs(halo_bbox: Dict[str, float],
     return terrain_index.bbox_from_wgs84(halo_bbox, info.get("crs_wkt", ""))
 
 
+#: Bytes per sample of a GDAL data type name (the folder index's ``dtype``).
+_DTYPE_BYTES = {"Byte": 1, "Int8": 1, "UInt16": 2, "Int16": 2, "UInt32": 4,
+                "Int32": 4, "Float32": 4, "UInt64": 8, "Int64": 8,
+                "Float64": 8, "CInt16": 4, "CInt32": 8, "CFloat32": 8,
+                "CFloat64": 16}
+
+
+def _materialized_sample_bytes(info: Dict[str, Any]) -> int:
+    """Bytes per pixel of :func:`materialize_for_converter`'s copy of one
+    file: Float32 for an unscaled or warped (rotated) copy, else the file's
+    own type (from the info, or its folder-index entry); unknown: 4."""
+    if info.get("unscale") or info.get("rotated"):
+        return 4
+    dtype = info.get("dtype")
+    if not dtype and info.get("index_folder"):
+        try:
+            entry = terrain_index.get_index(
+                info["index_folder"]).entries.get(info["path"]) or {}
+            dtype = entry.get("dtype")
+        except Exception:  # noqa: BLE001 — an estimate never fails a run
+            dtype = None
+    return _DTYPE_BYTES.get(str(dtype or ""), 4)
+
+
+def materialized_window_bytes(infos: List[Dict[str, Any]],
+                              tile_bbox: Dict[str, float],
+                              output_res_m: float,
+                              index: Optional[FootprintIndex] = None) -> int:
+    """Temp bytes :func:`build_tile_sources` writes for one tile: per
+    contributor it window-copies (``materialize`` routed), the tile+halo
+    window in the file's own CRS, clamped to the file, in native pixels ×
+    the copy's sample size (no compression assumed). Pure geometry — no file
+    is opened."""
+    total = 0
+    for _idx, info, halo_bbox in _tile_contributors(infos, tile_bbox,
+                                                    output_res_m, index=index):
+        if not info.get("materialize"):
+            continue
+        try:
+            win = _window_in_source_crs(halo_bbox, info)
+            win = (_clamp_bbox(win, info["native_bounds"])
+                   if win is not None else None)
+        except Exception:  # noqa: BLE001 — no transform: nothing to price
+            win = None
+        if win is None:
+            continue
+        px_x = abs(float(info.get("px_x") or 0.0))
+        px_y = abs(float(info.get("px_y") or 0.0))
+        if px_x <= 0 or px_y <= 0:
+            continue
+        cols = math.ceil((win["east"] - win["west"]) / px_x)
+        rows = math.ceil((win["north"] - win["south"]) / px_y)
+        total += max(0, cols) * max(0, rows) * _materialized_sample_bytes(info)
+    return total
+
+
+Contributor = Tuple[int, Dict[str, Any], Dict[str, float]]
+
+#: Bucket edge of :class:`FootprintIndex`, in degrees.
+_INDEX_CELL_DEG = 0.1
+#: A file spanning more buckets than this (a continental DEM) is not bucketed
+#: cell by cell; it is a candidate for every tile instead.
+_INDEX_MAX_FILE_CELLS = 1024
+#: A lookup spanning more buckets than this scans the whole list instead.
+_INDEX_MAX_QUERY_CELLS = 4096
+
+
+def _finite(*values: Any) -> bool:
+    try:
+        return all(math.isfinite(v) for v in values)
+    except TypeError:
+        return False
+
+
+class FootprintIndex:
+    """Grid-bucket index over *infos*' ``wgs84_bounds`` — how
+    :func:`_tile_contributors` finds a tile's files in a big folder without
+    testing every file against every tile.
+
+    Files are bucketed by 0.1° cell. A lookup takes the files whose buckets
+    meet the tile grown by the halo rule's maximum (the largest ``halo_deg``
+    in the list, 0.6 output cells, the same cos-latitude divisor) and runs
+    THE exact test on those, in list order — a superset filter, so the result
+    is the full scan's, element for element. Files with missing, non-finite
+    or inverted bounds/halo, or spanning more than ``_INDEX_MAX_FILE_CELLS``
+    buckets, are candidates for every tile.
+
+    Bound to the very list it was built from (results carry positions in
+    it). Each tile's result is kept per (tile bbox, output resolution), so
+    the stale check and the job build of one run match a tile once.
+    """
+
+    def __init__(self, infos: List[Dict[str, Any]],
+                 cell_deg: float = _INDEX_CELL_DEG) -> None:
+        self.infos = infos
+        self.cell = cell_deg
+        self.max_halo: Any = 0.0
+        self._buckets: Dict[Tuple[int, int], List[int]] = {}
+        self._always: List[int] = []
+        self._memo: Dict[Tuple[Any, ...], List[Contributor]] = {}
+        c = cell_deg
+        for idx, info in enumerate(infos):
+            try:
+                halo = info["halo_deg"]
+                b = info["wgs84_bounds"]
+                w, e, s, n = b["west"], b["east"], b["south"], b["north"]
+                ok = _finite(halo, w, e, s, n) and w <= e and s <= n
+            except (KeyError, TypeError):
+                ok = False
+            if not ok:
+                self._always.append(idx)
+                continue
+            cx0, cx1 = math.floor(w / c), math.floor(e / c)
+            cy0, cy1 = math.floor(s / c), math.floor(n / c)
+            if (cx1 - cx0 + 1) * (cy1 - cy0 + 1) > _INDEX_MAX_FILE_CELLS:
+                self._always.append(idx)
+                continue
+            if halo > self.max_halo:
+                self.max_halo = halo
+            for cy in range(cy0, cy1 + 1):
+                for cx in range(cx0, cx1 + 1):
+                    self._buckets.setdefault((cx, cy), []).append(idx)
+
+    def __len__(self) -> int:
+        return len(self.infos)
+
+    def contributors(self, infos: List[Dict[str, Any]],
+                     tile_bbox: Dict[str, float],
+                     output_res_m: float) -> List[Contributor]:
+        """:func:`_tile_contributors` for one tile, through the buckets."""
+        if infos is not self.infos:
+            raise ValueError("FootprintIndex used with a file list it was "
+                             "not built from")
+        w, s = tile_bbox["west"], tile_bbox["south"]
+        e, n = tile_bbox["east"], tile_bbox["north"]
+        key = (w, s, e, n, output_res_m)
+        hit = self._memo.get(key)
+        if hit is not None:
+            return hit
+        positions = self._candidates(w, s, e, n, output_res_m)
+        out = _scan_contributors(infos, positions, tile_bbox, output_res_m)
+        self._memo[key] = out
+        return out
+
+    def _candidates(self, w: Any, s: Any, e: Any, n: Any,
+                    output_res_m: Any) -> Sequence[int]:
+        everything = range(len(self.infos))
+        if not (_finite(w, s, e, n, output_res_m) and output_res_m > 0
+                and w <= e and s <= n):
+            return everything
+        # The query box contains every per-file halo box of the exact test:
+        # same expressions, and max(halo, r) <= max(max_halo, r).
+        center_lat = (n + s) / 2.0
+        cos_lat = max(math.cos(math.radians(center_lat)), 0.2)
+        hl = max(self.max_halo, 0.6 * output_res_m / 111_111.0)
+        hlon = hl / cos_lat
+        c = self.cell
+        cx0, cx1 = math.floor((w - hlon) / c), math.floor((e + hlon) / c)
+        cy0, cy1 = math.floor((s - hl) / c), math.floor((n + hl) / c)
+        if (cx1 - cx0 + 1) * (cy1 - cy0 + 1) > _INDEX_MAX_QUERY_CELLS:
+            return everything
+        found = set(self._always)
+        buckets = self._buckets
+        for cy in range(cy0, cy1 + 1):
+            for cx in range(cx0, cx1 + 1):
+                hit = buckets.get((cx, cy))
+                if hit:
+                    found.update(hit)
+        return sorted(found)
+
+
+def footprint_index(infos: Optional[List[Dict[str, Any]]]
+                    ) -> Optional[FootprintIndex]:
+    """A :class:`FootprintIndex` over *infos* (None for no files)."""
+    return FootprintIndex(infos) if infos else None
+
+
+class SubsetFootprintIndex:
+    """A :class:`FootprintIndex`'s answers for a SUB-list of its own infos
+    (same dicts, same relative order — what :func:`_infos_near` returns),
+    without building a second index: each lookup takes the full index's
+    match and keeps the files in *infos*, at their positions in *infos*.
+
+    The exact test is per file, so the result is the one a
+    :class:`FootprintIndex` built over *infos* gives, element for element
+    (positions included — they name a tile's materialized window copies).
+    Kept per (tile bbox, output resolution) like the full index's own memo.
+    """
+
+    def __init__(self, full: FootprintIndex,
+                 infos: List[Dict[str, Any]]) -> None:
+        self.infos = infos
+        self._full = full
+        self._pos = {id(info): k for k, info in enumerate(infos)}
+        self._memo: Dict[Tuple[Any, ...], List[Contributor]] = {}
+
+    def __len__(self) -> int:
+        return len(self.infos)
+
+    def contributors(self, infos: List[Dict[str, Any]],
+                     tile_bbox: Dict[str, float],
+                     output_res_m: float) -> List[Contributor]:
+        """:func:`_tile_contributors` for one tile of the sub-list."""
+        if infos is not self.infos:
+            raise ValueError("SubsetFootprintIndex used with a file list it "
+                             "was not made for")
+        key = (tile_bbox["west"], tile_bbox["south"], tile_bbox["east"],
+               tile_bbox["north"], output_res_m)
+        hit = self._memo.get(key)
+        if hit is not None:
+            return hit
+        pos = self._pos
+        out = [(pos[id(info)], info, halo) for _idx, info, halo
+               in self._full.contributors(self._full.infos, tile_bbox,
+                                          output_res_m)
+               if id(info) in pos]
+        self._memo[key] = out
+        return out
+
+
+def _scan_contributors(infos: List[Dict[str, Any]], positions: Sequence[int],
+                       tile_bbox: Dict[str, float], output_res_m: float
+                       ) -> List[Contributor]:
+    """THE exact per-file test of :func:`_tile_contributors`, over
+    *positions* of *infos* (ascending = priority order)."""
+    out = []
+    for idx in positions:
+        info = infos[idx]
+        halo_bbox = _halo_box(info, tile_bbox, output_res_m)
+        if bboxes_intersect(info["wgs84_bounds"], halo_bbox):
+            out.append((idx, info, halo_bbox))
+    return out
+
+
+def _halo_box(info: Dict[str, Any], tile_bbox: Dict[str, float],
+              output_res_m: float) -> Dict[str, float]:
+    """*tile_bbox* grown by *info*'s halo — THE halo rule (see
+    :func:`build_tile_sources`): ``max(halo_deg, 0.6 output cells)`` of
+    latitude, longitude divided by ``max(cos(centre lat), 0.2)``."""
+    center_lat = (tile_bbox["north"] + tile_bbox["south"]) / 2.0
+    cos_lat = max(math.cos(math.radians(center_lat)), 0.2)
+    halo_lat = max(info["halo_deg"], 0.6 * output_res_m / 111_111.0)
+    halo_lon = halo_lat / cos_lat
+    return {
+        "west": tile_bbox["west"] - halo_lon,
+        "east": tile_bbox["east"] + halo_lon,
+        "south": tile_bbox["south"] - halo_lat,
+        "north": tile_bbox["north"] + halo_lat,
+    }
+
+
+def _region_contributors(infos: List[Dict[str, Any]],
+                         regions: Sequence[Dict[str, float]],
+                         output_res_m: float,
+                         index: Optional[FootprintIndex] = None,
+                         ) -> List[Contributor]:
+    """:func:`_tile_contributors` of a UNION of regions of one tile: every
+    file any region admits (each region by THE rule, normal halo), once, in
+    priority order; its halo box is the union of the regions' halo boxes."""
+    merged: Dict[int, Tuple[Dict[str, Any], List[Dict[str, float]]]] = {}
+    for region in regions:
+        for idx, info, halo in _tile_contributors(infos, region, output_res_m,
+                                                  index=index):
+            merged.setdefault(idx, (info, []))[1].append(halo)
+    return [(idx, merged[idx][0], _union_bbox(merged[idx][1]))
+            for idx in sorted(merged)]
+
+
 def _tile_contributors(infos: List[Dict[str, Any]], tile_bbox: Dict[str, float],
-                       output_res_m: float
-                       ) -> List[Tuple[int, Dict[str, Any], Dict[str, float]]]:
+                       output_res_m: float,
+                       index: Optional[FootprintIndex] = None,
+                       ) -> List[Contributor]:
     """``(index, info, halo bbox)`` for every file that can contribute to one
     tile, in priority order — THE filter, shared by :func:`build_tile_sources`
     and :func:`tile_source_fingerprint` so the stale-tile check can never
     disagree with what a rebuild would read (halo rule: see
-    :func:`build_tile_sources`)."""
-    center_lat = (tile_bbox["north"] + tile_bbox["south"]) / 2.0
-    cos_lat = max(math.cos(math.radians(center_lat)), 0.2)
-    out = []
-    for idx, info in enumerate(infos):
-        halo_lat = max(info["halo_deg"], 0.6 * output_res_m / 111_111.0)
-        halo_lon = halo_lat / cos_lat
-        halo_bbox = {
-            "west": tile_bbox["west"] - halo_lon,
-            "east": tile_bbox["east"] + halo_lon,
-            "south": tile_bbox["south"] - halo_lat,
-            "north": tile_bbox["north"] + halo_lat,
-        }
-        if bboxes_intersect(info["wgs84_bounds"], halo_bbox):
-            out.append((idx, info, halo_bbox))
-    return out
+    :func:`build_tile_sources`).
+
+    With *index* (a :class:`FootprintIndex` built over this very *infos*
+    list) only the files near the tile are tested and the result is kept per
+    tile — the same list, in the same order, as the full scan."""
+    if index is not None:
+        return index.contributors(infos, tile_bbox, output_res_m)
+    return _scan_contributors(infos, range(len(infos)), tile_bbox,
+                              output_res_m)
 
 
 def _subtile_bbox(t: Dict[str, Any]) -> Dict[str, float]:
@@ -3109,20 +4826,146 @@ _SOURCE_ROUTE_VERSION = "r1"
 
 def tile_source_fingerprint(infos: List[Dict[str, Any]],
                             tile_bbox: Dict[str, float],
-                            output_res_m: float) -> str:
+                            output_res_m: float,
+                            index: Optional[FootprintIndex] = None) -> str:
     """Fingerprint of exactly the files that feed one tile, in priority order:
     path, size+mtime (from the folder index), the CRS it is read in and its
     route. A file added, changed, removed or re-prioritised changes this for
-    the tiles it touches — and for no other tile."""
+    the tiles it touches — and for no other tile. *index*: see
+    :func:`_tile_contributors`."""
     parts = [_SOURCE_ROUTE_VERSION]
-    for _idx, info, _halo in _tile_contributors(infos, tile_bbox, output_res_m):
+    for _idx, info, _halo in _tile_contributors(infos, tile_bbox, output_res_m,
+                                                index=index):
         parts.append("|".join((
             info["path"], str(info.get("fp", "")),
             str(info.get("crs_arg") or info.get("crs_authid") or ""),
             str(info.get("materialize") or ""),
             "u" if info.get("unscale") else "")))
-    return hashlib.md5("\n".join(parts).encode("utf-8"),
-                       usedforsecurity=False).hexdigest()
+    return hashes.md5("\n".join(parts).encode("utf-8")).hexdigest()
+
+
+#: Edges of :func:`_rects_cover` closer than this (relative to the
+#: coordinates' magnitude) are one edge: float noise between two files of one
+#: grid (~1e-13°) is no gap, and nothing real is that small.
+_COVER_EDGE_TOL = 1e-12
+#: The tile's native window is grown by this fraction of its size before the
+#: union test (the densified transform can cut a curved edge's extreme).
+_COVER_WINDOW_PAD = 1e-4
+#: Elementary cells beyond which the union test gives up (= not covered).
+_COVER_MAX_CELLS = 4_000_000
+
+
+def _edge_clusters(values: List[float], tol: float) -> Dict[float, int]:
+    """Each value -> the index of its cluster of values within *tol*."""
+    out: Dict[float, int] = {}
+    k, start = -1, None
+    for v in sorted(set(values)):
+        if start is None or v - start > tol:
+            k, start = k + 1, v
+        out[v] = k
+    return out
+
+
+def _rects_cover(rects: List[Dict[str, float]], box: Dict[str, float]) -> bool:
+    """True when the union of the axis-aligned *rects* covers ALL of *box* —
+    exact (coordinate compression over the rects' own edges), no sampling."""
+    W, S, E, N = box["west"], box["south"], box["east"], box["north"]
+    if not (_finite(W, S, E, N) and W < E and S < N):
+        return False
+    clipped = []
+    for r in rects:
+        try:
+            w, e = max(r["west"], W), min(r["east"], E)
+            s, n = max(r["south"], S), min(r["north"], N)
+        except (KeyError, TypeError):
+            continue
+        if _finite(w, e, s, n) and w < e and s < n:
+            clipped.append((w, s, e, n))
+    if not clipped:
+        return False
+    tol = _COVER_EDGE_TOL * max(1.0, abs(W), abs(E), abs(S), abs(N))
+    xi = _edge_clusters([W, E] + [c[0] for c in clipped]
+                        + [c[2] for c in clipped], tol)
+    yi = _edge_clusters([S, N] + [c[1] for c in clipped]
+                        + [c[3] for c in clipped], tol)
+    nx, ny = xi[E], yi[N]
+    if nx < 1 or ny < 1 or nx * ny > _COVER_MAX_CELLS:
+        return False
+    import numpy as np
+    cov = np.zeros((ny, nx), dtype=bool)
+    for w, s, e, n in clipped:
+        cov[yi[s]:yi[n], xi[w]:xi[e]] = True
+    return bool(cov.all())
+
+
+CoverStacks = Sequence[Tuple[List[Dict[str, Any]], Optional[FootprintIndex]]]
+
+
+def rect_cover_contributors(stacks: CoverStacks, tile_bbox: Dict[str, float],
+                            output_res_m: float
+                            ) -> Optional[List[Dict[str, Any]]]:
+    """The files of *stacks* — ``(infos, index)`` per entry, exactly as their
+    tile jobs read them (:func:`_tile_contributors`) — that feed one tile,
+    when their RECTANGLES cover every part of it plus its halo; else None.
+    Geometry only (the Map Converter's download estimate): holes inside the
+    files are found by the converter's ``[Tile] covered=`` count.
+
+    The halo is the rule's largest (max of the contributors' ``halo_deg`` and
+    0.6 output cells, longitude by the cos-latitude divisor). The test is an
+    exact union of the files' native rectangles, per CRS, over the region's
+    native window (densified transform, padded): files in one CRS must cover
+    it together; a union that needs two CRSs, a rotated/flipped file or a
+    CRS that cannot be transformed counts as not covered — conservative.
+    """
+    contrib: List[Dict[str, Any]] = []
+    for infos, index in stacks:
+        contrib.extend(info for _i, info, _h in _tile_contributors(
+            infos, tile_bbox, output_res_m, index=index))
+    if not contrib:
+        return None
+    hl = max([0.6 * output_res_m / 111_111.0]
+             + [info["halo_deg"] for info in contrib])
+    center_lat = (tile_bbox["north"] + tile_bbox["south"]) / 2.0
+    hlon = hl / max(math.cos(math.radians(center_lat)), 0.2)
+    region = {"west": tile_bbox["west"] - hlon,
+              "east": tile_bbox["east"] + hlon,
+              "south": tile_bbox["south"] - hl,
+              "north": tile_bbox["north"] + hl}
+    groups: Dict[Tuple[Any, ...], List[Dict[str, Any]]] = {}
+    for info in contrib:
+        if info.get("rotated"):
+            continue
+        key: Tuple[Any, ...] = (info.get("crs_authid") or "",
+                                info.get("crs_wkt") or "",
+                                info.get("crs_arg") or "")
+        if key == ("", "", ""):
+            key = ("", "", id(info))        # unknown CRS: stands alone
+        groups.setdefault(key, []).append(info)
+    for members in groups.values():
+        try:
+            win = _window_in_source_crs(region, members[0])
+            pad_x = _COVER_WINDOW_PAD * (win["east"] - win["west"])
+            pad_y = _COVER_WINDOW_PAD * (win["north"] - win["south"])
+            box = {"west": win["west"] - pad_x,
+                   "east": win["east"] + pad_x,
+                   "south": win["south"] - pad_y,
+                   "north": win["north"] + pad_y}
+        except Exception:  # noqa: BLE001 — no transform: cannot prove cover
+            continue
+        if _rects_cover([m.get("native_bounds") or {} for m in members], box):
+            return contrib
+    return None
+
+
+def files_cover_tile(stacks: CoverStacks, tile_bbox: Dict[str, float],
+                     output_res_m: float) -> bool:
+    """True when the RECTANGLES of the files of *stacks* cover one tile plus
+    its halo (:func:`rect_cover_contributors`). Geometry only — a file padded
+    with nodata still leaves holes, which only the converter's own
+    ``[Tile] covered=`` count reveals (the Map Converter's two-phase build);
+    this is what the download ESTIMATE uses (an upper bound of the pool
+    tiles a run fetches)."""
+    return rect_cover_contributors(stacks, tile_bbox, output_res_m) is not None
 
 
 #: Sidecar next to a pooled file-built tile: the tile_source_fingerprint it
@@ -3151,6 +4994,344 @@ def _write_source_fps(pool_dir: str, fps: Dict[str, Optional[str]],
                 os.remove(path)
         except OSError:
             pass
+
+
+# ---------------------------------------------------------------------------
+# Partial pool tiles — build only the part of a tile the site needs
+# ---------------------------------------------------------------------------
+#
+# A 50 km site at 90 m (1 deg tiles) touches 3-4 deg2 of tiles but needs
+# ~1.2 deg2 of terrain. For a FILE source (folder / file layer — the sources
+# whose bytes are a pure function of the files feeding each cell) a tile is
+# built for its region only: R = tile ∩ (sector bbox grown by
+# max(2 output px, 500 m)), snapped outward to the tile's pixel grid. The
+# converter job keeps the whole tile's geometry and lists only the files R
+# admits (normal halo), so every cell inside R samples exactly what a whole
+# build gives it and the rest is the usual void fill. XYZ downloads and
+# rendered services always build whole tiles.
+
+#: Region margin around the sector bbox: max(this many output px, metres).
+_REGION_MARGIN_PX = 2
+_REGION_MARGIN_M = 500.0
+
+
+class PoolTile(NamedTuple):
+    """Verdict of :func:`resolve_pool_tile` for one tile of one job."""
+
+    hit: bool
+    #: Pool file serving the job (``<name>`` or ``<name>.part``) on a hit.
+    path: Optional[str]
+    #: Hit: *path* is a ``.part``. Miss: the rebuild writes a ``.part``.
+    partial: bool
+    #: Miss: the regions to build (None = the whole tile).
+    regions: Optional[List[Dict[str, float]]]
+    #: hit | hit-part | missing | stale | flagged | outside
+    reason: str
+
+
+def _bbox_area(b: Optional[Dict[str, float]]) -> float:
+    if not b:
+        return 0.0
+    return max(0.0, b["east"] - b["west"]) * max(0.0, b["north"] - b["south"])
+
+
+def _tile_region(tile: Dict[str, Any], sector_bbox: Dict[str, float],
+                 output_res_m: float) -> Optional[Dict[str, float]]:
+    """The part of *tile* a job over *sector_bbox* needs: the tile ∩ the
+    bbox grown by ``max(2 output px, 500 m)``, snapped OUTWARD to the tile's
+    own pixel grid (bit-identical edges for the same tile, so unions and
+    containment are exact). None when that is the whole tile."""
+    tb = _subtile_bbox(tile)
+    size = int(tile["size_px"])
+    res_deg = tile["exact_res_m"] / 111_111.0
+    margin_m = max(_REGION_MARGIN_PX * float(output_res_m), _REGION_MARGIN_M)
+    m_lat = margin_m / 111_111.0
+    lat = min(max(abs(sector_bbox["north"]), abs(sector_bbox["south"])), 89.9)
+    m_lon = m_lat / max(math.cos(math.radians(lat)), 1e-6)
+    eps = 1e-9
+    c0 = max(0, math.floor((sector_bbox["west"] - m_lon - tb["west"])
+                           / res_deg + eps))
+    c1 = min(size, math.ceil((sector_bbox["east"] + m_lon - tb["west"])
+                             / res_deg - eps))
+    r0 = max(0, math.floor((tb["north"] - sector_bbox["north"] - m_lat)
+                           / res_deg + eps))
+    r1 = min(size, math.ceil((tb["north"] - sector_bbox["south"] + m_lat)
+                             / res_deg - eps))
+    if (c0 == 0 and r0 == 0 and c1 == size and r1 == size) or \
+            c1 <= c0 or r1 <= r0:
+        return None                 # whole tile (or degenerate: be whole)
+    return {"west": tile["ul_lon"] + c0 * res_deg,
+            "east": tile["ul_lon"] + c1 * res_deg,
+            "north": tile["ul_lat"] - r0 * res_deg,
+            "south": tile["ul_lat"] - r1 * res_deg}
+
+
+def tile_regions(subtiles: List[Dict[str, Any]], sector_bbox: Dict[str, float],
+                 resolution_m: float, output_res_m: Optional[float] = None,
+                 partial: bool = True) -> Dict[str, Optional[Dict[str, float]]]:
+    """``{tile name: region or None}`` for one job's tiles (*partial* False:
+    every tile whole). The margin's output pixel is the coarser of the tile
+    resolution and *output_res_m* (a range profile's output grid). THE region
+    rule — :func:`prepare_terrain`, :func:`prepare_terrain_profile`,
+    :func:`terrain_plan` and :func:`run_region_union` all call it."""
+    px = max(float(resolution_m), float(output_res_m or 0.0))
+    return {t["filename"]: (_tile_region(t, sector_bbox, px) if partial
+                            else None)
+            for t in subtiles}
+
+
+def _merge_regions(regions: Sequence[Dict[str, float]]
+                   ) -> List[Dict[str, float]]:
+    """*regions* without duplicates and without a region lying inside
+    another one, in a stable order."""
+    def inside(a: Dict[str, float], b: Dict[str, float]) -> bool:
+        return (b["west"] <= a["west"] and a["east"] <= b["east"]
+                and b["south"] <= a["south"] and a["north"] <= b["north"])
+    uniq: List[Dict[str, float]] = []
+    for r in sorted((dict(r) for r in regions),
+                    key=lambda r: (-_bbox_area(r), r["south"], r["west"],
+                                   r["north"], r["east"])):
+        if not any(inside(r, u) for u in uniq):
+            uniq.append(r)
+    return sorted(uniq, key=lambda r: (r["south"], r["west"], r["north"],
+                                       r["east"]))
+
+
+def _part_paths(pool_dir: str, name: str) -> Tuple[str, str]:
+    return (os.path.join(pool_dir, name + _PART_SUFFIX),
+            os.path.join(pool_dir, name + _PART_META_SUFFIX))
+
+
+def _read_part_meta(pool_dir: str, spec: Dict[str, Any],
+                    listing: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """The ``.part.json`` of tile *spec* when it is BOUND — the ``.part``
+    is whole (the tile rule, :func:`_listed_tile_whole`), its size + mtime
+    are the ones the sidecar recorded, the extent is this tile's — else
+    None (absent, corrupt, or stale: treated as no partial tile)."""
+    name = spec["filename"]
+    entry = listing.get(name + _PART_SUFFIX)
+    if entry is None or (name + _PART_META_SUFFIX) not in listing:
+        return None
+    try:
+        with open(os.path.join(pool_dir, name + _PART_META_SUFFIX), "r",
+                  encoding="utf-8") as fh:
+            meta = json.load(fh)
+        st = entry.stat()
+        if (int(meta["abt_size"]) != st.st_size
+                or int(meta["abt_mtime"]) != st.st_mtime_ns):
+            return None
+        extent = _subtile_bbox(spec)
+        if any(abs(float(meta["extent"][k]) - extent[k]) > 1e-9
+               for k in ("west", "east", "south", "north")):
+            return None
+        regions = [{"bbox": {k: float(r["bbox"][k])
+                             for k in ("west", "east", "south", "north")},
+                    "fp": r.get("fp")} for r in meta["regions"]]
+        if not regions:
+            return None
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+    if not _listed_tile_whole(listing, spec, pool_dir, name + _PART_SUFFIX):
+        return None
+    return {"regions": regions, "mtime_ns": st.st_mtime_ns}
+
+
+def _write_part_meta(pool_dir: str, spec: Dict[str, Any],
+                     regions: List[Dict[str, Any]],
+                     st: Optional[os.stat_result] = None) -> bool:
+    """Write the ``.part.json`` of tile *spec* (temp + rename), bound to
+    the ``.part`` file's size + mtime — *st* (the build's own file, statted
+    before it was renamed into place, so a concurrent build's file can never
+    inherit these regions) or the file as it is now. *regions*:
+    ``[{"bbox", "fp"}]``."""
+    part, meta_path = _part_paths(pool_dir, spec["filename"])
+    tmp = f"{meta_path}.{os.getpid()}.tmp"
+    try:
+        st = st or os.stat(part)
+        meta = {"extent": _subtile_bbox(spec), "regions": regions,
+                "abt_size": st.st_size, "abt_mtime": st.st_mtime_ns}
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(meta, fh)
+        replace_with_retry(tmp, meta_path)
+        return True
+    except OSError as exc:
+        _remove_quietly(tmp)
+        _log(f"  WARNING: could not record the regions of "
+             f"{os.path.basename(part)}: {exc}")
+        return False
+
+
+def _remove_quietly(*paths: str) -> None:
+    for path in paths:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+
+def resolve_pool_tile(pool_dir: str, spec: Dict[str, Any],
+                      region: Optional[Dict[str, float]] = None,
+                      fp_of: Optional[Callable[[Dict[str, float]],
+                                               Optional[str]]] = None,
+                      listing: Optional[Dict[str, Any]] = None,
+                      extra_regions: Optional[
+                          Sequence[Dict[str, float]]] = None,
+                      for_link: bool = False) -> PoolTile:
+    """THE pool hit rule for one tile of one job — the only way a ``.part``
+    is ever reached (prepare_terrain, prepare_terrain_profile, the views,
+    terrain_plan; Processing, the P2P tab and the torture runner come
+    through those).
+
+    *region*: the part of the tile the job needs (:func:`tile_regions`;
+    None = all of it). *fp_of(bbox)*: :func:`tile_source_fingerprint` of the
+    files feeding *bbox* (None = no fingerprint check: XYZ / rendered
+    pools, or the pre-run estimate without the folder index).
+
+    1. complete ``<name>`` + current ``.src`` (``fp_of`` of the whole tile),
+       no ``.rebuild`` flag → hit (today's rule);
+    2. else a bound ``.part`` (:func:`_read_part_meta`) whose regions cover
+       *region*, every region's fingerprint current, no ``.rebuild`` flag →
+       hit;
+    3. else miss: rebuild *region* ∪ the ``.part``'s regions ∪
+       *extra_regions* (the run's union, :func:`run_region_union`) — the
+       whole tile (``regions`` None) when that union covers it.
+
+    *for_link* (the view step, after the build decided): no flag and no
+    fingerprint check — the complete tile, or a bound ``.part`` covering
+    *region*; when both are there the newer one (the run's latest build).
+    """
+    name = spec["filename"]
+    if listing is None:
+        listing = _pool_listing(pool_dir)
+    if for_link:
+        return _link_verdict(pool_dir, spec, region, listing)
+    flagged = (name + _REBUILD_SUFFIX) in listing
+    reason = "missing"
+    if _listed_tile_ready(listing, spec, pool_dir):
+        # Whole and not flagged: today's rule, decided before any .part.
+        if fp_of is None or (
+                (_read_source_fp(pool_dir, name)
+                 if name + _SOURCE_FP_SUFFIX in listing else None)
+                == fp_of(_subtile_bbox(spec))):
+            return PoolTile(True, os.path.join(pool_dir, name), False, None,
+                            "hit")
+        reason = "stale"
+    elif flagged and _listed_tile_whole(listing, spec, pool_dir):
+        reason = "flagged"
+    meta = _read_part_meta(pool_dir, spec, listing)
+    if meta is not None and region is not None:
+        state = _part_state(meta, region, fp_of, flagged)
+        if state == "hit-part":
+            return PoolTile(True, os.path.join(pool_dir, name + _PART_SUFFIX),
+                            True, None, state)
+        if not (state == "outside" and reason != "missing"):
+            reason = state
+    return _miss_verdict(spec, region,
+                         [r["bbox"] for r in meta["regions"]] if meta else [],
+                         extra_regions, reason)
+
+
+def _part_state(meta: Dict[str, Any], region: Dict[str, float],
+                fp_of: Optional[Callable[[Dict[str, float]], Optional[str]]],
+                flagged: bool) -> str:
+    """Step 2 of :func:`resolve_pool_tile` for a bound ``.part``:
+    ``hit-part``, or why not (``flagged`` / ``outside`` / ``stale``)."""
+    if flagged:
+        return "flagged"
+    if not _rects_cover([r["bbox"] for r in meta["regions"]], region):
+        return "outside"
+    if fp_of is None or all(fp_of(r["bbox"]) == r["fp"]
+                            for r in meta["regions"]):
+        return "hit-part"
+    return "stale"
+
+
+def _miss_verdict(spec: Dict[str, Any], region: Optional[Dict[str, float]],
+                  known: List[Dict[str, float]],
+                  extra_regions: Optional[Sequence[Dict[str, float]]],
+                  reason: str) -> PoolTile:
+    """Step 3 of :func:`resolve_pool_tile`: what a rebuild covers — *region*
+    ∪ the ``.part``'s regions (*known*) ∪ the run's union; the whole tile
+    when the job needs all of it or the union covers it."""
+    if region is None:
+        return PoolTile(False, None, False, None, reason)
+    union = _merge_regions(list(known) + [region] + list(extra_regions or ()))
+    if _rects_cover(union, _subtile_bbox(spec)):
+        return PoolTile(False, None, False, None, reason)
+    return PoolTile(False, None, True, union, reason)
+
+
+def _link_verdict(pool_dir: str, spec: Dict[str, Any],
+                  region: Optional[Dict[str, float]],
+                  listing: Dict[str, Any]) -> PoolTile:
+    """``resolve_pool_tile(for_link=True)``: the complete tile, or a bound
+    ``.part`` covering *region* — the newer of the two when both are there
+    (the run's latest build); flags and fingerprints were the build's
+    business."""
+    name = spec["filename"]
+    whole = PoolTile(True, os.path.join(pool_dir, name), False, None, "hit")
+    part = PoolTile(True, os.path.join(pool_dir, name + _PART_SUFFIX), True,
+                    None, "hit-part")
+    complete = _listed_tile_whole(listing, spec, pool_dir)
+    meta = _read_part_meta(pool_dir, spec, listing)
+    covers = (meta is not None and region is not None
+              and _rects_cover([r["bbox"] for r in meta["regions"]], region))
+    if complete and covers:
+        try:
+            if meta["mtime_ns"] > listing[name].stat().st_mtime_ns:
+                return part
+        except (OSError, KeyError):
+            pass
+        return whole
+    if complete:
+        return whole
+    if covers:
+        return part
+    return PoolTile(False, None, False, None, "missing")
+
+
+def run_region_union(jobs: Sequence[Any]) -> Dict[str, List[Dict[str, float]]]:
+    """Per tile name, the regions ALL *jobs* of one run need — so a tile
+    several jobs share is built once, with their union, by the first of them
+    (``prepare_terrain(..., region_union=...)``, also through
+    :func:`prepare_terrain_profile`). *jobs*: CoverageParams-like objects
+    (``tx_lat``, ``tx_lon``, ``max_range_km``, ``resolution_m``,
+    ``az_start``, ``az_end``, ``range_profile``). A job needing a whole tile
+    contributes the tile's own extent. Geometry only — no I/O."""
+    out: Dict[str, List[Dict[str, float]]] = {}
+
+    def add(tiles: List[Dict[str, Any]], bbox: Dict[str, float],
+            res: float, output_res: Optional[float]) -> None:
+        regions = tile_regions(tiles, bbox, res, output_res)
+        for t in tiles:
+            r = regions[t["filename"]] or _subtile_bbox(t)
+            out.setdefault(t["filename"], []).append(r)
+
+    for p in jobs:
+        bands = getattr(p, "range_profile", None)
+        if bands:
+            for (_i, _until_km, step, _inner, bbox, tiles,
+                 _skip) in _profile_band_tiles(p.tx_lat, p.tx_lon, bands,
+                                               p.az_start, p.az_end):
+                add(tiles, bbox, step, p.resolution_m)
+        else:
+            bbox = _compute_sector_bbox(p.tx_lat, p.tx_lon, p.max_range_km,
+                                        p.az_start, p.az_end)
+            add(_compute_subtiles(bbox, p.resolution_m, p.tx_lat, p.tx_lon,
+                                  p.max_range_km, p.az_start, p.az_end),
+                bbox, p.resolution_m, None)
+    return {name: _merge_regions(rs) for name, rs in out.items()}
+
+
+def _partial_capable_source(source: str) -> bool:
+    """Can a pool of *source* hold partial tiles? Files and folders yes (the
+    pre-run estimate's guess without the folder index); XYZ and rendered
+    services never."""
+    if not source or "type=xyz" in source:
+        return False
+    base = source.partition("|")[0]
+    return (os.path.isdir(source) or os.path.isfile(base)
+            or source.startswith("/vsi"))
 
 
 #: Kept for callers that imported it: the folder scan's extension list
@@ -3185,16 +5366,17 @@ def list_abt_tiles(terrain_dir: str) -> List[str]:
     `engines/p2p.rs`, `engines/cpu_coverage.rs`), so tiles in sub-directories
     are invisible to it. Reporting them here would promise coverage the run
     would not have.
+
+    One ``scandir`` through the folder's header index
+    (:func:`abt_index.tile_names`), reused for ``abt_index.FRESH_S`` while
+    the folder's own mtime holds — it used to be a listing plus one
+    ``isfile`` per file on every call (~5 s for 2,463 tiles on the
+    container's Windows mount, several calls per run).
     """
-    try:
-        return sorted(
-            os.path.join(terrain_dir, f)
-            for f in os.listdir(terrain_dir)
-            if f.lower().endswith(".abt")
-            and os.path.isfile(os.path.join(terrain_dir, f))
-        )
-    except OSError:
+    if not terrain_dir or not os.path.isdir(terrain_dir):
         return []
+    return [os.path.join(terrain_dir, n)
+            for n in abt_index.tile_names(terrain_dir)]
 
 
 def is_abt_tile_dir(terrain_dir: Optional[str]) -> bool:
@@ -3204,8 +5386,366 @@ def is_abt_tile_dir(terrain_dir: Optional[str]) -> bool:
     convert — the two look alike in a folder picker but must not be conflated:
     handing `.abt` files to the converter as `sources` would fail, and running
     the conversion at all would waste the work the Map Converter already did.
+    Answered from the memoised listing (:func:`list_abt_tiles`), so asking
+    again within a run costs one ``stat`` of the folder.
     """
-    return bool(terrain_dir) and bool(list_abt_tiles(terrain_dir))
+    return bool(list_abt_tiles(terrain_dir)) if terrain_dir else False
+
+
+# ---------------------------------------------------------------------------
+# The Map Converter's record of an output folder (.waveshed_tiles.json)
+# ---------------------------------------------------------------------------
+
+#: The manifest the Map Converter keeps in its output folder: read back by
+#: the Map Converter (rebuild by fingerprint) and, when that folder is used
+#: as prepared terrain, by Site Analysis and P2P (do its tiles carry
+#: buildings? — :func:`prepared_buildings`).
+TILES_MANIFEST = ".waveshed_tiles.json"
+#: Schema 2 (2026-10-23): ``{"schema": 2, "tiles": {name: fingerprint},
+#: "buildings": {name: record}}``; schema 1 had ``tiles`` only (buildings
+#: unknown). ``tiles`` keeps its schema-1 meaning, so an older plugin reads
+#: a schema-2 file's fingerprints unchanged (and drops the buildings
+#: records when it rewrites it — "unknown" again, never a wrong record).
+#: Optional key ``"voids"`` (2026-10-25, no schema change): name →
+#: ``{"voids": n, "abt_size": bytes, "abt_mtime": ns}`` — the converter's
+#: ``[Tile] … voids=`` count (:func:`parse_tile_voids_line`) of a terrain
+#: POOL tile, bound like a ``.part.json`` to the size + mtime of the file it
+#: describes. The same file in a pool directory holds only these records
+#: (written by the download / Site Analysis ingest, read by the views,
+#: :func:`_view_voids`); absent, unbound or malformed = unknown. Written
+#: only when a record exists, so a manifest without one is byte-identical to
+#: before; an older plugin reads the file unchanged and drops the key when
+#: it rewrites it (unknown again).
+TILES_MANIFEST_SCHEMA = 2
+#: A tile's buildings record — what its job burned, written only once the
+#: converter's report of that batch was checked (``osm_buildings``
+#: ``BurnMonitor``); sources join with "+" (``file+openfreemap:z14``).
+BUILDINGS_OSM = _OSM_BUILDINGS_SOURCE_ID
+BUILDINGS_FILE = "file"
+BUILDINGS_NONE = "none"
+#: Written while the buildings could not be verified (the tile is rebuilt
+#: by the next Map Converter run; its fingerprint record is no fingerprint).
+BUILDINGS_UNVERIFIED = "unverified"
+
+
+class TilesManifest(NamedTuple):
+    """One output folder's manifest: ``schema`` (0 = none readable),
+    ``tiles`` name → fingerprint record, ``buildings`` name → buildings
+    record (schema >= 2 only), ``voids`` name → void-count record (the
+    optional key, schema >= 2; see :data:`TILES_MANIFEST_SCHEMA`)."""
+    schema: int
+    tiles: Dict[str, str]
+    buildings: Dict[str, str]
+    voids: Dict[str, Dict[str, int]] = types.MappingProxyType({})
+
+
+def _voids_records(raw: Any) -> Dict[str, Dict[str, int]]:
+    """The well-formed records of a manifest's ``"voids"`` value (an
+    absent key, or a record without a non-negative integer count and its
+    binding, is no record — unknown)."""
+    out: Dict[str, Dict[str, int]] = {}
+    if not isinstance(raw, dict):
+        return out
+    for name, rec in raw.items():
+        try:
+            n, size, mtime = (int(rec["voids"]), int(rec["abt_size"]),
+                              int(rec["abt_mtime"]))
+        except (KeyError, TypeError, ValueError):
+            continue
+        if n >= 0 and size >= 0:
+            out[str(name)] = {"voids": n, "abt_size": size,
+                              "abt_mtime": mtime}
+    return out
+
+
+def read_tiles_manifest(folder: str) -> TilesManifest:
+    """*folder*'s :data:`TILES_MANIFEST`, schema 1 or 2 (schema 1: no
+    buildings or void-count records); an absent or unreadable file is
+    schema 0, empty."""
+    try:
+        with open(os.path.join(folder, TILES_MANIFEST), "r",
+                  encoding="utf-8") as fh:
+            doc = json.load(fh)
+        tiles = dict(doc.get("tiles") or {})
+        try:
+            schema = int(doc.get("schema") or 1)
+        except (TypeError, ValueError):
+            schema = 1
+        records = (dict(doc.get("buildings") or {}) if schema >= 2 else {})
+        voids = _voids_records(doc.get("voids")) if schema >= 2 else {}
+        return TilesManifest(schema, tiles,
+                             {k: str(v) for k, v in records.items() if v},
+                             voids)
+    except (OSError, ValueError, AttributeError, TypeError):
+        return TilesManifest(0, {}, {}, {})
+
+
+#: ONE lock around every read-modify-write of a manifest: the ingest
+#: batches of a run record their tiles one after the other, never over
+#: each other's records.
+_TILES_MANIFEST_LOCK = threading.Lock()
+
+
+def write_tiles_manifest(folder: str, updates: Dict[str, Optional[str]],
+                         buildings: Optional[Dict[str, Optional[str]]] = None,
+                         voids: Optional[Dict[str, Optional[Dict[str, int]]]]
+                         = None) -> None:
+    """Merge *updates* (name → fingerprint; a false value drops the tile's
+    records) and their *buildings* records (name → record; a name of
+    *updates* without one has none afterwards — unknown) into *folder*'s
+    manifest, written as schema :data:`TILES_MANIFEST_SCHEMA`:
+    read-modify-write under one lock, a temp file beside it moved over it
+    (:func:`replace_with_retry`), so a reader never sees half a file and no
+    writer loses another's records. Best effort: a write that fails leaves
+    the previous manifest. *voids* (name → void-count record, a false value
+    drops it) is merged on its own — a name it does not mention keeps its
+    record; the ``"voids"`` key is written only while a record exists."""
+    path = os.path.join(folder, TILES_MANIFEST)
+    with _TILES_MANIFEST_LOCK:
+        cur = read_tiles_manifest(folder)
+        tiles, records = dict(cur.tiles), dict(cur.buildings)
+        counts = dict(cur.voids)
+        for name, fp in updates.items():
+            rec = (buildings or {}).get(name)
+            if fp:
+                tiles[name] = fp
+            else:
+                tiles.pop(name, None)
+                counts.pop(name, None)
+            if fp and rec:
+                records[name] = rec
+            else:
+                records.pop(name, None)
+        for name, count in (voids or {}).items():
+            if count:
+                counts[name] = dict(count)
+            else:
+                counts.pop(name, None)
+        doc: Dict[str, Any] = {"schema": TILES_MANIFEST_SCHEMA,
+                               "tiles": tiles, "buildings": records}
+        if counts:
+            doc["voids"] = counts
+        tmp = f"{path}.{os.getpid()}-{threading.get_ident()}.tmp"
+        try:
+            with open(tmp, "w", encoding="utf-8") as fh:
+                json.dump(doc, fh)
+            replace_with_retry(tmp, path)
+        except OSError:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+
+
+# ---------------------------------------------------------------------------
+# Void counts of pool tiles (aether_converter >= 0.2.11)
+# ---------------------------------------------------------------------------
+#
+# A Site Analysis view fills a pool tile's voids to 0 m (_fill_view_voids);
+# knowing WHICH tiles have any used to mean reading every one
+# (_tile_has_voids): 119 tiles of 2 m, 7.3 GB memory-mapped, 18 s on the
+# owner's machine (2026-10-24) for the two that had voids. The converter
+# >= 0.2.11 prints each written tile's count (parse_tile_voids_line); it is
+# recorded in the pool's TILES_MANIFEST ("voids", bound to the file's size
+# + mtime), and the view links a tile recorded void-free without reading
+# it, fills one recorded with voids without a scan first, and scans only a
+# tile without a bound record — exactly as before.
+
+def _voids_record(path: str, voids: int) -> Optional[Dict[str, int]]:
+    """The void-count record of the file at *path* — *voids* bound to its
+    size + mtime now; None when it cannot be stat'ed."""
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    return {"voids": int(voids), "abt_size": st.st_size,
+            "abt_mtime": st.st_mtime_ns}
+
+
+def _bound_voids(rec: Any, st: os.stat_result) -> Optional[int]:
+    """*rec*'s count when it is bound to the file *st* describes (same size
+    and mtime), else None."""
+    try:
+        if (rec and int(rec["abt_size"]) == st.st_size
+                and int(rec["abt_mtime"]) == st.st_mtime_ns):
+            n = int(rec["voids"])
+            return n if n >= 0 else None
+    except (KeyError, TypeError, ValueError):
+        pass
+    return None
+
+
+def _record_pool_voids(pool_dir: str,
+                       records: Dict[str, Optional[Dict[str, int]]]) -> None:
+    """Merge *records* (name → void-count record; None = unknown, the
+    tile's record dropped) into the pool's manifest. Only drops and none of
+    them recorded → nothing is written (no manifest appears in a pool whose
+    converter prints no counts). Best effort: never fails a run."""
+    if not records:
+        return
+    try:
+        if not any(records.values()):
+            held = read_tiles_manifest(pool_dir).voids
+            if not any(name in held for name in records):
+                return
+        write_tiles_manifest(pool_dir, {}, None, voids=records)
+    except Exception as exc:  # noqa: BLE001 — a record never fails a run
+        _log(f"  (void counts of {len(records)} pool tile(s) not recorded: "
+             f"{exc})")
+
+
+def _view_voids(pool_dir: str, names: Sequence[str],
+                tiles: Optional[Dict[str, Tuple[Dict[str, Any],
+                                                Optional[Dict[str, float]]]]
+                       ] = None,
+                run: Optional[Dict[str, Dict[str, int]]] = None
+                ) -> Dict[str, Optional[int]]:
+    """*voids* for :func:`_sync_view`: per name, the recorded void count of
+    the pool file the view links — this run's record (*run*, name → record)
+    first, else the pool manifest's (a cache HIT: an earlier run's) — when
+    it is bound to that file as it is now; None = unknown (no record, or a
+    record of another file). *tiles* as for :func:`_sync_view`: a
+    ``.part``-backed name resolves its file the way the view does
+    (:func:`resolve_pool_tile`, ``for_link``) and keeps the scan unless a
+    record is bound to that file."""
+    held = read_tiles_manifest(pool_dir).voids
+    if not held and not run:
+        return {name: None for name in names}
+    listing = _pool_listing(pool_dir) if tiles else {}
+    out: Dict[str, Optional[int]] = {}
+    for name in names:
+        if tiles is not None and name in tiles:
+            spec, region = tiles[name]
+            src: Optional[str] = resolve_pool_tile(
+                pool_dir, spec, region, listing=listing, for_link=True).path
+        else:
+            src = os.path.join(pool_dir, name)
+        count: Optional[int] = None
+        try:
+            st = os.stat(src) if src is not None else None
+        except OSError:
+            st = None
+        if st is not None:
+            for rec in ((run or {}).get(name), held.get(name)):
+                count = _bound_voids(rec, st)
+                if count is not None:
+                    break
+        out[name] = count
+    return out
+
+
+#: :func:`prepared_buildings` states.
+PREPARED_ALL = "all"
+PREPARED_NONE = "none"
+PREPARED_MIXED = "mixed"
+PREPARED_UNKNOWN = "unknown"
+
+
+class PreparedBuildings(NamedTuple):
+    """Do the tiles a run takes from a prepared ``.abt`` folder carry
+    buildings? ``state``: ``all`` / ``none`` (every tile recorded with /
+    without), ``unknown`` (no tile has a record — no manifest, schema 1, a
+    tile not built by the Map Converter, or ``unverified``), else ``mixed``.
+    ``sources``: the records of the tiles with buildings."""
+    state: str
+    with_buildings: int
+    without: int
+    unknown: int
+    sources: Tuple[str, ...]
+
+    @property
+    def total(self) -> int:
+        return self.with_buildings + self.without + self.unknown
+
+    def counts(self) -> str:
+        """``"3 with buildings (openfreemap:z14), 1 without, 2 not
+        recorded — of 6 tile(s)"``."""
+        parts = []
+        if self.with_buildings:
+            parts.append(f"{self.with_buildings:,} with buildings"
+                         + (f" ({', '.join(self.sources)})"
+                            if self.sources else ""))
+        if self.without:
+            parts.append(f"{self.without:,} without")
+        if self.unknown:
+            parts.append(f"{self.unknown:,} not recorded")
+        return f"{', '.join(parts) or 'none'} — of {self.total:,} tile(s)"
+
+
+def prepared_buildings(terrain_dir: str, tiles: Iterable[str]
+                       ) -> PreparedBuildings:
+    """The buildings records (:func:`read_tiles_manifest`, schema 2) of
+    *tiles* — the names or paths of the tiles a run SELECTED from the
+    prepared folder *terrain_dir* (``select_abt_tiles``). One manifest read,
+    GUI-free; Site Analysis (dialogs) and P2P (a log line) share it."""
+    names = sorted({os.path.basename(str(t)) for t in tiles})
+    man = read_tiles_manifest(terrain_dir)
+    with_b = without = unknown = 0
+    sources: set = set()
+    for name in names:
+        rec = man.buildings.get(name)
+        if not rec or rec == BUILDINGS_UNVERIFIED:
+            unknown += 1
+        elif rec == BUILDINGS_NONE:
+            without += 1
+        else:
+            with_b += 1
+            sources.update(r for r in rec.split("+") if r)
+    total = len(names)
+    if total == 0 or unknown == total:
+        state = PREPARED_UNKNOWN
+    elif with_b == total:
+        state = PREPARED_ALL
+    elif without == total:
+        state = PREPARED_NONE
+    else:
+        state = PREPARED_MIXED
+    return PreparedBuildings(state, with_b, without, unknown,
+                             tuple(sorted(sources)))
+
+
+def prepared_buildings_line(state: PreparedBuildings, requested: bool
+                            ) -> Optional[str]:
+    """One log line on the buildings of a prepared folder's selected tiles
+    (``WARNING:`` when buildings were *requested* and are not all there;
+    None when none were requested and none are recorded)."""
+    counts = state.counts()
+    if not requested:
+        if state.with_buildings:
+            return (f"buildings: the prepared terrain carries buildings "
+                    f"({counts}) although none were requested — they are "
+                    f"part of its tiles")
+        return None
+    if state.state == PREPARED_ALL:
+        return (f"buildings: the prepared terrain already carries buildings "
+                f"({counts}) — nothing is added")
+    if state.state == PREPARED_NONE:
+        return (f"WARNING: buildings were requested, but the prepared "
+                f"terrain carries none ({counts}) — they cannot be added to "
+                f"a prepared folder; build it with buildings in the Map "
+                f"Converter")
+    if state.state == PREPARED_MIXED:
+        return (f"WARNING: buildings were requested; the prepared terrain "
+                f"carries them only in part ({counts}) — nothing is added")
+    return (f"WARNING: buildings were requested, but whether the prepared "
+            f"terrain carries any is not recorded ({counts}; no Map "
+            f"Converter record of its buildings) — nothing is added to a "
+            f"prepared folder")
+
+
+def _log_prepared_buildings(terrain_dir: str, selection: "AbtSelection",
+                            requested: bool) -> None:
+    """Log :func:`prepared_buildings_line` for *selection*'s tiles (the
+    prepared-folder routes of prepare_terrain / prepare_terrain_profile —
+    Processing and the torture runner see no dialog)."""
+    try:
+        state = prepared_buildings(terrain_dir, selection.paths)
+    except Exception as exc:  # noqa: BLE001 — a note never stops a run
+        _log(f"  (prepared-terrain buildings check skipped: {exc})")
+        return
+    line = prepared_buildings_line(state, requested)
+    if line:
+        _log(f"  {line}")
 
 
 def _dataset_wgs84_bbox(ds) -> Optional[Dict[str, float]]:
@@ -3290,21 +5830,27 @@ def _abt_resolution_warning(headers: List[Any],
 class AbtSelection(NamedTuple):
     """Which pre-built tiles a run uses — chosen here, never by the engine.
 
-    ``paths``: exactly one tile per footprint, the one whose resolution is the
-    step that footprint needs. ``substitutions``: human-readable lines for every
-    footprint that needs a resolution the folder does not have there and gets
-    the closest one instead — shown to the user before the run, never silent.
-    ``summary``: one log line, e.g. ``2 m × 6 tile(s), 30 m × 12 tile(s)``.
+    ``paths``: exactly one tile per footprint used. ``substitutions``:
+    human-readable lines for every footprint that had to take a resolution
+    COARSER than the ground it serves needs — shown to the user before the
+    run, never silent. ``summary``: one log line, e.g. ``2 m × 6 tile(s),
+    30 m × 12 tile(s)``. ``finer``: footprints that took a FINER resolution
+    than needed (closest the folder had there; logged, no dialog).
+    ``uncovered``: 0.25° cells (``north/south/west/east`` dicts) of the
+    sector ∩ folder extent that the folder has data for but no chosen tile
+    covers — the engine would see NODATA there. Expected empty (see
+    :func:`select_abt_headers`); listed, never silent, if it ever is not.
     """
 
     paths: List[str]
     substitutions: List[str]
     summary: str
+    finer: Sequence[str] = ()
+    uncovered: Sequence[Dict[str, float]] = ()
 
 
 def _abt_nominal_res(header: Any) -> int:
     """A tile's resolution in metres, snapped to the plugin's list."""
-    from .job_builder import VALID_RESOLUTIONS
     res = header.pixel_res * 111_111.0
     return min(VALID_RESOLUTIONS, key=lambda r: abs(r - res))
 
@@ -3322,6 +5868,453 @@ def _rect_distance_range_m(n: float, s: float, w: float, e: float,
     return near, far
 
 
+#: Edge (degrees) of the uncovered-cell check grid of :func:`select_abt_headers`.
+ABT_HOLE_CELL_DEG = 0.25
+
+#: Smallest bucket edge (degrees) of the rectangle lookups in
+#: :func:`select_abt_headers` (the smallest footprint span otherwise, ≤ 1°).
+_SEL_BUCKET_MIN_DEG = 0.05
+
+
+class _RectBuckets:
+    """Rectangles ``(n, s, w, e)`` bucketed on a square grid, for point
+    lookups (inclusive edges)."""
+
+    def __init__(self, cell: float) -> None:
+        self.cell = cell
+        self.grid: Dict[Tuple[int, int], List[Any]] = {}
+
+    def add(self, item: Any, rect: Tuple[float, float, float, float]) -> None:
+        n, s_, w, e = rect
+        c, grid = self.cell, self.grid
+        cols = range(math.floor(w / c), math.floor(e / c) + 1)
+        for i in range(math.floor(s_ / c), math.floor(n / c) + 1):
+            for j in cols:
+                got = grid.get((i, j))
+                if got is None:
+                    grid[(i, j)] = [item]
+                else:
+                    got.append(item)
+
+    def at(self, lat: float, lon: float) -> List[Any]:
+        return self.grid.get((math.floor(lat / self.cell),
+                              math.floor(lon / self.cell)), [])
+
+
+def _cut_lines(values: List[float], eps: float = 1e-9) -> List[float]:
+    """*values* (the two ends first) sorted, without repeats closer than
+    *eps* — the ends kept exactly."""
+    lo, hi = values[0], values[1]
+    out = [lo]
+    for v in sorted(values[2:]):
+        if v - out[-1] > eps and hi - v > eps:
+            out.append(v)
+    out.append(hi)
+    return out
+
+
+def select_abt_headers(headers: Sequence[Any], tx_lat: float, tx_lon: float,
+                       bands: Sequence[Tuple[float, int]],
+                       az_start: float = 0.0,
+                       az_end: float = 360.0) -> AbtSelection:
+    """:func:`select_abt_tiles` on headers already read (``abt.TileHeader``
+    sequence, sorted by path) — pure geometry, no file access.
+
+    A footprint (corner + extent) is in play when it meets the sector bbox
+    and a band ring; its *wanted step* is the finest step any ring crossing
+    it needs. Only its NEEDED part counts: footprint ∩ sector bbox, within
+    the outermost ring — cut into cells by the edges of the footprints
+    overlapping it and sampled at each cell's point nearest the TX (exact,
+    see :meth:`_AbtChooser._points`). Each point wants the step of its
+    ring; its *limit* is that step where any footprint there holds it or
+    finer, else the finest resolution the folder has there (a true gap).
+
+    * Pass 1: every footprint holding a tile of exactly its wanted step is
+      chosen with that tile.
+    * Pass 2: a point no chosen tile of resolution ≤ its limit covers is
+      open; it belongs to every footprint there whose finest tile is ≤ its
+      limit (finer serves, a coarser tile never stands in where the folder
+      has the step or finer). A footprint with no open point is left out,
+      silently; else it is chosen with its coarsest tile ≤ the finest limit
+      of its open points, which serves them all: coarser than the step they
+      want → ``substitutions`` (a true gap), finer → ``finer``. Footprints
+      are taken best match first — the smallest resolution mismatch
+      (ratio), smaller footprint first — and re-ranked when a choice serves
+      points they share.
+
+    So every needed point a footprint could serve gets a tile, and a folder
+    holding the step over the whole needed part gives exactly that step's
+    tiles. The first two-pass version judged coverage over the WHOLE
+    footprint at 5×5 sample points: it added a 0.5° 30 m tile for its
+    samples outside a 50 km sector, with a false "needs 10 m, only 30 m"
+    (six of them on the owner's 10 m run), and a 2 m tile for samples
+    between 50 km and the bbox corner — the engine then ran on a 2 m grid
+    (VRAM 2.8 instead of 1.4 GB). The single pass before it (until
+    2026-10-23) dropped a footprint lacking its step whenever other
+    footprints merely HELD that step — never asking whether those were
+    themselves chosen; two such footprints dropped each other and left
+    holes (the owner's 31.5 / 126 / 500 km run: 44 cells of 0.25°, NODATA
+    in the engine, nothing logged). Best match first matters: taking
+    smaller footprints first instead picks 2 m tiles for the 30/90 m rings
+    of that run (330 tiles, 19.8 GiB, against the engine's ~3.86 GB
+    terrain atlas) where 0.5° / 1° tiles of the right step exist.
+    """
+    if not headers or not bands:
+        return AbtSelection([], [], "no tiles in range")
+    chooser = _AbtChooser(headers, tx_lat, tx_lon, bands, az_start, az_end)
+    if not chooser.rects:
+        return AbtSelection([], [], "no tiles in range")
+    chooser.pass1()
+    chooser.pass2()
+    return chooser.result(headers)
+
+
+class _AbtChooser:
+    """The state of one :func:`select_abt_headers` call. Footprint keys are
+    ``(north, west, span)`` rounded to 1e-6°."""
+
+    def __init__(self, headers: Sequence[Any], tx_lat: float, tx_lon: float,
+                 bands: Sequence[Tuple[float, int]], az_start: float,
+                 az_end: float) -> None:
+        self.tx_lat, self.tx_lon = tx_lat, tx_lon
+        self.max_m = float(bands[-1][0])
+        self.sector = _compute_sector_bbox(tx_lat, tx_lon, self.max_m / 1000.0,
+                                           az_start, az_end)
+        self.rings: List[Tuple[float, float, int]] = []
+        inner = 0.0
+        for until_m, step in bands:
+            self.rings.append((inner, float(until_m), int(step)))
+            inner = float(until_m)
+        # The metric of _rect_distance_range_m.
+        self.m_lon = 111_111.0 * max(math.cos(math.radians(tx_lat)), 1e-6)
+        self.rects: Dict[Any, Tuple[float, float, float, float]] = {}
+        self.wants: Dict[Any, int] = {}
+        self.tiles: Dict[Any, List[Tuple[int, Any]]] = {}
+        for h in headers:
+            self._add_tile(h)
+        self.chosen: Dict[Any, Tuple[int, Any]] = {}
+        # Pass 2's open points: (want, limit), the footprints that can serve
+        # each (finest tile <= limit), served yet; per footprint its points.
+        self.pts: List[Tuple[int, int]] = []
+        self.servers: List[List[Any]] = []
+        self.done: List[bool] = []
+        self.reg: Dict[Any, List[int]] = {}
+        self.coarser: Dict[Any, str] = {}
+        self.finer: Dict[Any, str] = {}
+        self.cell = min(1.0, max(_SEL_BUCKET_MIN_DEG,
+                                 min((k[2] for k in self.rects), default=1.0)))
+        self.picked = _RectBuckets(self.cell)
+
+    def dist_m(self, lat: float, lon: float) -> float:
+        return math.hypot((lat - self.tx_lat) * 111_111.0,
+                          (lon - self.tx_lon) * self.m_lon)
+
+    def want_at(self, lat: float, lon: float) -> int:
+        return self._step_at(self.dist_m(lat, lon))
+
+    def _step_at(self, d: float) -> int:
+        for _lo, hi, step in self.rings:
+            if d <= hi:
+                return step
+        return self.rings[-1][2]       # past the range: the outermost step
+
+    def _add_tile(self, h: Any) -> None:
+        """Group *h* into its footprint when that is in play (grouped ONCE;
+        tiles kept in path order with their nominal resolution)."""
+        span = h.size * h.pixel_res
+        n, w = h.ul_lat, h.ul_lon
+        s_, e = n - span, w + span
+        sec = self.sector
+        if (s_ > sec["north"] or n < sec["south"]
+                or w > sec["east"] or e < sec["west"]):
+            return
+        near, far = _rect_distance_range_m(n, s_, w, e, self.tx_lat,
+                                           self.tx_lon)
+        steps = [st for lo, hi, st in self.rings if near <= hi and far >= lo]
+        if not steps:
+            return
+        key = (round(n, 6), round(w, 6), round(span, 6))
+        if key not in self.rects:
+            self.rects[key] = (n, s_, w, e)
+            self.wants[key] = min(steps)
+            self.tiles[key] = []
+        self.tiles[key].append((_abt_nominal_res(h), h))
+
+    def pass1(self) -> None:
+        """The exact step, wherever the footprint has it."""
+        for key in sorted(self.rects):
+            exact = [t for t in self.tiles[key] if t[0] == self.wants[key]]
+            if exact:
+                self.chosen[key] = exact[0]
+                self.picked.add(key, self.rects[key])
+
+    def _points(self, key: Any, every: "_RectBuckets"
+                ) -> List[Tuple[float, float, int]]:
+        """``(lat, lon, wanted step)`` sample points of the footprint's NEEDED
+        part (footprint ∩ sector bbox, within the outermost ring): one per
+        cell of the grid the edges of the footprints overlapping it cut it
+        into — the cell's point nearest the TX, a hair inside.
+
+        Exact: in such a cell the footprints holding it, and so what the
+        folder has there and which chosen tiles cover it, do not change, and
+        its nearest point wants its finest step (steps never get finer with
+        distance), so a cell is served wherever its point is. *every* holds
+        the footprints in play as ``(key, n, s, w, e, finest resolution)``.
+        """
+        n, s_, w, e = self.rects[key]
+        sec = self.sector
+        n2, s2 = min(n, sec["north"]), max(s_, sec["south"])
+        w2, e2 = max(w, sec["west"]), min(e, sec["east"])
+        if n2 <= s2 or e2 <= w2:
+            return []                      # touches the bbox, needs nothing
+        ys, xs = [s2, n2], [w2, e2]
+        c = every.cell
+        seen = set()
+        cols = range(math.floor(w2 / c), math.floor(e2 / c) + 1)
+        for i in range(math.floor(s2 / c), math.floor(n2 / c) + 1):
+            for j in cols:
+                for it in every.grid.get((i, j), ()):
+                    if it[0] in seen:
+                        continue
+                    seen.add(it[0])
+                    _k, fn, fs, fw, fe, _f = it
+                    if s2 < fn < n2:
+                        ys.append(fn)
+                    if s2 < fs < n2:
+                        ys.append(fs)
+                    if w2 < fw < e2:
+                        xs.append(fw)
+                    if w2 < fe < e2:
+                        xs.append(fe)
+        ys, xs = _cut_lines(ys), _cut_lines(xs)
+        reach = self.max_m
+        tla, tlo, m_lon = self.tx_lat, self.tx_lon, self.m_lon
+        pts = []
+        for y0, y1 in zip(ys, ys[1:]):
+            hy = (y1 - y0) * 1e-6
+            la = min(max(tla, y0 + hy), y1 - hy)
+            dy = (la - tla) * 111_111.0
+            if abs(dy) > reach:
+                continue
+            for x0, x1 in zip(xs, xs[1:]):
+                hx = (x1 - x0) * 1e-6
+                lo = min(max(tlo, x0 + hx), x1 - hx)
+                d = math.hypot(dy, (lo - tlo) * m_lon)
+                if d <= reach:
+                    pts.append((la, lo, self._step_at(d)))
+        return pts
+
+    def _inside_chosen(self, key: Any) -> bool:
+        """One footprint pass 1 chose holds the whole of footprint ∩ bbox at
+        a resolution ≤ the finest step it wants — every needed point of it
+        is served, so its points are never sampled (the common case: a fine
+        footprint inside a coarser chosen one)."""
+        n, s_, w, e = self.rects[key]
+        sec = self.sector
+        n2, s2 = min(n, sec["north"]), max(s_, sec["south"])
+        w2, e2 = max(w, sec["west"]), min(e, sec["east"])
+        want = self.wants[key]
+        for k in self.picked.at((n2 + s2) / 2, (w2 + e2) / 2):
+            cn, cs, cw, ce = self.rects[k]
+            if (self.chosen[k][0] <= want and cs <= s2 and n2 <= cn
+                    and cw <= w2 and e2 <= ce):
+                return True
+        return False
+
+    def _served(self, la: float, lo: float, limit: int) -> bool:
+        for k in self.picked.at(la, lo):
+            n, s_, w, e = self.rects[k]
+            if self.chosen[k][0] <= limit and s_ <= la <= n and w <= lo <= e:
+                return True
+        return False
+
+    def _register(self, la: float, lo: float, want: int,
+                  every: "_RectBuckets") -> None:
+        """Book one needed point pass 1 does not serve at its *want*: its
+        limit, and — unless pass 1 serves it at that — the footprints that
+        can serve it (*every*: see :meth:`_points`)."""
+        here = [it for it in every.at(la, lo)
+                if it[2] <= la <= it[1] and it[3] <= lo <= it[4]]
+        if not here:
+            return
+        best = min(it[5] for it in here)
+        limit = want if best <= want else best      # a true gap: the finest
+        if limit > want and self._served(la, lo, limit):
+            return
+        chosen = self.chosen
+        servers = [it[0] for it in here
+                   if it[5] <= limit and it[0] not in chosen]
+        if not servers:
+            return
+        pid = len(self.pts)
+        self.pts.append((want, limit))
+        self.servers.append(servers)
+        self.done.append(False)
+        reg = self.reg
+        for k in servers:
+            got = reg.get(k)
+            if got is None:
+                reg[k] = [pid]
+            else:
+                got.append(pid)
+
+    def rank(self, key: Any):
+        """``(sort key, want, (res, header))`` — *want* the finest step its
+        open points want — or None when it has no open point (left out)."""
+        open_ = [p for p in self.reg.get(key, ()) if not self.done[p]]
+        if not open_:
+            return None
+        need = min(self.pts[p][1] for p in open_)
+        want = min(self.pts[p][0] for p in open_)
+        fits = [t for t in self.tiles[key] if t[0] <= need]
+        if fits:
+            # The coarsest tile <= every open limit serves them all (the
+            # first such in path order).
+            tile = max(fits, key=lambda t: t[0])
+        else:                      # not reached: a server holds one <= limit
+            tile = min(self.tiles[key], key=lambda t: (abs(t[0] - need), t[0]))
+        res = tile[0]
+        mismatch = abs(math.log(res / need)) if need > 0 else math.inf
+        return ((round(mismatch, 9), res > need, key[2], key), want, tile)
+
+    def pass2(self) -> None:
+        """Book every needed point pass 1 leaves open, then best match
+        first; a choice re-ranks the footprints sharing the points it
+        serves."""
+        every: Optional[_RectBuckets] = None
+        for key in sorted(self.rects):
+            if key in self.chosen or self._inside_chosen(key):
+                continue
+            if every is None:               # the footprints in play, once
+                every = _RectBuckets(self.cell)
+                for k, rect in self.rects.items():
+                    every.add((k, *rect, min(t[0] for t in self.tiles[k])),
+                              rect)
+            for la, lo, want in self._points(key, every):
+                if not self._served(la, lo, want):      # (limit >= want)
+                    self._register(la, lo, want, every)
+        version: Dict[Any, int] = {}
+        heap: List[Tuple[Any, Any, int]] = []
+        for key in sorted(self.reg):
+            r = self.rank(key)
+            if r is not None:
+                version[key] = 0
+                heap.append((r[0], key, 0))
+        heapq.heapify(heap)
+        while heap:
+            sort_key, key, ver = heapq.heappop(heap)
+            if version.get(key) != ver:
+                continue                   # superseded entry
+            r = self.rank(key)
+            if r is None or r[0] != sort_key:
+                self._requeue(key, r, heap, version)
+                continue
+            version.pop(key)
+            for other in sorted(self._choose(key, r[1], r[2])):
+                if other in version:
+                    self._requeue(other, self.rank(other), heap, version)
+
+    @staticmethod
+    def _requeue(key: Any, r: Any, heap: List[Tuple[Any, Any, int]],
+                 version: Dict[Any, int]) -> None:
+        """Push *key* with its current rank *r*; None = no open point, left
+        out."""
+        if r is None:
+            version.pop(key, None)
+            return
+        version[key] += 1
+        heapq.heappush(heap, (r[0], key, version[key]))
+
+    def _choose(self, key: Any, need: int, tile: Tuple[int, Any]) -> set:
+        """Choose *key* with *tile* (*need* = the finest step its open points
+        want, for the log lines); returns the other footprints sharing the
+        points it serves."""
+        self.chosen[key] = tile
+        self.picked.add(key, self.rects[key])
+        touched = set()
+        for p in self.reg.get(key, ()):
+            if not self.done[p] and self.pts[p][1] >= tile[0]:
+                self.done[p] = True
+                touched.update(self.servers[p])
+        touched.discard(key)
+        n, _s, w, _e = self.rects[key]
+        label = f"N{n:.2f} E{w:.2f} ({key[2]:g}°)"
+        if tile[0] > need:
+            self.coarser[key] = (f"{label}: needs {need} m, the folder has "
+                                 f"only {tile[0]} m there")
+        elif tile[0] < need:
+            self.finer[key] = (f"{label}: needs {need} m, the closest the "
+                               f"folder has there is {tile[0]} m (finer, used "
+                               "as is)")
+        return touched
+
+    def result(self, headers: Sequence[Any]) -> AbtSelection:
+        counts: Dict[int, int] = {}
+        for res, _h in self.chosen.values():
+            counts[res] = counts.get(res, 0) + 1
+        summary = ", ".join(f"{r} m × {c} tile(s)"
+                            for r, c in sorted(counts.items()))
+        return AbtSelection(
+            [self.chosen[k][1].path for k in sorted(self.chosen)],
+            [self.coarser[k] for k in sorted(self.coarser)],
+            summary or "no tiles in range",
+            [self.finer[k] for k in sorted(self.finer)],
+            _abt_uncovered_cells(headers, self))
+
+
+def _abt_uncovered_cells(headers: Sequence[Any],
+                         chooser: "_AbtChooser") -> List[Dict[str, float]]:
+    """The :data:`ABT_HOLE_CELL_DEG` cells whose centre lies in the sector
+    bbox, within the range and inside a tile of the folder, but in no
+    chosen tile."""
+    spans = [(h.ul_lat, h.ul_lat - h.size * h.pixel_res, h.ul_lon,
+              h.ul_lon + h.size * h.pixel_res) for h in headers]
+    sec = chooser.sector
+    north = min(sec["north"], max(r[0] for r in spans))
+    south = max(sec["south"], min(r[1] for r in spans))
+    west = max(sec["west"], min(r[2] for r in spans))
+    east = min(sec["east"], max(r[3] for r in spans))
+    c = ABT_HOLE_CELL_DEG
+    folder = _RectBuckets(c)
+    for r in spans:
+        folder.add(r, r)
+
+    def inside(found, la, lo):
+        return any(r[1] <= la <= r[0] and r[2] <= lo <= r[3] for r in found)
+
+    out: List[Dict[str, float]] = []
+    for i in range(math.floor(south / c), math.ceil(north / c)):
+        for j in range(math.floor(west / c), math.ceil(east / c)):
+            la, lo = (i + 0.5) * c, (j + 0.5) * c
+            if (south <= la <= north and west <= lo <= east
+                    and chooser.dist_m(la, lo) <= chooser.max_m
+                    and inside(folder.at(la, lo), la, lo)
+                    and not inside((chooser.rects[k]
+                                    for k in chooser.picked.at(la, lo)),
+                                   la, lo)):
+                out.append({"north": (i + 1) * c, "south": i * c,
+                            "west": j * c, "east": (j + 1) * c})
+    return out
+
+
+def abt_holes_text(cells: Sequence[Dict[str, float]], limit: int = 6) -> str:
+    """One sentence naming the uncovered *cells* (NODATA wording)."""
+    shown = ", ".join(
+        f"N{c['south']:.2f}–{c['north']:.2f} E{c['west']:.2f}–{c['east']:.2f}"
+        for c in list(cells)[:limit])
+    more = f" and {len(cells) - limit} more" if len(cells) > limit else ""
+    return (f"{len(cells)} area(s) of {ABT_HOLE_CELL_DEG:g}° inside the "
+            f"pre-built folder get no tile for this analysis ({shown}{more}). "
+            "There is no terrain data there — the engine treats it as NODATA.")
+
+
+#: How long a selection is reused for the same folder state and job: the
+#: GUI pre-check, the coverage warning and the worker's view share one.
+_ABT_SELECTION_TTL_S = 60.0
+_abt_selections: Dict[Tuple[Any, ...], Tuple[float, AbtSelection]] = {}
+_abt_selections_lock = threading.Lock()
+
+
 def select_abt_tiles(terrain_dir: str, tx_lat: float, tx_lon: float,
                      bands: List[Tuple[float, int]],
                      az_start: float = 0.0, az_end: float = 360.0) -> AbtSelection:
@@ -3332,81 +6325,49 @@ def select_abt_tiles(terrain_dir: str, tx_lat: float, tx_lon: float,
     job's ``resolution_m`` and lets finer footprints overwrite coarser ones. That
     choice is silent, and with an output resolution that differs from the
     profile steps it would take e.g. 30 m terrain under a 2 m near field. So the
-    plugin decides: per footprint the finest step any band crossing it needs,
-    the tile of exactly that resolution, and only that tile goes into the view
-    the engine sees. A footprint without that resolution is dropped when other
-    footprints already cover it at the needed resolution; otherwise the closest
-    resolution is used and reported in ``substitutions``.
+    plugin decides (:func:`select_abt_headers`: the exact step per footprint,
+    then — over the ground the run needs — a tile only where chosen ones do
+    not already serve it) and only the chosen tiles go into the view the
+    engine sees.
+
+    Headers come from the folder's header index (:func:`abt_index.read_folder`:
+    one listing + stat, only new/changed tiles opened, ``FRESH_S`` reuse); the
+    result is memoised for :data:`_ABT_SELECTION_TTL_S` per (folder, listing
+    signature, TX, bands, azimuths).
     """
-    from . import abt
-    headers = abt.read_headers(list_abt_tiles(terrain_dir))
-    max_m = bands[-1][0]
-    sector = _compute_sector_bbox(tx_lat, tx_lon, max_m / 1000.0, az_start, az_end)
-    rings = []
-    inner = 0.0
-    for until_m, step in bands:
-        rings.append((inner, float(until_m), int(step)))
-        inner = float(until_m)
-
-    groups: Dict[Tuple[float, float, float], List[Any]] = {}
-    needs: Dict[Tuple[float, float, float], int] = {}
-    rects: Dict[Tuple[float, float, float], Tuple[float, float, float, float]] = {}
-    for h in headers:
-        span = h.size * h.pixel_res
-        n, w = h.ul_lat, h.ul_lon
-        s_, e = n - span, w + span
-        if (s_ > sector["north"] or n < sector["south"]
-                or w > sector["east"] or e < sector["west"]):
-            continue
-        near, far = _rect_distance_range_m(n, s_, w, e, tx_lat, tx_lon)
-        steps = [st for lo, hi, st in rings if near <= hi and far >= lo]
-        if not steps:
-            continue
-        key = (round(n, 6), round(w, 6), round(span, 6))
-        groups.setdefault(key, []).append(h)
-        needs[key] = min(steps)
-        rects[key] = (n, s_, w, e)
-
-    def covered_at(key, step) -> bool:
-        """True if footprints holding *step* tiles cover this key's rect."""
-        n, s_, w, e = rects[key]
-        pts = [(s_ + (n - s_) * (i + 0.5) / 5, w + (e - w) * (j + 0.5) / 5)
-               for i in range(5) for j in range(5)]
-        others = [rects[k] for k, hs in groups.items()
-                  if k != key and any(_abt_nominal_res(h) == step for h in hs)]
-        return all(any(o[1] <= la <= o[0] and o[2] <= lo <= o[3] for o in others)
-                   for la, lo in pts)
-
-    chosen: List[str] = []
-    subs: List[str] = []
-    counts: Dict[int, int] = {}
-    for key in sorted(groups):
-        want = needs[key]
-        exact = [h for h in groups[key] if _abt_nominal_res(h) == want]
-        if exact:
-            pick = exact[0]
-        elif covered_at(key, want):
-            continue  # another footprint holds the needed resolution here
-        else:
-            pick = min(groups[key], key=lambda h: abs(_abt_nominal_res(h) - want))
-            n, s_, w, e = rects[key]
-            subs.append(f"N{n:.2f} E{w:.2f} ({key[2]:g}°): needs {want} m, "
-                        f"the folder has only {_abt_nominal_res(pick)} m there")
-        chosen.append(pick.path)
-        counts[_abt_nominal_res(pick)] = counts.get(_abt_nominal_res(pick), 0) + 1
-    summary = ", ".join(f"{r} m × {c} tile(s)" for r, c in sorted(counts.items()))
-    return AbtSelection(chosen, subs, summary or "no tiles in range")
+    listing = abt_index.read_folder(terrain_dir)
+    key = (terrain_dir, listing.signature, float(tx_lat), float(tx_lon),
+           tuple((float(u), int(s)) for u, s in bands),
+           float(az_start), float(az_end))
+    now = time.monotonic()
+    with _abt_selections_lock:
+        hit = _abt_selections.get(key)
+        if hit is not None and now - hit[0] < _ABT_SELECTION_TTL_S:
+            return hit[1]
+    sel = select_abt_headers(listing.headers, tx_lat, tx_lon, bands,
+                             az_start, az_end)
+    with _abt_selections_lock:
+        for old in [k for k, (t, _s) in _abt_selections.items()
+                    if now - t >= _ABT_SELECTION_TTL_S]:
+            del _abt_selections[old]
+        _abt_selections[key] = (now, sel)
+    return sel
 
 
 def _abt_view_for(terrain_dir: str, tx_lat: float, tx_lon: float,
                   bands: List[Tuple[float, int]], az_start: float,
                   az_end: float) -> str:
     """Select, log and link the pre-built tiles a run uses; substitutions are
-    logged as warnings here (the GUI already asked about them before the run)."""
+    logged as warnings here (the GUI already asked about them before the run),
+    finer-than-needed footprints as info, uncovered cells as a warning."""
     sel = select_abt_tiles(terrain_dir, tx_lat, tx_lon, bands, az_start, az_end)
     _log(f"  pre-built terrain chosen: {sel.summary}")
     for line in sel.substitutions:
         _log(f"  WARNING: terrain substitution — {line}")
+    for line in sel.finer:
+        _log(f"  terrain finer than needed — {line}")
+    if sel.uncovered:
+        _log(f"  WARNING: {abt_holes_text(sel.uncovered)}")
     view_dir = abt_selection_view(terrain_dir, sel)
     _log(f"  .abt view dir: {view_dir} ({len(sel.paths)} tile(s))")
     _record_view_dir(view_dir)
@@ -3439,30 +6400,54 @@ def abt_selection_view(terrain_dir: str, selection: AbtSelection) -> str:
     return view_dir
 
 
-def _abt_coverage_warning(terrain_dir: str, paths: List[str],
-                          bbox: Dict[str, float],
-                          resolution_m: Optional[float] = None,
-                          osm_buildings: bool = False,
-                          buildings_file: Optional[str] = None,
-                          ) -> Optional[str]:
-    """Check pre-built ``.abt`` tiles suit this analysis, by their own headers.
-
-    Same contract as the raster check: warn on anything that would silently
-    produce fiction. Three failure modes are specific to `.abt` — a tile whose
-    header cannot be read (the engine will skip it), a set that is coarser than
-    the requested resolution, and buildings that cannot be added because they
-    are already burned into the pixels.
-    """
+def _abt_tile_headers(terrain_dir: str, paths: List[str]
+                      ) -> Tuple[List[Any], List[str]]:
+    """``(headers, unreadable names)`` of *paths* (tiles of *terrain_dir*)
+    from the folder's header index; a path it does not know is read here."""
     from . import abt
 
-    headers = []
-    unreadable = []
+    listing = abt_index.read_folder(terrain_dir)
+    names = {os.path.basename(p) for p in paths}
+    headers = [h for h in listing.headers if os.path.basename(h.path) in names]
+    unreadable = [os.path.basename(p) for p in listing.unreadable
+                  if os.path.basename(p) in names]
+    known = {os.path.basename(h.path) for h in headers} | set(unreadable)
     for p in paths:
+        if os.path.basename(p) in known:
+            continue
         h = abt.read_header(p)
         if h is None:
             unreadable.append(os.path.basename(p))
         else:
             headers.append(h)
+    return headers, unreadable
+
+
+def _abt_coverage_warning(terrain_dir: str, paths: List[str],
+                          bbox: Dict[str, float],
+                          resolution_m: Optional[float] = None,
+                          osm_buildings: bool = False,
+                          buildings_file: Optional[str] = None,
+                          selections: Optional[Sequence[AbtSelection]] = None,
+                          ) -> Optional[str]:
+    """Check pre-built ``.abt`` tiles suit this analysis, by their own headers.
+
+    Same contract as the raster check: warn on anything that would silently
+    produce fiction. Failure modes specific to `.abt` — a tile whose header
+    cannot be read (the engine will skip it), a set that is coarser than the
+    requested resolution, buildings that cannot be added because they are
+    already burned into the pixels, and ground the folder has data for that
+    no chosen tile covers (*selections*' ``uncovered`` cells). Nothing fills
+    a pre-built folder's gaps (``abt_selection_view`` only links tiles), so
+    missing ground is NODATA to the engine — never 0 m.
+
+    Headers come from the folder's header index (:func:`abt_index.read_folder`)
+    — no file is opened again when the selection already read it.
+    """
+    headers, unreadable = _abt_tile_headers(terrain_dir, paths)
+    holes: List[Dict[str, float]] = []
+    for sel in selections or ():
+        holes.extend(c for c in sel.uncovered if c not in holes)
 
     if not headers:
         return (
@@ -3488,11 +6473,18 @@ def _abt_coverage_warning(terrain_dir: str, paths: List[str],
             f"The {len(headers)} .abt tile(s) in:\n{terrain_dir}\n\ndo not "
             f"overlap the analysis area at all.\n\n{extents}"
         )
+    hole_text = abt_holes_text(holes) + "\n\n" if holes else ""
     if frac < _COVERAGE_OK_FRACTION:
         return (
             f"The .abt tiles in:\n{terrain_dir}\n\ncover only about "
             f"{frac * 100:.0f}% of the analysis area. The rest has no terrain "
-            f"and will be computed as flat 0 m sea level.\n\n{extents}"
+            "data — the engine treats it as NODATA (a pre-built folder is "
+            f"used as it is; nothing fills its gaps).\n\n{hole_text}{extents}"
+        )
+    if holes:
+        return (
+            f"The .abt tiles in:\n{terrain_dir}\n\nleave holes in this "
+            f"analysis.\n\n{hole_text}{extents}"
         )
 
     res_msg = _abt_resolution_warning(headers, resolution_m)
@@ -3526,13 +6518,17 @@ def terrain_coverage_warning(terrain_dir: str,
                              resolution_m: Optional[float] = None,
                              osm_buildings: bool = False,
                              buildings_file: Optional[str] = None,
+                             abt_selections: Optional[Sequence[AbtSelection]] = None,
+                             infos: Optional[List[Dict[str, Any]]] = None,
                              ) -> Optional[str]:
     """Warn when *terrain_dir* cannot serve this analysis.
 
     *resolution_m* and the buildings flags are only consulted for pre-built
     `.abt` directories, where the tiles are finished output and neither can be
     changed by the run — a raster source is converted at whatever resolution is
-    asked for, and can have buildings burned in on the way.
+    asked for, and can have buildings burned in on the way. So are
+    *abt_selections* (the run's :func:`select_abt_tiles` results): ground
+    the folder has data for but no chosen tile covers is named (NODATA).
 
     Fires for the unambiguous mistakes — an empty or unreadable directory, or
     one whose data lies somewhere else entirely — and also when the terrain
@@ -3546,7 +6542,10 @@ def terrain_coverage_warning(terrain_dir: str,
     footprints, any CRS mix), which also finds GAPS INSIDE the data. The
     index is refreshed when older than ``terrain_index.FRESH_S`` — as slow as
     a folder scan, so never call this on the GUI thread (the Site Analysis
-    tab runs it in ``gui/terrain_folder_scan``).
+    tab runs it in ``gui/terrain_folder_scan``). *infos* (a raster folder's
+    usable source infos as :func:`folder_source_infos` read them — the
+    run's :class:`TerrainPrep`) are measured as given: no index look, no
+    second build of the file list (the same files, in another order).
     """
     try:
         if not os.path.isdir(terrain_dir):
@@ -3562,37 +6561,42 @@ def terrain_coverage_warning(terrain_dir: str,
         if abts:
             return _abt_coverage_warning(terrain_dir, abts, bbox,
                                          resolution_m, osm_buildings,
-                                         buildings_file)
+                                         buildings_file,
+                                         selections=abt_selections)
 
-        index = terrain_index.get_index(terrain_dir)
-        index.refresh(max_age_s=terrain_index.FRESH_S)
-        if not index.entries:
-            # Mention .abt too: a user who points this at Map Converter output
-            # nested one level down gets told what is actually wrong.
-            return (
-                f"No terrain files were found in:\n{terrain_dir}\n\n"
-                "Expected elevation rasters GDAL can read (GeoTIFF, .dem, "
-                ".hgt, .asc, .img, .bil, .jp2, .nc, … — searched "
-                "recursively, .zip archives included; .vrt files are "
-                "ignored), or pre-built .abt tiles directly in this folder "
-                "(not in sub-folders — the engine does not recurse)."
-            )
-        # Every file the run would read: usable as is, or 8-bit files the
-        # user chose to keep. Problem files are the pre-flight prompt's
-        # business (they are skipped or the run is cancelled), so they are
-        # not counted as coverage here.
-        decisions = terrain_index.approved_decisions(terrain_dir, index)
-        infos = []
-        for p, e in index.entries.items():
-            prob = terrain_index.problem_of(e)
-            if prob is None or (prob[0] == terrain_index.KIND_SUSPECT
-                                and decisions.get(p) == terrain_index.DECISION_USE):
-                infos.append(terrain_index.entry_info(p, e))
         if not infos:
-            return (
-                f"None of the {len(index.entries)} file(s) in:\n{terrain_dir}"
-                "\n\ncan be used as terrain (see the list of unusable files)."
-            )
+            index = terrain_index.get_index(terrain_dir)
+            index.refresh(max_age_s=terrain_index.FRESH_S)
+            if not index.entries:
+                # Mention .abt too: a user who points this at Map Converter
+                # output nested one level down gets told what is actually
+                # wrong.
+                return (
+                    f"No terrain files were found in:\n{terrain_dir}\n\n"
+                    "Expected elevation rasters GDAL can read (GeoTIFF, .dem, "
+                    ".hgt, .asc, .img, .bil, .jp2, .nc, … — searched "
+                    "recursively, .zip archives included; .vrt files are "
+                    "ignored), or pre-built .abt tiles directly in this folder "
+                    "(not in sub-folders — the engine does not recurse)."
+                )
+            # Every file the run would read: usable as is, or 8-bit files
+            # the user chose to keep. Problem files are the pre-flight
+            # prompt's business (they are skipped or the run is cancelled),
+            # so they are not counted as coverage here.
+            decisions = terrain_index.approved_decisions(terrain_dir, index)
+            infos = []
+            for p, e in index.entries.items():
+                prob = terrain_index.problem_of(e)
+                if prob is None or (
+                        prob[0] == terrain_index.KIND_SUSPECT
+                        and decisions.get(p) == terrain_index.DECISION_USE):
+                    infos.append(terrain_index.entry_info(p, e))
+            if not infos:
+                return (
+                    f"None of the {len(index.entries)} file(s) in:\n"
+                    f"{terrain_dir}\n\ncan be used as terrain (see the list "
+                    "of unusable files)."
+                )
         # Per-file WGS84 footprints, each file in its OWN CRS — never a
         # mosaic. gdal.BuildVRT dropped every file whose CRS differed from
         # the first one and reported the bbox of what was left (a false
@@ -3948,6 +6952,7 @@ def folder_source_infos(terrain_dir: str,
                         mode: Optional[str] = None,
                         should_cancel: Any = None,
                         log: Any = None,
+                        used: Optional[Dict[str, Any]] = None,
                         ) -> List[Dict[str, Any]]:
     """Usable source infos of a terrain FOLDER, in overlap-priority order,
     straight from its footprint index (``core/terrain_index``) — no per-run
@@ -3959,7 +6964,10 @@ def folder_source_infos(terrain_dir: str,
     the CRS the user assigned to CRS-less files (Map Converter). Any problem
     file without an answer is a hard error naming it — never silently
     dropped, never silently given another file's CRS. *log* (optional) also
-    receives every line (the Map Converter's own log panel).
+    receives every line (the Map Converter's own log panel). *used*
+    (optional dict) receives what the infos were read under: the index,
+    its ``generation`` / ``refreshed_at`` / ``dir_mtime_ns`` after the
+    refresh, the ``decisions`` and the ``mode`` (:func:`build_terrain_prep`).
     """
     def say(msg: str) -> None:
         _log(msg)
@@ -3979,6 +6987,11 @@ def folder_source_infos(terrain_dir: str,
     if decisions is None:
         decisions = terrain_index.approved_decisions(terrain_dir, index)
     mode = mode or terrain_index.get_overlap_priority(terrain_dir)
+    if used is not None:
+        used.update(index=index, generation=index.generation,
+                    refreshed_at=index.refreshed_at,
+                    dir_mtime_ns=index.dir_mtime_ns,
+                    decisions=dict(decisions), mode=mode)
     infos, skipped = terrain_index.source_infos(
         terrain_dir, mode, decisions, crs_overrides, index)
     for p, _kind, reason in skipped:
@@ -4033,7 +7046,8 @@ def file_layer_info(path: str, crs_authid: Optional[str] = None
     return info
 
 
-def _gather_source_infos(dem_layer: Any, terrain_dir: Optional[str]
+def _gather_source_infos(dem_layer: Any, terrain_dir: Optional[str],
+                         should_cancel: Optional[Callable[[], bool]] = None,
                          ) -> Tuple[List[Dict[str, Any]], bool]:
     """``(source file infos, use_qgis_export)`` for one prepare_terrain run.
 
@@ -4043,9 +7057,17 @@ def _gather_source_infos(dem_layer: Any, terrain_dir: Optional[str]
     it. A non-file provider (WMS/WMTS/ArcGIS/…) yields no infos and
     ``use_qgis_export=True`` — those are server-rendered per tile via
     :func:`_export_via_qgis`, which is unavoidable.
+
+    *should_cancel* reaches the folder index refresh (a first scan of a big
+    folder takes seconds); its stop comes back as :class:`ConverterCancelled`,
+    the one cancel exception of the terrain path.
     """
     if terrain_dir and os.path.isdir(terrain_dir):
-        return folder_source_infos(terrain_dir), False
+        try:
+            return folder_source_infos(terrain_dir,
+                                       should_cancel=should_cancel), False
+        except terrain_index.ScanCancelled:
+            raise ConverterCancelled() from None
 
     src = dem_layer.source()
     if os.path.isfile(src) or src.startswith("/vsi"):
@@ -4061,7 +7083,149 @@ def _gather_source_infos(dem_layer: Any, terrain_dir: Optional[str]
     return [], True
 
 
-def _run_converter(exe: str, job_file: str) -> List[str]:
+def _read_source_once(dem_layer: Any, terrain_dir: Optional[str],
+                      should_cancel: Optional[Callable[[], bool]] = None,
+                      ) -> Optional[Tuple[List[Dict[str, Any]], bool,
+                                          Optional[FootprintIndex]]]:
+    """``(infos, use_qgis_export, FootprintIndex)`` for the sources
+    :func:`prepare_terrain` reads before its cache check (a folder, a file
+    layer, a rendered provider); None for an XYZ layer, which has no files.
+    The ``source_infos`` a multi-band caller hands to every band; None too
+    for a layer prepare_terrain refuses as imagery (it says so first)."""
+    if not (terrain_dir or (dem_layer is not None
+                            and "type=xyz" not in dem_layer.source())):
+        return None
+    if (not (terrain_dir and os.path.isdir(terrain_dir))
+            and dem_layer is not None
+            and classify_raster_layer(dem_layer) == "imagery"):
+        return None
+    infos, qgis_export = _gather_source_infos(dem_layer, terrain_dir,
+                                              should_cancel=should_cancel)
+    return infos, qgis_export, footprint_index(infos)
+
+
+class TerrainPrep:
+    """ONE preparation of a terrain FOLDER for one Site Analysis run.
+
+    Built once, in the coverage check's worker thread
+    (``site_analysis_tab._terrain_dir_checks``, :func:`build_terrain_prep`),
+    right after the Run click's index check, and handed to the run's worker:
+    the usable source infos in overlap-priority order (``infos``), the
+    :class:`FootprintIndex` over them (``index``), the coverage warning
+    (``coverage``) and the priced plan (``plan``), plus the signature they
+    were read under — the folder's :class:`terrain_index.FolderIndex`
+    object, its ``generation``, the time of its last check
+    (``checked_at``), the folder's own mtime, the overlap priority and the
+    user's answers about problem files.
+
+    :func:`prepare_terrain` / :func:`prepare_terrain_profile` use it instead
+    of re-checking the index, rebuilding the source infos, re-sorting them
+    and building a new FootprintIndex — while :meth:`stale_reason` is None
+    (same index object and generation, younger than
+    ``terrain_index.FRESH_S``, folder mtime, overlap priority and answers
+    unchanged); otherwise they read the folder as every caller without a
+    bundle does (Processing, P2P, the torture runner). Jobs of one run share
+    it (same folder)."""
+
+    def __init__(self, folder: str, folder_index: Any, generation: int,
+                 checked_at: float, dir_mtime_ns: Optional[int], mode: str,
+                 decisions: Dict[str, str], infos: List[Dict[str, Any]],
+                 index: Optional[FootprintIndex]) -> None:
+        self.folder = folder
+        self.folder_index = folder_index
+        self.generation = generation
+        self.checked_at = checked_at
+        self.dir_mtime_ns = dir_mtime_ns
+        self.mode = mode
+        self.decisions = dict(decisions)
+        self.infos = infos
+        self.index = index
+        #: The coverage warning shown before the run (None = none).
+        self.coverage: Optional[str] = None
+        #: ``site_analysis_tab._plan_jobs``' priced totals.
+        self.plan: Optional[Dict[str, Any]] = None
+
+    def age_s(self) -> float:
+        """Seconds since the folder index behind it was checked."""
+        return time.time() - self.checked_at
+
+    def stale_reason(self, terrain_dir: Optional[str]) -> Optional[str]:
+        """Why this preparation cannot stand in for reading *terrain_dir*
+        now, or None when it can."""
+        if (not terrain_dir or terrain_index._norm_folder(terrain_dir)
+                != terrain_index._norm_folder(self.folder)):
+            return "another terrain folder"
+        index = terrain_index.get_index(terrain_dir)
+        if index is not self.folder_index:
+            return "the folder index was reloaded"
+        if index.generation != self.generation:
+            return "the folder index changed since"
+        age = self.age_s()
+        if not 0.0 <= age < terrain_index.FRESH_S:
+            return (f"checked {age:.0f} s ago — reused for "
+                    f"{terrain_index.FRESH_S:.0f} s")
+        mtime = terrain_index.dir_mtime_ns(terrain_dir)
+        if mtime is None or mtime != self.dir_mtime_ns:
+            return "files were added, removed or renamed in the folder"
+        if terrain_index.get_overlap_priority(terrain_dir) != self.mode:
+            return "the overlap priority changed"
+        answers = terrain_index.approved_decisions(terrain_dir, index)
+        if answers != self.decisions:
+            return "the answers about unusable files changed"
+        return None
+
+    def index_for(self, infos: List[Dict[str, Any]]) -> Any:
+        """The footprint index for *infos* — ``self.infos`` itself or a
+        sub-list of it (:func:`_infos_near`): the bundle's own index, or a
+        :class:`SubsetFootprintIndex` over it; None for no files."""
+        if not infos:
+            return None
+        if infos is self.infos:
+            return self.index
+        return SubsetFootprintIndex(self.index, infos)
+
+
+def build_terrain_prep(terrain_dir: str,
+                       should_cancel: Optional[Callable[[], bool]] = None,
+                       ) -> TerrainPrep:
+    """:class:`TerrainPrep` for a raster *terrain_dir* — the source infos
+    exactly as :func:`folder_source_infos` reads them for a run (its log
+    lines included; the index check the Run click just made is reused for
+    ``terrain_index.FRESH_S``) and ONE :class:`FootprintIndex` over them.
+    Raises as :func:`folder_source_infos` does."""
+    used: Dict[str, Any] = {}
+    # Under the index's lock: no other refresh between the read and the
+    # signature it is recorded with.
+    with terrain_index.get_index(terrain_dir).lock:
+        infos = folder_source_infos(terrain_dir, should_cancel=should_cancel,
+                                    used=used)
+    return TerrainPrep(terrain_dir, used["index"], used["generation"],
+                       used["refreshed_at"], used["dir_mtime_ns"],
+                       used["mode"], used["decisions"], infos,
+                       footprint_index(infos))
+
+
+def _current_prep(prep: Optional[TerrainPrep], terrain_dir: Optional[str]
+                  ) -> Optional[TerrainPrep]:
+    """*prep* when it still stands for *terrain_dir* (logged), else None —
+    logged too when there was one: the caller reads the folder again."""
+    if prep is None:
+        return None
+    why = prep.stale_reason(terrain_dir)
+    if why is not None:
+        _log(f"  terrain preparation of this run not reused ({why}) — "
+             f"reading the terrain folder again")
+        return None
+    _log(f"  source files: {len(prep.infos)} usable, from this run's terrain "
+         f"preparation (folder checked {prep.age_s():.1f} s ago)")
+    return prep
+
+
+def _run_converter(exe: str, job_file: str,
+                   should_cancel: Optional[Callable[[], bool]] = None,
+                   on_start: Optional[Callable[[Any], None]] = None,
+                   burns: Any = None,
+                   ) -> List[str]:
     # Stream the converter's output into the log so the .abt creation step is
     # visible. Keep a tail for the error message. Uses the one shared
     # subprocess runner (run_converter_streaming).
@@ -4070,18 +7234,537 @@ def _run_converter(exe: str, job_file: str) -> List[str]:
     # file it could not read is one `[Warn]` line and a successful exit (see
     # ingest.rs `[Warn] Failed to apply buildings`), so the caller has to read
     # what it said to know whether the run did what was asked.
+    #
+    # Cancel: the converter prints ingest progress only every 10 tiles, so the
+    # per-line *should_cancel* check alone can lag by minutes — *on_start*
+    # hands the process to the caller, whose cancel() kills it outright.
+    #
+    # The per-tile timing lines (`[Rust] tile <name>: …`, 920 in one run) are
+    # diagnostics: a converter >= 0.2.8 writes them to AETHER_DIAG_FILE
+    # (run_converter_streaming sets it); a 0.2.7 one still prints them, so
+    # they are dropped here — neither logged nor kept for the error tail.
+    #
+    # *burns* (an ``osm_buildings.BurnMonitor``, when the jobs carry
+    # ``buildings_pbf_dir``) reads every line; a decode warning stops the
+    # converter at the next line (``UndecodableBuildings``, a
+    # ConverterCancelled) — before its first tile.
     lines: List[str] = []
 
     def handle(line: str) -> None:
-        _log(f"    {line}")
+        if should_cancel is not None and should_cancel():
+            raise ConverterCancelled()
+        if line.startswith("[Rust] tile "):
+            return
+        if burns is not None and burns.feed(line):
+            from .osm_buildings import UndecodableBuildings
+            raise UndecodableBuildings()
         lines.append(line)
+        # Kept for the callers, not logged — one line per tile would bury
+        # the panel (the Map Converter drops the same two): the ``[Tile]
+        # covered=`` count the callers read from the returned lines, and the
+        # per-tile burn report the BurnMonitor sums into the run's one
+        # "buildings:" line.
+        if parse_tile_line(line) is not None:
+            return
+        if parse_tile_voids_line(line) is not None:
+            return          # one per output tile (0.2.11): read, never shown
+        if burns is not None and burns.last_kind == "report":
+            return
+        _log(f"    {line}")
 
     rc = run_converter_streaming(exe, ["ingest", "--job-file", job_file],
-                                 handle)
+                                 handle, on_start=on_start)
+    if rc != 0 and should_cancel is not None and should_cancel():
+        # Killed by cancel() before a line reached the check above: the exit
+        # code is the kill, not a converter failure.
+        raise ConverterCancelled()
     if rc != 0:
         tail = "\n".join(lines[-20:])
         raise RuntimeError(f"converter failed ({rc}):\n{tail}")
     return lines
+
+
+def _fetch_osm_buildings(todo: List[Dict[str, Any]],
+                         verdicts: Dict[str, "PoolTile"],
+                         should_cancel: Optional[Callable[[], bool]] = None,
+                         cover_needed: Optional[Tuple[Any, list]] = None,
+                         ) -> Optional[str]:
+    """The strict OpenFreeMap z14 fetch for the pool tiles a run builds
+    (``osm_buildings``: ONE cover rule, fetch and view for every route).
+
+    The cover is the WHOLE pool tiles of *todo* (a partial file-source
+    build: its regions) — not the run's sector: a tile pooled "with
+    buildings" holds every building on it, whichever run built it. No tile
+    cap; the count and a size bound (:data:`osm_buildings.TILE_BYTES_ESTIMATE`
+    a tile) are logged. Returns the view to hand the converter
+    (``buildings_pbf_dir``), or None when none of the tiles has data
+    (warned — there are no buildings to burn there). A tile still failing,
+    one never fetched, an undecodable answer or an unreadable TileJSON ENDS
+    the run (RuntimeError naming the cause); Stop → :class:`ConverterCancelled`.
+    Nothing has been built yet, so nothing is pooled without its buildings.
+
+    The sequential path: ingests on aether_converter < 0.2.12 (they decode
+    the directory when they start) and downloads on < 0.2.10; a newer
+    converter's run fetches next to the conversion
+    (:class:`_BuildingsBesideConverter`). *cover_needed*: ``(cover,
+    needed)`` already computed (and logged) for this run
+    (:func:`_osm_buildings_cover`)."""
+    from . import openfreemap
+    from . import osm_buildings as osm_b
+    cover, needed = cover_needed or _osm_buildings_cover(todo, verdicts)
+    if not needed:
+        return None
+    t0 = time.perf_counter()
+    try:
+        res = osm_b.ensure_tiles(needed, should_cancel=should_cancel, log=_log,
+                                 require_data=False)
+    except openfreemap.FetchCancelled:
+        raise ConverterCancelled()
+    except openfreemap.FetchFailed as exc:
+        _log(f"  ERROR: Buildings download failed (OpenFreeMap z14): {exc}")
+        raise RuntimeError(_buildings_fetch_failed_text(str(exc))) from exc
+    if not _log_buildings_ready(res, time.perf_counter() - t0):
+        return None
+    cover.present = set(res.present)
+    try:
+        return osm_b.batch_view(cover.view_names())
+    except (RuntimeError, OSError) as exc:
+        _log(f"  ERROR: Buildings: {exc}")
+        raise RuntimeError(f"Buildings: {exc}") from exc
+
+
+def _osm_buildings_cover(todo: List[Dict[str, Any]],
+                         verdicts: Dict[str, "PoolTile"]) -> Tuple[Any, list]:
+    """``(BuildingCover, needed (z, x, y))`` of the pool tiles a run builds —
+    the WHOLE tiles of *todo* (a partial file-source build: its regions) —
+    with the count line logged (its size bound at
+    ``osm_buildings.TILE_BYTES_ESTIMATE`` a tile) when any tile is needed."""
+    from . import osm_buildings as osm_b
+    extents: List[Dict[str, float]] = []
+    for t in todo:
+        regions = verdicts[t["filename"]].regions
+        extents.extend(regions if regions else [_subtile_bbox(t)])
+    cover = osm_b.BuildingCover(extents)
+    needed = cover.needed()
+    if needed:
+        bound_mb = len(needed) * osm_b.TILE_BYTES_ESTIMATE / (1024 * 1024)
+        _log(f"  buildings (OpenFreeMap z14): {len(needed):,} tile(s) for the "
+             f"{len(todo)} pool tile(s) to build — whole tiles, not only this "
+             f"run's area (at most ~{bound_mb:,.0f} MB at "
+             f"{osm_b.TILE_BYTES_ESTIMATE // 1024} KB a tile; tiles in the "
+             f"cache are reused)")
+    return cover, needed
+
+
+def _buildings_fetch_failed_text(cause: str) -> str:
+    """The run's error when Site Analysis's building fetch failed."""
+    return (f"Buildings download failed (OpenFreeMap z14): {cause}.\n\nThe run "
+            f"was stopped — terrain without the requested buildings is not "
+            f"built. The tiles already downloaded stay in the cache; run "
+            f"again to fetch the rest, or untick 'Include buildings'.")
+
+
+def _log_buildings_ready(res: Any, seconds: float) -> bool:
+    """Log a finished building fetch (*res*, an ``openfreemap.FetchResult``):
+    the counts, and the warning when no tile has data. True when some has."""
+    _log(f"  buildings ready: {len(res.present):,} of {res.total:,} tile(s) "
+         f"with data ({res.nbytes / 1e6:,.1f} MB; {res.cached:,} from the "
+         f"cache, {res.empty:,} without data) in {seconds:.1f} s")
+    if not res.present:
+        _log(f"  WARNING: buildings: none of the {res.total:,} OpenFreeMap "
+             f"tile(s) of these pool tiles has data — there are no buildings "
+             f"to burn here; the terrain is built without any")
+        return False
+    return True
+
+
+class _BuildingsBesideConverter:
+    """Site Analysis's OpenFreeMap z14 fetch NEXT TO the converter run that
+    burns the tiles — ONE class for both of its routes, *what*:
+
+    * ``"download"`` — the terrain download of an XYZ source (2026-10-23;
+      aether_converter >= 0.2.10, toolkit CONTRACT changelog 45 / §9b
+      "building tiles fetched during the download"). The download job burns
+      its ``buildings_pbf_dir`` after assembling the terrain, and used to
+      read the directory as it found it then — so the whole fetch ran first
+      (the owner's log: 27 s of building tiles, then 19 s of terrain, one
+      after the other). The fetch starts in :meth:`run`, with the download.
+    * ``"ingest"`` — the ingest of a folder / file / rendered source
+      (2026-10-25; aether_converter >= 0.2.12, CONTRACT item 48). An ingest
+      decoded the directory when it STARTED, so the fetch ran first (the
+      owner's folder run: 6 s of 27 s); now it starts its terrain work at
+      once and decodes the view when the marker appears, holding finished
+      tiles in memory until then (no tile is written before). The fetch is
+      started (:meth:`start`) before the ingest jobs are built, so it runs
+      beside their build too; the jobs carry :meth:`job_fields`.
+
+    Either way the job carries ``buildings_pbf_ready`` =
+    ``osm_buildings.READY_MARKER`` and ``buildings_pbf_wait_s`` =
+    ``osm_buildings.READY_WAIT_S`` (a download: every pass) and the
+    converter waits for the marker at its burn (its ``[Buildings] waiting
+    …`` / ``… ready after S s`` lines are logged like every line). The fetch
+    is the shared thread (``osm_buildings.BuildingsFetch``, the Map
+    Converter's) over the same cover as the sequential path — the WHOLE pool
+    tiles to build (a partial file-source build: its regions) — and the
+    same strict verdict; *pbf_dir* — the view — is named before it
+    ends, from the tiles NEEDED (``osm_buildings.ready_view``). When every
+    tile is in, the view gets exactly the tiles with data (none when there
+    is none) and THEN the marker, atomically (``osm_buildings.
+    complete_view``).
+
+    LIST mode (*pbf_list*, aether_converter >= 0.2.14, toolkit CONTRACT
+    changelog 51; both routes): no view is linked — *pbf_dir* is THE store
+    and the jobs carry ``buildings_pbf_list`` = *pbf_list* (named before
+    the fetch from the tiles NEEDED, a list an earlier run left removed:
+    ``osm_buildings.ready_list``) + ``buildings_pbf_wait_s``; the list IS
+    the ready signal: written atomically once every tile is in, naming
+    exactly the tiles with data (none when there is none) —
+    ``osm_buildings.complete_list`` — and the converter decodes only those,
+    straight from the store. Everything below holds for the list as for
+    the marker (:attr:`marker` is the file the converter waits for).
+
+    The caller's side of the marker, kept here: a marker an earlier run left
+    is removed before the launch (:func:`_buildings_beside` uses the
+    sequential path when it cannot be); a fetch that fails — or ends without
+    its marker for any reason, Stop included — kills the converter (every
+    process goes through :meth:`converter_on_start`, also one launched after
+    that; a run whose fetch ended so before its launch launches nothing) and
+    never writes the marker. A download that does not end normally leaves
+    terrain WITHOUT buildings under the output names (a killed converter
+    cannot clean up), so the pass's pool tiles are removed (:meth:`_discard`,
+    ``remove_pool_tiles``) — no building-keyed tile without its buildings
+    survives; an ingest writes into the caller's scratch directory, which
+    the caller removes. A failed fetch ends the run with its cause (the
+    strict policy); Stop stays a quiet ``ConverterCancelled``; no fetch
+    outlives the run (:meth:`close`)."""
+
+    def __init__(self, cover: Any, needed: List[Tuple[int, int, int]],
+                 pbf_dir: str, should_cancel: Optional[Callable[[], bool]],
+                 on_start: Optional[Callable[[Any], None]],
+                 what: str = "download",
+                 pbf_list: Optional[str] = None) -> None:
+        from . import osm_buildings as osm_b
+        self.cover = cover
+        #: The jobs' ``buildings_pbf_dir``: the view, or (list mode) THE
+        #: store; :attr:`view` is the view (None in list mode).
+        self.pbf_dir = pbf_dir
+        self.pbf_list = pbf_list
+        self.view = None if pbf_list else pbf_dir
+        self.what = what
+        #: The file the converter waits for: the list, or the view's marker.
+        self.marker = (pbf_list if pbf_list
+                       else os.path.join(pbf_dir, osm_b.READY_MARKER))
+        #: perf_counter() of the fetch's start and of the marker's write.
+        self.t_start: Optional[float] = None
+        self.marked: Optional[float] = None
+        #: No tile of the cover has data (warned; the marker still comes —
+        #: the converter then reports no buildings in extent, 0 tiles).
+        self.no_data = False
+        self._user_cancel = should_cancel
+        self._caller_on_start = on_start
+        self._abandon = threading.Event()
+        self._lock = threading.Lock()
+        self._procs: List[Any] = []
+        self._dead = False          # the fetch ended without its marker
+        self.fetch = osm_b.BuildingsFetch(
+            [needed], should_cancel=self._fetch_cancelled, log=_log,
+            cover=cover, require_data=False, on_fetched=self._fetched,
+            on_failed=self._failed, on_end=self._ended,
+            failure_text=_buildings_fetch_failed_text)
+
+    # -- what the converter run is handed -------------------------------------
+    def job_fields(self) -> Dict[str, Any]:
+        """The marker fields of every INGEST job carrying
+        ``buildings_pbf_dir`` — ``buildings_pbf_ready`` or, in list mode,
+        ``buildings_pbf_list``, never both — + ``buildings_pbf_wait_s`` (a
+        download job gets them through ``_try_rust_download``:
+        :meth:`launch_fields`)."""
+        from . import osm_buildings as osm_b
+        if self.pbf_list:
+            return {"buildings_pbf_list": os.path.abspath(self.pbf_list),
+                    "buildings_pbf_wait_s": osm_b.READY_WAIT_S}
+        return {"buildings_pbf_ready": osm_b.READY_MARKER,
+                "buildings_pbf_wait_s": osm_b.READY_WAIT_S}
+
+    def launch_fields(self) -> Dict[str, Any]:
+        """The same as ``_try_rust_download`` arguments: ``pbf_ready=`` or
+        ``pbf_list=``, and ``pbf_wait_s=``."""
+        from . import osm_buildings as osm_b
+        if self.pbf_list:
+            return {"pbf_list": self.pbf_list,
+                    "pbf_wait_s": osm_b.READY_WAIT_S}
+        return {"pbf_ready": osm_b.READY_MARKER,
+                "pbf_wait_s": osm_b.READY_WAIT_S}
+
+    def _stopped(self) -> bool:
+        return self._user_cancel is not None and bool(self._user_cancel())
+
+    def _fetch_cancelled(self) -> bool:
+        return self._abandon.is_set() or self._stopped()
+
+    def converter_cancel(self) -> bool:
+        """The converter run's ``should_cancel``: Stop, or the fetch
+        failed."""
+        return self._stopped() or self.fetch.error is not None
+
+    def converter_on_start(self, proc: Any) -> None:
+        """The converter run's ``on_start``: the caller's hook (Stop kills
+        it), and the process kept so the fetch can kill it — at once when
+        the fetch already ended without its marker."""
+        with self._lock:
+            self._procs.append(proc)
+            dead = self._dead
+        if self._caller_on_start is not None:
+            self._caller_on_start(proc)
+        if dead:
+            kill_engine_process(proc)
+
+    def _kill_converter(self) -> None:
+        with self._lock:
+            self._dead = True
+            procs = list(self._procs)
+        for proc in procs:
+            try:
+                kill_engine_process(proc)
+            except Exception:  # noqa: BLE001 — best effort, as for Stop
+                pass
+
+    # -- the fetch thread's hooks --------------------------------------------
+    def _fetched(self, res: Any) -> None:
+        from . import osm_buildings as osm_b
+        self.no_data = not _log_buildings_ready(res, res.seconds)
+        names = self.cover.view_names()
+        try:
+            if self.pbf_list:
+                # The list IS the signal: written atomically, the tiles with
+                # data named — the converter reads them from the store.
+                osm_b.complete_list(self.pbf_list, names)
+            else:
+                # The marker LAST: the converter reads the directory once,
+                # right after it sees the marker.
+                osm_b.complete_view(self.view, names)
+        except (RuntimeError, OSError) as exc:
+            raise RuntimeError(f"Buildings: {exc}") from exc
+        self.marked = time.perf_counter()
+        burner = "download" if self.what == "download" else "conversion"
+        if self.pbf_list:
+            _log(f"  buildings: {len(names):,} OpenFreeMap tile(s) listed "
+                 f"for the converter in {self.pbf_list} — the {burner} "
+                 f"burns them now")
+        else:
+            _log(f"  buildings: {len(names):,} OpenFreeMap tile(s) linked "
+                 f"into {self.view}, {osm_b.READY_MARKER} written — the "
+                 f"{burner} burns them now")
+
+    def _failed(self, cause: str) -> None:
+        if self.fetch.error == cause:      # the view or the marker
+            _log(f"  ERROR: {cause}")
+        else:
+            _log(f"  ERROR: Buildings download failed (OpenFreeMap z14): "
+                 f"{cause}")
+        self._kill_converter()
+
+    def _ended(self) -> None:
+        if self.marked is None:
+            # Failed or stopped: the converter would wait for nothing (and a
+            # caller without an on_start hook could not kill it).
+            self._kill_converter()
+
+    # -- the run ---------------------------------------------------------------
+    def start(self) -> None:
+        """Start the fetch — once — and say so: a download's :meth:`run`
+        does, with the download; an ingest calls it before its jobs are
+        built."""
+        if self.t_start is not None:
+            return
+        # The gate of this mode (the list: 0.2.14 on both routes).
+        since = ("0.2.14" if self.pbf_list
+                 else "0.2.10" if self.what == "download" else "0.2.12")
+        if self.what == "download":
+            _log(f"  buildings: fetched next to the terrain download "
+                 f"(aether_converter >= {since} waits for {self.marker})")
+        else:
+            _log(f"  buildings: fetched next to the conversion "
+                 f"(aether_converter >= {since} waits for {self.marker})")
+        self.t_start = time.perf_counter()
+        self.fetch.start()
+
+    def close(self) -> None:
+        """No fetch outlives the converter run: one still running is not
+        needed any more — stopped and joined (never started: nothing)."""
+        if self.t_start is None:
+            return
+        if self.fetch.alive():
+            self._abandon.set()
+        self.fetch.join()
+
+    def _discard(self, pool_dir: Optional[str],
+                 names: Optional[List[str]]) -> None:
+        if pool_dir is None or not names:
+            return          # an ingest: its scratch directory is the caller's
+        removal = remove_pool_tiles(pool_dir, names)
+        left = [n for n in names if os.path.exists(os.path.join(pool_dir, n))]
+        if left:
+            _set_rebuild_flags(pool_dir, left, set(left))
+        if removal.removed or left:
+            _log(f"  buildings: the download did not end with its buildings "
+                 f"burnt — {removal.removed} pool tile(s) it wrote removed"
+                 + (f", {len(left)} that could not be removed flagged for "
+                    f"rebuild" if left else "")
+                 + " (terrain without the requested buildings is never "
+                   "pooled)")
+
+    def run(self, launch: Callable[..., Any],
+            pool_dir: Optional[str] = None,
+            names: Optional[List[str]] = None, burns: Any = None) -> Any:
+        """Start the fetch (unless :meth:`start` did) and run
+        *launch(should_cancel, on_start, pbf_ready=… or pbf_list=…,
+        pbf_wait_s=…)* (:meth:`launch_fields`) next to
+        it at once — ``_try_rust_download``, or the ingest's
+        ``_run_converter`` (its jobs carry :meth:`job_fields`); returns what
+        it returns. A fetch that already ended without its marker (failed,
+        stopped — an ingest's jobs were being built) launches nothing. When
+        it raises (Stop, the fetch's failure, any error) a download's pool
+        tiles *names* (in *pool_dir*) are removed — but for the burn's own
+        verdict on undecodable tiles, which the caller flags. A failed
+        fetch raises its error (RuntimeError)."""
+        from . import osm_buildings as osm_b
+        self.start()
+        t_launch = time.perf_counter()
+        try:
+            with self._lock:
+                dead = self._dead
+            if dead:
+                raise ConverterCancelled()
+            outcome = launch(self.converter_cancel, self.converter_on_start,
+                             **self.launch_fields())
+        except osm_b.UndecodableBuildings:
+            self.close()
+            if (burns is not None and burns.bad_tiles and not self._stopped()
+                    and self.fetch.error is None):
+                # The burn's own verdict, read after the marker: the caller
+                # flags the pass's tiles and drops the undecodable ones.
+                raise
+            self._discard(pool_dir, names)
+            raise
+        except BaseException as exc:
+            self.close()
+            self._discard(pool_dir, names)
+            if (isinstance(exc, ConverterCancelled) and not self._stopped()
+                    and self.fetch.error is not None):
+                raise RuntimeError(self.fetch.error) from None
+            raise
+        converter_s = time.perf_counter() - t_launch
+        self.close()
+        if self.marked is not None and (outcome or self.what != "download"):
+            fetch_s = self.marked - self.t_start
+            waited = burns.waited_s if burns is not None else 0.0
+            if self.what == "download":
+                _log(f"  buildings fetched next to the terrain download: "
+                     f"fetch {fetch_s:.1f} s, download {converter_s:.1f} s, "
+                     f"converter waited {waited:.1f} s")
+            else:
+                _log(f"  buildings fetched next to the conversion: fetch "
+                     f"{fetch_s:.1f} s, converter {converter_s:.1f} s, "
+                     f"converter waited {waited:.1f} s")
+        return outcome
+
+
+def _buildings_beside(todo: List[Dict[str, Any]],
+                      verdicts: Dict[str, "PoolTile"],
+                      binary_manager: Any,
+                      should_cancel: Optional[Callable[[], bool]],
+                      on_start: Optional[Callable[[Any], None]],
+                      what: str = "download",
+                      ) -> Tuple[Optional[_BuildingsBesideConverter],
+                                 Optional[Tuple[Any, list]]]:
+    """``(the fetch next to the converter run, (cover, needed))`` for a Site
+    Analysis run with buildings over route *what* — ``"download"`` (an XYZ
+    source without a buildings FILE) or ``"ingest"`` (every other source) —
+    the fetch None for the sequential path (:func:`_fetch_osm_buildings`,
+    handed the cover): a converter older than
+    ``binary_manager.CONVERTER_BUILDINGS_READY_MIN_VERSION`` (0.2.10; an
+    ingest: ``CONVERTER_INGEST_BUILDINGS_READY_MIN_VERSION``, 0.2.12) or
+    unknown (the cached ``--version`` probe) ignores ``buildings_pbf_ready``
+    and would read the directory half-filled; no tile needed; or a marker
+    an earlier run left that cannot be removed (``osm_buildings.
+    ready_view``). The cover is None when the converter decided.
+
+    On aether_converter >= 0.2.14
+    (``binary_manager.converter_supports_buildings_list``, toolkit CONTRACT
+    changelog 51) the fetch is in LIST mode: no view, the jobs read THE
+    store through a list file named now (``osm_buildings.ready_list``); a
+    list an earlier run left that cannot be removed → the view and its
+    marker, as on 0.2.12."""
+    from . import binary_manager as bm
+    from . import openfreemap
+    from . import osm_buildings as osm_b
+    supports = (bm.converter_supports_buildings_ready if what == "download"
+                else bm.converter_supports_ingest_buildings_ready)
+    try:
+        exe = binary_manager.find_binary("aether_converter")
+        ready = supports(exe)
+        listing = ready and bm.converter_supports_buildings_list(exe)
+    except Exception:  # noqa: BLE001 — a probe never takes the run down
+        ready = listing = False
+    if not ready:
+        return None, None
+    cover, needed = _osm_buildings_cover(todo, verdicts)
+    if not needed:
+        return None, (cover, needed)
+    names = [openfreemap.tile_filename(*t) for t in needed]
+    if listing:
+        pbf_list = osm_b.ready_list(names)
+        if pbf_list is not None:
+            return (_BuildingsBesideConverter(
+                cover, needed, osm_buildings_store_dir(), should_cancel,
+                on_start, what, pbf_list=pbf_list), (cover, needed))
+        _log(f"  WARNING: buildings: {osm_buildings_list_path(names)} (left "
+             f"by an earlier run) could not be removed — the building tiles "
+             f"are linked into a view for the "
+             + ("download" if what == "download" else "conversion")
+             + " instead")
+    view = osm_b.ready_view(names)
+    if view is None:
+        stale = os.path.join(
+            osm_buildings_view_dir(names, marker=osm_b.READY_MARKER),
+            osm_b.READY_MARKER)
+        _log(f"  WARNING: buildings: {stale} (left by an earlier run) could "
+             f"not be removed — the building tiles are fetched before the "
+             + ("download" if what == "download" else "conversion")
+             + " instead")
+        return None, (cover, needed)
+    return (_BuildingsBesideConverter(cover, needed, view, should_cancel,
+                                      on_start, what), (cover, needed))
+
+
+def _buildings_burn_failed(burns: Any, pool: bool = False) -> str:
+    """The run's error when the converter's buildings report (*burns*, an
+    ``osm_buildings.BurnMonitor``) is not clean — logged; building tiles it
+    could not decode leave the store and every view first. *pool*: the
+    pass wrote into the pool (its tiles were flagged for rebuild)."""
+    from . import osm_buildings as osm_b
+    if burns.bad_tiles:
+        msg = osm_b.drop_undecodable(burns.bad_tiles)
+    else:
+        msg = burns.verdict() or "Buildings: the burn could not be verified."
+    _log(f"  ERROR: {msg}")
+    return (msg + "\n\nThe run was stopped — terrain without the requested "
+            "buildings is not used. "
+            + ("The terrain tiles this run wrote are flagged for rebuild."
+               if pool else "Nothing was added to the terrain cache."))
+
+
+def _log_buildings_burn(burns: Any) -> None:
+    """The burn's log line: the totals, or — every report "no buildings in
+    extent" — the warning that the area holds none (no error: the tiles
+    were fetched and read, there is simply nothing to burn)."""
+    if burns.empty:
+        _log(f"  WARNING: buildings: the {burns.pbf_tiles:,} OpenFreeMap "
+             f"tile(s) of these pool tiles hold no building (\"no buildings "
+             f"in extent\") — the terrain carries none here")
+    else:
+        _log(f"  buildings: {burns.summary()}")
 
 
 # ---------------------------------------------------------------------------
@@ -4104,8 +7787,42 @@ def prepare_terrain(
     progress_span: Optional[Tuple[float, float]] = None,
     min_range_km: float = 0.0,
     skip_footprints: Optional[set] = None,
+    should_cancel: Optional[Callable[[], bool]] = None,
+    on_start: Optional[Callable[[Any], None]] = None,
+    source_infos: Optional[Tuple[List[Dict[str, Any]], bool,
+                                 Optional[FootprintIndex]]] = None,
+    output_res_m: Optional[float] = None,
+    region_union: Optional[Dict[str, List[Dict[str, float]]]] = None,
+    terrain_prep: Optional[TerrainPrep] = None,
 ) -> str:
     """Produce .abt terrain tiles for aether_core. Returns cache directory.
+
+    File sources (a folder, a file layer) build only the part of each tile
+    the job needs (:func:`tile_regions`; a partial tile is pooled as
+    ``<name>.part``, see :func:`resolve_pool_tile`) — the view links it under
+    the canonical name. *output_res_m* is the job's output pixel when it is
+    coarser than *resolution_m* (a range-profile band), for the region
+    margin. *region_union* (:func:`run_region_union`) is every region the
+    run's jobs need per tile: a tile this job builds is built for all of
+    them at once, so a multi-site run builds each tile once.
+
+    *source_infos* ``(infos, use_qgis_export, index)`` is the source already
+    read by :func:`_read_source_once` — :func:`prepare_terrain_profile` reads
+    and indexes it once for all bands; None (every other caller) reads it
+    here. *terrain_prep* (Site Analysis: the run's :class:`TerrainPrep` of
+    *terrain_dir*) stands in for that read while it is current — no index
+    re-check, source-info build, overlap sort or FootprintIndex build; the
+    files near the job's tiles are matched through its index
+    (:class:`SubsetFootprintIndex`), so the jobs are the ones the read
+    gives. A stale or absent one: the folder is read here, as before.
+
+    *should_cancel()* is polled per tile (fingerprints, job building), per
+    folder-index file and per engine output line; *on_start(proc)* receives
+    every engine process this starts (download passes, ingest) so the
+    caller's cancel can kill it — the converter prints ingest progress only
+    every 10 tiles, so polling lines alone cannot stop it promptly. A stop is
+    always :class:`ConverterCancelled`; scratch files are removed on the way
+    out. Both default to None (not cancellable), as for every older caller.
 
     *min_range_km* and *skip_footprints* narrow the tile set for one band of a
     range profile (:func:`prepare_terrain_profile`): tiles lying wholly inside
@@ -4121,7 +7838,19 @@ def prepare_terrain(
     Buildings can come from *buildings_file* (FlatGeobuf, absolute roof
     elevations) and/or *osm_buildings* (OpenFreeMap vector tiles, heights above
     ground). Either way they are burned into the terrain surface, so the choice
-    is part of the cache identity.
+    is part of the cache identity. OpenFreeMap goes the one strict way
+    (``osm_buildings``, as the Map Converter's row): the z14 tiles of the
+    WHOLE pool tiles to build are fetched — next to the download on
+    aether_converter >= 0.2.10 and next to the ingest on >= 0.2.12
+    (:class:`_BuildingsBesideConverter`: the jobs wait for the view's marker
+    file at their burn), else before the download/ingest
+    (:func:`_fetch_osm_buildings`); a failure ends the run (a converter it
+    ran beside killed, a download's pool tiles removed) — the download
+    job or the ingest jobs carry them as ``buildings_pbf_dir``, and the
+    converter's lines decide (``BurnMonitor``: an undecodable tile, a pass
+    without a burn report, buildings decoded and none drawn → RuntimeError,
+    pool tiles a download pass wrote flagged for rebuild; "no buildings in
+    extent" everywhere or no tile with data → a warning).
     """
     t0 = time.perf_counter()
     source = terrain_dir or dem_layer.source()
@@ -4164,22 +7893,30 @@ def prepare_terrain(
         tiles = list_abt_tiles(terrain_dir)
         _log(f"  using {len(tiles)} pre-built .abt tile(s) from {terrain_dir} "
              f"— no download or conversion")
+        abt_bands = [(max_range_km * 1000.0, int(resolution_m))]
         # Re-run the same checks the GUI shows as a dialog. A Processing run
         # never sees that dialog, and this path skips every other safeguard in
         # this function, so anything wrong with the tiles has to be said here
-        # or the run produces a confident, wrong answer with no trace.
+        # or the run produces a confident, wrong answer with no trace. The
+        # selection is memoised: _abt_view_for below reuses it.
+        selection = select_abt_tiles(terrain_dir, tx_lat, tx_lon, abt_bands,
+                                     az_start, az_end)
         problem = _abt_coverage_warning(
             terrain_dir, tiles,
             _compute_sector_bbox(tx_lat, tx_lon, max_range_km, az_start, az_end),
-            resolution_m, osm_buildings, buildings_file,
+            resolution_m, selections=[selection],
         )
         if problem:
             for line in problem.splitlines():
                 if line.strip():
                     _log(f"  WARNING: {line.strip()}")
+        # Buildings are baked into a prepared tile when it is built: what
+        # the Map Converter recorded for the chosen tiles is said here (the
+        # GUI asks before the run).
+        _log_prepared_buildings(terrain_dir, selection,
+                                bool(osm_buildings or buildings_file))
         _record_route("terrain_dir")
-        return _abt_view_for(terrain_dir, tx_lat, tx_lon,
-                             [(max_range_km * 1000.0, int(resolution_m))],
+        return _abt_view_for(terrain_dir, tx_lat, tx_lon, abt_bands,
                              az_start, az_end)
 
     bbox = _compute_sector_bbox(tx_lat, tx_lon, max_range_km, az_start, az_end)
@@ -4217,13 +7954,6 @@ def prepare_terrain(
     # run — never recomputed at the launch site, where a changed cache-dir
     # setting would move them out from under the directories already made.
     pool_dir = _pool_dir(source, buildings_id)
-    view_dir = _view_dir(source, subtiles, resolution_m, buildings_id)
-    ensure_engine_dirs(pool_dir, view_dir)
-    # Log the resolved paths so the user can inspect the .abt tiles directly
-    # (e.g. to check for missing tiles that show up as empty stripes through a
-    # line-of-sight). Set QgsSettings "waveshed/cache_dir" to relocate.
-    _log(f"  tile pool: {pool_dir}")
-    _log(f"  .abt view dir: {view_dir}")
 
     # File sources (a folder or a file layer): read the folder index BEFORE
     # deciding what is cached. The pool is keyed on the folder path, so each
@@ -4231,39 +7961,102 @@ def prepare_terrain(
     # it (path + size + mtime, priority order); a file added, changed or
     # removed makes the tiles it touches stale — and no others. Without this
     # a folder whose files changed served the old terrain as a "cache HIT".
+    #
+    # Tile -> file matching goes through ONE FootprintIndex per run, so each
+    # tile's files are found once (not by testing every file) and the job
+    # build below reuses the match the fingerprint made.
     early_infos: Optional[List[Dict[str, Any]]] = None
     early_qgis_export = False
-    tile_fps: Dict[str, Optional[str]] = {}
-    if terrain_dir or (dem_layer is not None
-                       and "type=xyz" not in dem_layer.source()):
-        early_infos, early_qgis_export = _gather_source_infos(
-            dem_layer, terrain_dir)
-        if early_infos:
-            early_infos = _infos_near(early_infos, subtiles)
-            for t in subtiles:
-                tile_fps[t["filename"]] = tile_source_fingerprint(
-                    early_infos, _subtile_bbox(t), t["exact_res_m"])
+    src_index: Optional[FootprintIndex] = None
+    if source_infos is not None:
+        # prepare_terrain_profile read the source (and indexed it) once for
+        # all of its bands.
+        early_infos, early_qgis_export, src_index = source_infos
+    elif terrain_dir or (dem_layer is not None
+                         and "type=xyz" not in dem_layer.source()):
+        prep = _current_prep(terrain_prep, terrain_dir)
+        if prep is not None:
+            # The run's preparation (one index check, one source-info build,
+            # one FootprintIndex per Run click): the same files near the
+            # job's tiles, matched through its index.
+            early_infos = _infos_near(prep.infos, subtiles)
+            src_index = prep.index_for(early_infos)
+        else:
+            early_infos, early_qgis_export = _gather_source_infos(
+                dem_layer, terrain_dir, should_cancel=should_cancel)
+            if early_infos:
+                early_infos = _infos_near(early_infos, subtiles)
+                src_index = footprint_index(early_infos)
+    # A file source builds only the part of each tile this job needs
+    # (resolve_pool_tile); XYZ and rendered sources always whole tiles. The
+    # view identity carries the regions, so a view is never handed a partial
+    # tile built for another region.
+    partial_ok = bool(early_infos)
+    regions = tile_regions(subtiles, bbox, resolution_m, output_res_m,
+                           partial_ok)
+    link_tiles = ({t["filename"]: (t, regions[t["filename"]])
+                   for t in subtiles} if partial_ok else None)
+    view_dir = _view_dir(source, subtiles, resolution_m, buildings_id,
+                         regions)
+    ensure_engine_dirs(pool_dir, view_dir)
+    # Log the resolved paths so the user can inspect the .abt tiles directly
+    # (e.g. to check for missing tiles that show up as empty stripes through a
+    # line-of-sight). Set QgsSettings "waveshed/cache_dir" to relocate.
+    _log(f"  tile pool: {pool_dir}")
+    _log(f"  .abt view dir: {view_dir}")
+
+    # One fingerprint per (tile, region), kept for the run: the stale check
+    # and the sidecars written after the build share them.
+    fp_memo: Dict[Tuple[Any, ...], str] = {}
+
+    def fp_for(t: Dict[str, Any], box: Dict[str, float]) -> str:
+        key = (t["filename"], box["west"], box["south"], box["east"],
+               box["north"])
+        if key not in fp_memo:
+            fp_memo[key] = tile_source_fingerprint(
+                early_infos, box, t["exact_res_m"], index=src_index)
+        return fp_memo[key]
+
+    if early_infos:
+        for t in subtiles:
+            if should_cancel is not None and should_cancel():
+                raise ConverterCancelled()
+            fp_for(t, regions[t["filename"]] or _subtile_bbox(t))
 
     # Membership is per tile, so a smaller range, a nudged site or a narrower
     # sector fetches nothing: every tile it needs is already pooled.
-    stale = [t for t in subtiles
-             if t["filename"] in tile_fps
-             and _tile_ready(pool_dir, t["filename"])
-             and _read_source_fp(pool_dir, t["filename"])
-             != tile_fps[t["filename"]]]
+    #
+    # ONE listing of the pool decides which tiles are there (no header read
+    # per tile; _tile_ready's size rule), which carry a fingerprint and
+    # which regions a partial tile holds — THE hit rule, resolve_pool_tile.
+    listing = _pool_listing(pool_dir)
+    verdicts: Dict[str, PoolTile] = {}
+    for t in subtiles:
+        if should_cancel is not None and should_cancel():
+            raise ConverterCancelled()
+        name = t["filename"]
+        verdicts[name] = resolve_pool_tile(
+            pool_dir, t, regions[name],
+            fp_of=((lambda box, t=t: fp_for(t, box)) if early_infos
+                   else None),
+            listing=listing, extra_regions=(region_union or {}).get(name))
+    stale = [t for t in subtiles if not verdicts[t["filename"]].hit
+             and verdicts[t["filename"]].reason == "stale"]
     if stale:
         _log(f"  {len(stale)} pooled tile(s) are stale — the files that "
              f"feed them changed (or were added/removed) since they were "
              f"built; rebuilding just those (first: {stale[0]['filename']})")
-    stale_names = {t["filename"] for t in stale}
-    todo = [t for t in subtiles
-            if t["filename"] in stale_names
-            or not _tile_ready(pool_dir, t["filename"])]
+    todo = [t for t in subtiles if not verdicts[t["filename"]].hit]
     if not todo:
-        gone = _sync_view(pool_dir, view_dir, expected)
+        # Every tile is pooled from an earlier run: the void counts that
+        # run recorded say which ones need the 0 m fill.
+        gone = _sync_view(pool_dir, view_dir, expected, tiles=link_tiles,
+                          voids=_view_voids(pool_dir, expected, link_tiles))
         if not gone:
-            _log(f"  cache HIT — {len(expected)} tile(s) from the pool "
-                 f"({time.perf_counter() - t0:.1f}s)")
+            n_part = sum(1 for v in verdicts.values() if v.partial)
+            _log(f"  cache HIT — {len(expected)} tile(s) from the pool"
+                 + (f" ({n_part} partial)" if n_part else "")
+                 + f" ({time.perf_counter() - t0:.1f}s)")
             # A hit re-serves what the source's contract route pooled
             # earlier (nothing else can fill a pool any more), so it counts
             # as that route — a warm run must not read as "acquired nothing".
@@ -4273,6 +8066,19 @@ def prepare_terrain(
             return view_dir
         _log(f"  {len(gone)} pooled tile(s) vanished between check and link; "
              f"rebuilding those")
+        listing = _pool_listing(pool_dir)
+        for name in gone:
+            spec = next(t for t in subtiles if t["filename"] == name)
+            v = resolve_pool_tile(
+                pool_dir, spec, regions[name],
+                fp_of=((lambda box, t=spec: fp_for(t, box)) if early_infos
+                       else None),
+                listing=listing, extra_regions=(region_union or {}).get(name))
+            if v.hit:               # raced back in: rebuild what the job needs
+                r = regions[name]
+                v = PoolTile(False, None, r is not None,
+                             [r] if r is not None else None, "missing")
+            verdicts[name] = v
         todo = [t for t in subtiles if t["filename"] in set(gone)]
 
     # Building anything at all needs the converter, so check before the work
@@ -4291,22 +8097,42 @@ def prepare_terrain(
     # "output tiles" = the .abt files we write. Kept distinct from the "source
     # tiles" (XYZ web tiles) counted during the download below — the two counts
     # differ by orders of magnitude and used to be indistinguishable in the log.
+    # A partial build (resolve_pool_tile) reads only its region's files —
+    # say how many there are and how much ground they cover.
+    part_todo = [t for t in todo if verdicts[t["filename"]].regions]
+    part_note = ""
+    if part_todo:
+        reg_deg2 = sum(_bbox_area(r) for t in part_todo
+                       for r in verdicts[t["filename"]].regions)
+        tile_deg2 = sum(_bbox_area(_subtile_bbox(t)) for t in part_todo)
+        part_note = (f" ({len(part_todo)} partial: region {reg_deg2:.3f} deg² "
+                     f"of their {tile_deg2:.3f} deg²)")
     _log(f"  cache MISS — {len(todo)} of {len(subtiles)} output tiles (.abt) "
-         f"need building, ~{disk_mb} MB on disk, "
+         f"need building{part_note}, ~{disk_mb} MB on disk, "
          f"bbox N={bbox['north']:.3f} S={bbox['south']:.3f} "
          f"E={bbox['east']:.3f} W={bbox['west']:.3f}")
 
-    # Fetch building tiles before the converter runs, so they are on disk when
-    # the ingest jobs reference them.
+    # Buildings are fetched strictly: every tile is in the store or
+    # answered "no data", or the run ENDS with the cause — a pool keyed
+    # "with buildings" is never built without them. A DOWNLOAD on
+    # aether_converter >= 0.2.10 fetches them next to the terrain (the job
+    # waits for the view's marker file at its buildings post-pass) and an
+    # INGEST (file / folder / rendered sources, a buildings FILE beside
+    # OpenFreeMap) on >= 0.2.12 next to the conversion (it starts at once
+    # and decodes the view when the marker appears): _BuildingsBesideConverter.
+    # On >= 0.2.14 both read THE store through a list file instead of a
+    # view (buildings_pbf_list: nothing linked, the list is the signal).
+    # Older converters fetch them first — a download reads the directory as
+    # it finds it when its terrain is done, an older ingest decodes it when
+    # it STARTS.
     #
-    # `buildings_missing` is the reconciliation between what the identity above
-    # CLAIMS these tiles carry and what they will really carry: whenever it
-    # ends up True the tiles are flagged for rebuild, so a pool keyed "with
-    # buildings" never serves a cache hit over building-free terrain. Three
-    # things can set it: an unusable buildings file (here), a failed
-    # OpenFreeMap fetch (below), and the converter's own complaint after the
-    # ingest ran.
+    # `buildings_missing` is the reconciliation for a buildings FILE: an
+    # unusable one (here) or the converter's own complaint after the ingest
+    # flags the tiles for rebuild, so a pool keyed "with buildings" never
+    # serves a cache hit over building-free terrain.
     pbf_dir: Optional[str] = None
+    burns: Any = None
+    beside: Optional[_BuildingsBesideConverter] = None
     buildings_missing = False
     if buildings_file and not buildings_source.is_converter_readable(
             buildings_file):
@@ -4316,45 +8142,24 @@ def prepare_terrain(
              f"terrain without buildings.")
         buildings_missing = True
     if osm_buildings:
-        # Building tiles pool alongside the terrain tiles — they are globally
-        # addressed (z_x_y.pbf), so 30 km -> 31 km reuses every one of them
-        # instead of re-fetching 1369 tiles.  The converter, though, is handed
-        # a per-run view: ingest.rs re-scans the whole buildings directory for
-        # every output tile it writes, so pointing it at a pool that grows
-        # across runs would make each run slower than the last.
-        pbf_pool = os.path.join(pool_dir, "_buildings")
-        pbf_dir = os.path.join(view_dir, "_buildings")
-        try:
-            from . import openfreemap
-            # The (ok, missing) result used to be dropped on the floor, so a
-            # run that fetched NOTHING carried on with buildings_missing=False
-            # and pooled building-free terrain under a buildings-keyed
-            # identity — a cache HIT for every later run, forever. Per-tile
-            # failures are the silent case: the over-MAX_TILES guard raises,
-            # but a dead network or a moved endpoint just returns (0, N).
-            ok, missing = openfreemap.download_building_tiles(
-                bbox, pbf_pool, log=_log)
-            if ok == 0:
-                raise RuntimeError(
-                    f"no building tiles could be fetched ({missing} tile(s) "
-                    f"empty or unavailable) — the terrain would carry no "
-                    f"buildings at all"
-                )
-            _link_pbf_view(pbf_pool, pbf_dir, [
-                openfreemap.tile_filename(*t)
-                for t in openfreemap.tiles_for_bbox(bbox)
-            ])
-        except Exception as exc:  # noqa: BLE001
-            # Terrain without buildings beats no terrain at all, but the user
-            # must know the result is not what they asked for.
-            _log(f"  WARNING: building download failed ({exc}); "
-                 "continuing without buildings")
-            pbf_dir = None
-            # The cache identity says these tiles carry buildings. They do not,
-            # so the directory must not be reused — otherwise the next run
-            # hits the cache, skips the download, and silently produces
-            # building-free terrain with no warning at all.
-            buildings_missing = True
+        from . import osm_buildings as osm_b
+        # The route below: the download (an XYZ source without a buildings
+        # FILE — that diverts to the ingest path), else the ingest.
+        route = ("download" if (not buildings_file and not terrain_dir
+                                and "type=xyz" in dem_layer.source())
+                 else "ingest")
+        beside, cover_needed = _buildings_beside(
+            todo, verdicts, binary_manager, should_cancel, on_start, route)
+        if beside is not None:
+            pbf_dir = beside.pbf_dir
+        else:
+            pbf_dir = _fetch_osm_buildings(todo, verdicts, should_cancel,
+                                           cover_needed=cover_needed)
+        if pbf_dir:
+            # Every pass that carries the field is read (the converter's
+            # own lines): a tile it cannot decode, a pass that reports no
+            # burn, buildings decoded and none drawn — each ends the run.
+            burns = osm_b.BurnMonitor()
 
     # Path 1: Rust downloader (XYZ → .abt directly, no intermediate file).
     #
@@ -4385,20 +8190,53 @@ def prepare_terrain(
                         int(span_lo + frac * (span_hi - span_lo)))
                 except Exception:  # noqa: BLE001 — progress must never abort
                     pass
-        outcome = _try_rust_download(dem_layer.source(), pool_dir, bbox,
-                                     resolution_m, todo, binary_manager,
-                                     pbf_dir=pbf_dir, progress_cb=progress_cb)
+        built_names = [t["filename"] for t in todo]
+
+        def download(cancel: Any, start: Any, **ready: Any) -> Any:
+            return _try_rust_download(
+                dem_layer.source(), pool_dir, bbox, resolution_m, todo,
+                binary_manager, pbf_dir=pbf_dir, progress_cb=progress_cb,
+                should_cancel=cancel, on_start=start,
+                **({"burns": burns} if burns is not None else {}), **ready)
+        try:
+            if beside is not None:
+                # The building fetch runs NOW, next to this download, which
+                # waits for the view's marker before its burn; a failed
+                # fetch raises its own error (the pass's tiles removed).
+                outcome = beside.run(download, pool_dir, built_names, burns)
+            else:
+                outcome = download(should_cancel, on_start)
+        except ConverterCancelled:
+            if (burns is None or not burns.bad_tiles
+                    or (should_cancel is not None and should_cancel())):
+                raise
+            # A pass warned it could not decode building tiles (raised after
+            # its lines were read): the pool tiles it wrote carry only some
+            # of their buildings — flagged, never served as built.
+            _set_rebuild_flags(pool_dir, built_names, set(built_names))
+            raise RuntimeError(_buildings_burn_failed(burns, pool=True))
+        if outcome and burns is not None:
+            if burns.verdict() is not None:
+                _set_rebuild_flags(pool_dir, built_names, set(built_names))
+                raise RuntimeError(_buildings_burn_failed(burns, pool=True))
+            if beside is None or not beside.no_data:
+                # (No tile with data: the fetch warned already, and the
+                # burn of the empty view says "0 pbf tile(s)".)
+                _log_buildings_burn(burns)
         if outcome:
-            # Reached either with buildings fused in (pbf_dir set) or with no
-            # buildings at all. In the second case the pool identity may still
-            # claim buildings — a failed OpenFreeMap download clears pbf_dir
-            # but not the identity — so those tiles must not be reused.
+            # A buildings FILE that turned out unusable: the pool identity
+            # claims buildings these tiles do not carry — never reused.
             if buildings_missing:
                 _set_rebuild_flags(pool_dir, [t["filename"] for t in todo],
                                    {t["filename"] for t in todo})
                 _log("  buildings were requested but unavailable — tiles "
                      "flagged for rebuild so the next run retries them")
-            _finish_view(pool_dir, view_dir, expected, t0)
+            # This download's counts first, the pool's records for the
+            # tiles an earlier run pooled.
+            _finish_view(pool_dir, view_dir, expected, t0,
+                         voids=_view_voids(
+                             pool_dir, expected,
+                             run=getattr(outcome, "voids", None)))
             _record_route("download")
             _record_view_dir(view_dir)
             return view_dir
@@ -4422,12 +8260,28 @@ def prepare_terrain(
     # Per-tile filtering (not one whole-extent raster) bounds every decode to
     # one tile, independent of the total range or resolution.
     temp_tifs: List[str] = []
+    # The converter writes every output into a scratch directory inside the
+    # pool, and each finished tile is renamed into place: a pool tile is
+    # replaced, never truncated in place — views hardlink pool tiles, and a
+    # rewrite in place would change (or, mid-write, break) the terrain of a
+    # view built earlier, possibly for another region.
+    incoming: Optional[str] = None
+    # The void counts the ingest printed for the tiles it placed, bound to
+    # the placed files (converter >= 0.2.11; 0 with void_fill_m).
+    built_voids: Dict[str, Dict[str, int]] = {}
     try:
+        if beside is not None:
+            # The building fetch runs NOW, beside the job build and the
+            # conversion (the converter, >= 0.2.12, waits for the view's
+            # marker at its burn).
+            beside.start()
         if early_infos is not None or early_qgis_export:
             infos, use_qgis_export = early_infos or [], early_qgis_export
         else:
-            infos, use_qgis_export = _gather_source_infos(dem_layer,
-                                                          terrain_dir)
+            infos, use_qgis_export = _gather_source_infos(
+                dem_layer, terrain_dir, should_cancel=should_cancel)
+        if src_index is None or src_index.infos is not infos:
+            src_index = footprint_index(infos)
         if use_qgis_export:
             # One provider query for the run; the shared rule keeps this
             # export identical to the Map Converter's for the same layer.
@@ -4454,7 +8308,13 @@ def prepare_terrain(
                 _warn_if_bbox_exceeds_bounds(layer_bounds, bbox, source)
 
         jobs = []
+        ensure_engine_dirs(pool_dir)
+        incoming = tempfile.mkdtemp(prefix=".incoming-", dir=pool_dir)
         for t in todo:
+            # Per tile: a rendered export or a materialized window can take
+            # seconds each, and nothing else here can be killed.
+            if should_cancel is not None and should_cancel():
+                raise ConverterCancelled()
             res_deg = t["exact_res_m"] / 111_111.0
             tile_bbox = {
                 "north": t["ul_lat"],
@@ -4462,8 +8322,11 @@ def prepare_terrain(
                 "west": t["ul_lon"],
                 "east": t["ul_lon"] + t["size_px"] * res_deg,
             }
+            # A partial build keeps the whole tile's geometry (ul_lat /
+            # ul_lon / size_px) and lists only its regions' files.
             job = {
-                "output_path": os.path.abspath(os.path.join(pool_dir, t["filename"])),
+                "output_path": os.path.abspath(os.path.join(incoming,
+                                                            t["filename"])),
                 "format": "r16sint",
                 "ul_lat": t["ul_lat"],
                 "ul_lon": t["ul_lon"],
@@ -4499,7 +8362,8 @@ def prepare_terrain(
                     infos, tile_bbox, tempfile.gettempdir(),
                     tag=f"{os.path.basename(pool_dir)}_{os.getpid()}_"
                         f"{t['filename']}",
-                    output_res_m=t["exact_res_m"])
+                    output_res_m=t["exact_res_m"], index=src_index,
+                    regions=verdicts[t["filename"]].regions)
                 temp_tifs.extend(temps)
             # Omitted entirely when unset — MPT_SIGMA and older converters must
             # keep seeing exactly the job shape they do today.
@@ -4507,6 +8371,8 @@ def prepare_terrain(
                 job["buildings_file"] = os.path.abspath(buildings_file)
             if pbf_dir:
                 job["buildings_pbf_dir"] = os.path.abspath(pbf_dir)
+                if beside is not None:
+                    job.update(beside.job_fields())
             jobs.append(job)
 
         # Immediately before the write and the launch, not only at the top of
@@ -4524,8 +8390,41 @@ def prepare_terrain(
 
         t2 = time.perf_counter()
         exe = binary_manager.find_binary("aether_converter")
-        out_lines = _run_converter(exe, job_file)
+        if burns is not None:
+            burns.begin(sum(1 for j in jobs if j.get("buildings_pbf_dir")))
+        try:
+            if beside is not None:
+                # Launched at once: the converter decodes the view once the
+                # fetch has written its marker; a failed fetch kills it and
+                # raises its own error (nothing is placed).
+                out_lines = beside.run(
+                    lambda cancel, start, **_ready: _run_converter(
+                        exe, job_file, should_cancel=cancel, on_start=start,
+                        burns=burns), burns=burns)
+            else:
+                out_lines = _run_converter(
+                    exe, job_file, should_cancel=should_cancel,
+                    on_start=on_start,
+                    **({"burns": burns} if burns is not None else {}))
+        except ConverterCancelled:
+            if (burns is None or not burns.bad_tiles
+                    or (should_cancel is not None and should_cancel())):
+                raise
+            # Killed at the line after the converter's decode warning —
+            # before its first tile: nothing reaches the pool (the
+            # `finally` removes the scratch dir).
+            raise RuntimeError(_buildings_burn_failed(burns))
         _log(f"  converter: {time.perf_counter() - t2:.1f}s ({len(jobs)} tiles)")
+        if burns is not None:
+            burns.end(tiles=len(jobs))
+            if burns.verdict() is not None:
+                # Before a tile is placed: the pool keeps what it had (those
+                # tiles were not hits — they are built again next run).
+                raise RuntimeError(_buildings_burn_failed(burns))
+            if beside is None or not beside.no_data:
+                # (No tile with data: the fetch warned already, and the
+                # burn of the empty view says "0 tile(s)".)
+                _log_buildings_burn(burns)
 
         # Exit 0 is not the verdict on buildings: a file it could not read is
         # one "[Warn] Failed to apply buildings: …" line and a clean exit, and
@@ -4547,30 +8446,196 @@ def prepare_terrain(
                     buildings_missing = True
 
         # The converter can exit 0 having skipped a tile it could not build,
-        # so flag whatever did not land whole. Buildings that were requested
-        # but unavailable flag everything: the pool identity claims buildings
-        # these pixels do not carry.
+        # so flag whatever did not land whole (a .part by the same rule as a
+        # tile). Buildings that were requested but unavailable flag
+        # everything: the pool identity claims buildings these pixels do not
+        # carry.
         built = [t["filename"] for t in todo]
-        bad = {n for n in built
-               if not _tile_is_whole(os.path.join(pool_dir, n))}
-        if bad:
-            _log(f"  WARNING: {len(built) - len(bad)}/{len(built)} tiles "
-                 f"written whole; {len(bad)} short or missing "
-                 f"(first: {sorted(bad)[0]}) — flagged for rebuild")
+        short = {n for n in built
+                 if not _tile_is_whole(os.path.join(incoming, n))}
+        if short:
+            _log(f"  WARNING: {len(built) - len(short)}/{len(built)} tiles "
+                 f"written whole; {len(short)} short or missing "
+                 f"(first: {sorted(short)[0]}) — flagged for rebuild")
+        short |= _place_built_tiles(pool_dir, incoming, todo, verdicts, short,
+                                    fp_for if early_infos else None)
+        bad = set(short)
         if buildings_missing:
             _log("  buildings were requested but unavailable — tiles flagged "
                  "for rebuild so the next run retries them")
             bad = set(built)
         _set_rebuild_flags(pool_dir, built, bad)
-        _write_source_fps(pool_dir, {n: tile_fps.get(n) for n in built}, bad)
+        _write_source_fps(pool_dir, {
+            t["filename"]: (fp_for(t, _subtile_bbox(t)) if early_infos
+                            else None)
+            for t in todo if verdicts[t["filename"]].regions is None
+            and t["filename"] not in short}, bad)
+        # Each placed tile's `[Tile] <name> voids=<n>` count, bound to the
+        # file it was placed as (`<name>`, or `<name>.part` for a region
+        # build — _place_built_tiles' rule); a tile not placed, or without a
+        # line (an older converter), is unknown: its earlier record goes.
+        counts = _parse_tile_voids(out_lines)
+        placed: Dict[str, Optional[Dict[str, int]]] = {}
+        for t in todo:
+            name = t["filename"]
+            n = None if name in short else counts.get(name)
+            target = os.path.join(
+                pool_dir, name + (_PART_SUFFIX if verdicts[name].regions
+                                  is not None else ""))
+            placed[name] = None if n is None else _voids_record(target, n)
+        _record_pool_voids(pool_dir, placed)
+        built_voids = {n: r for n, r in placed.items() if r}
     finally:
+        if beside is not None:
+            beside.close()          # no fetch outlives the run
         for tf in temp_tifs:
             if os.path.exists(tf):
                 os.remove(tf)
+        if incoming:
+            shutil.rmtree(incoming, ignore_errors=True)
 
-    _finish_view(pool_dir, view_dir, expected, t0)
+    _finish_view(pool_dir, view_dir, expected, t0, tiles=link_tiles,
+                 voids=_view_voids(pool_dir, expected, link_tiles,
+                                   run=built_voids))
     _record_view_dir(view_dir)
     return view_dir
+
+
+#: Windows errors of a rename refused because another process holds the
+#: source or the target open: ERROR_ACCESS_DENIED, ERROR_SHARING_VIOLATION.
+_RENAME_REFUSED_WINERRORS = (5, 32)
+
+
+def _rename_refused(exc: OSError) -> bool:
+    """True for the refusal :func:`replace_with_retry` waits out:
+    PermissionError, ``EACCES`` / ``EPERM``, Windows error 5 / 32."""
+    return (isinstance(exc, PermissionError)
+            or exc.errno in (errno.EACCES, errno.EPERM)
+            or getattr(exc, "winerror", None) in _RENAME_REFUSED_WINERRORS)
+
+
+def replace_with_retry(src: str, dst: str, attempts: int = 5,
+                       delay: float = 0.1) -> None:
+    """``os.replace(src, dst)``, tried up to *attempts* times *delay*
+    seconds apart while the rename is REFUSED (:func:`_rename_refused`).
+
+    Windows refuses a rename over (or of) a file another process still
+    holds open — Defender's on-close scan of a file just written, GDAL, a
+    viewer — and lets go a moment later; POSIX renames over open files, so
+    a working rename there is one call, as before. Any other error, and a
+    refusal on the last attempt, is raised."""
+    attempts = max(1, int(attempts))
+    for attempt in range(1, attempts + 1):
+        try:
+            os.replace(src, dst)
+            return
+        except OSError as exc:
+            if attempt == attempts or not _rename_refused(exc):
+                raise
+        time.sleep(delay)
+
+
+def _read_bytes(path: str) -> Optional[bytes]:
+    try:
+        with open(path, "rb") as fh:
+            return fh.read()
+    except OSError:
+        return None
+
+
+def _write_bytes_quietly(path: str, data: bytes) -> None:
+    try:
+        with open(path, "wb") as fh:
+            fh.write(data)
+    except OSError:
+        pass
+
+
+def _place_built_tiles(pool_dir: str, incoming: str,
+                       todo: List[Dict[str, Any]],
+                       verdicts: Dict[str, PoolTile], short: set,
+                       fp_for: Optional[Callable[[Dict[str, Any],
+                                                  Dict[str, float]], str]],
+                       ) -> set:
+    """Rename each finished tile from *incoming* into the pool — a partial
+    build as ``<name>.part`` + its ``.part.json`` (abt first, sidecar
+    second; the superseded complete tile and its ``.src`` removed), a whole
+    build as ``<name>`` (a promoted ``.part`` pair removed; its ``.src`` is
+    the caller's). A *short* tile is not served at all: every pool copy of
+    it is removed (as an in-place rewrite used to destroy it).
+
+    The rename goes through :func:`replace_with_retry`. One that is still
+    refused after its retries leaves the pool as it was — the previous
+    ``<name>`` / ``.part`` pair (its sidecar restored) and ``.src`` stay,
+    only the new file is removed — and the tile counts as not built.
+    Returns those names (the caller flags them for rebuild like a short
+    tile; the view then links the previous copy, or reports the hole)."""
+    failed: set = set()
+    for t in todo:
+        name = t["filename"]
+        v = verdicts[name]
+        tmp = os.path.join(incoming, name)
+        canonical = os.path.join(pool_dir, name)
+        src_fp = canonical + _SOURCE_FP_SUFFIX
+        part, meta = _part_paths(pool_dir, name)
+        if name in short:
+            _remove_quietly(tmp, canonical, src_fp, part, meta)
+            continue
+        target = part if v.regions is not None else canonical
+        old_meta: Optional[bytes] = None
+        try:
+            st = os.stat(tmp)
+            if v.regions is not None:
+                # Never bound to the new file — kept to restore if the old
+                # .part stays.
+                old_meta = _read_bytes(meta)
+                _remove_quietly(meta)
+            replace_with_retry(tmp, target)
+        except OSError as exc:
+            _remove_quietly(tmp)
+            if old_meta is not None and not os.path.exists(meta):
+                _write_bytes_quietly(meta, old_meta)
+            kept = os.path.exists(canonical) or os.path.exists(part)
+            _log(f"  WARNING: could not move {name} into the pool ({exc}) — "
+                 + ("the previous pool copy is kept, " if kept else "")
+                 + "flagged for rebuild")
+            failed.add(name)
+            continue
+        if v.regions is not None:
+            # Sidecar AFTER the rename (abt first, json second), bound to
+            # this build's own file.
+            _write_part_meta(pool_dir, t, [
+                {"bbox": r, "fp": fp_for(t, r) if fp_for else None}
+                for r in v.regions], st)
+            _remove_quietly(canonical, src_fp)        # superseded
+        else:
+            _remove_quietly(part, meta)               # promoted / replaced
+    return failed
+
+
+def _profile_band_tiles(tx_lat: float, tx_lon: float,
+                        bands: Sequence[Tuple[float, int]],
+                        az_start: float, az_end: float):
+    """Per band of a range profile: ``(idx, until_km, step, inner_km, bbox,
+    tiles, skip_footprints)`` — the tiles :func:`prepare_terrain` builds for
+    the band (its outer edge, minus tiles wholly inside the finer disc and
+    footprints a finer band holds; *skip_footprints* is that set). ONE
+    enumeration for :func:`prepare_terrain_profile` and
+    :func:`run_region_union`."""
+    covered: set = set()
+    inner_km = 0.0
+    for idx, (until_m, step) in enumerate(bands):
+        until_km = until_m / 1000.0
+        bbox = _compute_sector_bbox(tx_lat, tx_lon, until_km, az_start, az_end)
+        skip = set(covered)
+        tiles = _band_tiles(
+            _compute_subtiles(bbox, step, tx_lat, tx_lon, until_km, az_start,
+                              az_end),
+            tx_lat, tx_lon, inner_km, skip)
+        yield idx, until_km, step, inner_km, bbox, tiles, skip
+        if tiles:
+            covered.update(tile_footprint(t) for t in tiles)
+        inner_km = until_km
 
 
 def prepare_terrain_profile(
@@ -4586,9 +8651,17 @@ def prepare_terrain_profile(
     osm_buildings: bool = False,
     band_buildings: Optional[Sequence[bool]] = None,
     buildings_notes: Optional[Sequence[str]] = None,
+    should_cancel: Optional[Callable[[], bool]] = None,
+    on_start: Optional[Callable[[Any], None]] = None,
+    output_res_m: Optional[float] = None,
+    region_union: Optional[Dict[str, List[Dict[str, float]]]] = None,
+    terrain_prep: Optional[TerrainPrep] = None,
 ) -> str:
     """Terrain for a range-profile job (core.range_profile): one view directory
     holding, per band, the tiles at that band's step.
+
+    *should_cancel* / *on_start* as for :func:`prepare_terrain`, which every
+    band runs through; *should_cancel* is also polled once per band.
 
     Each band gets the tiles :func:`prepare_terrain` would build for its outer
     edge, minus what a finer band already covers — tiles wholly inside the finer
@@ -4609,12 +8682,29 @@ def prepare_terrain_profile(
     each tile from its own pool (footprints never repeat across bands, so a
     view still holds one tile per footprint). *buildings_notes* is the per-band
     reason, logged alongside each band.
+
+    A file source builds each band's tiles for the band's region only
+    (:func:`resolve_pool_tile`; *output_res_m* = the job's output pixel, for
+    the margin) and the view links each band tile through the same rule —
+    the complete tile or a ``.part`` holding the region — under the
+    canonical name; the view key carries the regions. *region_union*: see
+    :func:`prepare_terrain`. *terrain_prep* (the run's :class:`TerrainPrep`):
+    while current it IS the source read once for all bands (its infos and
+    FootprintIndex); else the folder is read here, as before.
     """
     if is_abt_tile_dir(terrain_dir):
         # Pre-built .abt tiles: chosen per footprint for each band's step (never
         # left to the engine's closest-to-output-resolution pick).
         _log(f"  using pre-built .abt tiles from {terrain_dir} for the profile "
              f"— no download or conversion")
+        # Buildings cannot be added to (or taken from) a prepared tile: say
+        # what its record holds (the selection is memoised — _abt_view_for
+        # reuses it).
+        _log_prepared_buildings(
+            terrain_dir, select_abt_tiles(terrain_dir, tx_lat, tx_lon,
+                                          list(bands), az_start, az_end),
+            bool(osm_buildings) and (band_buildings is None
+                                     or any(band_buildings)))
         _record_route("terrain_dir")
         return _abt_view_for(terrain_dir, tx_lat, tx_lon, list(bands),
                              az_start, az_end)
@@ -4626,18 +8716,20 @@ def prepare_terrain_profile(
             raise ValueError(f"band_buildings has {len(band_buildings)} flag(s) "
                              f"for {len(bands)} band(s)")
         flags = [bool(osm_buildings) and bool(f) for f in band_buildings]
-    covered: set = set()
     # pool identity (buildings id or None) -> tile names linked from that pool
     groups: Dict[Optional[str], List[str]] = {}
     names: List[str] = []
-    inner_km = 0.0
-    for idx, (until_m, step) in enumerate(bands):
+    # name -> (spec, region): how each band tile is linked (file sources)
+    link: Dict[str, Tuple[Dict[str, Any], Optional[Dict[str, float]]]] = {}
+    partial_ok = False
+    # The source is read and its FootprintIndex built ONCE for every band
+    # (each band used to re-read the folder and re-match every file).
+    source_infos = None
+    for (idx, until_km, step, inner_km, bbox, tiles,
+         skip) in _profile_band_tiles(tx_lat, tx_lon, bands, az_start, az_end):
+        if should_cancel is not None and should_cancel():
+            raise ConverterCancelled()
         band_osm = flags[idx]
-        until_km = until_m / 1000.0
-        bbox = _compute_sector_bbox(tx_lat, tx_lon, until_km, az_start, az_end)
-        tiles = _band_tiles(
-            _compute_subtiles(bbox, step, tx_lat, tx_lon, until_km, az_start, az_end),
-            tx_lat, tx_lon, inner_km, covered)
         if buildings_notes and idx < len(buildings_notes):
             note = buildings_notes[idx]
         elif band_osm:
@@ -4649,15 +8741,28 @@ def prepare_terrain_profile(
         _log(f"prepare_terrain_profile: band {inner_km:g}-{until_km:g} km @ {step} m "
              f"— {len(tiles)} tile(s), {note}")
         if tiles:
+            if source_infos is None:
+                prep = _current_prep(terrain_prep, terrain_dir)
+                source_infos = (
+                    (prep.infos, False, prep.index) if prep is not None
+                    else _read_source_once(dem_layer, terrain_dir,
+                                           should_cancel=should_cancel))
+                partial_ok = bool(source_infos and source_infos[0])
             prepare_terrain(dem_layer, tx_lat, tx_lon, until_km, step,
                             binary_manager, feedback, terrain_dir, az_start, az_end,
                             osm_buildings=band_osm,
-                            min_range_km=inner_km, skip_footprints=set(covered))
+                            min_range_km=inner_km, skip_footprints=skip,
+                            should_cancel=should_cancel, on_start=on_start,
+                            source_infos=source_infos,
+                            output_res_m=output_res_m,
+                            region_union=region_union)
+            band_regions = tile_regions(tiles, bbox, step, output_res_m,
+                                        partial_ok)
+            for t in tiles:
+                link[t["filename"]] = (t, band_regions[t["filename"]])
             band_names = [t["filename"] for t in tiles]
             names.extend(band_names)
             groups.setdefault(buildings_identity(None, band_osm), []).extend(band_names)
-            covered.update(tile_footprint(t) for t in tiles)
-        inner_km = until_km
 
     # The view identity carries WHICH bands have buildings: the same tile
     # names with buildings on every band, on the fine bands only, or on none
@@ -4669,13 +8774,21 @@ def prepare_terrain_profile(
     else:
         view_buildings = next(iter(groups), buildings_identity(None, osm_buildings))
     view_dir = _view_dir(source, [{"filename": n} for n in names],
-                         "profile", view_buildings)
+                         "profile", view_buildings,
+                         {n: r for n, (_t, r) in link.items()})
     gone: List[str] = []
     for buildings_id, group_names in (groups.items() or
                                       [(view_buildings, [])]):
         pool_dir = _pool_dir(source, buildings_id)
         ensure_engine_dirs(pool_dir, view_dir)
-        gone += _sync_view(pool_dir, view_dir, group_names, keep=names)
+        group_tiles = ({n: link[n] for n in group_names}
+                       if partial_ok else None)
+        # The bands' prepare_terrain recorded each tile's void count in its
+        # pool (this run's downloads / ingests, or an earlier run's).
+        gone += _sync_view(pool_dir, view_dir, group_names, keep=names,
+                           tiles=group_tiles,
+                           voids=_view_voids(pool_dir, group_names,
+                                             group_tiles))
     if gone:
         raise RuntimeError(
             f"{len(gone)} terrain tile(s) vanished from the cache while the "

@@ -311,17 +311,22 @@ class P2PAlgorithm(QgsProcessingAlgorithm):
         except bm.EngineTooOldError as exc:
             raise QgsProcessingException(str(exc)) from exc
 
-        abt_dir = prepare_terrain(
-            dem_layer=dem_layer,
-            tx_lat=centre_lat,
-            tx_lon=centre_lon,
-            max_range_km=terrain_radius_km,
-            resolution_m=resolution_m,
-            binary_manager=bm,
-            feedback=feedback,
-            # Terrain occupies the 10-20 % stretch of this algorithm's bar.
-            progress_span=(10.0, 20.0),
-        )
+        try:
+            abt_dir = prepare_terrain(
+                dem_layer=dem_layer,
+                tx_lat=centre_lat,
+                tx_lon=centre_lon,
+                max_range_km=terrain_radius_km,
+                resolution_m=resolution_m,
+                binary_manager=bm,
+                feedback=feedback,
+                # Terrain occupies the 10-20 % stretch of this algorithm's bar.
+                progress_span=(10.0, 20.0),
+                # Cancel reaches the terrain step too (per tile / output line).
+                should_cancel=feedback.isCanceled,
+            )
+        except terrain_adapter.ConverterCancelled:
+            return {}
 
         if feedback.isCanceled():
             return {}

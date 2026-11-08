@@ -179,6 +179,39 @@ _WATCHED_KEYS = (
 )
 
 
+#: The checkbox of the "Clear Terrain Cache" confirmation (unticked).
+CLEAR_INDEX_LABEL = ("Also clear the folder index (the next scan reads every "
+                     "file again)")
+
+
+def clear_cache_texts(n_entries: int, size_mb: float, n_index: int,
+                      cache_dir: str, raw_mb: float = 0.0) -> tuple[str, str]:
+    """``(text, informative text)`` of the "Clear Terrain Cache"
+    confirmation: what is deleted — *n_entries* cached terrain sets and the
+    downloaded source tiles (``<cache>/xyz``, *raw_mb* of the *size_mb*) —
+    and that the folder index (per-folder file metadata, ``<cache>/index``)
+    is kept unless :data:`CLEAR_INDEX_LABEL` is ticked."""
+    if n_entries:
+        text = (f"Delete {n_entries} cached terrain set(s), freeing "
+                f"{size_mb:,.0f} MB"
+                + (f", of which {raw_mb:,.0f} MB downloaded source tiles"
+                   if raw_mb > 0 else "") + "?")
+        info = (f"{cache_dir}\n\nTerrain will be re-downloaded or rebuilt "
+                "on the next run.")
+    elif raw_mb > 0:
+        text = f"Delete {raw_mb:,.0f} MB of downloaded source tiles?"
+        info = (f"{cache_dir}\n\nThey will be downloaded again when a run "
+                "needs them.")
+    else:
+        text = "No cached terrain tiles to delete."
+        info = cache_dir
+    info += ("\n\nThe folder index (per-folder file metadata"
+             + (f", {n_index} index file(s)" if n_index else "")
+             + ") is kept: the next scan of an unchanged folder only checks "
+               "file sizes and dates.")
+    return text, info
+
+
 class SettingsDialog(QDialog):
     """Waveshed plugin settings dialog."""
 
@@ -315,7 +348,7 @@ class SettingsDialog(QDialog):
 
         btn_register = QPushButton("Get API Key")
         btn_register.clicked.connect(
-            lambda: QDesktopServices.openUrl(QUrl(api_key.GET_API_KEY_URL))
+            lambda: QDesktopServices.openUrl(QUrl(api_key.get_api_key_page_url()))
         )
         row2.addWidget(btn_register)
 
@@ -399,10 +432,13 @@ class SettingsDialog(QDialog):
         row.addWidget(btn_browse)
         btn_clear_cache = QPushButton("Clear...")
         btn_clear_cache.setToolTip(
-            "Delete every cached .abt terrain tile.\n"
+            "Delete every cached .abt terrain tile, including the downloaded "
+            "source tiles.\n"
             "The cache never evicts anything on its own, so this is how you "
             "reclaim the space — and how you pick up refreshed OpenStreetMap "
-            "building data, which is otherwise cached indefinitely."
+            "building data, which is otherwise cached indefinitely.\n"
+            "The folder index (file metadata of your terrain folders) is "
+            "kept unless you tick the box in the confirmation."
         )
         btn_clear_cache.clicked.connect(self._clear_cache)
         row.addWidget(btn_clear_cache)
@@ -979,44 +1015,94 @@ class SettingsDialog(QDialog):
         if path:
             self._cache_dir_edit.setText(path)
 
+    def _confirm_clear_cache(self, text: str, info: str) -> bool | None:
+        """The confirmation: None = No (the default), else whether
+        :data:`CLEAR_INDEX_LABEL` was ticked."""
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Question)
+        box.setWindowTitle("Clear Terrain Cache")
+        box.setText(text)
+        box.setInformativeText(info)
+        also_index = QCheckBox(CLEAR_INDEX_LABEL)
+        also_index.setChecked(False)
+        box.setCheckBox(also_index)
+        btn_yes = box.addButton(QMessageBox.StandardButton.Yes)
+        btn_no = box.addButton(QMessageBox.StandardButton.No)
+        box.setDefaultButton(btn_no)
+        box.setEscapeButton(btn_no)
+        box.exec()
+        if box.clickedButton() is not btn_yes:
+            return None
+        return also_index.isChecked()
+
     def _clear_cache(self) -> None:
-        """Delete every terrain cache entry, after confirming the size."""
+        """Delete every terrain cache entry — the cached terrain sets and
+        the downloaded source tiles (``<cache>/xyz``) — after confirming the
+        size, and the folder index too when the user ticks the box."""
         from ..core import terrain_adapter
 
         # Read against the saved cache path, not whatever is in the edit box:
         # an unsaved path change would otherwise clear a directory the user is
         # only considering.
         entries = terrain_adapter.cache_entries()
-        if not entries:
+        indexes = terrain_adapter.index_files()
+        cache_dir = terrain_adapter.get_cache_dir()
+        # The source-tile cache is one entry; an empty one (every download
+        # makes it, a converter older than 0.2.8 never fills it) is nothing
+        # to report — clear_cache still removes it with the sets.
+        raw_dir = terrain_adapter.xyz_cache_dir()
+        sets = [p for p in entries if p != raw_dir]
+        raw_bytes = (terrain_adapter.dir_size_bytes(raw_dir)
+                     if raw_dir in entries else 0)
+        if not sets and not raw_bytes and not indexes:
             QMessageBox.information(
                 self, "Clear Terrain Cache",
-                f"No cached terrain found in\n{terrain_adapter.get_cache_dir()}",
+                f"No cached terrain found in\n{cache_dir}",
             )
             return
 
-        size_mb = terrain_adapter.cache_size_bytes() / 1e6
-        answer = QMessageBox.question(
-            self, "Clear Terrain Cache",
-            f"Delete {len(entries)} cached terrain set(s), freeing "
-            f"{size_mb:,.0f} MB?\n\n{terrain_adapter.get_cache_dir()}\n\n"
-            "Terrain will be re-downloaded or rebuilt on the next run.",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.No,
-        )
-        if answer != QMessageBox.StandardButton.Yes:
+        size_mb = (terrain_adapter.cache_size_bytes() / 1e6
+                   if sets or raw_bytes else 0.0)
+        with_index = self._confirm_clear_cache(*clear_cache_texts(
+            len(sets), size_mb, len(indexes), cache_dir,
+            raw_mb=raw_bytes / 1e6))
+        if with_index is None:
             return
 
-        removed, freed = terrain_adapter.clear_cache()
-        if removed < len(entries):
+        _removed, freed = (terrain_adapter.clear_cache() if entries
+                           else (0, 0))
+        n_index = terrain_adapter.clear_index()[0] if with_index else 0
+        sets_left = sum(1 for p in sets if os.path.exists(p))
+        raw_left = bool(raw_bytes) and os.path.exists(raw_dir)
+        gone = []
+        if sets:
+            gone.append(f"{len(sets) - sets_left}"
+                        + (f" of {len(sets)}" if sets_left else "")
+                        + " cached terrain set(s)")
+        if raw_bytes and not raw_left:
+            gone.append("the downloaded source tiles")
+        parts = []
+        if gone:
+            parts.append(" and ".join(gone)
+                         + f", freeing {freed / 1e6:,.0f} MB")
+        if with_index:
+            parts.append(
+                f"{n_index}"
+                + (f" of {len(indexes)}" if n_index < len(indexes) else "")
+                + " index file(s)")
+        failed = bool(sets_left or raw_left
+                      or (with_index and n_index < len(indexes)))
+        if not parts and not failed:
+            QMessageBox.information(self, "Clear Terrain Cache",
+                                    "Nothing was removed.")
+            return
+        msg = ("Removed " + ", and ".join(parts) + "." if parts
+               else "Nothing was removed.")
+        if failed:
             QMessageBox.warning(
                 self, "Clear Terrain Cache",
-                f"Removed {removed} of {len(entries)} cached terrain set(s), "
-                f"freeing {freed / 1e6:,.0f} MB.\nThe rest could not be "
-                "deleted — they may be open in QGIS or another program.",
+                msg + "\nThe rest could not be deleted — they may be open in "
+                "QGIS or another program.",
             )
         else:
-            QMessageBox.information(
-                self, "Clear Terrain Cache",
-                f"Removed {removed} cached terrain set(s), freeing "
-                f"{freed / 1e6:,.0f} MB.",
-            )
+            QMessageBox.information(self, "Clear Terrain Cache", msg)

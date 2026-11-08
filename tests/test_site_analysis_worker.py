@@ -129,6 +129,31 @@ class WorkerAbortsOnFirstEngineFailure(unittest.TestCase):
         self.assertEqual(prep.call_count, 1)
         self.assertEqual(core.call_count, 1)
 
+    def test_qgis_memory_is_logged_once_per_run(self):
+        # Owner's run 2026-11-07: the converters' peaks are in their lines,
+        # QGIS's own share was attributed to nothing. One line per run,
+        # after the engine gate and before any terrain; none when the OS
+        # does not say (never a failure).
+        from waveshed.core import process_memory
+        logged = []
+        with mock.patch.object(process_memory, "resident_bytes",
+                               return_value=(4812 * 1024 ** 2,
+                                             6201 * 1024 ** 2)), \
+                mock.patch.object(sat.QgsMessageLog, "logMessage",
+                                  side_effect=lambda *a, **k: logged.append(a[0])):
+            self._run(n_jobs=2)
+        lines = [m for m in logged if "QGIS process:" in m]
+        self.assertEqual(lines,
+                         ["  QGIS process: 4,812 MB resident (peak 6,201 MB)"])
+        logged.clear()
+        with mock.patch.object(process_memory, "resident_bytes",
+                               return_value=(None, None)), \
+                mock.patch.object(sat.QgsMessageLog, "logMessage",
+                                  side_effect=lambda *a, **k: logged.append(a[0])):
+            errs, *_ = self._run(n_jobs=1)
+        self.assertEqual([m for m in logged if "QGIS process:" in m], [])
+        self.assertEqual(len(errs), 1, "the run went on to the engine")
+
 
 if __name__ == "__main__":
     unittest.main()

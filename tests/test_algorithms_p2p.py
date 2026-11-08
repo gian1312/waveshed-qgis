@@ -207,6 +207,23 @@ class TestP2PProducesItsCsvDirectly(unittest.TestCase):
         self.assertNotIn(".tiles", source)
 
 
+class TestP2PCancelDuringTerrain(unittest.TestCase):
+    """Processing Cancel reaches the terrain step and ends as a cancel."""
+
+    def test_terrain_cancel_is_the_normal_cancelled_outcome(self):
+        feedback = _FakeFeedback()
+        with tempfile.TemporaryDirectory() as out_dir:
+            with _Run(out_dir) as run, \
+                 mock.patch.object(alg, "prepare_terrain",
+                                   side_effect=ta.ConverterCancelled) as prep:
+                result = _StubbedP2P(out_dir).processAlgorithm(
+                    {}, mock.Mock(), feedback)
+        self.assertEqual(result, {})
+        self.assertEqual(prep.call_args.kwargs["should_cancel"],
+                         feedback.isCanceled)
+        self.assertEqual(run.binaries, [], "aether_core ran after Cancel")
+
+
 class TestP2PTabPricesTheTilePool(unittest.TestCase):
     """The tab's pre-run estimate must price the pool, like Site Analysis.
 
