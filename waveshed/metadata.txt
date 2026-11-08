@@ -15,7 +15,37 @@ license=GPL-2.0-or-later
 tags=rf,propagation,radio,coverage,p2p,gpu,terrain,ITM,LOS,line of sight,viewshed,waveshed
 category=Analysis
 icon=resources/icon.png
-changelog=0.3.3
+changelog=0.4.0
+    - Needs Aether engine 0.4.3 or newer. The Map Converter's new seam filter
+      and its faster building preparation need the converter shipped with
+      engine 0.4.11; older engines fall back to the previous behaviour.
+    - Map Converter: terrain from an XYZ service is downloaded through one
+      shared pool in 1° bands with two lanes per pool (the next band's finest
+      zoom downloads while the previous band's coarser zooms are derived), a
+      repair pass re-fetches tiles the server failed to deliver, and tiles
+      already covered by local files are converted while the download runs.
+    - Map Converter: OpenFreeMap buildings are fetched next to the terrain
+      download and handed to the converter as a list of tiles; preparing the
+      buildings of a batch takes well under a second instead of ~25 s.
+    - Map Converter: the size estimate runs in the background so the
+      resolution boxes react at once; "Auto" picks the finest source
+      resolution plus the analysis profile's 30 m and 90 m rings; tiles
+      outside every layer's extent are skipped instead of converted empty;
+      Terrarium's seam artefacts at 10°E are voided and filled from coarser
+      zooms (engine 0.4.11).
+    - Map Converter: a whole-run progress bar, extents shared between rows,
+      adding a folder or all loaded layers at once; folders of GeoTIFFs are
+      indexed once (footprints read by the converter) and re-checked per run.
+    - Site Analysis and Point-to-Point: a "Folder…" button picks a terrain
+      folder directly and remembers recent folders; the engine's diagnostics
+      go to a daily log file in the terrain cache (logs/aether_core-<date>.log)
+      while the QGIS log panel keeps the key lines; output folders are
+      remembered; buildings per band for adaptive and custom range profiles.
+    - Point-to-Point: the path and profile plots are drawn by the plugin
+      itself (no matplotlib needed).
+    - Settings → Data sources and the help credit the data the plugin itself
+      fetches (Terrarium terrain via AWS, OpenFreeMap buildings).
+    0.3.3
     - Minor fixes. (New Icon and proper Metadata)
     0.3.2
     - Settings no longer shows "Installed engine: unknown" right after a
