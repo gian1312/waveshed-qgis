@@ -18,7 +18,7 @@ icon=resources/icon.png
 changelog=0.4.0
     - Needs Aether engine 0.4.3 or newer. The Map Converter's new seam filter
       and its faster building preparation need the converter shipped with
-      engine 0.4.11; older engines fall back to the previous behaviour.
+      engine 0.5.0; older engines fall back to the previous behaviour.
     - Map Converter: terrain from an XYZ service is downloaded through one
       shared pool in 1° bands with two lanes per pool (the next band's finest
       zoom downloads while the previous band's coarser zooms are derived), a
@@ -32,7 +32,7 @@ changelog=0.4.0
       resolution plus the analysis profile's 30 m and 90 m rings; tiles
       outside every layer's extent are skipped instead of converted empty;
       Terrarium's seam artefacts at 10°E are voided and filled from coarser
-      zooms (engine 0.4.11).
+      zooms (engine 0.5.0).
     - Map Converter: a whole-run progress bar, extents shared between rows,
       adding a folder or all loaded layers at once; folders of GeoTIFFs are
       indexed once (footprints read by the converter) and re-checked per run.
