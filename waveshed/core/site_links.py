@@ -1,21 +1,21 @@
 """Links from the plugin to pages on waveshed.io.
 
 The single place that builds a URL to a human-facing waveshed.io page. The
-engine download (``/downloads``) and the key generator (``/get-key``) sit
-behind a preview gate on the site until the public launch: without ``?prv``
-the downloads page shows only a "coming soon" overlay and ``/get-key``
-answers 404. The plugin works on both sides of that launch without a new
-release:
+engine download (``/downloads``) and the key generator (``/get-key``) used to
+sit behind a preview gate on the site. The gate was lifted on 2026-11-08: both
+pages are public, and the site ignores the old preview flag, so plugins that
+still append it keep working.
 
-* :func:`site_page_url` builds the preview URL (``…?prv``). Static text — the
-  help, the messages — uses it; the flag is harmless once the gate is gone.
-* :func:`page_url` is what a button opens. It asks the site ONCE per QGIS
-  session whether ``/get-key`` answers without the flag (the gate is lifted)
-  and then returns the plain URL, else the preview URL. No answer at all
-  (offline, a timeout) also means the preview URL, which works either way.
+* :func:`site_page_url` builds the plain URL for static text (the help, the
+  messages): :data:`PREVIEW_QUERY` is empty.
+* :func:`page_url` is what a button opens. While :data:`PREVIEW_QUERY` is empty
+  it returns the plain URL without any network call. Only if a preview query
+  is set again (a future gate) does it ask the site ONCE per QGIS session
+  whether ``/get-key`` answers without the flag, and returns the plain URL if
+  so, else the preview URL. That probe machinery stays here, dormant.
 
-Machine endpoints are deliberately *not* built here and never carry ``?prv``:
-the release manifest (``binary_manager.MANIFEST_URL``) and the EULA text
+Machine endpoints are deliberately *not* built here and never carry a preview
+flag: the release manifest (``binary_manager.MANIFEST_URL``) and the EULA text
 (``eula.EULA_URL``) are public files, not gated pages.
 
 Pure standard library, no Qt/QGIS imports: ``help/content.py`` (which must stay
@@ -32,28 +32,28 @@ from typing import Optional
 #: Site root.
 SITE_URL = "https://waveshed.io"
 
-#: The preview flag the gated pages need until the public launch. Appended by
-#: :func:`site_page_url`; :func:`page_url` drops it once the site answers
-#: without it. Harmless on a page that is already public. May be set to ""
-#: in a release after the launch to tidy the static links; nothing depends
-#: on it.
-PREVIEW_QUERY = "?prv"
+#: Query a gated page needs. Empty since the gate was lifted (2026-11-08):
+#: static links are plain and :func:`page_url` does not probe. Set it (e.g.
+#: to the former value, the ``prv`` flag) only for a future preview gate; it
+#: is appended by :func:`site_page_url` and wakes the probe in
+#: :func:`page_url`.
+PREVIEW_QUERY = ""
 
-#: The page whose plain answer tells the gate's state: 404 while gated, 2xx
-#: once public. (``/downloads`` answers 200 either way, with an overlay.)
+#: The page whose plain answer tells a gate's state: 404 while gated, 2xx
+#: once public. Only asked while :data:`PREVIEW_QUERY` is set.
 GATE_PROBE_PATH = "/get-key"
 
-#: Seconds the one probe per session may take; after that the preview URL
-#: is used.
+#: Seconds the one probe per session may take (only while a preview query is
+#: set); after that the preview URL is used.
 GATE_PROBE_TIMEOUT_S = 2.0
 
 
 def site_page_url(path: str) -> str:
-    """Return the preview URL of the waveshed.io page at *path*.
+    """Return the URL of the waveshed.io page at *path* for static text.
 
-    *path* must start with ``/``. The preview flag is appended so the page
-    renders its content while the site is gated; it changes nothing once the
-    page is public. For the URL a button should open see :func:`page_url`.
+    *path* must start with ``/``. :data:`PREVIEW_QUERY` is appended; it is
+    empty since the gate was lifted, so this is the plain URL. For the URL a
+    button should open see :func:`page_url`.
     """
     if not path.startswith("/"):
         raise ValueError(f"site path must start with '/': {path!r}")
@@ -61,12 +61,15 @@ def site_page_url(path: str) -> str:
 
 
 def page_url(path: str) -> str:
-    """The URL to open for the gated page at *path*: the plain page once the
-    site serves the pages publicly, the preview URL until then — or when the
+    """The URL a button opens for the page at *path*.
+
+    With an empty :data:`PREVIEW_QUERY` (since 2026-11-08) the plain URL,
+    without a network call. While a preview query is set: the plain page once
+    the site serves it publicly, the preview URL until then — or when the
     site cannot be asked."""
     if not path.startswith("/"):
         raise ValueError(f"site path must start with '/': {path!r}")
-    if gate_lifted():
+    if not PREVIEW_QUERY or gate_lifted():
         return f"{SITE_URL}{path}"
     return site_page_url(path)
 
@@ -111,8 +114,8 @@ def _open(request: urllib.request.Request, timeout: float):
     return urllib.request.urlopen(request, timeout=timeout)  # nosec B310 — fixed https URL
 
 
-#: Where users get an access (API) key: the key generator page (preview URL,
-#: for static text; buttons open ``page_url("/get-key")``).
+#: Where users get an access (API) key: the key generator page (static text;
+#: buttons open ``page_url("/get-key")``).
 GET_KEY_URL = site_page_url("/get-key")
 
 #: The engine downloads page (engine details, EULA, manual downloads).

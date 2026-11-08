@@ -115,16 +115,13 @@ Interim channel (2026-10-05): the custom repository
   `https://waveshed.io/qgis/plugins.xml` / `latest.json` serve 0.3.3 and the
   ZIPs are on `releases.waveshed.io/qgis/`.
 
-- [x] **`?prv` is handled at runtime (2026-11-08).** The plugin works on both
-  sides of the site's public launch without a release: static links (Help →
-  Installing, the key messages) carry `?prv`, which stays harmless once the
-  gate is gone, and **Get API Key** opens `site_links.page_url("/get-key")`,
-  which probes `/get-key` once per QGIS session (2 s timeout; 404 = gated,
-  2xx = public, no answer = keep the flag) and drops the flag when the site
-  answers without it. The old `package.py` warning is gone. After the launch
-  `PREVIEW_QUERY` may be set to `""` in a later release to tidy the static
-  links; nothing depends on it. The machine URLs (release manifest, EULA
-  text) are not gated and never carry the flag.
+- [x] **Site preview gate lifted (2026-11-08).** `/downloads` and `/get-key`
+  are public on waveshed.io and the site ignores `?prv`, so released plugins
+  (which still append it) keep working. 0.4.0 ships `PREVIEW_QUERY = ""` in
+  `core/site_links.py`: static links and **Get API Key** open plain URLs and
+  no probe runs. The once-per-session `/get-key` probe stays dormant for a
+  future gate (runs only while `PREVIEW_QUERY` is set; covered by tests).
+  The machine URLs (release manifest, EULA text) never carried the flag.
 
 - [x] **Runtime data attribution.** Done. `core/attribution.py` is the single
   source of credit for every dataset the plugin fetches itself

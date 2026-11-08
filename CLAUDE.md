@@ -1476,16 +1476,16 @@ metadata URLs and a trusted manifest key; unknown flags exit 2 with usage —
 `package.py --help` once built a ZIP into a directory named `--help`, which
 was tracked in git until 2026-11-08).
 
-**waveshed.io preview gate.** `/downloads` and `/get-key` are gated behind
-`?prv` until the public launch. `core/site_links.py` is the only place that
-builds such URLs: `site_page_url()` gives the preview URL for static text
-(help, messages — harmless once the gate is gone); `page_url()` is what a
-button opens — it probes `/get-key` once per QGIS session (2 s timeout;
-404 = gated, 2xx = public, no answer = keep the flag) and drops the flag
-when the site answers without it. So the plugin works on both sides of the
-launch without a release; `PREVIEW_QUERY` may be set to `""` afterwards to
-tidy the static links. `tests/test_site_links.py` pins the probe (the
-`_open` seam) and that no gated URL is hardcoded elsewhere.
+**waveshed.io links (preview gate lifted 2026-11-08).** `/downloads` and
+`/get-key` are public; the site ignores the old `?prv` flag, so older plugin
+releases keep working. `core/site_links.py` is the only place that builds
+such URLs. `PREVIEW_QUERY = ""`: `site_page_url()` (static text) and
+`page_url()` (buttons) return plain URLs, and `page_url()` makes no network
+call. The once-per-session `/get-key` probe (2 s timeout) stays dormant for
+a future gate and only runs while `PREVIEW_QUERY` is set.
+`tests/test_site_links.py` pins the plain URLs, the no-probe path, the
+dormant probe (with a preview query monkeypatched in, `_open` seam) and that
+no gated URL is hardcoded elsewhere.
 
 Before uploading to plugins.qgis.org, run `python3 tools/release_check.py`
 (the pipeline GUI's *Run checks*): the full test suite — failures, errors AND

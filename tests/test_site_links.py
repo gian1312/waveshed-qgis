@@ -1,12 +1,11 @@
-"""Pins the waveshed.io page links and the preview gate they live behind.
+"""Pins the waveshed.io page links and the (dormant) preview-gate handling.
 
-``/downloads`` and ``/get-key`` are gated on waveshed.io until the public
-launch: without ``?prv`` they show a placeholder / 404. Every plugin link to
-them is built by ``core/site_links.py``: static text carries ``?prv`` (harmless
-once the gate is gone), and what a button opens — ``site_links.page_url`` —
-probes the site once per session and drops the flag as soon as the pages are
-public. The plugin therefore works on both sides of the launch without a new
-release.
+``/downloads`` and ``/get-key`` are public on waveshed.io since 2026-11-08;
+the site ignores the old preview flag. Every plugin link to them is built by
+``core/site_links.py``. ``PREVIEW_QUERY`` is empty, so static text and what a
+button opens (``site_links.page_url``) are the plain URLs and nothing probes
+the site. The probe machinery stays for a future gate; its tests set a
+preview query to keep it covered.
 """
 
 from __future__ import annotations
@@ -31,10 +30,21 @@ def _fresh_gate():
     site_links.reset_gate()
 
 
-def test_helper_appends_preview_flag():
+def test_helper_builds_plain_urls():
     assert site_links.SITE_URL == "https://waveshed.io"
-    assert site_links.PREVIEW_QUERY == "?prv"
-    assert site_links.site_page_url("/downloads") == "https://waveshed.io/downloads?prv"
+    assert site_links.PREVIEW_QUERY == ""
+    assert site_links.site_page_url("/downloads") == "https://waveshed.io/downloads"
+    assert site_links.GET_KEY_URL == "https://waveshed.io/get-key"
+    assert site_links.DOWNLOADS_URL == "https://waveshed.io/downloads"
+
+
+def test_no_preview_query_means_no_probe(monkeypatch):
+    probe = _Probe(_not_found())
+    monkeypatch.setattr(site_links, "_open", probe)
+    assert site_links.page_url("/get-key") == "https://waveshed.io/get-key"
+    assert site_links.page_url("/downloads") == "https://waveshed.io/downloads"
+    assert api_key.get_api_key_page_url() == "https://waveshed.io/get-key"
+    assert probe.calls == []
 
 
 def test_helper_rejects_relative_paths():
@@ -45,9 +55,9 @@ def test_helper_rejects_relative_paths():
 
 
 def test_get_api_key_button_opens_the_resolved_page():
-    # The static constant stays the preview link (messages, help); the button
-    # opens the resolved URL so it is clean once the site is public.
-    assert api_key.GET_API_KEY_URL == "https://waveshed.io/get-key?prv"
+    # The static constant (messages, help) and the button both give the plain
+    # page; the button goes through page_url so a future gate is handled.
+    assert api_key.GET_API_KEY_URL == "https://waveshed.io/get-key"
     assert api_key.GET_API_KEY_URL == site_links.GET_KEY_URL
     src = (PKG / "gui" / "settings_dialog.py").read_text(encoding="utf-8")
     assert 'QPushButton("Get API Key")' in src
@@ -88,7 +98,13 @@ def test_no_hardcoded_gated_links():
     assert not offenders, offenders
 
 
-# --- the gate probe --------------------------------------------------------
+# --- the gate probe (dormant while PREVIEW_QUERY is empty) -----------------
+# These tests set a preview query again so the machinery stays covered.
+
+@pytest.fixture
+def gated(monkeypatch):
+    monkeypatch.setattr(site_links, "PREVIEW_QUERY", "?prv")
+    site_links.reset_gate()
 
 class _Response(io.BytesIO):
     def __init__(self, status: int):
@@ -115,7 +131,7 @@ def _not_found():
                                   "Not Found", {}, None)
 
 
-def test_gate_on_keeps_the_preview_flag(monkeypatch):
+def test_gate_on_keeps_the_preview_flag(monkeypatch, gated):
     probe = _Probe(_not_found())
     monkeypatch.setattr(site_links, "_open", probe)
     assert site_links.page_url("/get-key") == "https://waveshed.io/get-key?prv"
@@ -123,14 +139,14 @@ def test_gate_on_keeps_the_preview_flag(monkeypatch):
     assert api_key.get_api_key_page_url() == "https://waveshed.io/get-key?prv"
 
 
-def test_gate_lifted_opens_the_plain_pages(monkeypatch):
+def test_gate_lifted_opens_the_plain_pages(monkeypatch, gated):
     probe = _Probe(200)
     monkeypatch.setattr(site_links, "_open", probe)
     assert site_links.page_url("/get-key") == "https://waveshed.io/get-key"
     assert site_links.page_url("/downloads") == "https://waveshed.io/downloads"
     assert api_key.get_api_key_page_url() == "https://waveshed.io/get-key"
-    # Static text keeps the flag: it is harmless on a public page.
-    assert site_links.GET_KEY_URL.endswith("?prv")
+    # Static text carries the query set at import time (empty): plain.
+    assert site_links.GET_KEY_URL == "https://waveshed.io/get-key"
 
 
 @pytest.mark.parametrize("failure", [
@@ -138,12 +154,12 @@ def test_gate_lifted_opens_the_plain_pages(monkeypatch):
     TimeoutError("timed out"),
     OSError("reset"),
 ])
-def test_no_answer_means_the_preview_url(monkeypatch, failure):
+def test_no_answer_means_the_preview_url(monkeypatch, gated, failure):
     monkeypatch.setattr(site_links, "_open", _Probe(failure))
     assert site_links.page_url("/get-key") == "https://waveshed.io/get-key?prv"
 
 
-def test_the_probe_asks_get_key_once_per_session(monkeypatch):
+def test_the_probe_asks_get_key_once_per_session(monkeypatch, gated):
     probe = _Probe(200)
     monkeypatch.setattr(site_links, "_open", probe)
     for _ in range(3):
@@ -159,6 +175,6 @@ def test_the_probe_asks_get_key_once_per_session(monkeypatch):
     assert len(probe.calls) == 2
 
 
-def test_redirects_and_server_errors_are_not_a_lifted_gate(monkeypatch):
+def test_redirects_and_server_errors_are_not_a_lifted_gate(monkeypatch, gated):
     monkeypatch.setattr(site_links, "_open", _Probe(503))
     assert site_links.page_url("/get-key") == "https://waveshed.io/get-key?prv"

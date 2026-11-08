@@ -16,8 +16,8 @@ from __future__ import annotations
 
 from typing import List, NamedTuple, Tuple
 
-# The one pure-stdlib module this file uses: page links carry the site's
-# preview flag, and that must stay in a single place (core/site_links.py).
+# The one pure-stdlib module this file uses: waveshed.io page links are built
+# in a single place (core/site_links.py).
 from ..core.site_links import GET_KEY_URL
 
 

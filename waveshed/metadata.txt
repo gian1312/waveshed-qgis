@@ -45,6 +45,8 @@ changelog=0.4.0
       itself (no matplotlib needed).
     - Settings → Data sources and the help credit the data the plugin itself
       fetches (Terrarium terrain via AWS, OpenFreeMap buildings).
+    - Links to waveshed.io open the public downloads and key pages; the
+      preview flag is gone.
     0.3.3
     - Minor fixes. (New Icon and proper Metadata)
     0.3.2
