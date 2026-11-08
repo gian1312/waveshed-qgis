@@ -257,7 +257,7 @@ No built-in switches. The real levers:
 | Partial failure | AOI straddling the service's coverage edge, or open ocean |
 | Force the slow path | Point `waveshed/binary_dir` at a dir missing any of the three binaries |
 | Disable retries | QgsSettings `waveshed/download_max_passes` = **1** (default 4) |
-| Throttle | `waveshed/download_connections`, default **256**, floor 32 |
+| Throttle | `waveshed/download_connections`, default **256** (every pass, no plugin-side halving) |
 | Network timeout | **Not configurable** — hardcoded 30 s in `download.rs` |
 | Disk-space failure | Fill the target volume; the pre-flight raises before any fetch |
 

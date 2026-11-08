@@ -214,7 +214,7 @@ ds.SetGeoTransform((0.0, 1.0, 0.0, 0.0, 0.0, 1.0)); ds = None  # GDAL drops the 
 |---|---|---|---|
 | 3.1 | swissBUILDINGS3D 3.0 | https://www.swisstopo.admin.ch/en/landscape-model-swissbuildings3d-3-0 — free download, GDB and GPKG flavors | Real GDB → FGB conversion; LV95 vector CRS. |
 | 3.2 | Multi-layer GPKG | `ogr2ogr -f GPKG multi.gpkg buildings_a.shp -nln buildings` then `ogr2ogr -f GPKG -update multi.gpkg other.shp -nln other_layer` — then add the **second** layer in QGIS | The `\|layername=` sublayer fix — was silently broken; the converter must receive the *selected* layer. |
-| 3.3 | OSM Overpass | plugin's own "Download OSM buildings" button over a city | Built-in path incl. height tags. |
+| 3.3 | OSM buildings row (OpenFreeMap z14, Map Converter) | the Map Converter's "Download Buildings..." row over a city | z14 fetch next to the terrain download, jobs carry `buildings_pbf_dir`; cut the network → the run must FAIL naming the cause and the missing tile count, never convert without buildings. |
 | 3.4 | OpenFreeMap PBF (Site Analysis) | tick "OSM buildings" on a coverage run | z14 MVT fetch; then repeat with network cut → run must FAIL, not cache building-free terrain under a buildings key. |
 | 3.5 | Wrong-CRS shapefile | `ogr2ogr -t_srs EPSG:2056 lv95.shp osm.geojson` | Reprojection-on-conversion path. |
 | 3.6 | FGB passthrough | `ogr2ogr -f FlatGeobuf direct.fgb buildings.gpkg` | Must not be re-converted, and must not be handed over with wrong CRS. |

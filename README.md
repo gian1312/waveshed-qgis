@@ -6,7 +6,9 @@ Waveshed is a QGIS plugin for radio-frequency propagation modelling. It adds:
 
 - **Site Analysis** — area coverage / signal-strength maps from a transmitter.
 - **Point-to-Point (P2P)** — link-budget analysis between two sites, single or batch.
-- Propagation models: **LOS**, **Free-Space Path Loss**, and **ITM (Longley-Rice)**.
+- Propagation models: **LOS** and **ITM (Longley-Rice)**; Site Analysis also
+  computes the **LOS Floor** (the lowest altitude at which each location sees
+  the transmitter).
 
 All computation runs on the **Aether engine**, a GPU-accelerated propagation core.
 The plugin itself is a pure-Python wrapper: it prepares terrain, builds job

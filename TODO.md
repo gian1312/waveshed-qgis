@@ -109,28 +109,30 @@ Interim channel (2026-10-05): the custom repository
   `tools/make_plugin_repo.py` (plugins.xml + latest.json from the metadata in
   the ZIP), R2 `qgis/` upload, live check through the waveshed.io relays.
   `experimental=False`.
-- [ ] **First tag needs owner action:** make `github.com/gian1312/waveshed-qgis`
-  public (and point the `qgis_plugin` remote there — `package.py --release`
-  checks the metadata URLs answer 200), add the three `R2_*` secrets to this
-  repository, and put the release manifest public key into
-  `waveshed/core/release_keys.py` (the AETHER release GUI writes it;
-  `--release` refuses an empty key list).
+- [x] **First tag (owner action).** Done: v0.3.1 (2026-10-06) to v0.3.3
+  (2026-10-10) published — `github.com/gian1312/waveshed-qgis` is public, the
+  release manifest key is in `waveshed/core/release_keys.py`,
+  `https://waveshed.io/qgis/plugins.xml` / `latest.json` serve 0.3.3 and the
+  ZIPs are on `releases.waveshed.io/qgis/`.
 
-- [ ] **TODO(release): remove `?prv` before publication.** Every link to a
-  preview-gated waveshed.io page (`/get-key` behind **Get API Key**, the
-  `/get-key` link in Help → Installing, and anything built with
-  `site_page_url`) carries `?prv` from ONE place:
-  `PREVIEW_QUERY` in `waveshed/core/site_links.py`. Set it to `""` once
-  `/downloads` and `/get-key` are public, and flip the pins in
-  `tests/test_site_links.py`. `package.py` prints a loud `WARNING` block (the ZIP
-  is still built) while any packaged text file contains `?prv`. The machine
-  URLs (release manifest, EULA text) are not gated and never carry the flag.
+- [x] **`?prv` is handled at runtime (2026-11-08).** The plugin works on both
+  sides of the site's public launch without a release: static links (Help →
+  Installing, the key messages) carry `?prv`, which stays harmless once the
+  gate is gone, and **Get API Key** opens `site_links.page_url("/get-key")`,
+  which probes `/get-key` once per QGIS session (2 s timeout; 404 = gated,
+  2xx = public, no answer = keep the flag) and drops the flag when the site
+  answers without it. The old `package.py` warning is gone. After the launch
+  `PREVIEW_QUERY` may be set to `""` in a later release to tidy the static
+  links; nothing depends on it. The machine URLs (release manifest, EULA
+  text) are not gated and never carry the flag.
 
 - [x] **Runtime data attribution.** Done. `core/attribution.py` is the single
-  source of credit for every dataset the plugin fetches (Mapzen/Terrarium,
-  OpenFreeMap, Copernicus, swisstopo), shown in Settings under "Data sources"
-  and in the buildings tooltip. Tests pin that ODbL sources credit
-  OpenStreetMap and that we never credit a dataset we do not request.
+  source of credit for every dataset the plugin fetches itself
+  (Mapzen/Terrarium and OpenFreeMap — nothing else since 2026-10-25: data the
+  user adds in QGIS, such as a swisstopo folder or a Copernicus GeoTIFF, is
+  theirs to credit), shown in Settings under "Data sources", in the Help
+  licence page and in the buildings tooltip. Tests pin that ODbL sources
+  credit OpenStreetMap and that we never credit a dataset we do not request.
 - [x] **Add `changelog=` to `waveshed/metadata.txt`** — done 2026-08-03, with a
   0.2.0 entry covering the tile pool, the buildings pool, the SIMPLE_LOSS
   removal (including its Processing-index break), attribution, cache clearing
@@ -369,6 +371,56 @@ carried the buildings marker, the plugin's copy did not.
 - [ ] **P2P asset list does not refresh** while the dialog is open.
   `_refresh_assets` exists but nothing calls it; wire it to the Assets tab's
   change signal, the same way the 360° tab refreshes its cache.
+- [ ] **Map Converter: finer download bands (0.5°) as an A/B switch** —
+  owner 2026-11-07: "note to the todo but don't implement yet". The owner's
+  run of 2026-11-05 (2,438 tiles, 18 min 11 s, 1° bands) spent 232 s of
+  1,090 s after the last download landed: band 4's ingest (282 tiles) queued
+  187 s behind band 3's (727 tiles) because ingests run one at a time and the
+  last two bands are large. 0.5° bands would halve the last batch, about
+  100 s per run (10 %); the cost is twice the converter launches (each decodes
+  its building tiles, 5–6 s for 20,000 tiles), more timing lines and smaller,
+  more numerous coarse passes on the derive lane. Proposed: a
+  `WAVESHED_BAND_DEG=0.5` env switch (`_band_height`, map_converter_tab.py)
+  for one A/B run on the owner's HDD before deciding the default.
+- [ ] **Map Converter: derive-footprint rule instead of the one-band lag** —
+  owner 2026-11-07: "move to the todo for now". The derive lane holds a
+  band's coarser passes until the next band's z15 has landed
+  (`_DownloadBranch._held_for`), so the source tiles straddling a band edge
+  derive from both sides in every run. Run of 2026-11-07: bands held 210 s,
+  162 s and 88 s; band 2's batch started at +550 s instead of ~+360 s, band 3
+  queued 85 s and band 4 246 s — about 95 s of a 1,072 s run (9 %). Fix in
+  the toolkit instead: derive a coarse source tile only from children inside
+  the job's OWN z15 footprint (a few hundred small edge tiles per band are
+  then fetched, the interior stays derived), deterministic without any hold;
+  the plugin then drops `_held_for` (keep `WAVESHED_SERIAL_ZOOMS` for A/B).
+  + the 95 s back, determinism kept. − edge coarse tiles are the service's own
+  resample while the interior is a z15 mean; a toolkit release with a
+  contract item.
+- [ ] **Toolkit memory budgets — reverted 2026-11-08 (owner: "revert your
+  memory fiasko").** The 0.2.15 download model (CONTRACT 52, never released)
+  charged the whole process against the old strip share, min(available / 4,
+  2 GiB), priced the assembly of the owner's 638-tile-wide 2 m passes at
+  2 × 508 MB plus a 55 % "Windows allocator" share taken from mimalloc on
+  Linux, found no room for connections and dropped every z15 pass to 16
+  connections at 3.9 MB/s (256 at 27–35 MB/s before): band 1's pass 345 s
+  instead of 75 s, the run headed for hours; actual peak 961 MB against a
+  printed 2,271 MB. Its acceptance never ran the owner's geometry. The
+  toolkit is back at 0.2.14 (sources restored from the agents' saved copies
+  and the recorded edits; the 0.2.15 state is kept in
+  `aether-tools/.tmp/mem_revert/state_0215/`). If memory budgets are ever
+  redone: measure on the owner's geometry (638 wide, 2 m outputs, 16 CPUs,
+  31 GB, Windows), never shrink connections below what the REAL available
+  memory allows, keep the printed budget informational first, and test the
+  model with the owner's numbers before any run.
+- [ ] **Seam filter gaps (toolkit 0.2.13, CONTRACT 49)** — owner 2026-11-07:
+  "move to the todo". Zooms 10 and coarser (the service's own z7–z9 tiles
+  hold real 3.7–6 km pits in Himalayan gorges, so no depth tells a seam from
+  data there), Mapbox jobs, and the in-memory / browser decode paths are not
+  filtered — AETHER_Web's `assemble_terrain` gets tiles pre-decoded in JS, so
+  the web app still shows the 10°E trench. The +20,889 m spike at
+  z11/1081/721 is untouched: a mirror rule (both neighbours far BELOW) needs
+  its own false-positive survey like changelog 49's. Fix: filter in the
+  browser decode path (AETHER_Web) and survey the spike rule.
 - [ ] **Map Converter and Site Analysis still cannot run concurrently** — the
   layer-preparation dialog is modal. Accepted for now; the real fix is
   replacing `writeRaster` with a GDAL warp.
@@ -715,7 +767,9 @@ the run rather than by everything ever downloaded, but the real fix is the
 bbox filter in the converter.
 
 **Still capped at 4096 building tiles** (`core/openfreemap.py:47`) — a 100 km
-radius is already ~7000 tiles, so 500 km cannot even start. The limit has to go
+radius is already ~7000 tiles, so 500 km cannot even start. *(2026-10-23: the
+cap is gone — Site Analysis uses the Map Converter's strict, parallel fetch,
+`core/osm_buildings.py`, per pool tile.)* The limit has to go
 away by chunking per `.abt` tile (see below); there is no z-level fallback
 because the `building` layer only exists at z14.
 
@@ -814,7 +868,10 @@ a long download — or gets a misleading error from the engine. Needed:
   The WMS provider's tile fetch runs a nested `QEventLoop` over the thread-affine
   `QgsNetworkAccessManager`.
 
-- [ ] **Building downloads are capped at 4096 tiles with no way around it.**
+- [x] **Building downloads are capped at 4096 tiles with no way around it.**
+  Fixed 2026-10-23: `MAX_TILES` and the lenient `download_building_tiles`
+  are gone; both tabs fetch through `core/osm_buildings.ensure_tiles`
+  (strict, 32 connections), Site Analysis per whole pool tile being built.
   `core/openfreemap.py:36,47` (`BUILDING_ZOOM = 14`, `MAX_TILES = 4096`); the
   error at `:157-164` is what large-range runs hit ("This area needs 32761
   building tiles"). There is no z-level fallback and there cannot be one — the
