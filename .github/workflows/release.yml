@@ -33,6 +33,11 @@ jobs:
           set -euo pipefail
           sudo apt-get update -q
           sudo apt-get install -y -q python3-gdal python3-numpy python3-pytest
+          # The registry-scan tests (tests/test_qgis_scan.py) run the real
+          # analysers from tmp/scan-venv, the same pins as the check container;
+          # without them those tests would skip, and a skipped check is not a check.
+          /usr/bin/python3 -m venv --system-site-packages tmp/scan-venv
+          tmp/scan-venv/bin/pip install -q bandit==1.9.4 detect-secrets==1.5.0 flake8==7.4.1
 
       - name: Version
         id: version

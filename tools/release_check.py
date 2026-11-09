@@ -15,8 +15,16 @@ run:
    and most skips here mean a missing prerequisite (GDAL, numpy, the
    converter binary) that would hide real defects.  Every skip is listed with
    its reason.
-2. **Registry scans** — ``tools/qgis_scan.py`` on a freshly built ZIP
-   (Bandit, detect-secrets, flake8, file analysis).  FAIL on any Critical.
+2. **Registry scans** — ``tools/qgis_scan.py`` on a freshly built ZIP: the
+   five checks of plugins.qgis.org's ``security_scanner.py`` (Bandit,
+   Secrets Detection, Flake8, File Permissions, Suspicious Files) with the
+   registry's exact invocations and enabled rules.  FAIL exactly when the
+   registry would BLOCK the version (``tasks/run_security_scan.py``: any
+   failed critical-severity check = any Bandit or detect-secrets finding).
+   A blocked version cannot be unblocked — the next upload needs a higher
+   version — so this must pass before uploading.  Flake8 / permission /
+   suspicious-file findings are printed but do not fail it.  The scanner's
+   ``CHECK:`` / ``REGISTRY:`` lines are repeated in the final summary.
 
 The interpreter must provide GDAL (``osgeo``), numpy and pytest. The GUI runs
 this inside ``tools/check_container`` (Docker), which has all of them and the
@@ -146,12 +154,25 @@ def run_tests(bin_dir: Optional[str] = None) -> Tuple[bool, str]:
     return passed > 0, summary
 
 
-def run_scan() -> Tuple[bool, str]:
+def parse_scan_output(rc: int, lines: List[str]) -> Tuple[bool, str, List[str]]:
+    """(passed, verdict, per-check summary lines) from ``qgis_scan.py``.
+
+    Passed only with exit 0 AND a "would validate" verdict: a scanner that
+    crashed or printed no verdict is a FAIL, never a green stage."""
+    result = next((line for line in reversed(lines)
+                   if line.startswith("RESULT:")), None)
+    summary = [line for line in lines
+               if line.startswith(("CHECK:", "REGISTRY:"))]
+    if result is None:
+        return False, f"no result line (exit {rc})", summary
+    verdict = result.replace("RESULT: ", "")
+    return rc == 0 and verdict.startswith("would validate"), verdict, summary
+
+
+def run_scan() -> Tuple[bool, str, List[str]]:
     rc, lines = _stream([sys.executable, os.path.join(REPO, "tools", "qgis_scan.py"),
                          "--tools", scan_tools_dir()])
-    result = next((line for line in reversed(lines)
-                   if line.startswith("RESULT:")), "no result line")
-    return rc == 0, result.replace("RESULT: ", "")
+    return parse_scan_output(rc, lines)
 
 
 def install_tools() -> int:
@@ -194,10 +215,14 @@ def main() -> int:
               "QGIS's Python.")
         return 2
 
-    results = [("Tests", *run_tests(args.bin_dir)), ("Registry scans", *run_scan())]
+    tests = ("Tests", *run_tests(args.bin_dir))
+    scan_ok, scan_verdict, scan_lines = run_scan()
+    results = [tests, ("Registry scans", scan_ok, scan_verdict)]
     print("\n==== Pre-upload check ====")
     for name, ok, detail in results:
         print(f"  {'PASS' if ok else 'FAIL'}  {name}: {detail}")
+    for line in scan_lines:
+        print(f"        {line}")
     ok = all(passed for _, passed, _ in results)
     print("  => " + ("READY TO UPLOAD (scans + tests)" if ok
                      else "NOT READY — fix the FAIL lines above"))

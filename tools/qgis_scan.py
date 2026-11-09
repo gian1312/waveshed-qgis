@@ -1,27 +1,59 @@
 #!/usr/bin/env python3
-"""Run the plugins.qgis.org upload scans locally, on the ZIP that ships.
+"""Predict the plugins.qgis.org upload scan locally, on the ZIP that ships.
 
-plugins.qgis.org scans every uploaded plugin with four analysers — "Bandit
-security", "Detect Secrets", "Flake8 quality" and "File analysis" — and
-grades each finding Critical / Warning / Info.  This mirrors them on the
-package ``package.py`` builds, so a release is checked before upload rather
-than by the registry.
+The registry's model (github.com/qgis/QGIS-Plugins-Website, ``qgis-app/
+plugins/security_scanner.py`` — ``PluginSecurityScanner``; ``qgis-app/plugins/
+tasks/run_security_scan.py`` — the blocking decision; ``qgis-app/plugins/
+models.py`` — ``PluginVersionSecurityScan.pass_rate``; rule lists from
+``management/commands/data/*_rules.json`` as overridden by the admins, live at
+https://plugins.qgis.org/docs/security-scanning/rules, read 2026-11-09):
 
-What runs:
+Every upload runs five CHECKS.  A check passes only when it has ZERO findings;
+the rule a finding came from does not grade it — the check's own severity does.
 
-* **Bandit** over the extracted package (every rule; graded by the registry's
-  table below, not Bandit's own severity).
-* **detect-secrets** ``scan --all-files`` over the extracted package.
-* **flake8** with exactly the registry's codes selected and
-  ``--max-complexity 10`` (C901).
-* **File analysis** in Python, on the ZIP entries themselves: suspicious
-  extensions, binary content, executable bits and hidden names.
+==========================  ==========  =====================================
+Check                       Severity    What runs
+==========================  ==========  =====================================
+Bandit Security Analysis    critical    ``bandit -r <dir> -f json --quiet
+                                        -t <the 72 enabled rules>`` (no -ll,
+                                        so LOW findings count; ``# nosec``
+                                        honoured)
+Secrets Detection           critical    ``detect-secrets scan --all-files
+                                        --exclude-files metadata\\.txt
+                                        --exclude-files \\.secrets\\.baseline
+                                        [--baseline ..] --disable-plugin
+                                        IPPublicDetector .`` in the extracted
+                                        tree; every finding fails it
+Code Quality (Flake8)       info        ``flake8 --format=json
+                                        --max-line-length=120 [--config
+                                        .flake8] --select <26 codes>`` on
+                                        every .py (plain-format fallback when
+                                        flake8-json is absent; NO
+                                        --max-complexity, so C901 is inert)
+File Permissions            info        .py ZIP entries with an execute bit
+Suspicious Files            warning     .exe .dll .so .dylib .bat .sh .ps1
+                                        .cmd entries (FILE_HIDDEN is
+                                        disabled; FILE_BINARY is enabled in
+                                        the rule table but no code checks it)
+==========================  ==========  =====================================
 
-Exit status is 1 when any *Critical* finding exists, else 0.  Warnings and
-Info are listed (``--verbose`` prints every hit) but do not fail the run —
-the registry shows them to reviewers; it does not reject the upload for them.
+A version is BLOCKED when any critical-severity check failed — i.e. any
+Bandit or detect-secrets finding at all.  Pass rate = passed checks / 5,
+rounded to 0.1 %.  A blocked version can NOT be unblocked or rescanned into
+"validated": the next upload needs a higher version number.  Developers may
+skip *skippable* rules at upload time; this tool assumes none are skipped.
+
+Output: one ``CHECK:`` line per check (name, severity, findings, PASS/FAIL),
+the findings grouped by rule with file:line (Bandit with its issue severity /
+confidence), then ``REGISTRY:`` lines (critical checks failed, pass rate) and
+the ``RESULT:`` verdict "WOULD BE BLOCKED" / "would validate".  The rule
+table's own per-rule severity is shown in brackets for information only.
+
+Exit status 1 when the registry would block the version, else 0 (flake8,
+permission and suspicious-file findings are informational).
 
 The three analysers are dev tools, never plugin dependencies.  Install them
+(the check container pins bandit 1.9.4, detect-secrets 1.5.0, flake8 7.4.1)
 into a scratch venv inside the gitignored ``tmp/`` folder::
 
     python3 -m venv tmp/scan-venv
@@ -35,7 +67,7 @@ Usage::
 Without ``--zip`` the package is built first (``package.py`` into
 ``tmp/qgis-scan``).  ``--tools`` is the directory holding the analyser
 executables (default ``tmp/scan-venv/bin``, ``Scripts`` on Windows; else
-``PATH``).
+``PATH``).  ``--verbose`` adds each finding's message.
 
 Standard library only.
 """
@@ -47,68 +79,84 @@ import collections
 import json
 import os
 import shutil
-import stat
 import subprocess  # nosec B404 — runs the local analysers, fixed argv
 import sys
 import tempfile
 import zipfile
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Sequence
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 # --------------------------------------------------------------------------
-# The registry's grading (copied from its rule table, 2026-10).
+# The registry's enabled rules (rules page, 2026-11-09).  The JSON seed files
+# still enable B111/B320; the live table has them off — the live table wins.
 # --------------------------------------------------------------------------
 
-BANDIT_CRITICAL = {
-    "B102", "B103", "B105", "B106", "B107", "B111", "B201", "B202", "B301",
-    "B302", "B304", "B305", "B306", "B307", "B312", "B321", "B323", "B401",
-    "B402", "B412", "B413", "B501", "B502", "B503", "B505", "B506", "B507",
-    "B601", "B602", "B604", "B605", "B609", "B610", "B611", "B612", "B613",
-    "B615", "B701",
+BANDIT_ENABLED = (
+    "B101 B102 B103 B104 B105 B106 B107 B108 B110 B112 B113 B201 B202 B301 "
+    "B302 B303 B304 B305 B306 B307 B308 B310 B311 B312 B313 B314 B315 B316 "
+    "B317 B318 B319 B321 B323 B324 B401 B402 B403 B405 B406 B407 B408 B409 "
+    "B412 B413 B501 B502 B503 B504 B505 B506 B507 B508 B509 B601 B602 B603 "
+    "B604 B605 B606 B607 B608 B609 B610 B611 B612 B613 B614 B615 B701 B702 "
+    "B703 B704").split()
+BANDIT_DISABLED = ("B109", "B111", "B320", "B404", "B410", "B411")
+
+#: All detect-secrets plugins in the registry's table; the scanner passes
+#: ``--disable-plugin`` for every one that is not enabled.
+SECRETS_DISABLED = ("IPPublicDetector",)
+SECRETS_ENABLED = (
+    "AWSKeyDetector ArtifactoryDetector AzureStorageKeyDetector "
+    "BasicAuthDetector CloudantDetector DiscordBotTokenDetector "
+    "GitHubTokenDetector GitLabTokenDetector IbmCloudIamDetector "
+    "IbmCosHmacDetector JwtTokenDetector MailchimpDetector NpmDetector "
+    "OpenAIDetector PrivateKeyDetector PypiTokenDetector SendGridDetector "
+    "SlackDetector SoftlayerDetector SquareOAuthDetector StripeDetector "
+    "TelegramBotTokenDetector TwilioKeyDetector Base64HighEntropyString "
+    "HexHighEntropyString KeywordDetector").split()
+
+FLAKE8_ENABLED = (
+    "E901 E902 E999 F821 F823 F831 C901 E101 E711 E712 E713 E714 E721 E722 "
+    "E731 E741 E742 E743 F402 F403 F404 F405 F811 F822 F901 W605").split()
+
+FILE_ANALYSIS_ENABLED = ("FILE_SUSPICIOUS", "FILE_BINARY", "FILE_EXECUTABLE")
+SUSPICIOUS_EXTS = (".exe", ".dll", ".so", ".dylib", ".bat", ".sh", ".ps1",
+                   ".cmd")
+#: Files the secrets check drops from detect-secrets' results.
+_SECRETS_SKIP_EXTS = (".pyc", ".pyo", ".so", ".dll", ".exe")
+
+# Per-rule severity from the rule table — shown for information only; the
+# verdict comes from the CHECK severity below.
+_RULE_CRITICAL = {
+    "B102", "B103", "B105", "B106", "B107", "B201", "B202", "B301", "B302",
+    "B304", "B305", "B306", "B307", "B312", "B321", "B323", "B401", "B402",
+    "B412", "B413", "B501", "B502", "B503", "B505", "B506", "B507", "B601",
+    "B602", "B604", "B605", "B609", "B610", "B611", "B612", "B613", "B615",
+    "B701", "E901", "E902", "E999", "F821", "F823", "F831", "FILE_SUSPICIOUS",
 }
-BANDIT_INFO = {"B109", "B404", "B410", "B411"}
-# Everything else Bandit reports is a Warning in the registry's table.
 
-SECRETS_CRITICAL = {
-    "AWS Access Key", "Artifactory Credentials", "Azure Storage Account access key",
-    "Basic Auth Credentials", "Cloudant Credentials", "Discord Bot Token",
-    "GitHub Token", "GitLab Token", "IBM Cloud IAM Key", "IBM COS HMAC Credentials",
-    "JSON Web Token", "Mailchimp Access Key", "NPM tokens", "OpenAI Token",
-    "Private Key", "PyPI Token", "SendGrid API Key", "Slack Token",
-    "SoftLayer Credentials", "Square OAuth Secret", "Stripe Access Key",
-    "Telegram Bot Token", "Twilio API Key",
-}
-SECRETS_INFO = {"Public IP (ipv4)"}
-# High-entropy strings and secret keywords are Warnings.
+BANDIT = "Bandit Security Analysis"
+SECRETS = "Secrets Detection"
+FLAKE8 = "Code Quality (Flake8)"
+PERMISSIONS = "File Permissions"
+SUSPICIOUS = "Suspicious Files"
+CRITICAL, WARNING, INFO = "critical", "warning", "info"
 
-FLAKE8_CRITICAL = ["E901", "E902", "E999", "F821", "F823", "F831"]
-FLAKE8_WARNING = [
-    "C901", "E101", "E711", "E712", "E713", "E714", "E721", "E722", "E731",
-    "E741", "E742", "E743", "F402", "F403", "F404", "F405", "F811", "F822",
-    "F901", "W605",
-]
-FLAKE8_INFO = [
-    "E111", "E112", "E113", "E114", "E115", "E116", "E117", "E121", "E122",
-    "E123", "E124", "E125", "E126", "E127", "E128", "E129", "E131", "E133",
-    "E201", "E202", "E203", "E211", "E221", "E222", "E223", "E224", "E225",
-    "E226", "E227", "E228", "E231", "E241", "E242", "E251", "E261", "E262",
-    "E265", "E266", "E271", "E272", "E273", "E274", "E275", "E301", "E302",
-    "E303", "E304", "E305", "E306", "E401", "E402", "E501", "E502", "E701",
-    "E702", "E703", "E704", "F401", "F841", "W191", "W291", "W292", "W293",
-    "W391", "W503", "W504", "W601", "W602", "W603", "W604",
-]
 
-SUSPICIOUS_EXTS = {
-    ".exe", ".dll", ".so", ".dylib", ".sh", ".bat", ".cmd", ".ps1", ".com",
-    ".msi", ".scr", ".pyd", ".jar", ".bin",
-}
-#: Formats a reviewer can still inspect; flagged as binary but expected.
-_IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".svg", ".ico", ".qm"}
+class Check:
+    """One registry check: passed only with zero findings."""
 
-CRITICAL, WARNING, INFO = "Critical", "Warning", "Info"
+    def __init__(self, name: str, severity: str) -> None:
+        self.name = name
+        self.severity = severity
+        self.findings: List[Dict[str, object]] = []
+        self.notes: List[str] = []
 
-Finding = Tuple[str, str, str, str]  # (severity, scanner, code, where)
+    @property
+    def passed(self) -> bool:
+        return not self.findings
+
+    def add(self, rule: str, file: str, line: int = 0, **extra: object) -> None:
+        self.findings.append(dict(rule=rule, file=file, line=line, **extra))
 
 
 def _tool(tools_dir: str, name: str) -> str:
@@ -123,8 +171,13 @@ def _tool(tools_dir: str, name: str) -> str:
     return found
 
 
-def _run(argv: List[str]) -> subprocess.CompletedProcess:
-    return subprocess.run(argv, capture_output=True, text=True)  # nosec B603
+def _run(argv: List[str], cwd: Optional[str] = None) -> subprocess.CompletedProcess:
+    return subprocess.run(argv, capture_output=True, text=True,  # nosec B603
+                          cwd=cwd)
+
+
+def _rel(path: str, root: str) -> str:
+    return os.path.relpath(os.path.join(root, path), root).replace(os.sep, "/")
 
 
 def build_zip(out_dir: str) -> str:
@@ -138,117 +191,239 @@ def build_zip(out_dir: str) -> str:
     return os.path.join(out_dir, zips[-1])
 
 
-def file_analysis(zip_path: str) -> List[Finding]:
-    findings: List[Finding] = []
+def _python_files(root: str) -> List[str]:
+    return [os.path.join(dirpath, name)
+            for dirpath, _, names in os.walk(root)
+            for name in names if name.endswith(".py")]
+
+
+# --------------------------------------------------------------------------
+# The five checks (security_scanner.py, same order).
+# --------------------------------------------------------------------------
+
+def bandit_argv(tools_dir: str, root: str) -> List[str]:
+    return [_tool(tools_dir, "bandit"), "-r", root, "-f", "json", "--quiet",
+            "-t", ",".join(sorted(BANDIT_ENABLED))]
+
+
+def bandit(tools_dir: str, root: str) -> Check:
+    check = Check(BANDIT, CRITICAL)
+    if not _python_files(root):
+        return check
+    result = _run(bandit_argv(tools_dir, root))
+    if not result.stdout.strip():
+        # The registry passes the check here; do not hide it.
+        check.notes.append("bandit printed nothing: " + result.stderr[:200])
+        return check
+    report = json.loads(result.stdout)
+    for hit in report.get("results", []):
+        check.add(hit.get("test_id", ""), _rel(hit.get("filename", ""), root),
+                  hit.get("line_number", 0),
+                  severity=hit.get("issue_severity", ""),
+                  confidence=hit.get("issue_confidence", ""),
+                  message=hit.get("issue_text", ""))
+    for error in report.get("errors", []):
+        # Ignored by the registry (it reads only "results").
+        check.notes.append(f"bandit could not scan {error.get('filename', '?')}"
+                           f": {error.get('reason', '')}")
+    return check
+
+
+def secrets_argv(tools_dir: str, root: str) -> List[str]:
+    argv = [_tool(tools_dir, "detect-secrets"), "scan", "--all-files",
+            "--exclude-files", r"metadata\.txt",
+            "--exclude-files", r"\.secrets\.baseline"]
+    for dirpath, _, names in os.walk(root):
+        if ".secrets.baseline" in names:
+            argv += ["--baseline", os.path.relpath(
+                os.path.join(dirpath, ".secrets.baseline"), root)]
+            break
+    for plugin in SECRETS_DISABLED:
+        argv += ["--disable-plugin", plugin]
+    return argv + ["."]
+
+
+def detect_secrets(tools_dir: str, root: str) -> Check:
+    check = Check(SECRETS, CRITICAL)
+    result = _run(secrets_argv(tools_dir, root), cwd=root)
+    if not result.stdout:
+        check.notes.append("detect-secrets printed nothing: "
+                           + result.stderr[:200])
+        return check
+    for filename, hits in json.loads(result.stdout).get("results", {}).items():
+        if filename.endswith(_SECRETS_SKIP_EXTS):
+            continue
+        for hit in hits:
+            check.add(hit.get("type", "Unknown"), _rel(filename, root),
+                      hit.get("line_number", 0))
+    return check
+
+
+def _flake8_config(root: str) -> Optional[str]:
+    config = os.path.join(root, ".flake8")
+    if os.path.isfile(config):
+        return config
+    for entry in sorted(os.scandir(root), key=lambda e: e.name):
+        if entry.is_dir() and os.path.isfile(os.path.join(entry.path, ".flake8")):
+            return os.path.join(entry.path, ".flake8")
+    return None
+
+
+def flake8_argv(tools_dir: str, root: str, files: Sequence[str],
+                json_format: bool = True) -> List[str]:
+    argv = [_tool(tools_dir, "flake8")]
+    if json_format:
+        argv.append("--format=json")
+    argv.append("--max-line-length=120")
+    config = _flake8_config(root)
+    if config:
+        argv += ["--config", config]
+    return argv + ["--select", ",".join(sorted(FLAKE8_ENABLED)), *files]
+
+
+def flake8(tools_dir: str, root: str) -> Check:
+    check = Check(FLAKE8, INFO)
+    files = _python_files(root)
+    if not files:
+        return check
+    # An empty cwd: flake8 must not pick up a setup.cfg / tox.ini of ours.
+    cwd = tempfile.mkdtemp(prefix="flake8-cwd-")
+    try:
+        result = _run(flake8_argv(tools_dir, root, files), cwd=cwd)
+        try:
+            data = json.loads(result.stdout) if result.stdout else None
+        except json.JSONDecodeError:
+            data = None
+        if isinstance(data, dict):
+            for path, issues in data.items():
+                for issue in issues:
+                    check.add(issue.get("code", ""), _rel(path, root),
+                              issue.get("line_number", 0),
+                              message=issue.get("text", ""))
+            return check
+        # Registry fallback: no flake8-json plugin → default text format.
+        result = _run(flake8_argv(tools_dir, root, files, json_format=False),
+                      cwd=cwd)
+    finally:
+        shutil.rmtree(cwd, ignore_errors=True)
+    for line in result.stdout.splitlines():
+        parts = line.split(":", 3)
+        if len(parts) < 4:
+            continue
+        code, _, message = parts[3].strip().partition(" ")
+        check.add(code, _rel(parts[0], root),
+                  int(parts[1]) if parts[1].isdigit() else 0, message=message)
+    return check
+
+
+def file_permissions(zip_path: str) -> Check:
+    check = Check(PERMISSIONS, INFO)
     with zipfile.ZipFile(zip_path) as archive:
         for info in archive.infolist():
-            name = info.filename
-            if name.endswith("/"):
-                continue
-            base = os.path.basename(name)
-            ext = os.path.splitext(base)[1].lower()
-            if ext in SUSPICIOUS_EXTS:
-                findings.append((CRITICAL, "files", "FILE_SUSPICIOUS", name))
             mode = info.external_attr >> 16
-            if mode & (stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH):
-                findings.append((WARNING, "files", "FILE_EXECUTABLE", name))
-            if any(part.startswith(".") for part in name.split("/")):
-                findings.append((INFO, "files", "FILE_HIDDEN", name))
-            data = archive.read(info)[:8192]
-            if b"\0" in data:
-                findings.append((WARNING, "files", "FILE_BINARY",
-                                 name + (" (image)" if ext in _IMAGE_EXTS
-                                         else "")))
-    return findings
+            if mode & 0o111 and info.filename.endswith(".py"):
+                check.add("FILE_EXECUTABLE", info.filename)
+    return check
 
 
-def bandit(tools_dir: str, root: str) -> List[Finding]:
-    result = _run([_tool(tools_dir, "bandit"), "-r", root, "-f", "json", "-q"])
-    report = json.loads(result.stdout or "{}")
-    findings: List[Finding] = []
-    for hit in report.get("results", []):
-        code = hit["test_id"]
-        severity = (CRITICAL if code in BANDIT_CRITICAL
-                    else INFO if code in BANDIT_INFO else WARNING)
-        where = f"{os.path.relpath(hit['filename'], root)}:{hit['line_number']}"
-        findings.append((severity, "bandit", code, where))
-    for error in report.get("errors", []):
-        findings.append((CRITICAL, "bandit", "PARSE", error.get("filename", "?")))
-    return findings
+def suspicious_files(zip_path: str) -> Check:
+    # FILE_HIDDEN is disabled in the registry's table, so hidden names pass.
+    check = Check(SUSPICIOUS, WARNING)
+    with zipfile.ZipFile(zip_path) as archive:
+        for info in archive.infolist():
+            name = info.filename.lower()
+            if name.endswith(SUSPICIOUS_EXTS):
+                check.add("FILE_SUSPICIOUS", info.filename)
+    return check
 
 
-def detect_secrets(tools_dir: str, root: str) -> List[Finding]:
-    result = _run([_tool(tools_dir, "detect-secrets"), "scan", "--all-files",
-                   root])
-    report = json.loads(result.stdout or "{}")
-    findings: List[Finding] = []
-    for filename, hits in report.get("results", {}).items():
-        for hit in hits:
-            kind = hit["type"]
-            severity = (CRITICAL if kind in SECRETS_CRITICAL
-                        else INFO if kind in SECRETS_INFO else WARNING)
-            where = f"{os.path.relpath(filename, root)}:{hit['line_number']}"
-            findings.append((severity, "detect-secrets", kind, where))
-    return findings
-
-
-def flake8(tools_dir: str, root: str) -> List[Finding]:
-    codes = FLAKE8_CRITICAL + FLAKE8_WARNING + FLAKE8_INFO
-    result = _run([
-        _tool(tools_dir, "flake8"), "--isolated", "--max-complexity", "10",
-        "--select", ",".join(codes), "--format",
-        "%(path)s:%(row)d\t%(code)s", root,
-    ])
-    findings: List[Finding] = []
-    for line in result.stdout.splitlines():
-        where, _, code = line.partition("\t")
-        severity = (CRITICAL if code in FLAKE8_CRITICAL
-                    else WARNING if code in FLAKE8_WARNING else INFO)
-        findings.append((severity, "flake8", code, os.path.relpath(where, root)))
-    return findings
-
-
-def report(findings: List[Finding], verbose: bool) -> int:
-    by_severity: Dict[str, List[Finding]] = collections.defaultdict(list)
-    for finding in findings:
-        by_severity[finding[0]].append(finding)
-    for severity in (CRITICAL, WARNING, INFO):
-        hits = by_severity.get(severity, [])
-        print(f"\n== {severity}: {len(hits)}")
-        counts = collections.Counter((scanner, code) for _, scanner, code, _ in hits)
-        for (scanner, code), count in sorted(counts.items()):
-            print(f"   {scanner:15} {code:30} {count:5}")
-            if verbose or severity == CRITICAL:
-                for _, s, c, where in hits:
-                    if (s, c) == (scanner, code):
-                        print(f"        {where}")
-    critical = len(by_severity.get(CRITICAL, []))
-    print("\nRESULT:", "FAIL — critical findings" if critical
-          else "PASS — no critical findings")
-    return 1 if critical else 0
-
-
-def main() -> int:
-    parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    parser.add_argument("--zip", help="plugin ZIP to scan (default: build one)")
-    parser.add_argument("--tools", default=os.path.join(
-        REPO, "tmp", "scan-venv", "Scripts" if os.name == "nt" else "bin"))
-    parser.add_argument("--verbose", action="store_true")
-    args = parser.parse_args()
-
-    scratch = os.path.join(REPO, "tmp", "qgis-scan")
-    zip_path = args.zip or build_zip(scratch)
-    print(f"Scanning {zip_path}")
+def scan(zip_path: str, tools_dir: str, scratch: str) -> List[Check]:
     os.makedirs(scratch, exist_ok=True)
     root = tempfile.mkdtemp(prefix="extract-", dir=scratch)
     try:
         with zipfile.ZipFile(zip_path) as archive:
             archive.extractall(root)
-        findings = (file_analysis(zip_path) + bandit(args.tools, root)
-                    + detect_secrets(args.tools, root) + flake8(args.tools, root))
+        return [bandit(tools_dir, root), detect_secrets(tools_dir, root),
+                flake8(tools_dir, root), file_permissions(zip_path),
+                suspicious_files(zip_path)]
     finally:
         shutil.rmtree(root, ignore_errors=True)
-    return report(findings, args.verbose)
+
+
+# --------------------------------------------------------------------------
+# The registry's verdict (run_security_scan.py, models.py).
+# --------------------------------------------------------------------------
+
+def summarize(checks: Sequence[Check]) -> Dict[str, object]:
+    passed = sum(1 for c in checks if c.passed)
+    critical = sum(1 for c in checks if not c.passed and c.severity == CRITICAL)
+    total = len(checks)
+    return {
+        "total": total,
+        "passed": passed,
+        "critical_failed": critical,
+        "pass_rate": round(passed / total * 100, 1) if total else 0,
+        "blocked": critical > 0,
+    }
+
+
+def _rule_label(rule: str) -> str:
+    # Everything else enabled is Warning (entropy / keyword secrets too).
+    return "Critical" if rule in _RULE_CRITICAL else "Warning"
+
+
+def report(checks: Sequence[Check], verbose: bool = False) -> int:
+    for check in checks:
+        print(f"CHECK: {check.name:26} {check.severity:8} "
+              f"{len(check.findings):4} findings  "
+              f"{'PASS' if check.passed else 'FAIL'}")
+    for check in checks:
+        if check.passed and not check.notes:
+            continue
+        print(f"\n== {check.name} ({check.severity}): "
+              f"{len(check.findings)} findings")
+        for note in check.notes:
+            print(f"   note: {note}")
+        groups: Dict[str, List[Dict[str, object]]] = collections.defaultdict(list)
+        for finding in check.findings:
+            groups[str(finding["rule"])].append(finding)
+        for rule in sorted(groups):
+            hits = groups[rule]
+            print(f"   {rule:30} {len(hits):4}   [rule table: "
+                  f"{_rule_label(rule)}]")
+            for hit in hits:
+                where = f"{hit['file']}:{hit['line']}" if hit["line"] else hit["file"]
+                extra = ""
+                if "severity" in hit:
+                    extra = f"  severity {hit['severity']} / confidence {hit['confidence']}"
+                if verbose and hit.get("message"):
+                    extra += f"  — {hit['message']}"
+                print(f"        {where}{extra}")
+    summary = summarize(checks)
+    print(f"\nREGISTRY: critical checks failed: {summary['critical_failed']}")
+    print(f"REGISTRY: checks passed: {summary['passed']} / {summary['total']}")
+    print(f"REGISTRY: pass rate: {summary['pass_rate']} %")
+    if summary["blocked"]:
+        print("RESULT: WOULD BE BLOCKED — a Bandit / detect-secrets finding; a "
+              "blocked version cannot be unblocked, re-upload needs a higher "
+              "version")
+        return 1
+    print("RESULT: would validate — no critical check failed")
+    return 0
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    parser.add_argument("--zip", help="plugin ZIP to scan (default: build one)")
+    parser.add_argument("--tools", default=os.path.join(
+        REPO, "tmp", "scan-venv", "Scripts" if os.name == "nt" else "bin"))
+    parser.add_argument("--verbose", action="store_true")
+    args = parser.parse_args(argv)
+
+    scratch = os.path.join(REPO, "tmp", "qgis-scan")
+    zip_path = args.zip or build_zip(scratch)
+    print(f"Scanning {zip_path}")
+    return report(scan(zip_path, args.tools, scratch), args.verbose)
 
 
 if __name__ == "__main__":
