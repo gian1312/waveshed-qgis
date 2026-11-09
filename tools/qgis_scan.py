@@ -422,8 +422,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     scratch = os.path.join(REPO, "tmp", "qgis-scan")
     zip_path = args.zip or build_zip(scratch)
+    # detect-secrets and flake8 run from inside the extracted tree, so a
+    # relative --tools (e.g. tmp/scan-venv/bin) must be resolved first.
+    tools_dir = os.path.abspath(args.tools)
     print(f"Scanning {zip_path}")
-    return report(scan(zip_path, args.tools, scratch), args.verbose)
+    return report(scan(zip_path, tools_dir, scratch), args.verbose)
 
 
 if __name__ == "__main__":
