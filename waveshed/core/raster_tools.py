@@ -16,6 +16,7 @@ QgsVectorLayer construction for the outputs lives in ``result_loader``.
 
 from __future__ import annotations
 
+import contextlib
 import math
 import os
 from typing import Callable, List, NamedTuple, Optional, Sequence, Tuple
@@ -737,14 +738,12 @@ def generate_contours(
         # traceback plus an abort. Hence the blanket catch: a hiccup emitting
         # progress must not silently truncate the contours.
         nonlocal canceled
-        try:
+        with contextlib.suppress(Exception):  # an abort would be far worse
             if should_cancel is not None and should_cancel():
                 canceled = True
                 return 0
             if on_progress is not None:
                 on_progress(float(complete))
-        except Exception:  # noqa: BLE001 — an abort would be far worse
-            pass
         return 1
 
     # Contours run in RAW pixel units (0.5 m/count), so the levels go out
@@ -786,10 +785,8 @@ def generate_contours(
     if failure is not None:
         # Nothing in this cleanup may mask the failure that got us here — the
         # message is all the user will see.
-        try:
+        with contextlib.suppress(Exception):
             dst.RollbackTransaction()
-        except Exception:  # noqa: BLE001
-            pass
         # The layer proxy dangles once its datasource closes, so it goes first.
         layer = band = work = dst = None
         try:
@@ -807,7 +804,7 @@ def generate_contours(
     # Metres attribute as ONE set-based UPDATE rather than a per-feature
     # SetFeature() loop, for the same reason the load is wrapped above.
     result = dst.ExecuteSQL(
-        f"UPDATE contours SET alt_m = COALESCE(elev_raw, 0) * {MIN_ALT_STEP_M}"
+        f"UPDATE contours SET alt_m = COALESCE(elev_raw, 0) * {MIN_ALT_STEP_M}"  # nosec B608 — constant, own schema
     )
     if result is not None:  # UPDATE yields no result set; release if one appears
         dst.ReleaseResultSet(result)

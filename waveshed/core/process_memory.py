@@ -15,6 +15,7 @@ through ``/proc/self/status`` (``VmRSS`` / ``VmHWM``), macOS through
 
 from __future__ import annotations
 
+import contextlib
 import sys
 from typing import Optional, Tuple
 
@@ -22,15 +23,13 @@ from typing import Optional, Tuple
 def resident_bytes() -> Tuple[Optional[int], Optional[int]]:
     """``(current, peak)`` resident set of this process in bytes; either
     may be None when the platform does not report it."""
-    try:
+    with contextlib.suppress(Exception):  # informative only, never fatal
         if sys.platform == "win32":
             return _windows()
         if sys.platform.startswith("linux"):
             return _linux()
         if sys.platform == "darwin":
             return _macos()
-    except Exception:  # noqa: BLE001 — informative only, never fatal
-        pass
     return None, None
 
 

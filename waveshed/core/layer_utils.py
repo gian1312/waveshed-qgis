@@ -6,6 +6,7 @@ the same DEM/imagery classification without duplicating heuristics.
 
 from __future__ import annotations
 
+import contextlib
 from typing import Optional
 
 from .min_alt import REF_AGL, normalize_reference
@@ -29,23 +30,19 @@ _TERRAIN_PROP = "aether/terrain_dir"   # .abt directory the run used
 def mark_aether_output(layer, role: str = "") -> None:
     """Stamp *layer* as plugin-created (with an optional *role*) so DEM pickers
     can tell our result rasters from terrain we generated."""
-    try:
+    with contextlib.suppress(Exception):
         layer.setCustomProperty(_OUTPUT_PROP, "1")
         if role:
             layer.setCustomProperty(_ROLE_PROP, role)
-    except Exception:
-        pass
 
 
 def mark_aether_model(layer, model: str) -> None:
     """Stamp the propagation model (``LOS`` / ``ITM`` / ``MIN_ALT`` …) that
     produced *layer* so downstream tools (e.g. the Altitude Explorer) can find
     the layers they know how to drive."""
-    try:
+    with contextlib.suppress(Exception):
         if model:
             layer.setCustomProperty(_MODEL_PROP, str(model).upper())
-    except Exception:
-        pass
 
 
 def aether_model(layer) -> str:
@@ -62,11 +59,9 @@ def is_min_alt_layer(layer) -> bool:
 
 
 def _set_prop(layer, key: str, value: str) -> None:
-    try:
+    with contextlib.suppress(Exception):
         if value:
             layer.setCustomProperty(key, str(value))
-    except Exception:
-        pass
 
 
 def _get_prop(layer, key: str) -> str:
@@ -251,13 +246,11 @@ def classify_raster_layer(layer) -> str:
     if provider is None:
         return "unknown"
 
-    try:
+    with contextlib.suppress(Exception):
         if provider.bandCount() >= 3:
             return "imagery"
-    except Exception:
-        pass
 
-    try:
+    with contextlib.suppress(Exception):
         from qgis.core import Qgis
         # ARGB32 is what every rendered-image provider reports, so it catches
         # any service the guard above does not name. Members are looked up by
@@ -269,8 +262,6 @@ def classify_raster_layer(layer) -> str:
         }
         if provider.dataType(1) in image_types:
             return "imagery"
-    except Exception:
-        pass
 
     return "dem"
 

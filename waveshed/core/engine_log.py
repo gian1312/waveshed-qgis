@@ -23,6 +23,7 @@ file cannot be written the panel gets every line, as before.
 
 from __future__ import annotations
 
+import contextlib
 import os
 import re
 import time
@@ -173,10 +174,8 @@ class EngineLog:
     def _close_file(self) -> None:
         fh, self._fh = self._fh, None
         if fh is not None:
-            try:
+            with contextlib.suppress(Exception):
                 fh.close()
-            except Exception:  # noqa: BLE001
-                pass
 
     def close(self) -> None:
         """End of the run: the file is closed (the panel is untouched)."""

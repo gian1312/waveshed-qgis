@@ -367,7 +367,7 @@ class CoverageAlgorithm(QgsProcessingAlgorithm):
             feedback.pushInfo(f"GeoTIFF already written by aether_core: {tif_path}")
             result = None
         else:
-            result = subprocess.run(
+            result = subprocess.run(  # nosec B603 — aether_export from binary_manager, args are our own
                 [export_exe, "-i", input_file, "-j", json_sidecar, "-o", tif_path],
                 capture_output=True,
                 text=True,

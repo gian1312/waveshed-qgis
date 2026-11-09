@@ -22,6 +22,7 @@ GDAL is QGIS's own (``osgeo``) — never a pip dependency.
 
 from __future__ import annotations
 
+import contextlib
 import os
 import shutil
 import tempfile
@@ -35,11 +36,9 @@ _FGB_CACHE_DIRNAME = "aether_fgb"
 
 
 def _log(msg: str) -> None:
-    try:
+    with contextlib.suppress(Exception):  # logging must never break a conversion
         from qgis.core import Qgis, QgsMessageLog
         QgsMessageLog.logMessage(msg, "Waveshed-Terrain", Qgis.MessageLevel.Info)
-    except Exception:  # noqa: BLE001 — logging must never break a conversion
-        pass
 
 
 def fgb_cache_dir() -> str:

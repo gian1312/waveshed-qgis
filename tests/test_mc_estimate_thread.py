@@ -194,7 +194,7 @@ class ARequestNeverComputes(_Base):
             self.tab._update_estimate()
             self.assertEqual(
                 self.tab._lbl_estimate.text,
-                "1 layer(s) have no extent set. Select a layer and click "
+                "1 layer(s) have no extent set. Choose a layer and click "
                 "'Draw Extent' or 'Extent from Layer'.")
             self.tab._layers = [_LayerEntry(layer_type="buildings",
                                             source_path="/b.fgb")]

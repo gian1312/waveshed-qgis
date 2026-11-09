@@ -16,6 +16,7 @@ Also supports a local terrain directory of GeoTIFF/DEM files (path 2).
 
 from __future__ import annotations
 
+import contextlib
 import errno
 import heapq
 import json
@@ -66,11 +67,9 @@ _SUBPROCESS_FLAGS = _no_window_flags()
 
 
 def _log(msg: str) -> None:
-    try:
+    with contextlib.suppress(Exception):
         from qgis.core import Qgis, QgsMessageLog
         QgsMessageLog.logMessage(msg, "Waveshed-Terrain", Qgis.MessageLevel.Info)
-    except Exception:
-        pass
 
 
 # DEM sources already warned about this run (requested range exceeds the DEM
@@ -2446,7 +2445,7 @@ def run_converter_streaming(exe: str, args: List[str], on_line: Any,
     env = _with_diag_file(env)
     first: Optional[float] = None
     last: Optional[float] = None
-    with subprocess.Popen(
+    with subprocess.Popen(  # nosec B603 — engine binary from binary_manager, args are our own
         [exe, *args],
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
@@ -2467,14 +2466,12 @@ def run_converter_streaming(exe: str, args: List[str], on_line: Any,
                         first = last
                     on_line(line)
         except ConverterCancelled:
-            try:
+            with contextlib.suppress(Exception):  # best-effort kill on cancel
                 proc.terminate()
                 try:
                     proc.wait(timeout=3)
                 except subprocess.TimeoutExpired:
                     proc.kill()
-            except Exception:  # noqa: BLE001 — best-effort kill on cancel
-                pass
             raise
     _STREAM_TIMING.last = StreamTiming(launched, first, last,
                                        time.perf_counter())
@@ -2504,7 +2501,7 @@ def kill_engine_process(proc: Any) -> None:
     except OSError:
         pass
     try:
-        taskkill = subprocess.Popen(
+        taskkill = subprocess.Popen(  # nosec B603 B607 — Windows taskkill, fixed args + our child's PID
             ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL, creationflags=_no_window_flags())
@@ -3065,11 +3062,9 @@ def _source_route(source: str, dem_layer: Any) -> str:
     if "type=xyz" in source:
         return "download"
     src = source
-    try:
+    with contextlib.suppress(Exception):  # routing must not depend on the layer
         if dem_layer is not None:
             src = dem_layer.source() or source
-    except Exception:  # noqa: BLE001 — routing must not depend on the layer
-        pass
     base = src.partition("|")[0]
     if os.path.isfile(base) or src.startswith("/vsi"):
         return "sources"
@@ -4942,7 +4937,8 @@ def rect_cover_contributors(stacks: CoverStacks, tile_bbox: Dict[str, float],
             key = ("", "", id(info))        # unknown CRS: stands alone
         groups.setdefault(key, []).append(info)
     for members in groups.values():
-        try:
+        box: Optional[Dict[str, float]] = None
+        with contextlib.suppress(Exception):  # no transform: cannot prove cover
             win = _window_in_source_crs(region, members[0])
             pad_x = _COVER_WINDOW_PAD * (win["east"] - win["west"])
             pad_y = _COVER_WINDOW_PAD * (win["north"] - win["south"])
@@ -4950,7 +4946,7 @@ def rect_cover_contributors(stacks: CoverStacks, tile_bbox: Dict[str, float],
                    "east": win["east"] + pad_x,
                    "south": win["south"] - pad_y,
                    "north": win["north"] + pad_y}
-        except Exception:  # noqa: BLE001 — no transform: cannot prove cover
+        if box is None:
             continue
         if _rects_cover([m.get("native_bounds") or {} for m in members], box):
             return contrib
@@ -7524,10 +7520,8 @@ class _BuildingsBesideConverter:
             self._dead = True
             procs = list(self._procs)
         for proc in procs:
-            try:
+            with contextlib.suppress(Exception):  # best effort, as for Stop
                 kill_engine_process(proc)
-            except Exception:  # noqa: BLE001 — best effort, as for Stop
-                pass
 
     # -- the fetch thread's hooks --------------------------------------------
     def _fetched(self, res: Any) -> None:
@@ -8185,11 +8179,9 @@ def prepare_terrain(
             span_lo, span_hi = progress_span
 
             def progress_cb(frac: float, _label: str) -> None:
-                try:
+                with contextlib.suppress(Exception):  # progress must never abort
                     feedback.setProgress(
                         int(span_lo + frac * (span_hi - span_lo)))
-                except Exception:  # noqa: BLE001 — progress must never abort
-                    pass
         built_names = [t["filename"] for t in todo]
 
         def download(cancel: Any, start: Any, **ready: Any) -> Any:

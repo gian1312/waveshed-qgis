@@ -12,12 +12,14 @@ assignment in exactly one of these two forms so that rewrite stays trivial:
     MANIFEST_PUBLIC_KEYS: tuple[str, ...] = ()
 
     MANIFEST_PUBLIC_KEYS: tuple[str, ...] = (
-        "<64 lowercase hex>",
-        "<64 lowercase hex>",
+        "<64 lowercase hex>",  # pragma: allowlist secret
+        "<64 lowercase hex>",  # pragma: allowlist secret
     )
 
 One key per line, each a 32-byte Ed25519 public key as 64 lowercase hex
-characters, in double quotes, followed by a comma. Listing more than one key
+characters, in double quotes, followed by a comma and the detect-secrets
+pragma (plugins.qgis.org blocks a plugin on any detect-secrets finding, and a
+public key looks like a high-entropy secret to it). Listing more than one key
 is how a rotation works: ship the new key alongside the old one first.
 
 An empty tuple means "no trusted key": every signed manifest is refused, and
@@ -29,5 +31,5 @@ state.
 from __future__ import annotations
 
 MANIFEST_PUBLIC_KEYS: tuple[str, ...] = (
-    "e83d72d8ca4437e58078ab2db42abaa38309ba00712038effff7432560bc6cb8",
+    "e83d72d8ca4437e58078ab2db42abaa38309ba00712038effff7432560bc6cb8",  # pragma: allowlist secret
 )

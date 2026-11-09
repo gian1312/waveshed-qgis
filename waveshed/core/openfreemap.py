@@ -15,6 +15,7 @@ The data is OpenStreetMap-derived and carries an attribution requirement; see
 
 from __future__ import annotations
 
+import contextlib
 import email.utils
 import http.client
 import json
@@ -194,7 +195,7 @@ def resolve_tile_template_strict(
             try:
                 req = urllib.request.Request(
                     TILEJSON_URL, headers={"User-Agent": _USER_AGENT})
-                with urllib.request.urlopen(req, timeout=timeout) as resp:
+                with urllib.request.urlopen(req, timeout=timeout) as resp:  # nosec B310 — fixed https URL
                     box["doc"] = json.loads(resp.read().decode("utf-8"))
             except Exception as exc:  # noqa: BLE001 — named below
                 box["exc"] = exc
@@ -477,7 +478,7 @@ def _http_get(url: str, timeout: float, deadline: float) -> Tuple[int, bytes]:
     req = urllib.request.Request(
         url, headers={"User-Agent": _USER_AGENT, "Accept-Encoding": "gzip"})
     t0 = time.monotonic()
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
+    with urllib.request.urlopen(req, timeout=timeout) as resp:  # nosec B310 — OpenFreeMap https tile URL
         status = int(getattr(resp, "status", 200) or 200)
         return status, _read_body(resp, t0, deadline)
 
@@ -519,10 +520,8 @@ class _TileClient:
 
     def close(self) -> None:
         if self.conn is not None:
-            try:
+            with contextlib.suppress(Exception):  # closing is best effort
                 self.conn.close()
-            except Exception:  # noqa: BLE001 — closing is best effort
-                pass
             self.conn = None
 
     def get(self, url: str, deadline: float) -> Tuple[int, bytes]:

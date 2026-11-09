@@ -32,6 +32,7 @@ is only the UI.
 
 from __future__ import annotations
 
+import contextlib
 import os
 import tempfile
 from datetime import datetime
@@ -1028,12 +1029,10 @@ class AltitudeExplorerDock(QgsDockWidget):
 
     def _set_layer_visible(self, layer, visible: bool) -> None:
         """Tick/untick *layer* in the Layers panel (canvas visibility)."""
-        try:
+        with contextlib.suppress(Exception):  # cosmetic; never worth an error
             node = QgsProject.instance().layerTreeRoot().findLayer(layer.id())
             if node is not None:
                 node.setItemVisibilityChecked(visible)
-        except Exception:  # noqa: BLE001 — cosmetic; never worth an error
-            pass
 
     def _sync_layer_visibility(self) -> None:
         """Show each ticked layer on the references it is actually painting.
@@ -2138,20 +2137,16 @@ class AltitudeExplorerDock(QgsDockWidget):
         for attr in ("_contour_worker", "_merge_worker", "_amsl_worker"):
             worker = getattr(self, attr, None)
             if worker is not None:
-                try:
+                with contextlib.suppress(Exception):
                     worker.cancel()
                     worker.wait(5000)
-                except Exception:
-                    pass
                 setattr(self, attr, None)
         for attr in ("_contour_progress", "_merge_progress", "_amsl_progress"):
             progress = getattr(self, attr, None)
             if progress is not None:
-                try:
+                with contextlib.suppress(Exception):
                     progress.reset()
                     progress.close()
-                except Exception:
-                    pass
                 setattr(self, attr, None)
 
 
@@ -2170,14 +2165,12 @@ def show_altitude_explorer(iface) -> "AltitudeExplorerDock":
     from qgis.PyQt import sip
 
     if _INSTANCE is not None:
-        try:
+        with contextlib.suppress(Exception):
             if not sip.isdeleted(_INSTANCE):
                 _INSTANCE.refresh_layers()
                 _INSTANCE.show()
                 _INSTANCE.raise_()
                 return _INSTANCE
-        except Exception:
-            pass
         _INSTANCE = None
 
     _INSTANCE = AltitudeExplorerDock(iface, iface.mainWindow())
@@ -2193,11 +2186,9 @@ def remove_altitude_explorer(iface) -> None:
     from qgis.PyQt import sip
 
     if _INSTANCE is not None:
-        try:
+        with contextlib.suppress(Exception):
             if not sip.isdeleted(_INSTANCE):
                 _INSTANCE._shutdown_workers()
                 iface.removeDockWidget(_INSTANCE)
                 _INSTANCE.deleteLater()
-        except Exception:
-            pass
         _INSTANCE = None

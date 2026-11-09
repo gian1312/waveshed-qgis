@@ -9,6 +9,7 @@ Modeled after the MPT SIGMA emitter management pattern, adapted for AETHER.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import math
 import os
@@ -201,15 +202,13 @@ def load_asset(path: str) -> dict:
     )
     if height_error is not None:
         asset["default_height_m"] = MIN_ANTENNA_AGL_M
-        try:
+        with contextlib.suppress(Exception):  # no QGIS available (unit tests)
             from qgis.core import Qgis, QgsMessageLog
             QgsMessageLog.logMessage(
                 f"asset {os.path.basename(path)}: {height_error} "
                 f"Using {MIN_ANTENNA_AGL_M:.1f} m instead.",
                 "Waveshed", Qgis.MessageLevel.Warning,
             )
-        except Exception:  # noqa: BLE001 — no QGIS available (unit tests)
-            pass
 
     # Recompute ERP for consistency.
     asset["erp_watts"] = compute_erp(

@@ -1,5 +1,6 @@
 """Main plugin class — toolbar, menu, lifecycle."""
 
+import contextlib
 import os
 from qgis.PyQt.QtGui import QIcon
 from qgis.core import QgsApplication
@@ -118,11 +119,9 @@ class AetherPlugin:
             except RuntimeError:
                 pass
         self._main_dialog = None
-        try:
+        with contextlib.suppress(Exception):
             from .gui.altitude_explorer import remove_altitude_explorer
             remove_altitude_explorer(self.iface)
-        except Exception:
-            pass
         for action in self.actions:
             self.iface.removePluginMenu(self.menu_name, action)
         if self.toolbar:

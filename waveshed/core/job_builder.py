@@ -3,6 +3,7 @@
 Produces JSON matching the schema defined in rust/aether_core/src/config.rs.
 """
 
+import contextlib
 import dataclasses
 import json
 import math
@@ -424,14 +425,12 @@ def log_model_warnings(params: "CoverageParams | P2PParams") -> "list[ModelWarni
     warnings = model_warnings(params)
     if not warnings:
         return warnings
-    try:
+    with contextlib.suppress(Exception):  # no QGIS available (unit tests)
         from qgis.core import Qgis, QgsMessageLog
         for w in warnings:
             level = (Qgis.MessageLevel.Warning if w.severity == INVALID
                      else Qgis.MessageLevel.Info)
             QgsMessageLog.logMessage(f"model validity: {w}", "Waveshed", level)
-    except Exception:  # noqa: BLE001 — no QGIS available (unit tests)
-        pass
     return warnings
 
 

@@ -65,11 +65,9 @@ _SUBPROCESS_FLAGS = (
 
 
 def _log(msg: str) -> None:
-    try:
+    with contextlib.suppress(Exception):  # logging never breaks a scan
         from qgis.core import Qgis, QgsMessageLog
         QgsMessageLog.logMessage(msg, "Waveshed-Terrain", Qgis.MessageLevel.Info)
-    except Exception:  # noqa: BLE001 — logging never breaks a scan
-        pass
 
 #: Bump when the stored layout changes (the whole index is dropped).
 INDEX_SCHEMA = "ti1"
@@ -1023,10 +1021,8 @@ def _probe_command(exe: str, list_path: str) -> List[str]:
 
 
 def _kill(proc: Any) -> None:
-    try:
+    with contextlib.suppress(Exception):  # already gone
         proc.kill()
-    except Exception:  # noqa: BLE001 — already gone
-        pass
 
 
 def run_probe(exe: str, paths: List[str],
@@ -1054,7 +1050,7 @@ def run_probe(exe: str, paths: List[str],
         # stderr to a file: one summary line, but a panic must not fill a
         # pipe nobody reads while stdout is being drained.
         with tempfile.TemporaryFile() as err:
-            proc = subprocess.Popen(
+            proc = subprocess.Popen(  # nosec B603 — aether_converter from binary_manager, args are our own
                 _probe_command(exe, list_path),
                 stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=err,
                 text=True, encoding="utf-8", errors="replace", bufsize=1,
@@ -1607,10 +1603,8 @@ class FolderIndex:
 
             def tick(done: int, total: int, phase: str) -> None:
                 if progress is not None:
-                    try:
+                    with contextlib.suppress(Exception):  # progress never aborts
                         progress(done, total, phase)
-                    except Exception:  # noqa: BLE001 — progress never aborts
-                        pass
 
             tick(0, 0, "listing")
             # Before the listing: an entry added or removed while it runs

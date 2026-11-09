@@ -65,6 +65,17 @@ VALID_KEY = _b58encode(_v3_raw())
 
 
 class TestBase58(unittest.TestCase):
+    def test_alphabet_is_the_bitcoin_base58_alphabet(self):
+        # api_key builds the alphabet from string constants (a literal trips
+        # detect-secrets on plugins.qgis.org); it must stay this exact string,
+        # in this order — the index of each character is its digit value.
+        self.assertEqual(
+            ak._B58_ALPHABET,
+            "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz")  # pragma: allowlist secret
+        self.assertEqual(len(ak._B58_ALPHABET), 58)
+        self.assertEqual(ak._B58_INDEX["1"], 0)
+        self.assertEqual(ak._B58_INDEX["z"], 57)
+
     def test_roundtrip(self):
         for raw in (b"\x00", b"hello", _v3_raw(), b"\x00\x00\x01\x02"):
             self.assertEqual(ak.b58decode(_b58encode(raw)), raw)

@@ -9,6 +9,7 @@ Dual-Qt: imports go through the ``qgis.PyQt`` shim and use scoped enums only, so
 one source runs on PyQt5 (QGIS 3) and PyQt6 (QGIS 4).
 """
 
+import contextlib
 from typing import Optional, Sequence, Union
 
 from qgis.PyQt.QtCore import QPointF, QRectF, QSize, Qt
@@ -278,13 +279,11 @@ class BasePlotWidget(QWidget):
 
     def _save_image(self) -> None:
         """Grab the widget to a PNG chosen via a file dialog. Best-effort."""
-        try:
+        # Exporting is a convenience; never let it crash the host.
+        with contextlib.suppress(Exception):
             path, _ = QFileDialog.getSaveFileName(self, "Save Image", "", "PNG Image (*.png)")
             if not path:
                 return
             if not path.lower().endswith(".png"):
                 path += ".png"
             self.grab().save(path)
-        except Exception:
-            # Exporting is a convenience; never let it crash the host.
-            pass

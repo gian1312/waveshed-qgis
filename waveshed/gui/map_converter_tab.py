@@ -10,6 +10,7 @@ The parent dialog must provide ``self.iface`` (QgisInterface).
 
 from __future__ import annotations
 
+import contextlib
 import json
 import math
 import os
@@ -550,7 +551,7 @@ def _osm_rows_problem(layers: List[Any]) -> Optional[str]:
             continue
         extent = e["extent"] if isinstance(e, dict) else e.extent
         if not extent:
-            return (f"The OSM buildings row (row {k}) has no extent. Select "
+            return (f"The OSM buildings row (row {k}) has no extent. Choose "
                     f"it and use 'Draw Extent for Layer' or 'Extent from "
                     f"Layer' — its extent is the area whose buildings are "
                     f"downloaded.")
@@ -725,7 +726,7 @@ def _run_plan(converter_exe: str, bbox: Dict[str, float],
         "--resolutions", ",".join(str(r) for r in sorted(resolutions)),
     ]
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True,
+        proc = subprocess.run(cmd, capture_output=True, text=True,  # nosec B603 — engine binary, our args
                               encoding="utf-8", errors="replace",
                               creationflags=_SUBPROCESS_FLAGS)
     except OSError as exc:
@@ -2708,21 +2709,16 @@ def _kill_procs(procs: List[Any], timeout: float = 3.0) -> None:
     own: TerminateProcess on Windows, SIGTERM/SIGKILL on Linux and macOS);
     a process that already ended is left alone by ``Popen`` itself."""
     for proc in procs:
-        try:
+        with contextlib.suppress(Exception):  # best effort, as before
             proc.terminate()
-        except Exception:  # noqa: BLE001 — best effort, as before
-            pass
     deadline = time.monotonic() + timeout
     for proc in procs:
-        try:
-            proc.wait(timeout=max(0.0, deadline - time.monotonic()))
-        except subprocess.TimeoutExpired:
+        with contextlib.suppress(Exception):
             try:
-                proc.kill()
-            except Exception:  # noqa: BLE001
-                pass
-        except Exception:  # noqa: BLE001
-            pass
+                proc.wait(timeout=max(0.0, deadline - time.monotonic()))
+            except subprocess.TimeoutExpired:
+                with contextlib.suppress(Exception):
+                    proc.kill()
 
 
 def _kill_proc(proc: subprocess.Popen) -> None:
@@ -5316,11 +5312,9 @@ class _RectangleDrawTool:
     def cleanup(self):
         """Remove rubber band from canvas."""
         if self._rb:
-            try:
+            with contextlib.suppress(Exception):
                 self._rb.reset()
                 self._canvas.scene().removeItem(self._rb)
-            except Exception:
-                pass
             self._rb = None
 
 
@@ -6047,7 +6041,7 @@ class MapConverterTab(QWidget):
 
     def _detect_vector_crs(self, path: str) -> Optional[str]:
         """Try to detect CRS of a vector file or directory."""
-        try:
+        with contextlib.suppress(Exception):
             target = path
             if os.path.isdir(path):
                 # GDB directories are loadable directly by OGR.
@@ -6061,8 +6055,6 @@ class MapConverterTab(QWidget):
             tmp = QgsVectorLayer(target, "tmp", "ogr")
             if tmp.isValid() and tmp.crs().isValid():
                 return tmp.crs().authid()
-        except Exception:
-            pass
         return None
 
     def _ask_crs(self, context: str) -> Optional[str]:
@@ -6439,7 +6431,7 @@ class MapConverterTab(QWidget):
                       if e.layer_type != "buildings" and not e.extent)
         if without:
             return (f"{without} layer(s) have no extent set. "
-                    f"Select a layer and click 'Draw Extent' or 'Extent "
+                    f"Choose a layer and click 'Draw Extent' or 'Extent "
                     f"from Layer'.")
         if _union_extent(self._layers) is None:
             return "Add raster layers and set extents to see estimate."
@@ -6710,7 +6702,7 @@ class MapConverterTab(QWidget):
             QMessageBox.warning(
                 self, "Missing Extent",
                 f"{len(missing)} raster layer(s) have no extent.\n"
-                f"Select each and use 'Draw Extent' or 'Extent from Layer'."
+                f"Choose each and use 'Draw Extent' or 'Extent from Layer'."
             )
             return
         # An OSM buildings row needs its download area — without one (or

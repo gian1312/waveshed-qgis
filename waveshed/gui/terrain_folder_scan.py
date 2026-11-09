@@ -24,6 +24,7 @@ Shared by Site Analysis (Run) and the Map Converter (Add Folder / Convert):
 
 from __future__ import annotations
 
+import contextlib
 import sys
 import textwrap
 from collections import Counter
@@ -36,11 +37,9 @@ from ..core import terrain_index
 
 
 def _log(msg: str) -> None:
-    try:
+    with contextlib.suppress(Exception):
         from qgis.core import Qgis, QgsMessageLog
         QgsMessageLog.logMessage(msg, "Waveshed-Terrain", Qgis.MessageLevel.Info)
-    except Exception:  # noqa: BLE001
-        pass
 
 
 class FolderScanThread(QThread):

@@ -12,6 +12,7 @@ The parent dialog must provide:
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import os
 import re
@@ -688,7 +689,7 @@ class _SiteAnalysisWorker(QThread):
                         TAG, Qgis.MessageLevel.Info)
                     result = None
                 else:
-                    result = subprocess.run(
+                    result = subprocess.run(  # nosec B603 — aether_export from binary_manager, args are our own
                         [
                             export_exe,
                             "-i", input_file,
@@ -1848,15 +1849,13 @@ class SiteAnalysisTab(QWidget):
                 "pixel shows one point of its cell, not an average).")
         if fixed:
             text = "Fixed: the output pixel is the resolution (" + f"{base} m)."
-        try:
+        with contextlib.suppress(Exception):  # the estimate is informative only
             from ..core import output_estimate as oe
             mode = self._dialog.get_mode()
             model = ("MIN_ALT" if mode == "MIN_ALT"
                      else self._dialog.get_loss_model() if mode == "LOSS" else "LOS")
             size = oe.engine_output_bytes(model, self._profile_range_km(), out)
             text += f" Result at {out} m to {self._profile_range_km():g} km: ~{oe.format_bytes(size)}."
-        except Exception:  # noqa: BLE001 — the estimate is informative only
-            pass
         self.lbl_output_res.setText(text)
 
     def _on_resolution_changed(self, _index: int) -> None:
@@ -1941,10 +1940,8 @@ class SiteAnalysisTab(QWidget):
 
             # If the asset has a file path, reload it for fresh data.
             if asset and asset.get("_path"):
-                try:
+                with contextlib.suppress(Exception):  # fall back to cached version
                     asset = load_asset(asset["_path"])
-                except Exception:
-                    pass  # fall back to cached version
 
             # Extract RF parameters from asset (with sensible fallbacks).
             freq_mhz = 433.0
@@ -2431,11 +2428,9 @@ class SiteAnalysisTab(QWidget):
         tip = (_PREPARED_BUILDINGS_HINT if prepared else "")
         self.chk_buildings.setStatusTip(tip)
         if prepared:
-            try:
+            with contextlib.suppress(Exception):  # no bar (tests, headless)
                 self.iface.messageBar().pushMessage(
                     "Waveshed", tip, Qgis.MessageLevel.Info, 8)
-            except Exception:  # noqa: BLE001 — no bar (tests, headless)
-                pass
 
     def _launch_worker(
         self, jobs: List[Tuple[CoverageParams, str]],

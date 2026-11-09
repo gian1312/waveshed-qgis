@@ -8,6 +8,7 @@ the interaction handlers live here; all shared chrome comes from
 :class:`~.base.BasePlotWidget`.
 """
 
+import contextlib
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
@@ -624,7 +625,7 @@ class XYPlotWidget(BasePlotWidget):
 
     def wheelEvent(self, event) -> None:  # noqa: D401 - Qt override
         """Zoom both axes about the cursor."""
-        try:
+        with contextlib.suppress(Exception):
             if self._scale_x is None:
                 return
             pos = self._event_pos(event)
@@ -634,8 +635,6 @@ class XYPlotWidget(BasePlotWidget):
             factor = 0.8 if delta > 0 else 1.25
             self._zoom_about(pos[0], pos[1], factor)
             self.update()
-        except Exception:
-            pass
 
     def _zoom_about(self, px: float, py: float, factor: float) -> None:
         """Scale each axis range by ``factor`` around the data point under (px, py)."""
@@ -662,7 +661,7 @@ class XYPlotWidget(BasePlotWidget):
 
     def mouseMoveEvent(self, event) -> None:  # noqa: D401 - Qt override
         """Translate the view while dragging."""
-        try:
+        with contextlib.suppress(Exception):
             if self._pan_anchor is None or self._pan_scale_x is None or self._pan_start_view is None:
                 return
             pos = self._event_pos(event)
@@ -681,8 +680,6 @@ class XYPlotWidget(BasePlotWidget):
                     new_view[axis] = (rng[0] - dy_data, rng[1] - dy_data)
             self._view = new_view
             self.update()
-        except Exception:
-            pass
 
     def mouseReleaseEvent(self, event) -> None:  # noqa: D401 - Qt override
         """End a pan."""

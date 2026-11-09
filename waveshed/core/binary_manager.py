@@ -425,7 +425,7 @@ def read_machine_fingerprint(timeout: float = 10.0) -> str:
     """
     exe = find_binary("aether_core")
     try:
-        result = subprocess.run(
+        result = subprocess.run(  # nosec B603 — engine binary from binary_manager, args are our own
             [exe, "--fingerprint"],
             capture_output=True, text=True, timeout=timeout, check=False,
             stdin=subprocess.DEVNULL, creationflags=_no_window_flags(),
@@ -1032,7 +1032,7 @@ def _verify_staged_version(staging: str, expected: str) -> None:
     """
     exe = os.path.join(staging, _binary_name("aether_core"))
     try:
-        result = subprocess.run(
+        result = subprocess.run(  # nosec B603 — staged engine binary, args are our own
             [exe, "--version"], capture_output=True, text=True,
             timeout=15, check=False,
             stdin=subprocess.DEVNULL, creationflags=_no_window_flags(),
@@ -1253,7 +1253,7 @@ def _clear_quarantine(target_dir: str, files: list) -> None:
 
     if system == "Darwin":
         try:
-            result = subprocess.run(
+            result = subprocess.run(  # nosec B603 B607 — macOS system xattr, fixed args
                 ["xattr", "-cr", str(target_dir)],
                 capture_output=True, text=True, timeout=10, check=False,
             )
@@ -1496,7 +1496,7 @@ def _probe_exe_version(exe: str, name: str, binary_dir: str,
             and _is_engine_dir(binary_dir)):
         prepare_engine_dir(binary_dir)
     try:
-        result = subprocess.run(
+        result = subprocess.run(  # nosec B603 — engine binary from binary_manager, args are our own
             [exe, "--version"],
             capture_output=True, text=True, timeout=timeout, check=False,
             stdin=subprocess.DEVNULL, creationflags=_no_window_flags(),
@@ -1705,7 +1705,7 @@ def _vulkan_issue() -> Optional[str]:
     if _VULKAN_ISSUE is _VULKAN_UNCHECKED:
         issue: Optional[str] = None
         try:
-            subprocess.run(
+            subprocess.run(  # nosec B603 B607 — vulkaninfo probe, fixed args
                 ["vulkaninfo", "--summary"],
                 capture_output=True,
                 timeout=5,
