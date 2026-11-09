@@ -3543,7 +3543,7 @@ def _try_rust_download(
             _emit(group_idx, zoom, f"Downloading terrain ({tag})",
                   {"event": "pass_start", **kind})
 
-            def on_line(line: str) -> None:
+            def _progress_line(line: str) -> None:
                 header = run_progress.parse_download_header(line)
                 if header is not None:
                     aggregator.pass_total(group_idx, header[1])
@@ -3561,6 +3561,7 @@ def _try_rust_download(
                           {"event": "progress", "mbps": parsed.mbps,
                            "errors": parsed.errors,
                            "in_flight": parsed.in_flight, **kind})
+            on_line = _progress_line
 
         timing_passes[zoom] = timing_passes.get(zoom, 0) + 1
         # The previous pass's timing line: its "next launch" ends here.
@@ -8178,10 +8179,11 @@ def prepare_terrain(
                 and hasattr(feedback, "setProgress")):
             span_lo, span_hi = progress_span
 
-            def progress_cb(frac: float, _label: str) -> None:
+            def _feedback_progress(frac: float, _label: str) -> None:
                 with contextlib.suppress(Exception):  # progress must never abort
                     feedback.setProgress(
                         int(span_lo + frac * (span_hi - span_lo)))
+            progress_cb = _feedback_progress
         built_names = [t["filename"] for t in todo]
 
         def download(cancel: Any, start: Any, **ready: Any) -> Any:
