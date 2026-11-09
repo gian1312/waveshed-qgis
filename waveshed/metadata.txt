@@ -14,7 +14,11 @@ license=GPL-2.0-or-later
 tags=rf,propagation,radio,coverage,p2p,gpu,terrain,ITM,LOS,line of sight,viewshed,waveshed
 category=Analysis
 icon=resources/icon.png
-changelog=0.4.1
+changelog=0.4.2
+    - Needs Aether engine 0.4.3 or newer; the Map Converter's seam filter and
+      fast building preparation need the converter of engine 0.5.0.
+    - New plugin description for the plugin repositories.
+    0.4.1
     - Needs Aether engine 0.4.3 or newer; the Map Converter's seam filter and
       fast building preparation need the converter of engine 0.5.0.
     - Code hygiene for the plugins.qgis.org security scan; deprecated
