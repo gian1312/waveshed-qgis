@@ -2,7 +2,7 @@
 name=Waveshed
 qgisMinimumVersion=3.28
 qgisMaximumVersion=4.99
-version=0.4.0
+version=0.4.1
 author=Gian-Andrea Heinrich
 email=info@waveshed.io
 description=RF propagation and viewshed/LOS analysis (coverage, point-to-point) powered by the Aether GPU engine.
