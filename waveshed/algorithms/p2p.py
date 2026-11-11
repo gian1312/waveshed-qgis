@@ -254,6 +254,12 @@ class P2PAlgorithm(QgsProcessingAlgorithm):
             8. Return output path
         """
 
+        # ---- Engine + API key first: nothing below can run without them,
+        # and the key used to be checked only after the terrain download.
+        not_ready = bm.setup_warning()
+        if not_ready:
+            raise QgsProcessingException(not_ready)
+
         # ---- Resolve parameters ----
         dem_layer: QgsRasterLayer = self.parameterAsRasterLayer(
             parameters, self.INPUT_DEM, context,
@@ -404,10 +410,9 @@ class P2PAlgorithm(QgsProcessingAlgorithm):
             return {}
         if rc != 0:
             tail = "\n".join(output_lines[-20:])
-            raise QgsProcessingException(
-                f"aether_core exited with code {rc}:\n{tail}"
-                + bm.engine_error_hint(tail)
-            )
+            raise QgsProcessingException(bm.engine_failure_message(
+                "aether_core", rc, tail, subject="the link analysis",
+                hint=bm.engine_error_hint(tail, rc)))
 
         if feedback.isCanceled():
             return {}

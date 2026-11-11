@@ -86,7 +86,7 @@ from ..core.result_loader import (
     add_layer_to_project,
     load_coverage_result,
 )
-from ..core.binary_manager import binaries_warning
+from ..core.binary_manager import setup_warning
 from ..core.terrain_adapter import (
     XYZ_CACHE_DIRNAME,
     TerrainPrep,
@@ -112,7 +112,7 @@ from ..core import range_profile as rp
 from ..core import terrain_index
 from . import terrain_dirs
 from . import terrain_folder_scan
-from .engine_notices import show_run_error
+from .engine_notices import setup_title, show_run_error
 from .height_inputs import MIN_AMSL_M, bind_height_mode
 from .output_dir import SITE_OUTPUT_DIR_KEY, bind_output_dir, save_output_dir
 from .map_tools import activate_point_capture
@@ -650,11 +650,10 @@ class _SiteAnalysisWorker(QThread):
                     return
                 if rc != 0:
                     tail = "\n".join(stderr_lines[-20:])
-                    raise RuntimeError(
-                        f"aether_core exited with code {rc}"
-                        f" for {display_name}:\n{tail}"
-                        + engine_error_hint(tail, rc)
-                    )
+                    raise RuntimeError(bm.engine_failure_message(
+                        "aether_core", rc, tail, subject=display_name,
+                        hint=engine_error_hint(tail, rc),
+                        log_path=elog.path))
 
                 if self._canceled:
                     return
@@ -701,10 +700,13 @@ class _SiteAnalysisWorker(QThread):
                         creationflags=_SUBPROCESS_FLAGS,
                     )
                 if result is not None and result.returncode != 0:
-                    raise RuntimeError(
-                        f"aether_export failed for {display_name}"
-                        f" (exit {result.returncode}):\n{result.stderr}"
-                    )
+                    raise RuntimeError(bm.with_details(
+                        f"The analysis of {display_name} finished, but its "
+                        "result could not be written as a GeoTIFF.\n\n"
+                        "Check that the output folder is writable and has "
+                        "free space, then run again.",
+                        f"aether_export failed (exit {result.returncode}):\n"
+                        f"{(result.stderr or '').strip()}"))
 
                 results.append((tif_path, params.model, display_name))
                 self.progress.emit(_job_progress(100))
@@ -2095,14 +2097,14 @@ class SiteAnalysisTab(QWidget):
         # The folder this run uses is the one the next dialog opens with.
         save_output_dir(SITE_OUTPUT_DIR_KEY, output_dir)
 
-        # ---- The engine has to be there ----
+        # ---- The engine and the API key have to be there ----
         # Checked before anything else: terrain preparation falls back to the
         # slow QGIS raster path when aether_converter is missing, so without
         # this the user waits out the whole extract and only then hits the
         # error. Blocking, not advisory — the run cannot succeed.
-        engine_warning = binaries_warning()
+        engine_warning = setup_warning()
         if engine_warning:
-            show_run_error(self, "Aether engine not found", engine_warning)
+            show_run_error(self, setup_title(engine_warning), engine_warning)
             return
 
         # Refresh asset cache before building jobs so latest data is used.

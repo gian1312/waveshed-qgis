@@ -58,8 +58,9 @@ from qgis.core import (
 from qgis.gui import QgsRubberBand
 
 from ..core.binary_manager import (
-    binaries_warning,
+    setup_warning,
     engine_error_hint,
+    engine_failure_message,
     find_binary,
 )
 from ..core import api_key
@@ -87,7 +88,7 @@ from ..core.terrain_adapter import (
     terrain_plan,
     terrain_size_warning,
 )
-from .engine_notices import show_run_error
+from .engine_notices import setup_title, show_run_error
 from .height_inputs import MIN_AMSL_M, bind_height_mode
 from .output_dir import P2P_OUTPUT_DIR_KEY, bind_output_dir, save_output_dir
 from .map_tools import activate_point_capture
@@ -678,10 +679,9 @@ class _P2PWorker(QThread):
                 return
             if rc != 0:
                 tail = "\n".join(output_lines[-20:])
-                raise RuntimeError(
-                    f"aether_core exited with code {rc}:\n{tail}"
-                    + engine_error_hint(tail)
-                )
+                raise RuntimeError(engine_failure_message(
+                    "aether_core", rc, tail, subject="the link analysis",
+                    hint=engine_error_hint(tail, rc), log_path=elog.path))
 
             if self._canceled:
                 return
@@ -1557,9 +1557,9 @@ class P2PTab(QWidget):
         # The engine has to be there. Terrain preparation falls back to the
         # slow QGIS raster path when aether_converter is missing, so without
         # this the user waits out the whole extract before hitting the error.
-        engine_warning = binaries_warning()
+        engine_warning = setup_warning()
         if engine_warning:
-            show_run_error(self, "Aether engine not found", engine_warning)
+            show_run_error(self, setup_title(engine_warning), engine_warning)
             return
 
         dem_layer = self._selected_dem_layer()

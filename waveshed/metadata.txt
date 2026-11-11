@@ -2,7 +2,7 @@
 name=Waveshed
 qgisMinimumVersion=3.28
 qgisMaximumVersion=4.99
-version=0.4.2
+version=0.4.3
 author=Gian-Andrea Heinrich
 email=info@waveshed.io
 description=RF propagation and viewshed/LOS analysis (coverage, point-to-point) powered by the Aether GPU engine.
@@ -14,7 +14,20 @@ license=GPL-2.0-or-later
 tags=rf,propagation,radio,coverage,p2p,gpu,terrain,ITM,LOS,line of sight,viewshed,waveshed
 category=Analysis
 icon=resources/icon.png
-changelog=0.4.2
+changelog=0.4.3
+    - Needs Aether engine 0.4.3 or newer; the Map Converter's seam filter and
+      fast building preparation need the converter of engine 0.5.0.
+    - Setup: opening the plugin without the engine or a valid API key shows a
+      "Set up Waveshed" dialog with "Download engine" / "Enter API key"
+      buttons ("Don't show this again" until the setup is complete); the
+      QGIS start notice names the key too.
+    - Runs check the engine and the API key before anything is downloaded
+      (the key used to be checked only after the terrain download); the Map
+      Converter checks for its converter before Convert.
+    - Clearer error messages: what happened and what to do first, technical
+      details (exit code, engine output, log file) behind "Show Details...";
+      buttons jump straight to the engine download or the API key field.
+    0.4.2
     - Needs Aether engine 0.4.3 or newer; the Map Converter's seam filter and
       fast building preparation need the converter of engine 0.5.0.
     - New plugin description for the plugin repositories.

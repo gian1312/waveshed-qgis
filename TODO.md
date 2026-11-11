@@ -105,6 +105,10 @@ Interim channel (2026-10-05): the custom repository
 `.github/workflows/release.yml` on a `v*` tag (see CLAUDE.md "Build / Package
 / Release"). plugins.qgis.org stays the target.
 
+- [x] **Listed on plugins.qgis.org** (seen 2026-11-11: plugin id 6922, 0.4.1,
+  not experimental). Website, README and help now name it as the primary
+  install path; the custom repository and ZIP are the alternatives.
+
 - [x] **Release workflow + custom repository listing.** Done 2026-10-05:
   `tools/make_plugin_repo.py` (plugins.xml + latest.json from the metadata in
   the ZIP), R2 `qgis/` upload, live check through the waveshed.io relays.

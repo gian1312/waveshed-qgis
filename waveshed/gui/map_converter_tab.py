@@ -71,7 +71,8 @@ from ..core import (openfreemap, osm_buildings, output_estimate,
                     hashes, process_memory, run_progress, terrain_adapter,
                     terrain_index)
 from . import terrain_folder_scan
-from ..core.binary_manager import find_binary
+from ..core.binary_manager import binaries_warning, find_binary, with_details
+from .engine_notices import show_run_error
 # The vector→FlatGeobuf machinery lives in core/ (business logic, no GUI): the
 # Site Analysis path needs it just as much, and two copies of a conversion
 # cache key is two caches. Imported back under its own names so this module
@@ -4872,9 +4873,13 @@ class _MapConverterWorker(QThread):
                      reset=True)
             self._emit_progress()
 
+        recent: deque = deque(maxlen=20)    # the error's details
+
         def on_line(line: str) -> None:
             if self._stopping():
                 raise terrain_adapter.ConverterCancelled()
+            if not line.startswith("[Rust] tile "):
+                recent.append(line)
             if pbf_jobs:
                 if burns.feed(line):
                     raise _UndecodableBuildings()
@@ -4962,7 +4967,12 @@ class _MapConverterWorker(QThread):
         if rc != 0:
             msg = f"Converter failed (exit code {rc}). See log."
             self._log(msg)
-            raise _RunFailed(msg)
+            raise _RunFailed(with_details(
+                "The terrain conversion stopped with an error. Tiles finished "
+                "before it are kept; the next Convert continues from there."
+                "\n\nThe complete output is in the log panel of this tab.",
+                msg + ("\n\nLast converter output:\n" + "\n".join(recent)
+                       if recent else "")))
         if pbf_jobs:
             msg = burns.end(tiles=len(jobs))
             if msg:
@@ -6687,6 +6697,11 @@ class MapConverterTab(QWidget):
     # ------------------------------------------------------------------
 
     def _on_run(self):
+        # The engine first: nothing below can run without the converter.
+        engine_warning = binaries_warning(("aether_converter",))
+        if engine_warning:
+            show_run_error(self, "Aether engine not found", engine_warning)
+            return
         # Validate layers.
         if not self._layers:
             QMessageBox.warning(self, "No Layers", "Add layers first.")
@@ -6898,7 +6913,7 @@ class MapConverterTab(QWidget):
         if self._run_model is not None:
             self._run_model.stop("Failed.")
         self._set_running(False)
-        QMessageBox.critical(self, "Failed", msg)
+        show_run_error(self, "Conversion Failed", msg)
 
     def _on_worker_finished(self, worker) -> None:
         """QThread.finished of *worker*: a run neither done nor failed was

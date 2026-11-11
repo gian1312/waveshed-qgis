@@ -141,6 +141,8 @@ class _Run:
             mock.patch.object(alg, "write_job_file",
                               side_effect=self._write_job_file),
             mock.patch.object(alg.api_key, "apply_license_env"),
+            # The up-front engine + key check (its own tests elsewhere).
+            mock.patch.object(alg.bm, "setup_warning", return_value=None),
             # p2p.py no longer imports subprocess at all — every engine run
             # goes through terrain_adapter.run_converter_streaming, so the
             # process fakes are installed on the adapter's subprocess module

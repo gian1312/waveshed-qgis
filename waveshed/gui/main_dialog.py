@@ -127,6 +127,21 @@ class AetherMainDialog(QDialog):
         self.tabs.setCurrentWidget(self.settings_tab)
         if start_download:
             self._settings_widget.start_engine_download()
+        else:
+            self._settings_widget.focus_engine_section()
+
+    def show_key_settings(self) -> None:
+        """Bring the Settings tab to the front with the API key field focused
+        and its section highlighted (startup notice, setup dialog, the
+        "Enter API key" button on run errors)."""
+        self.tabs.setCurrentWidget(self.settings_tab)
+        self._settings_widget.focus_api_key()
+
+    def check_setup(self) -> bool:
+        """When the window opens: a dialog naming what is not set up yet
+        (engine, API key), with a button to each fix. True when shown."""
+        from .engine_notices import show_setup_dialog
+        return show_setup_dialog(self)
 
     # ------------------------------------------------------------------
     # UI construction

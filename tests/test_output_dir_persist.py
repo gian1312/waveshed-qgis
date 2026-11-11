@@ -177,7 +177,7 @@ class TestSiteAnalysisTab(_TabCase, unittest.TestCase):
             tab._selected_terrain_dir = lambda: "/terrain"
             err = mock.MagicMock()
             # Stop the run at the engine check that follows the save.
-            with mock.patch.object(sa_mod, "binaries_warning", lambda: "missing"), \
+            with mock.patch.object(sa_mod, "setup_warning", lambda: "missing"), \
                  mock.patch.object(sa_mod, "show_run_error", err):
                 tab._on_run()
             err.assert_called_once()
@@ -198,7 +198,7 @@ class TestP2PTab(_TabCase, unittest.TestCase):
             tab._worker = None
             tab._validate_inputs = lambda: None
             err = mock.MagicMock()
-            with mock.patch.object(p2p_mod, "binaries_warning", lambda: "missing"), \
+            with mock.patch.object(p2p_mod, "setup_warning", lambda: "missing"), \
                  mock.patch.object(p2p_mod, "show_run_error", err):
                 tab._on_run()
             err.assert_called_once()

@@ -217,6 +217,12 @@ class CoverageAlgorithm(QgsProcessingAlgorithm):
         context: QgsProcessingContext,
         feedback: QgsProcessingFeedback,
     ) -> Dict[str, Any]:
+        # ---- Engine + API key first: nothing below can run without them,
+        # and the key used to be checked only after the terrain download.
+        not_ready = bm.setup_warning()
+        if not_ready:
+            raise QgsProcessingException(not_ready)
+
         # ---- Read parameters ----
         dem_layer = self.parameterAsRasterLayer(parameters, self.INPUT_DEM, context)
         tx_lat = self.parameterAsDouble(parameters, self.TX_LAT, context)
@@ -337,10 +343,8 @@ class CoverageAlgorithm(QgsProcessingAlgorithm):
 
         if rc != 0:
             tail = "\n".join(output_lines[-20:])
-            raise QgsProcessingException(
-                f"aether_core failed (exit {rc}):\n{tail}"
-                + bm.engine_error_hint(tail, rc)
-            )
+            raise QgsProcessingException(bm.engine_failure_message(
+                "aether_core", rc, tail, hint=bm.engine_error_hint(tail, rc)))
 
         if feedback.isCanceled():
             return {}
@@ -375,9 +379,12 @@ class CoverageAlgorithm(QgsProcessingAlgorithm):
             )
 
         if result is not None and result.returncode != 0:
-            raise QgsProcessingException(
-                f"aether_export failed (exit {result.returncode}):\n{result.stderr}"
-            )
+            raise QgsProcessingException(bm.with_details(
+                "The analysis finished, but its result could not be written "
+                "as a GeoTIFF. Check that the output folder is writable and "
+                "has free space, then run again.",
+                f"aether_export failed (exit {result.returncode}):\n"
+                f"{(result.stderr or '').strip()}"))
 
         # ---- 6. Load result ----
         feedback.setProgressText("Loading result...")

@@ -290,8 +290,8 @@ def check_key_or_raise() -> datetime.date | None:
     key = get_stored_key()
     if not key:
         raise ApiKeyError(
-            f"API key required to run the Aether engine. Enter your key in "
-            f"Waveshed Settings — {_GET_KEY_HINT}."
+            "Waveshed needs an API key to run the Aether engine, and none is "
+            "entered yet.\n\n" + key_steps()
         )
 
     is_valid, message, expiry = validate_api_key(key)
@@ -299,6 +299,46 @@ def check_key_or_raise() -> datetime.date | None:
         raise ApiKeyError(message)
 
     return expiry
+
+
+#: The words of the "Enter API key" button every key message names; the
+#: run-error box keys its button on it (``binary_manager.message_actions``).
+ENTER_KEY_BUTTON = "Enter API key"
+
+
+def key_steps(in_settings: bool = False) -> str:
+    """How to get and enter a key, in the words every key message uses.
+
+    *in_settings*: the reader is already in Settings (no button below).
+    """
+    first = ("Paste it into the API key field above." if in_settings else
+             f"Click \"{ENTER_KEY_BUTTON}\" below (Waveshed \u2192 Settings "
+             "\u2192 API Key).")
+    return (
+        "How to set it up:\n"
+        f"  1. {first}\n"
+        "  2. No key yet? Click \"Get API Key\" there \u2014 it opens "
+        f"{GET_API_KEY_URL}.\n"
+        "  3. Paste the key, click \"Save\", then run again."
+    )
+
+
+def key_problem() -> tuple[str, str] | None:
+    """What is wrong with the stored key, or None when it is usable.
+
+    ``(summary, detail)``: *summary* says what happened in one sentence,
+    *detail* is the validator's own text ("" for a missing key). Structural
+    only, no engine launch — cheap enough for the GUI thread.
+    """
+    key = get_stored_key()
+    if not key:
+        return ("No API key is entered yet.", "")
+    is_valid, message, expiry = validate_api_key(key)
+    if is_valid:
+        return None
+    if expiry is not None and expiry < datetime.date.today():
+        return (f"Your API key expired on {expiry.isoformat()}.", message)
+    return ("The API key in Settings is not valid.", message)
 
 
 def apply_license_env(env: dict[str, str]) -> dict[str, str]:

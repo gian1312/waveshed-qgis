@@ -146,6 +146,8 @@ class _MockQSettings:
         return self._store.get(key, default)
     def setValue(self, key, value):
         self._store[key] = value
+    def remove(self, key):
+        self._store.pop(key, None)
 
 
 # ---------------------------------------------------------------------------

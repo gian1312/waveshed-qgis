@@ -817,7 +817,8 @@ class MapConverterCancel(unittest.TestCase):
         return tab
 
     def _start(self, tab):
-        with mock.patch.object(mct, "_pending_render_jobs",
+        with mock.patch.object(mct, "binaries_warning", return_value=None), \
+             mock.patch.object(mct, "_pending_render_jobs",
                                return_value=(None, [])), \
              mock.patch.object(mct, "_estimate_run_work"), \
              mock.patch.object(mct, "resolve_sources_with_progress",

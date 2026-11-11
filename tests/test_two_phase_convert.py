@@ -1573,6 +1573,8 @@ class TabDiskEstimate(unittest.TestCase):
             box = mock.Mock()
             with mock.patch.object(oe, "free_bytes", return_value=1 * GB), \
                  mock.patch.object(mct, "QMessageBox", box), \
+                 mock.patch.object(mct, "binaries_warning",
+                                   return_value=None), \
                  mock.patch.object(mct, "resolve_sources_with_progress") \
                     as resolve:
                 tab._on_run()

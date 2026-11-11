@@ -137,6 +137,9 @@ class EngineLog:
     def __init__(self, label: str, panel: Callable[[str], None]) -> None:
         self._panel = panel
         self._fh: Optional[TextIO] = None
+        #: The file this run's lines go to ("" when there is none) — named
+        #: in a failed run's error details.
+        self.path = ""
         self._open(label)
 
     def _open(self, label: str) -> None:
@@ -147,6 +150,7 @@ class EngineLog:
             log_dir = os.path.dirname(path)
             os.makedirs(log_dir, exist_ok=True)
             self._fh = open(path, "a", encoding="utf-8", buffering=1)
+            self.path = path
             self._fh.write(f"=== {time.strftime('%Y-%m-%d %H:%M:%S')} "
                            f"aether_core — {label} ===\n")
             if _announced != path:

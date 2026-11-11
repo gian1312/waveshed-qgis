@@ -611,6 +611,8 @@ class MapConverterLabelAndRun(unittest.TestCase):
             tab = _tab(os.path.join(self.d, "out"), [_xyz_layer()])
             box = mock.Mock()
             with mock.patch.object(mct, "QMessageBox", box), \
+                 mock.patch.object(mct, "binaries_warning",
+                                   return_value=None), \
                  mock.patch.object(mct, "resolve_sources_with_progress",
                                    return_value=None) as resolve:
                 tab._on_run()
@@ -832,7 +834,7 @@ class SiteAnalysisRunWiring(unittest.TestCase):
                                return_value=self.cache), \
              mock.patch.object(sat, "dem_layer_warning", return_value=None), \
              mock.patch.object(sat, "save_output_dir"), \
-             mock.patch.object(sat, "binaries_warning", return_value=None), \
+             mock.patch.object(sat, "setup_warning", return_value=None), \
              mock.patch.object(sat, "antenna_height_error",
                                return_value=None), \
              mock.patch.object(sat, "model_warnings", return_value=[]), \

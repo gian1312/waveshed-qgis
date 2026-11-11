@@ -1474,12 +1474,42 @@ after EULA consent (asked every time). Rules, all in `core/binary_manager.py`:
   --version` synchronously (an AV-scanned exe on Windows) froze open and close
   for 2–3 s.
 - **Notices** (`gui/engine_notices.py`): first start without an engine →
-  message bar with "Open Settings"; once per session (switch
+  message bar (`FIRST_RUN_TEXT`) with "Download engine" → Settings download
+  flow; once per session (switch
   `waveshed/engine_update_check`, default on; silent offline) a newer release
   → one notice per version (`waveshed/engine_update_notified_version`) with
-  "Update" → Settings download flow. Run errors that say "Settings →
-  Download binaries" get an "Update engine" / "Open Settings" button
-  (`show_run_error`). Nothing ever downloads without the consent dialog.
+  "Update" → Settings download flow. Run errors whose summary says "Settings →
+  Download binaries" get an "Update engine" / "Download engine" button
+  (`show_run_error`; both start the download flow). Nothing ever downloads
+  without the consent dialog. Missing-engine texts use
+  `binary_manager.install_steps()`.
+- **Setup check: engine + API key, up front (2026-11-11).**
+  `binary_manager.setup_problems` / `setup_warning` (file checks +
+  `api_key.key_problem`, structural only — GUI-thread safe, no engine
+  launch): one message for a missing engine, a missing/invalid/expired key,
+  or both. Site Analysis / P2P `_on_run` and both Processing algorithms check
+  it before anything (the key used to be checked only at the aether_core
+  launch, after the terrain download); the Map Converter checks
+  `binaries_warning(("aether_converter",))` only (the converter needs no
+  key). `message_actions` turns the summary into buttons ("Download engine",
+  "Update engine", "Enter API key" = `api_key.ENTER_KEY_BUTTON`);
+  "Enter API key" → `main_dialog.show_key_settings` → Settings tab,
+  `SettingsDialog.focus_api_key` (field focused + section highlighted 4 s).
+  Opening the plugin window (`plugin._open_main_dialog`, not when only
+  raised, not via `open_engine_settings` / `open_key_settings`) shows
+  `engine_notices.show_setup_dialog` ("Set up Waveshed", buttons + "Later")
+  while anything is missing; its "Don't show this again" box sets
+  `waveshed/setup_dialog_off` (`SETUP_DIALOG_OFF_KEY`), which silences only
+  that dialog and is removed the first time the setup is complete, so a
+  later problem (expired key, moved engine) is shown again. The Run check
+  is never silenced. The QGIS-start message bar names the key too.
+- **Error messages: the user's part first.** A run error is
+  `with_details(summary, details)`: summary = what happened + what to do;
+  details (after `DETAILS_HEADER`) = program, exit code, log file, last engine
+  lines, searched paths. `show_run_error` shows the summary and puts the rest
+  behind "Show Details…" (`split_details`); Processing prints both. A failed
+  engine run goes through `engine_failure_message` (the engine's last
+  `[E:…]` as "Reason:", `engine_error_hint` as the action).
 
 ## Build / Package / Release
 
@@ -1535,6 +1565,7 @@ overwritten), then `qgis/latest.json`, then `qgis/plugins.xml` — and waits
 until `https://waveshed.io/qgis/latest.json` / `plugins.xml` (AETHER_Web
 relays) serve the new version, then re-downloads the ZIP and checks its
 SHA-256. Secrets: `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY`, `R2_S3_ENDPOINT`.
-`workflow_dispatch` is a dry run (no upload). QGIS users add
-`https://waveshed.io/qgis/plugins.xml` as a plugin repository; plugins.qgis.org
-is the later, separate channel.
+`workflow_dispatch` is a dry run (no upload). Since 2026-11 the plugin is on plugins.qgis.org
+(plugin id 6922), the primary install path users are told about; the custom
+repository `https://waveshed.io/qgis/plugins.xml` stays as the documented
+alternative. Uploads to plugins.qgis.org are a separate, manual step.

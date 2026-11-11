@@ -451,6 +451,8 @@ class PlainInputsAndTheLock(_Base):
             self.tab._est_thread.finished.emit()
             # _on_run prices on the GUI thread with the same cache.
             with mock.patch.object(mct, "resolve_sources_with_progress",
+                                   return_value=None), \
+                 mock.patch.object(mct, "binaries_warning",
                                    return_value=None):
                 self.tab._on_run()
         self.assertEqual(held, [(True, True), (True, True)])

@@ -567,7 +567,7 @@ class OneRunPreparesOnce(_FolderCase):
 
         with mock.patch.object(sat, "dem_layer_warning", return_value=None), \
              mock.patch.object(sat, "save_output_dir"), \
-             mock.patch.object(sat, "binaries_warning", return_value=None), \
+             mock.patch.object(sat, "setup_warning", return_value=None), \
              mock.patch.object(sat, "output_space_problem",
                                return_value=(None, False)), \
              mock.patch.object(sat, "_disk_refusal", return_value=None), \

@@ -2330,7 +2330,7 @@ class SiteAnalysisDialogs(_PreparedCase):
         logged = []
         with mock.patch.object(sat, "dem_layer_warning", return_value=None), \
              mock.patch.object(sat, "save_output_dir"), \
-             mock.patch.object(sat, "binaries_warning", return_value=None), \
+             mock.patch.object(sat, "setup_warning", return_value=None), \
              mock.patch.object(sat, "antenna_height_error", return_value=None), \
              mock.patch.object(sat, "model_warnings", return_value=[]), \
              mock.patch.object(sat, "output_space_problem",

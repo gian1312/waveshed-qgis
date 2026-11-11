@@ -9,7 +9,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-from qgis.PyQt.QtCore import Qt, QThread, QUrl, pyqtSignal
+from qgis.PyQt.QtCore import Qt, QThread, QTimer, QUrl, pyqtSignal
 from qgis.PyQt.QtGui import QDesktopServices
 from qgis.PyQt.QtWidgets import (
     QCheckBox,
@@ -255,6 +255,7 @@ class SettingsDialog(QDialog):
     # ------------------------------------------------------------------ build
     def _build_binaries_group(self) -> QGroupBox:
         group = QGroupBox("Binaries")
+        self._binaries_group = group
         vbox = QVBoxLayout(group)
 
         # Binary directory row
@@ -320,6 +321,7 @@ class SettingsDialog(QDialog):
 
     def _build_api_key_group(self) -> QGroupBox:
         group = QGroupBox("API Key")
+        self._api_key_group = group
         vbox = QVBoxLayout(group)
 
         # Key input row
@@ -612,8 +614,32 @@ class SettingsDialog(QDialog):
             self._binary_dir_edit.setText(detected)
             self._refresh_binary_status()
         else:
-            self._binary_status_label.setText("Binaries: Not found")
+            self._binary_status_label.setText(
+                "Binaries: Not found \u2014 click \"Download Binaries\" to install the engine")
             self._binary_status_label.setStyleSheet("color: red;")
+
+    #: How long a section the user was sent to stays highlighted (ms).
+    _HIGHLIGHT_MS = 4000
+    _HIGHLIGHT_STYLE = ("QGroupBox { border: 2px solid #d97706; "
+                        "border-radius: 4px; margin-top: 1.2em; }")
+
+    def _highlight(self, group) -> None:
+        """Mark *group* for a few seconds so the eye finds it."""
+        if group is None:
+            return
+        group.setStyleSheet(self._HIGHLIGHT_STYLE)
+        QTimer.singleShot(self._HIGHLIGHT_MS, lambda: group.setStyleSheet(""))
+
+    def focus_api_key(self) -> None:
+        """Put the cursor in the API key field and highlight its section."""
+        self._highlight(getattr(self, "_api_key_group", None))
+        self._api_key_edit.setFocus()
+        self._api_key_edit.selectAll()
+
+    def focus_engine_section(self) -> None:
+        """Highlight the engine section and focus "Download Binaries"."""
+        self._highlight(getattr(self, "_binaries_group", None))
+        self._btn_download.setFocus()
 
     def start_engine_download(self) -> None:
         """Start the download flow (manifest -> EULA consent -> download).
@@ -621,6 +647,7 @@ class SettingsDialog(QDialog):
         Public entry point for the startup update notice and the "Update
         engine" button on run errors.
         """
+        self._highlight(getattr(self, "_binaries_group", None))
         self._download_binaries()
 
     def _check_for_updates(self) -> None:
@@ -845,7 +872,8 @@ class SettingsDialog(QDialog):
             self._refresh_engine_version()
 
         if not binary_dir or not os.path.isdir(binary_dir):
-            self._binary_status_label.setText("Binaries: Missing")
+            self._binary_status_label.setText(
+                "Binaries: Missing \u2014 click \"Download Binaries\" to install the engine")
             self._binary_status_label.setStyleSheet("color: red;")
             self._prereq_label.setText("")
             return
@@ -860,7 +888,8 @@ class SettingsDialog(QDialog):
             self._binary_status_label.setText(f"Binaries: Found ({found}/{total})")
             self._binary_status_label.setStyleSheet("color: green;")
         else:
-            self._binary_status_label.setText(f"Binaries: Missing ({found}/{total} found)")
+            self._binary_status_label.setText(
+                f"Binaries: Missing ({found}/{total} found) \u2014 click \"Download Binaries\" to install the engine")
             self._binary_status_label.setStyleSheet("color: red;")
 
         if background:
@@ -935,9 +964,8 @@ class SettingsDialog(QDialog):
             QMessageBox.information(
                 self,
                 "Aether engine not installed",
-                "The Aether engine binaries are not installed yet. Use "
-                "'Download Binaries' above (or set the binary directory), "
-                "then try again.",
+                "The Aether engine is not installed yet.\n\n"
+                + binary_manager.install_steps(in_settings=True),
             )
             return
 

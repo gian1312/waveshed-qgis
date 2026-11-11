@@ -431,6 +431,26 @@ class TestMissingBinaryWarning(unittest.TestCase):
         self.assertIn(bm.DEFAULT_INSTALL_DIR, msg)
         self.assertIn("Download Binaries", msg)
 
+    def test_warning_puts_the_install_steps_first(self):
+        with mock.patch.object(bm, "find_binary",
+                               side_effect=RuntimeError("nope")):
+            summary, details = bm.split_details(bm.binaries_warning())
+        # What the user does comes first; where it looked is the detail.
+        self.assertIn("Download Binaries", summary)
+        self.assertIn("EULA", summary)
+        self.assertNotIn("AETHER_BIN_DIR", summary)
+        self.assertIn("AETHER_BIN_DIR", details)
+        self.assertNotIn("update", summary.lower())  # install, not update
+
+    def test_find_binary_error_is_an_install_message(self):
+        with mock.patch.object(bm, "discover_binary_dir", return_value=None), \
+                mock.patch.object(bm.shutil, "which", return_value=None):
+            with self.assertRaises(RuntimeError) as ctx:
+                bm.find_binary("aether_export")
+        msg = str(ctx.exception)
+        self.assertEqual(bm.engine_message_action(msg), "install")
+        self.assertIn("aether_export", bm.split_details(msg)[1])
+
     def test_subset_can_be_checked(self):
         with mock.patch.object(bm, "find_binary",
                                side_effect=RuntimeError("nope")):
@@ -581,3 +601,42 @@ class TestBinariesFoundAnnouncedOnce(unittest.TestCase):
                     os.path.join(d, bm._binary_name("aether_core")))
             self.assertEqual([m for m in logged if "Binaries found" in m],
                              [f"Binaries found in {d}"])
+
+
+class TestErrorDetails(unittest.TestCase):
+    """Run errors: what the user needs first, the technical rest after."""
+
+    def test_round_trip(self):
+        msg = bm.with_details("Summary.", "exit 3\nline")
+        self.assertEqual(bm.split_details(msg), ("Summary.", "exit 3\nline"))
+        self.assertTrue(msg.startswith("Summary."))
+
+    def test_no_details(self):
+        self.assertEqual(bm.with_details("Summary.", "  "), "Summary.")
+        self.assertEqual(bm.split_details("Old style message"),
+                         ("Old style message", ""))
+
+    def test_engine_reason_is_the_last_error_line(self):
+        out = "[I:start]\n[E:first]\nnoise\n[E:Out of GPU memory]\n"
+        self.assertEqual(bm.engine_error_text(out), "Out of GPU memory")
+        self.assertEqual(bm.engine_error_text("no error marker"), "")
+
+    def test_failure_message_leads_with_reason_and_hint(self):
+        tail = "[I:loading]\n[E:terrain tile missing]"
+        msg = bm.engine_failure_message(
+            "aether_core", 1, tail, subject="Site 1",
+            hint="\n\nWhat to do: X.", log_path="/c/logs/aether_core.log")
+        summary, details = bm.split_details(msg)
+        self.assertIn("Site 1", summary)
+        self.assertIn("Reason: terrain tile missing", summary)
+        self.assertIn("What to do: X.", summary)
+        self.assertNotIn("exited with code", summary)
+        self.assertIn("aether_core exited with code 1 for Site 1", details)
+        self.assertIn("/c/logs/aether_core.log", details)
+        self.assertIn("[I:loading]", details)
+
+    def test_failure_without_hint_says_where_the_output_is(self):
+        summary, _ = bm.split_details(
+            bm.engine_failure_message("aether_core", 1, ""))
+        self.assertIn("Log Messages", summary)
+        self.assertIsNone(bm.engine_message_action(summary))

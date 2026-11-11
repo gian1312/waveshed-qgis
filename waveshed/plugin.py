@@ -2,6 +2,7 @@
 
 import contextlib
 import os
+from qgis.PyQt.QtCore import QTimer
 from qgis.PyQt.QtGui import QIcon
 from qgis.core import QgsApplication
 
@@ -66,15 +67,23 @@ class AetherPlugin:
         # First-run prompt / update notice — deferred, never blocks start-up,
         # never downloads anything by itself.
         from .gui.engine_notices import EngineNotices
-        self._engine_notices = EngineNotices(self.iface, self.open_engine_settings)
+        self._engine_notices = EngineNotices(
+            self.iface, self.open_engine_settings, self.open_key_settings)
         self._engine_notices.start()
 
     def open_engine_settings(self, start_download: bool = False) -> None:
         """Open the main dialog on its Settings tab (optionally starting the download)."""
-        self._open_main_dialog()
+        self._open_main_dialog(check_setup=False)
         show = getattr(self._main_dialog, "show_engine_settings", None)
         if callable(show):
             show(start_download=start_download)
+
+    def open_key_settings(self) -> None:
+        """Open the main dialog on its Settings tab, API key field focused."""
+        self._open_main_dialog(check_setup=False)
+        show = getattr(self._main_dialog, "show_key_settings", None)
+        if callable(show):
+            show()
 
     def _is_dialog_alive(self) -> bool:
         """Check if the dialog reference is still valid (not deleted by Qt)."""
@@ -130,7 +139,10 @@ class AetherPlugin:
             QgsApplication.processingRegistry().removeProvider(self.provider)
         self.actions.clear()
 
-    def _open_main_dialog(self):
+    def _open_main_dialog(self, check_setup: bool = True):
+        """Show the main window. Each time it opens (not when it is only
+        raised) and *check_setup*: a dialog naming a missing engine / API key
+        — skipped when the caller is already taking the user to Settings."""
         if self._is_dialog_alive() and self._main_dialog.isVisible():
             self._main_dialog.raise_()
             self._main_dialog.activateWindow()
@@ -140,6 +152,17 @@ class AetherPlugin:
         # Clear our reference when Qt deletes the dialog (WA_DeleteOnClose).
         self._main_dialog.destroyed.connect(self._on_dialog_destroyed)
         self._main_dialog.show()
+        if check_setup:
+            # After the window is on screen, so the dialog sits on top of it.
+            dialog = self._main_dialog
+            QTimer.singleShot(0, lambda: self._check_setup(dialog))
+
+    def _check_setup(self, dialog) -> None:
+        if self._main_dialog is not dialog or not self._is_dialog_alive():
+            return  # closed before the timer fired
+        check = getattr(dialog, "check_setup", None)
+        if callable(check):
+            check()
 
     def _on_dialog_destroyed(self):
         self._main_dialog = None

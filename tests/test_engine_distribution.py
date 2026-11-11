@@ -656,15 +656,18 @@ class TestEngineNotices(unittest.TestCase):
                 mock.patch.object(en, "_UpdateCheckThread") as thread:
             self.notices.run_startup_checks()
         self.assertEqual(len(self.bar.pushed), 1)
-        self.assertIn("needs the Aether engine", self.bar.pushed[0].text)
-        self.assertEqual(_Button.instances[0].text, "Open Settings")
+        self.assertIn("needs the free Aether engine", self.bar.pushed[0].text)
+        self.assertIn("Download Binaries", self.bar.pushed[0].text)
+        self.assertEqual(_Button.instances[0].text, "Download engine")
         _Button.instances[0].slots[0]()
-        self.assertEqual(self.opened, [False])
+        # Settings + the download flow, which asks for EULA consent itself.
+        self.assertEqual(self.opened, [True])
         dl.assert_not_called()
         thread.assert_not_called()
 
     def test_installed_engine_starts_the_update_check_unless_disabled(self):
         with mock.patch.object(bm, "discover_binary_dir", return_value="/e"), \
+                mock.patch.object(en.api_key, "key_problem", return_value=None), \
                 mock.patch.object(en.threading, "Thread"), \
                 mock.patch.object(en, "_UpdateCheckThread") as thread:
             self.notices.run_startup_checks()
@@ -734,10 +737,24 @@ class TestShowRunError(unittest.TestCase):
         self.assertEqual(box.addButton.call_args_list[0].args[0], "Update engine")
         self.assertEqual(h.calls, [True])
 
-    def test_missing_engine_offers_open_settings(self):
+    def test_missing_engine_offers_the_download(self):
         h, box, _ = self._run('Open Settings and use "Download Binaries".')
-        self.assertEqual(box.addButton.call_args_list[0].args[0], "Open Settings")
-        self.assertEqual(h.calls, [False])
+        self.assertEqual(box.addButton.call_args_list[0].args[0], "Download engine")
+        self.assertEqual(h.calls, [True])
+
+    def test_summary_first_details_behind_show_details(self):
+        msg = bm.with_details("What happened. What to do: Settings \u2192 "
+                              "Download binaries, update.",
+                              "aether_core exited with code 3\nlast line")
+        h, box, _ = self._run(msg)
+        box.setText.assert_called_once_with(
+            "What happened. What to do: Settings \u2192 Download binaries, update.")
+        box.setDetailedText.assert_called_once_with(
+            "aether_core exited with code 3\nlast line")
+
+    def test_no_details_no_details_section(self):
+        h, box, _ = self._run("Terrain download failed")
+        box.setDetailedText.assert_not_called()
 
     def test_close_does_nothing(self):
         h, _, _ = self._run("Update via Settings → Download binaries", click_go=False)
@@ -747,8 +764,9 @@ class TestShowRunError(unittest.TestCase):
         for message, host in (("Terrain download failed", True),
                               ("Update via Settings → Download binaries", False)):
             h, box, mb = self._run(message, host=host)
-            mb.critical.assert_called_once()
-            mb.assert_not_called()
+            labels = [c.args[0] for c in box.addButton.call_args_list]
+            self.assertFalse(any(isinstance(x, str) for x in labels), labels)
+            box.exec.assert_called_once()
             self.assertEqual(h.calls, [])
 
 
@@ -873,12 +891,19 @@ class TestMainDialogAndPluginWiring(unittest.TestCase):
         plugin = AetherPlugin(mock.Mock())
         dialog = mock.Mock()
 
-        def fake_open():
+        opened = []
+
+        def fake_open(check_setup=True):
+            opened.append(check_setup)
             plugin._main_dialog = dialog
 
         with mock.patch.object(plugin, "_open_main_dialog", side_effect=fake_open):
             plugin.open_engine_settings(start_download=True)
+            plugin.open_key_settings()
         dialog.show_engine_settings.assert_called_once_with(start_download=True)
+        dialog.show_key_settings.assert_called_once_with()
+        # Already on the way to Settings: no setup dialog on top.
+        self.assertEqual(opened, [False, False])
 
 
 
@@ -1038,3 +1063,241 @@ class TestSettingsProbesOffTheGuiThread(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestMapConverterRefusesWithoutEngine(unittest.TestCase):
+    """Convert names a missing converter before any layer work starts."""
+
+    def test_convert_shows_the_install_message_and_stops(self):
+        from waveshed.gui import map_converter_tab as mct
+        tab = mock.Mock()
+        with mock.patch.object(mct, "binaries_warning",
+                               return_value="not installed") as warn, \
+                mock.patch.object(mct, "show_run_error") as shown:
+            mct.MapConverterTab._on_run(tab)
+        warn.assert_called_once_with(("aether_converter",))
+        shown.assert_called_once_with(tab, "Aether engine not found",
+                                      "not installed")
+        tab._set_running.assert_not_called()
+
+
+# --------------------------------------------------------------------------
+# Engine + API key: one setup check (run, plugin open, QGIS start)
+# --------------------------------------------------------------------------
+
+from waveshed.core import api_key as ak  # noqa: E402
+
+_GOOD = None                             # key_problem() of a usable key
+_NO_KEY = ("No API key is entered yet.", "")
+
+
+class TestKeyProblem(unittest.TestCase):
+    def test_missing_invalid_and_valid(self):
+        with mock.patch.object(ak, "get_stored_key", return_value=""):
+            self.assertEqual(ak.key_problem(), _NO_KEY)
+        with mock.patch.object(ak, "get_stored_key", return_value="0OIl"), \
+                mock.patch.object(ak, "validate_api_key",
+                                  return_value=(False, "Invalid API key", None)):
+            self.assertEqual(ak.key_problem(),
+                             ("The API key in Settings is not valid.",
+                              "Invalid API key"))
+        with mock.patch.object(ak, "get_stored_key", return_value="k"), \
+                mock.patch.object(ak, "validate_api_key",
+                                  return_value=(True, "ok", None)):
+            self.assertIsNone(ak.key_problem())
+
+    def test_missing_key_at_run_time_names_the_button(self):
+        with mock.patch.object(ak, "get_stored_key", return_value=""):
+            with self.assertRaises(ak.ApiKeyError) as ctx:
+                ak.check_key_or_raise()
+        self.assertEqual(bm.message_actions(str(ctx.exception)), ["key"])
+
+
+class TestSetupWarning(unittest.TestCase):
+    def _warn(self, missing, key):
+        with mock.patch.object(bm, "missing_binaries", return_value=missing), \
+                mock.patch.object(ak, "key_problem", return_value=key):
+            return bm.setup_warning()
+
+    def test_all_set_is_silent(self):
+        self.assertIsNone(self._warn([], _GOOD))
+
+    def test_engine_only_is_the_install_message(self):
+        msg = self._warn(["aether_core"], _GOOD)
+        self.assertEqual(bm.message_actions(msg), ["install"])
+        self.assertEqual(en.setup_title(msg), "Aether engine not found")
+
+    def test_key_only(self):
+        msg = self._warn([], _NO_KEY)
+        summary, _ = bm.split_details(msg)
+        self.assertIn("needs an API key", summary)
+        self.assertIn(ak.GET_API_KEY_URL, summary)
+        self.assertEqual(bm.message_actions(msg), ["key"])
+        self.assertEqual(en.setup_title(msg), "API key needed")
+
+    def test_invalid_key_reason_is_a_detail(self):
+        msg = self._warn([], ("Your API key expired on 2026-01-02.",
+                              "API key expired on 2026-01-02. Get a key at …"))
+        summary, details = bm.split_details(msg)
+        self.assertIn("expired on 2026-01-02", summary)
+        self.assertIn("Get a key at", details)
+
+    def test_both_in_one_message_with_two_buttons(self):
+        msg = self._warn(["aether_core"], _NO_KEY)
+        summary, details = bm.split_details(msg)
+        self.assertIn("two things", summary)
+        self.assertEqual(bm.message_actions(msg), ["install", "key"])
+        self.assertIn("AETHER_BIN_DIR", details)
+        self.assertEqual(en.setup_title(msg), "Waveshed is not set up yet")
+
+
+class _KeyHost(_Host):
+    def show_key_settings(self):
+        self.calls.append("key")
+
+
+class TestSetupButtons(unittest.TestCase):
+    def setUp(self):
+        p = mock.patch.object(QgsSettings, "_store", {})
+        p.start()
+        self.addCleanup(p.stop)
+
+    def _box(self, pick):
+        box = mock.Mock()
+        made = {}
+
+        def add(label, *_a):
+            made[label] = object()
+            return made[label]
+        box.addButton.side_effect = add
+        box.clickedButton.side_effect = lambda: made.get(pick)
+        return box
+
+    def test_run_error_key_button_opens_the_key_field(self):
+        host = _KeyHost()
+        with mock.patch.object(ak, "get_stored_key", return_value=""):
+            with self.assertRaises(ak.ApiKeyError) as ctx:
+                ak.check_key_or_raise()
+        msg = str(ctx.exception)
+        box = self._box("Enter API key")
+        with mock.patch.object(en, "QMessageBox") as mb:
+            mb.return_value = box
+            en.show_run_error(_Child(host), "API key needed", msg)
+        self.assertEqual(host.calls, ["key"])
+
+    def test_setup_dialog_on_open_offers_both_fixes(self):
+        host = _KeyHost()
+        box = self._box("Download engine")
+        with mock.patch.object(bm, "missing_binaries", return_value=["x"]), \
+                mock.patch.object(ak, "key_problem", return_value=_NO_KEY), \
+                mock.patch.object(en, "QCheckBox"), \
+                mock.patch.object(en, "QMessageBox") as mb:
+            mb.return_value = box
+            self.assertTrue(en.show_setup_dialog(_Child(host)))
+        labels = [c.args[0] for c in box.addButton.call_args_list]
+        self.assertEqual(labels, ["Download engine", "Enter API key", "Later"])
+        self.assertEqual(host.calls, [True])          # the download flow
+        self.assertNotIn("run again", box.setText.call_args.args[0])
+
+    def test_setup_dialog_is_silent_when_all_is_set(self):
+        with mock.patch.object(bm, "missing_binaries", return_value=[]), \
+                mock.patch.object(ak, "key_problem", return_value=None), \
+                mock.patch.object(en, "QMessageBox") as mb:
+            self.assertFalse(en.show_setup_dialog(mock.Mock()))
+        mb.assert_not_called()
+
+
+class TestStartupBarNamesTheKey(unittest.TestCase):
+    def setUp(self):
+        p = mock.patch.object(en, "QPushButton", _Button)
+        p.start()
+        self.addCleanup(p.stop)
+        _Button.instances.clear()
+        self.bar = _Bar()
+        iface = mock.Mock()
+        iface.messageBar.return_value = self.bar
+        self.engine, self.key = [], []
+        self.notices = en.EngineNotices(iface, self.engine.append,
+                                        lambda: self.key.append(1))
+
+    def test_engine_present_key_missing(self):
+        with mock.patch.object(bm, "discover_binary_dir", return_value="/e"), \
+                mock.patch.object(en.threading, "Thread"), \
+                mock.patch.object(en, "_UpdateCheckThread"), \
+                mock.patch.object(ak, "key_problem", return_value=_NO_KEY):
+            self.notices.run_startup_checks()
+        self.assertEqual(len(self.bar.pushed), 1)
+        self.assertEqual([b.text for b in _Button.instances], ["Enter API key"])
+        _Button.instances[0].slots[0]()
+        self.assertEqual(self.key, [1])
+
+    def test_both_missing_two_buttons_one_bar(self):
+        with mock.patch.object(bm, "discover_binary_dir", return_value=None), \
+                mock.patch.object(ak, "key_problem", return_value=_NO_KEY):
+            self.notices.run_startup_checks()
+        self.assertEqual(len(self.bar.pushed), 1)
+        self.assertEqual([b.text for b in _Button.instances],
+                         ["Download engine", "Enter API key"])
+
+
+class TestMainDialogKeyJump(unittest.TestCase):
+    def test_show_key_settings_focuses_the_field(self):
+        dlg = AetherMainDialog.__new__(AetherMainDialog)
+        dlg.tabs = mock.Mock()
+        dlg.settings_tab = object()
+        dlg._settings_widget = mock.Mock()
+        dlg.show_key_settings()
+        dlg.tabs.setCurrentWidget.assert_called_with(dlg.settings_tab)
+        dlg._settings_widget.focus_api_key.assert_called_once_with()
+
+    def test_focus_api_key_highlights_and_focuses(self):
+        dlg = SettingsDialog.__new__(SettingsDialog)
+        dlg._api_key_group = mock.Mock()
+        dlg._api_key_edit = mock.Mock()
+        dlg.focus_api_key()
+        dlg._api_key_group.setStyleSheet.assert_called_once()
+        dlg._api_key_edit.setFocus.assert_called_once_with()
+
+
+class TestSetupDialogDontShowAgain(unittest.TestCase):
+    """The tick silences the dialog on opening until the setup is complete
+    once; a later problem is shown again."""
+
+    def setUp(self):
+        p = mock.patch.object(QgsSettings, "_store", {})
+        p.start()
+        self.addCleanup(p.stop)
+
+    def _open(self, problems, tick=False):
+        box = mock.Mock()
+        box.clickedButton.return_value = None
+        checkbox = mock.Mock()
+        checkbox.isChecked.return_value = tick
+        missing, key = problems
+        with mock.patch.object(bm, "missing_binaries", return_value=missing), \
+                mock.patch.object(ak, "key_problem", return_value=key), \
+                mock.patch.object(en, "QCheckBox", return_value=checkbox), \
+                mock.patch.object(en, "QMessageBox") as mb:
+            mb.return_value = box
+            shown = en.show_setup_dialog(mock.Mock())
+        return shown, box
+
+    def test_untouched_box_keeps_asking(self):
+        self.assertTrue(self._open(([], _NO_KEY))[0])
+        self.assertTrue(self._open(([], _NO_KEY))[0])
+
+    def test_ticked_box_silences_until_the_setup_is_complete(self):
+        shown, box = self._open(([], _NO_KEY), tick=True)
+        self.assertTrue(shown)
+        box.setCheckBox.assert_called_once()
+        self.assertFalse(self._open(([], _NO_KEY))[0])
+        self.assertFalse(self._open((["aether_core"], _NO_KEY))[0])
+        # Complete once (nothing shown) — the next problem is shown again.
+        self.assertFalse(self._open(([], None))[0])
+        self.assertTrue(self._open(([], _NO_KEY))[0])
+
+    def test_the_run_check_is_not_silenced(self):
+        self._open(([], _NO_KEY), tick=True)
+        with mock.patch.object(bm, "missing_binaries", return_value=[]), \
+                mock.patch.object(ak, "key_problem", return_value=_NO_KEY):
+            self.assertIsNotNone(bm.setup_warning())

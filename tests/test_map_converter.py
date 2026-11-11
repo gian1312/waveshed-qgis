@@ -1533,6 +1533,7 @@ class TestUpsamplingWarningAtRunStart(unittest.TestCase):
         box.StandardButton = mct.QMessageBox.StandardButton
         box.warning.return_value = answer
         with mock.patch.object(mct, "QMessageBox", box), \
+             mock.patch.object(mct, "binaries_warning", return_value=None), \
              mock.patch.object(mct, "_estimate_disk_need", return_value=None), \
              mock.patch.object(mct, "_pending_render_jobs",
                                return_value=(None, [])), \

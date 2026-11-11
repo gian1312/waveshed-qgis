@@ -137,9 +137,10 @@ GeoTIFF.</td><td>No</td></tr>
 <h3>Installing</h3>
 <ol>
 <li>Open the <b>Settings</b> tab and press <b>Download Binaries</b>. On a QGIS
-start without an engine, a notice in the message bar has an <b>Open
-Settings</b> button that takes you there; nothing is ever downloaded without
-this step.</li>
+start without an engine, a notice in the message bar has a <b>Download
+engine</b> button that opens Settings and starts this step; a run refused with
+<b>Aether engine not found</b> offers the same button. Nothing is ever
+downloaded without your consent to the EULA (next steps).</li>
 <li>The plugin fetches the release manifest from
 <a href="https://waveshed.io/releases/latest.json">waveshed.io/releases/latest.json</a>
 and checks its <b>signature</b> against the Waveshed release key built into
@@ -1611,14 +1612,19 @@ height, which it clamps to 1 m.</li>
 # ---------------------------------------------------------------------------
 
 _TROUBLESHOOTING = """
-<p>The QGIS <b>Log Messages</b> panel (tags <b>Waveshed</b> and
+<p>Every error message starts with what happened and what to do. The
+technical part — program, exit code, the engine's last lines, the log file —
+is behind <b>Show Details…</b>; include it when you report a problem. The
+QGIS <b>Log Messages</b> panel (tags <b>Waveshed</b> and
 <b>Waveshed-Terrain</b>) carries the engine's own words and the terrain
-decisions. Start there.</p>
+decisions.</p>
 
 <h3>"Aether engine not found"</h3>
 <p>One or more of <code>aether_core</code>, <code>aether_converter</code>,
-<code>aether_export</code> could not be located. The message lists every place
-that was searched. Fix it in <b>Settings</b>: <b>Download Binaries</b>, or
+<code>aether_export</code> could not be located. The message says how to
+install the engine; <b>Show Details…</b> lists every place that was searched.
+Press <b>Download engine</b> in the message, or fix it in <b>Settings</b>:
+<b>Download Binaries</b>, or
 point <b>Binary directory:</b> at an existing install, or press
 <b>Auto-detect</b>. Remember all three must be in the <i>same</i> directory —
 a partial build directory is skipped and something else on
@@ -1643,8 +1649,15 @@ plugin appends exactly this hint to the engine's error.</p>
 
 <h3>API key problems</h3>
 <ul>
-<li><b>"API key required to run the Aether engine"</b> — nothing is stored.
-Paste the key in <b>Settings &rarr; API key:</b> and press <b>Save</b>.</li>
+<li><b>"API key needed"</b> / <b>"needs an API key"</b> — nothing is stored,
+or the stored key is invalid or expired. The check runs before anything is
+downloaded, and the message has an <b>Enter API key</b> button that opens
+Settings with the key field selected. Paste the key there and press
+<b>Save</b>. Opening the plugin window without an engine or a usable key shows
+a <b>Set up Waveshed</b> dialog with the same buttons; <b>Don't show this
+again</b> silences that dialog until the setup is complete (a later problem,
+such as an expired key, is shown again). A run always says what is
+missing.</li>
 <li><b>"not valid Base58 text"</b> — characters were mangled in copying. Copy
 the key again; internal whitespace from a wrapped terminal line is handled
 automatically, but a substituted character is not.</li>

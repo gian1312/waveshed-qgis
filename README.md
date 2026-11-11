@@ -16,38 +16,49 @@ configurations, invokes the engine, and loads results back into QGIS.
 
 ## Installation
 
-### From the Waveshed plugin repository (recommended)
+### From the official QGIS plugin repository (recommended)
 
-1. In QGIS, open **Plugins → Manage and Install Plugins… → Settings**.
-2. Under **Plugin Repositories** click **Add…**, name it `Waveshed` and enter
-   the URL `https://waveshed.io/qgis/plugins.xml`.
-3. Go to **All**, search for **Waveshed** and click **Install Plugin**.
-   QGIS offers updates from the same repository from then on.
+Waveshed is listed in the official QGIS plugin repository:
+<https://plugins.qgis.org/plugins/waveshed/>. It is not marked experimental,
+so no setting has to change.
 
-(Publication on plugins.qgis.org follows; until then the plugin is not in the
-default QGIS repository.)
+1. In QGIS, open **Plugins → Manage and Install Plugins…**.
+2. On the **All** tab, search for **Waveshed** and click **Install Plugin**.
 
-### From a ZIP
+QGIS offers every new version as an update from there. Requires QGIS 3.28 or
+newer (QGIS 4 included).
 
-1. Download the latest `waveshed.<version>.zip` (https://waveshed.io/downloads).
-2. In QGIS, open **Plugins → Manage and Install Plugins… → Install from ZIP**.
-3. Select the downloaded ZIP and click **Install Plugin**.
+### Other ways to install
+
+- **From a ZIP** (for computers without internet access, no automatic
+  updates): download the latest `waveshed.<version>.zip` from
+  <https://waveshed.io/downloads>, then in QGIS open
+  **Plugins → Manage and Install Plugins… → Install from ZIP**, select the
+  file and click **Install Plugin**.
+- **From the Waveshed plugin repository** (alternative): under
+  **Plugins → Manage and Install Plugins… → Settings → Plugin Repositories**
+  click **Add…** and enter `https://waveshed.io/qgis/plugins.xml`. If you
+  added this repository before the plugin was listed on plugins.qgis.org, you
+  can remove it again on the same page, so QGIS lists Waveshed from one source.
 
 ## The Aether engine (downloaded separately)
 
 The plugin does **not** bundle the Aether engine binaries. The engine is
 **separate, proprietary, closed-source software** and is **not** covered by this
-repository's license. On first use, open the plugin's **Settings → Download**
-dialog: it fetches the engine on demand from [waveshed.io](https://waveshed.io),
-shows the engine **EULA** for your acceptance, and installs the binaries locally.
+repository's license. On first use, open **Plugins → Waveshed → Waveshed
+Analysis**, switch to the **Settings** tab and click **Download Binaries**: the
+plugin fetches the engine on demand from [waveshed.io](https://waveshed.io),
+shows the engine **EULA** for your acceptance (**Accept & Download**), and
+installs the binaries locally.
 This download is always an explicit, user-initiated action.
 
 On **macOS**, the plugin automatically clears the download-quarantine (Gatekeeper)
 attribute from the installed engine after download, so the binaries launch
 without a manual `xattr -cr` step.
 
-Running analyses also requires an **API key** from
-[waveshed.io](https://waveshed.io), entered in the plugin's Settings dialog.
+Running analyses also requires an **API key**. **Get API Key** on the same
+tab opens <https://waveshed.io/get-key>, which issues free keys for
+non-commercial use; paste the key into **API key:** and click **Save**.
 
 Supported engine platforms: **Windows x64**, **Linux x64**, and **macOS arm64**.
 

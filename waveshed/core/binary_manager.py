@@ -176,6 +176,97 @@ def discover_binary_dir() -> Optional[str]:
     return None
 
 
+def install_steps(in_settings: bool = False) -> str:
+    """The steps to install the engine, in the words every "not installed"
+    message uses. Names the "Download Binaries" button (the key of
+    :func:`engine_message_action`) and never says "update". *in_settings*:
+    the reader is already on the Settings tab (no "Download engine" button).
+    """
+    first = ("Click \"Download Binaries\" above." if in_settings else
+             "Click \"Download engine\" below, or open Waveshed \u2192 "
+             "Settings and click \"Download Binaries\".")
+    return (
+        "How to install it (one time):\n"
+        f"  1. {first}\n"
+        "  2. Read and accept the engine licence (EULA).\n"
+        "  3. Wait until Settings shows the engine as found, then run again.\n\n"
+        "Already have the engine in another folder? Pick that folder under "
+        "Settings \u2192 Binary directory."
+    )
+
+
+INSTALL_STEPS = install_steps()
+
+
+#: Separates what the user needs (first) from the technical rest in every
+#: run-error message. :func:`split_details` cuts there; the error dialog
+#: (``gui.engine_notices.show_run_error``) shows the rest behind
+#: "Show Details…", plain-text consumers (Processing) print it after.
+DETAILS_HEADER = "Technical details:"
+_DETAILS_SEP = "\n\n" + DETAILS_HEADER + "\n"
+
+
+def with_details(summary: str, details: str = "") -> str:
+    """*summary* (what happened, what to do), then *details* if any."""
+    details = (details or "").strip("\n")
+    summary = (summary or "").rstrip()
+    return summary + (_DETAILS_SEP + details if details.strip() else "")
+
+
+def split_details(message: str) -> Tuple[str, str]:
+    """``(summary, details)`` of a :func:`with_details` message.
+
+    A message without details (any older wording) is all summary.
+    """
+    head, sep, tail = (message or "").partition(_DETAILS_SEP)
+    return head.rstrip(), (tail if sep else "")
+
+
+#: ``[E:<reason>]`` — the engine's own one-line error.
+_ENGINE_ERROR_RE = re.compile(r"\[E:\s*(.+?)\]\s*$")
+
+
+def engine_error_text(output: str) -> str:
+    """The engine's own reason (the last ``[E:…]``), else ``""``."""
+    for line in reversed((output or "").splitlines()):
+        m = _ENGINE_ERROR_RE.search(line.strip())
+        if m:
+            return m.group(1).strip()
+    return ""
+
+
+def engine_failure_message(program: str, returncode: Optional[int],
+                           output: str, subject: str = "",
+                           hint: str = "", log_path: str = "") -> str:
+    """A failed engine run, the user's part first.
+
+    Summary: which run failed, the engine's own reason (``[E:…]``) and
+    *hint* (what to do, e.g. :func:`engine_error_hint`) — or, without one,
+    where the full output is. Details: the program, its exit code, the log
+    file and the last lines it printed.
+    """
+    what = f" for {subject}" if subject else ""
+    summary = f"The Aether engine stopped with an error{what}."
+    reason = engine_error_text(output)
+    if reason:
+        summary += f"\n\nReason: {reason}"
+    hint = (hint or "").strip()
+    if hint:
+        summary += "\n\n" + hint
+    else:
+        summary += ("\n\nThe complete engine output is in QGIS \u2192 View "
+                    "\u2192 Panels \u2192 Log Messages (Waveshed tab)"
+                    + (" and in the engine log file below" if log_path else "")
+                    + ". Please include it when you report the problem.")
+    details = f"{program} exited with code {returncode}{what}."
+    if log_path:
+        details += f"\nEngine log: {log_path}"
+    tail = (output or "").strip("\n")
+    if tail.strip():
+        details += "\n\nLast engine output:\n" + tail
+    return with_details(summary, details)
+
+
 def find_binary(name: str) -> str:
     """Return the full path to the binary *name*.
 
@@ -202,10 +293,11 @@ def find_binary(name: str) -> str:
     if exe is not None:
         return os.path.abspath(exe)
 
-    raise RuntimeError(
-        f"AETHER binary '{name}' not found. Please configure the binary "
-        f"directory in Settings or run 'Download Binaries'."
-    )
+    raise RuntimeError(with_details(
+        "The Aether engine is not installed, or Waveshed cannot find it.\n\n"
+        + INSTALL_STEPS,
+        f"Missing program: {_binary_name(name)}",
+    ))
 
 
 def missing_binaries(names: Sequence[str] = REQUIRED_BINARIES) -> List[str]:
@@ -245,13 +337,69 @@ def binaries_warning(names: Sequence[str] = REQUIRED_BINARIES) -> Optional[str]:
     absent = missing_binaries(names)
     if not absent:
         return None
-    return (
-        "The Aether engine is not installed, or the plugin cannot find it.\n\n"
-        f"Missing: {', '.join(absent)}\n\n"
-        "Searched:\n  " + "\n  ".join(_searched_locations()) + "\n\n"
-        "Open Settings and use \"Download Binaries\", or point the engine "
-        "directory at an existing install."
+    return with_details(
+        "Waveshed needs the free Aether engine to compute anything, and it "
+        "is not installed yet (or Waveshed cannot find it).\n\n"
+        + INSTALL_STEPS,
+        f"Missing: {', '.join(absent)}\n"
+        "Searched:\n  " + "\n  ".join(_searched_locations()),
     )
+
+
+#: What :func:`setup_problems` can report.
+SETUP_ENGINE = "engine"
+SETUP_KEY = "key"
+
+
+def setup_problems(binaries: Sequence[str] = REQUIRED_BINARIES,
+                   need_key: bool = True) -> List[str]:
+    """What is not set up yet: :data:`SETUP_ENGINE` and/or :data:`SETUP_KEY`.
+
+    File checks and the key's structural check only — no engine launch, so
+    it is safe on the GUI thread (dialog open, Run click).
+    """
+    from . import api_key
+    problems = []
+    if missing_binaries(binaries):
+        problems.append(SETUP_ENGINE)
+    if need_key and api_key.key_problem() is not None:
+        problems.append(SETUP_KEY)
+    return problems
+
+
+def setup_warning(binaries: Sequence[str] = REQUIRED_BINARIES,
+                  need_key: bool = True) -> Optional[str]:
+    """One message for everything a run still needs (engine, API key), or None.
+
+    The user's part first — what is missing and the steps, each naming the
+    button the error box adds (:func:`message_actions`) — the searched paths
+    and the key validator's words after :data:`DETAILS_HEADER`.
+    """
+    from . import api_key
+    problems = setup_problems(binaries, need_key)
+    if not problems:
+        return None
+    key_issue = api_key.key_problem() if SETUP_KEY in problems else None
+    if problems == [SETUP_ENGINE]:
+        return binaries_warning(binaries)
+    if problems == [SETUP_KEY]:
+        summary, detail = key_issue
+        return with_details(
+            f"Waveshed needs an API key to run analyses. {summary}\n\n"
+            + api_key.key_steps(), detail)
+    engine = split_details(binaries_warning(binaries) or "")
+    summary, detail = key_issue
+    return with_details(
+        "Before the first analysis, Waveshed needs two things that are not "
+        "set up yet.\n\n"
+        "1) The Aether engine \u2014 click \"Download engine\" below "
+        "(Settings \u2192 Download Binaries), accept its licence (EULA); it "
+        "downloads and installs by itself.\n\n"
+        f"2) An API key \u2014 {summary} Click \"{api_key.ENTER_KEY_BUTTON}\" "
+        "below (Settings \u2192 API Key). No key yet? \"Get API Key\" there "
+        f"opens {api_key.GET_API_KEY_URL}. Paste it and click \"Save\".\n\n"
+        "Then run again.",
+        "\n\n".join(x for x in (engine[1], detail) if x))
 
 
 def _fingerprint_error_message(returncode: int, stdout: str, stderr: str) -> str:
@@ -313,11 +461,11 @@ def engine_error_hint(output: str, returncode: Optional[int] = None) -> str:
     """
     if "unsupported resolution" in (output or "").lower():
         return (
-            "\n\nThe installed Aether engine build only accepts 2, 5, 10 and "
-            "30 m on the GPU path (a hardcoded list removed in engine "
-            f"{COARSE_RESOLUTION_MIN_ENGINE}). Update the engine via Settings "
-            "\u2192 Download binaries, or pick one of those resolutions for "
-            "this run."
+            "\n\nThe installed Aether engine is too old for this resolution: "
+            "it only accepts 2, 5, 10 and 30 m on the GPU path (fixed in "
+            f"engine {COARSE_RESOLUTION_MIN_ENGINE}).\n\n"
+            "What to do: Update the engine (Settings \u2192 Download "
+            "binaries), or pick one of those resolutions for this run."
         )
     if macos_oom_kill(output, returncode):
         return (
@@ -398,10 +546,25 @@ def engine_message_action(message: str) -> Optional[str]:
     else ``None``. Every such message names the Settings "Download binaries"
     step, which is what this keys on.
     """
-    text = (message or "").lower()
+    text = split_details(message or "")[0].lower()
     if "download binaries" not in text:
         return None
     return "update" if "update" in text else "install"
+
+
+def message_actions(message: str) -> List[str]:
+    """Every button a run-error message asks for, in order: the engine one
+    (:func:`engine_message_action`) and ``"key"`` when its summary names the
+    "Enter API key" button (``api_key.ENTER_KEY_BUTTON``)."""
+    from . import api_key
+    actions = []
+    engine = engine_message_action(message)
+    if engine:
+        actions.append(engine)
+    summary = split_details(message or "")[0].lower()
+    if f'"{api_key.ENTER_KEY_BUTTON.lower()}"' in summary:
+        actions.append("key")
+    return actions
 
 
 def read_machine_fingerprint(timeout: float = 10.0) -> str:
@@ -1605,23 +1768,29 @@ def check_engine_for_job(resolution_m: float, range_profile: bool = False) -> st
     )
     if not engine_supports_resolution(version, resolution_m):
         allowed = ", ".join(str(r) for r in LEGACY_ENGINE_RESOLUTIONS)
-        raise EngineTooOldError(
-            f"The installed Aether engine (aether_core {shown}) cannot run a "
+        raise EngineTooOldError(with_details(
+            f"This {resolution_m:g} m analysis needs a newer Aether engine. "
+            "Nothing was downloaded.\n\n"
+            "What to do: click \"Update engine\" below (Settings \u2192 "
+            f"Download binaries), or pick {allowed} m for this run.",
+            f"Installed: aether_core {shown} \u2014 it cannot run a "
             f"{resolution_m:g} m analysis: it accepts only {allowed} m on the "
             f"GPU path. Engine {COARSE_RESOLUTION_MIN_ENGINE} or newer is "
-            "required. Update it via Settings \u2192 Download binaries, or pick "
-            "one of those resolutions. Nothing was downloaded."
-        )
+            f"required.\nEngine: {exe}",
+        ))
     if range_profile:
         from .range_profile import RANGE_PROFILE_MIN_ENGINE
         if not version or compare_versions(version, RANGE_PROFILE_MIN_ENGINE) < 0:
-            raise EngineTooOldError(
-                f"The installed Aether engine (aether_core {shown}) does not "
-                f"support adaptive / custom resolution; engine "
-                f"{RANGE_PROFILE_MIN_ENGINE} or newer is required. Update it via "
-                "Settings \u2192 Download binaries, or choose Fixed resolution. "
-                "Nothing was downloaded."
-            )
+            raise EngineTooOldError(with_details(
+                "Adaptive / Custom resolution needs a newer Aether engine. "
+                "Nothing was downloaded.\n\n"
+                "What to do: click \"Update engine\" below (Settings \u2192 "
+                "Download binaries), or choose Fixed resolution.",
+                f"Installed: aether_core {shown} \u2014 it does not support "
+                f"adaptive / custom resolution; engine "
+                f"{RANGE_PROFILE_MIN_ENGINE} or newer is required.\n"
+                f"Engine: {exe}",
+            ))
     return shown
 
 
