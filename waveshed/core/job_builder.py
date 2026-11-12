@@ -8,7 +8,7 @@ import dataclasses
 import json
 import math
 import os
-from typing import Optional, Sequence, Tuple
+from typing import List, Optional, Sequence, Tuple
 
 # Resolution values (metres) the plugin offers throughout the UI. aether_core
 # takes resolution_m as a plain f32 (clamped to >= 0.1 m) with no fixed set, so
@@ -689,11 +689,52 @@ def write_job_file(job_config: dict, output_dir: str, name: str) -> str:
     Returns:
         Absolute path to the written JSON file.
     """
+    job_config = engine_safe_job(job_config)
     os.makedirs(output_dir, exist_ok=True)
     path = os.path.join(output_dir, f"{name}_job.json")
     with open(path, "w", encoding="utf-8") as f:
-        json.dump(job_config, f, indent=2)
+        json.dump(job_config, f, indent=2, allow_nan=False)
     return os.path.abspath(path)
+
+
+def _non_finite_paths(value, path: str = "") -> List[str]:
+    """Dotted paths of every NaN/inf float inside *value*."""
+    if isinstance(value, bool):
+        return []
+    if isinstance(value, float):
+        return [] if math.isfinite(value) else [path or "(root)"]
+    if isinstance(value, dict):
+        out: List[str] = []
+        for k, v in value.items():
+            out += _non_finite_paths(v, f"{path}.{k}" if path else str(k))
+        return out
+    if isinstance(value, (list, tuple)):
+        out = []
+        for i, v in enumerate(value):
+            out += _non_finite_paths(v, f"{path}[{i}]")
+        return out
+    return []
+
+
+def engine_safe_job(job_config: dict) -> dict:
+    """Last check before a job reaches aether_core (the website hit both, 2026-11-11).
+
+    - ``analysis.max_range_km`` is a ``u32`` in the engine: a float would fail
+      with "invalid type: floating point". It is rounded UP, never down, because
+      for P2P it is the per-link distance cap (see ``batch_max_range_km``).
+    - NaN / infinity cannot be written as JSON the engine reads: refused with the
+      field named, instead of a parse error from inside the engine.
+    """
+    bad = _non_finite_paths(job_config)
+    if bad:
+        raise ValueError("Job contains an empty or invalid number in: " + ", ".join(bad))
+    analysis = job_config.get("analysis")
+    if isinstance(analysis, dict):
+        r = analysis.get("max_range_km")
+        if isinstance(r, float):
+            analysis = dict(analysis, max_range_km=max(1, int(math.ceil(r))))
+            job_config = dict(job_config, analysis=analysis)
+    return job_config
 
 
 def job_file_for_result(result_path: str) -> Optional[str]:
