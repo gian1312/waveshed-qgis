@@ -1359,6 +1359,44 @@ path and the estimate). Multi-site (2026-10-19, Rigi/Pilatus, real terrarium +
 OpenFreeMap): sites share pool tiles, each gets its own view; pinned by
 `MultiSiteBuildingsViews`.
 
+## Assets, result styling, antenna patterns (2026-11-14)
+
+- **Assets reach the run tabs at once.** `AssetManagerTab.assets_changed` (New, Save,
+  Save As into the store, Delete, Reload, Change…) / `asset_renamed(old, new)`;
+  `main_dialog` refreshes the 360° and P2P tabs, and on a tab switch only when
+  `asset_manager.assets_signature()` (scandir: name, size, mtime_ns) changed. ONE
+  name → asset rule, `resolve_assets` (first file by path wins, duplicates logged).
+  `save_asset(path=None)` never overwrites (`name.json`, `name_2.json`, …), writes
+  atomically; a rename moves the file (`save_renamed_asset`, write first, delete
+  second). A Propagation run refuses a row whose asset no longer resolves
+  (`UnresolvedAssetError`; P2P `P2PAssetError`), never the 433 MHz / 10 W
+  fallback. "Stored in: … [Open folder] [Change…]" on the Assets tab.
+  `tests/test_assets_store.py`.
+- **Styling in the scaled unit.** QGIS applies the GeoTIFF scale/offset (3.22
+  measured, 3.28→master read): renderers, Identify and stats see dBm / metres.
+  Every renderer pins shader min/max AND classification min/max
+  (`result_loader._pin_value_range`) — unset, the Layers-panel legend reads
+  "255 / 0" and Layer Properties → Symbology reclassifies on open. ITM /
+  SIMPLE_LOSS: MPT's five-stop ramp over the exact dBm range (`dbm_range`: GDAL
+  `ComputeRasterMinMax(False)`, memoised by path + size + mtime; the 360° worker
+  and Processing call it off the GUI thread; never the approximate routes —
+  the exporter's overviews carry no GDAL_NODATA), fallback −140…−40; source
+  no-data off + user no-data the SINGLE value −150 (0 dBm draws; Layer
+  Properties OK collapses a range). LOS Floor stops, thresholds, bands and the
+  range estimate are metres (`min_alt.quantized_floor_m` / `quantized_above_m`);
+  `altitude_to_raw` / `raw_to_altitude` only for GDAL arrays (best-site merge,
+  AMSL twin, contours). Verify legends by grabbing a real `QgsLayerTreeView`,
+  not `legendSymbologyItems()`. `tests/test_result_style.py`.
+- **Antenna patterns go inline.** Asset `azimuth_pattern` / `elevation_pattern`
+  data → `tx.az_pattern_data` / `tx.el_pattern_data` unchanged (field gains,
+  peak divided to 1 when above it; elevation −90…+90, + = up; tilt baked into
+  the data, "Tilt (+ up)"), `az_rotation` only with a pattern, whole degrees,
+  clockwise. Propagation mode only (`job_builder.GEOMETRIC_MODELS` send none).
+  `PATTERN_DATA_MIN_ENGINE` 0.4.3 (older engines drop the fields silently).
+  aether_core's CPU P2P ignores patterns (p2p.rs returns before the LUT load):
+  the P2P tab asks first. `.az`/`.el` import: line 1 is the header, as the
+  engine reads it. `tests/test_patterns_engine.py`.
+
 ## Sensitive Files (DO NOT commit)
 
 - `api_private_key.bin` / `api_private_key.pem` - Ed25519 signing key (server-side only)
