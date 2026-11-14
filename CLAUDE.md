@@ -1399,11 +1399,17 @@ OpenFreeMap): sites share pool tiles, each gets its own view; pinned by
 - **ITM parameters: one group, one instance per tab** (`gui/itm_params.py`
   `ItmParamsGroup`, 360° and P2P, each its own values; Propagation + ITM only).
   Radio climate 1–7. **Earth Radius Mode is NOT in it**: each tab's Analysis
-  section shows it in every mode (owner: the curvature matters for LOS too;
-  the wanted set is Real / 4/3 / Advanced). Today aether_core reads
-  `earth_radius_mode` in its CPU ITM paths only (GPU, LOS, LOS Floor: fixed
-  k = 4/3 in shader.wgsl / cpu_coverage.rs; no k = 1 mode) — making it real is
-  an engine change that needs the owner's yes. A spin box rounds
+  section shows it in every mode (owner: the curvature matters for LOS too):
+  Real (k = 1) / 4/3 earth / Advanced, with what this engine version cannot
+  apply greyed out (`itm_params.earth_radius_unavailable` +
+  `apply_earth_radius_availability`, re-run on mode / model / backend
+  changes; a greyed pick falls back to 4/3 and returns). Today aether_core
+  reads `earth_radius_mode` in its CPU ITM paths only (GPU, LOS, LOS Floor:
+  fixed k = 4/3; no k = 1 mode) — the engine work is HIGH PRIORITY in
+  `AETHER/TODO.md` and needs the owner's go-ahead.
+- **P2P: typed height wins.** An asset fills Site A's height and mode only
+  until the user sets them (`_site_a_height_touched`); then its default goes
+  into the tooltip (owner, 2026-11-14). A spin box rounds
   to its CURRENT decimals: set decimals before the value (0.005 at 2 decimals
   became 0.01 — every ITM job sent wet-ground conductivity until be1fb51);
   `tests/test_spinbox_decimals.py` scans for it.
