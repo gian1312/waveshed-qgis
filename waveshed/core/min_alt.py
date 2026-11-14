@@ -22,10 +22,18 @@ testable.  The actual QgsRasterRenderer construction lives in
 pure Python that both the loader and the Altitude Explorer dock share.
 
 .. note::
-   QGIS' pseudocolour renderer classifies on the *raw* band value, not on the
-   GDAL-scaled value.  Every threshold/ramp stop we hand to a renderer is
-   therefore expressed in raw u16 units — convert metres with
-   :func:`altitude_to_raw` at the boundary and nowhere else.
+   Two value domains, never mixed:
+
+   * **QGIS sees metres.**  The GDAL provider applies the band's SCALE/OFFSET,
+     so the pseudocolour renderer, band statistics, Identify and the shader
+     all work on ``raw * MIN_ALT_STEP_M`` (measured on QGIS 3.22: a 100 m
+     pixel identifies and classifies as 100.0, not 200).  Every ramp stop,
+     threshold and statistic on a QGIS layer is therefore in metres — see
+     :func:`band_stops` and ``result_loader.build_min_alt_renderer``.
+   * **GDAL arrays are raw.**  ``ReadAsArray`` returns the unscaled u16
+     counts, so code reading or writing the band itself (``raster_tools``'s
+     best-site merge, the AMSL twin, contours) converts with
+     :func:`altitude_to_raw` / :func:`raw_to_altitude`.
 """
 
 from __future__ import annotations
@@ -52,6 +60,32 @@ MIN_ALT_MAX_RAW: int = 0xFFFE  # 65534
 #: most an altitude box may accept.  Anything above a layer's own data reaches
 #: no further than its top value, but asking is legitimate.
 MIN_ALT_MAX_ALTITUDE_M: int = MIN_ALT_MAX_RAW // 2
+
+#: The no-data sentinel as QGIS sees it, i.e. after the band's scale
+#: (65535 × 0.5 = 32767.5 m) — one step above :data:`MIN_ALT_MAX_ALTITUDE_M`.
+MIN_ALT_SENTINEL_M: float = MIN_ALT_SENTINEL * MIN_ALT_STEP_M
+
+
+def quantized_floor_m(altitude_m: float) -> float:
+    """The highest altitude the encoding can hold that is ``<= altitude_m``.
+
+    Pixels only ever carry multiples of :data:`MIN_ALT_STEP_M`, so two
+    altitudes with the same floor select exactly the same pixels — "≤ 100.2 m"
+    is "≤ 100 m".  The tiny epsilon keeps a float that lands a hair under a
+    step (``100.5 - 1e-12``) on that step.
+    """
+    if altitude_m <= 0:
+        return 0.0
+    return math.floor(altitude_m / MIN_ALT_STEP_M + 1e-9) * MIN_ALT_STEP_M
+
+
+def quantized_above_m(altitude_m: float) -> float:
+    """The first altitude the encoding can hold that is ``> altitude_m``.
+
+    Where a "reachable at ≤ *altitude_m*" mask turns transparent: a pixel at
+    exactly *altitude_m* (on the grid) is still drawn, the next step is not.
+    """
+    return quantized_floor_m(altitude_m) + MIN_ALT_STEP_M
 
 
 def altitude_to_raw(altitude_m: float) -> int:
@@ -340,10 +374,11 @@ def split_bands_by_reference(
 
 class BandStop(NamedTuple):
     """One stop of a *discrete* colour ramp: everything at or below
-    :attr:`raw` — and above the previous stop — takes :attr:`color`."""
+    :attr:`value_m` — and above the previous stop — takes :attr:`color`."""
 
-    #: Upper bound in raw u16 band units, inclusive.
-    raw: int
+    #: Upper bound in metres (what QGIS classifies — the band's scaled
+    #: value), inclusive.
+    value_m: float
     #: ``(r, g, b)``, or None for "draw nothing here".
     color: Optional[Tuple[int, int, int]]
     #: Legend text (empty for the transparent tail).
@@ -389,23 +424,26 @@ def band_stops(
 
     suffix = reference_suffix(reference)
     stops: List[BandStop] = []
-    seen_raw = set()
+    seen_m = set()
     previous_m: Optional[float] = None
 
     for band in sorted(bands, key=lambda b: b.altitude_m):
-        raw = altitude_to_raw(band.altitude_m)
-        if raw in seen_raw:
+        # Two altitudes inside one quantisation step select the same pixels.
+        key = quantized_floor_m(band.altitude_m)
+        if key in seen_m:
             continue
-        seen_raw.add(raw)
+        seen_m.add(key)
         label = (f"≤ {band.altitude_m:g}{suffix}" if previous_m is None
                  else f"{previous_m:g} – {band.altitude_m:g}{suffix}")
         stops.append(BandStop(
-            raw, tuple(band.color) if band.visible else None, label,
+            float(band.altitude_m),
+            tuple(band.color) if band.visible else None, label,
         ))
         previous_m = band.altitude_m
 
     # Above the highest band nothing is reachable *at the altitudes asked for*,
-    # so it must not inherit the top colour. The stop sits on the sentinel so it
-    # also swallows a no-data pixel that arrives without its nodata tag.
-    stops.append(BandStop(MIN_ALT_SENTINEL, None, ""))
+    # so it must not inherit the top colour. The stop sits on the (scaled)
+    # sentinel so it also swallows a no-data pixel that arrives without its
+    # nodata tag.
+    stops.append(BandStop(MIN_ALT_SENTINEL_M, None, ""))
     return stops

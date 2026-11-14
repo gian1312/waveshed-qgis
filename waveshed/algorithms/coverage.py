@@ -37,6 +37,7 @@ from ..core.job_builder import (
 from ..core.result_loader import (
     GROUP_COVERAGE,
     add_layer_to_project,
+    dbm_range,
     load_coverage_result,
 )
 from ..core.terrain_adapter import prepare_terrain
@@ -391,7 +392,12 @@ class CoverageAlgorithm(QgsProcessingAlgorithm):
         feedback.setProgress(95)
 
         try:
-            layer = load_coverage_result(tif_path, model)
+            # The dBm ramp spans the raster's exact range — a full read of
+            # the band, done here (memoised) rather than inside the styling.
+            value_range = (dbm_range(tif_path)
+                           if model in ("SIMPLE_LOSS", "ITM") else None)
+            layer = load_coverage_result(tif_path, model,
+                                         value_range=value_range)
             add_layer_to_project(layer, GROUP_COVERAGE)
         except Exception as exc:
             # Non-fatal — the output file still exists

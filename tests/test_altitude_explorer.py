@@ -706,6 +706,12 @@ class _RampShader:
     def setClip(self, clip):
         self.clip = clip
 
+    def setMinimumValue(self, value):
+        self.minimum = value
+
+    def setMaximumValue(self, value):
+        self.maximum = value
+
 
 class _Shader:
     def __init__(self):
@@ -720,6 +726,12 @@ class _PseudoColorRenderer:
         self.provider = provider
         self.band = band
         self.shader = shader
+
+    def setClassificationMin(self, value):
+        self.classification_min = value
+
+    def setClassificationMax(self, value):
+        self.classification_max = value
 
 
 class TestSubsetRenderer(_PatchMixin, unittest.TestCase):
@@ -744,10 +756,11 @@ class TestSubsetRenderer(_PatchMixin, unittest.TestCase):
         return renderer.shader.function.items
 
     def test_the_above_ground_subset_keeps_its_rings(self):
+        # Metres — QGIS classifies the scaled band — with the tail on the
+        # scaled sentinel.
         items = self._items(ma.REF_AGL)
         self.assertEqual([item.value for item in items], [
-            ma.altitude_to_raw(100.0), ma.altitude_to_raw(300.0),
-            ma.MIN_ALT_SENTINEL,
+            100.0, 300.0, ma.MIN_ALT_SENTINEL_M,
         ])
         self.assertEqual([item.label for item in items],
                          ["≤ 100 m AGL", "100 – 300 m AGL", ""])
@@ -757,16 +770,26 @@ class TestSubsetRenderer(_PatchMixin, unittest.TestCase):
         # "300 – 2500", which would be a band of the *other* raster's ladder.
         items = self._items(ma.REF_AMSL)
         self.assertEqual([item.value for item in items],
-                         [ma.altitude_to_raw(2500.0), ma.MIN_ALT_SENTINEL])
+                         [2500.0, ma.MIN_ALT_SENTINEL_M])
         self.assertEqual([item.label for item in items],
                          ["≤ 2500 m AMSL", ""])
 
     def test_neither_subset_carries_the_other_s_altitudes(self):
         agl = {item.value for item in self._items(ma.REF_AGL)}
         amsl = {item.value for item in self._items(ma.REF_AMSL)}
-        self.assertNotIn(ma.altitude_to_raw(2500.0), agl)
-        self.assertNotIn(ma.altitude_to_raw(100.0), amsl)
-        self.assertNotIn(ma.altitude_to_raw(300.0), amsl)
+        self.assertNotIn(2500.0, agl)
+        self.assertNotIn(100.0, amsl)
+        self.assertNotIn(300.0, amsl)
+
+    def test_the_range_is_pinned_from_the_ground_to_the_top_band(self):
+        # Without it Layer Properties → Symbology reclassifies on open.
+        renderer = rl.build_band_renderer(
+            "provider", 1, self.grouped[ma.REF_AGL], reference=ma.REF_AGL,
+        )
+        self.assertEqual((renderer.classification_min,
+                          renderer.classification_max), (0.0, 300.0))
+        function = renderer.shader.function
+        self.assertEqual((function.minimum, function.maximum), (0.0, 300.0))
 
     def test_every_subset_is_a_discrete_ramp_ending_transparent(self):
         for reference in ma.REFERENCES:
@@ -775,7 +798,7 @@ class TestSubsetRenderer(_PatchMixin, unittest.TestCase):
                 values = [item.value for item in items]
                 self.assertEqual(values, sorted(values))
                 self.assertEqual(len(set(values)), len(values))
-                self.assertEqual(items[-1].value, ma.MIN_ALT_SENTINEL)
+                self.assertEqual(items[-1].value, ma.MIN_ALT_SENTINEL_M)
                 self.assertEqual(items[-1].color.alpha, 1.0)
                 self.assertEqual(
                     (items[-1].color.red(), items[-1].color.green(),

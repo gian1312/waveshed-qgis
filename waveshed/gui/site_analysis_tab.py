@@ -86,6 +86,7 @@ from ..core.output_estimate import output_space_problem
 from ..core.result_loader import (
     GROUP_COVERAGE,
     add_layer_to_project,
+    dbm_range,
     load_coverage_result,
 )
 from ..core.binary_manager import setup_warning
@@ -709,6 +710,14 @@ class _SiteAnalysisWorker(QThread):
                         "free space, then run again.",
                         f"aether_export failed (exit {result.returncode}):\n"
                         f"{(result.stderr or '').strip()}"))
+
+                if str(params.model).upper() in ("SIMPLE_LOSS", "ITM"):
+                    # The dBm colour ramp spans the raster's exact range — a
+                    # full read of the band (seconds on a 20,000² result).
+                    # Done here, off the GUI thread; dbm_range memoises it, so
+                    # the loader's own call in _on_finished_ok is a lookup.
+                    self.status.emit(f"{job_label}: Reading the value range...")
+                    dbm_range(tif_path)
 
                 results.append((tif_path, params.model, display_name))
                 self.progress.emit(_job_progress(100))

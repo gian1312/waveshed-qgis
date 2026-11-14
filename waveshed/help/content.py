@@ -765,9 +765,13 @@ layers.</td></tr>
 <ul>
 <li><b>LOS</b> — exact two-value ramp: 0 is transparent (<i>No Data</i>),
 1 is green at 70&nbsp;% opacity (<i>Visible</i>).</li>
-<li><b>Propagation (ITM)</b> — interpolated signal-strength ramp from
--140 dBm (red) through -70 dBm (yellow) to 0 dBm (green). The band holds
-received power in dBm.</li>
+<li><b>Propagation (ITM)</b> — received power on a ramp over the result's
+own range: blue (weakest) → cyan → green → yellow → red (strongest),
+five stops at 0, 25, 50, 75 and 100&nbsp;% of the raster's exact minimum and
+maximum in dBm. A raster without a usable range gets −140 to −40 dBm. Only
+pixels the engine left empty are transparent; 0&nbsp;dBm is drawn. The legend
+and Layer Properties → Symbology show the range in dBm. The GeoTIFF stores a
+byte per pixel with a scale/offset (dBm = value − 150), which QGIS applies.</li>
 <li><b>LOS Floor</b> — a continuous blue-to-red ramp over the altitude actually
 required: blue where a receiver at ground level already sees the transmitter,
 red where it must climb. The ramp spans the layer's own range (for a sea-level
@@ -779,10 +783,10 @@ name; 255 means no site reaches that pixel.</li>
 the <code>alt_m</code> attribute; labels appear once you zoom in on a dense
 layer.</li>
 </ul>
-<p>QGIS classifies on the <i>raw</i> band value, so a LOS Floor raster's
-pixel values are counts of 0.5 m, not metres (GDAL scale 0.5). Anything you
-build on top of one should convert at the boundary rather than assume
-metres.</p>
+<p>QGIS applies the GeoTIFF's scale and offset, so a LOS Floor raster reads
+in metres in the renderer, Identify, statistics and the Raster Calculator
+(values come in 0.5&nbsp;m steps). Reading the band directly with GDAL gives
+the raw counts of 0.5&nbsp;m: multiply by 0.5 (the GDAL scale) there.</p>
 
 <h3>Files a run leaves behind</h3>
 <table border="1" cellspacing="0" cellpadding="4">

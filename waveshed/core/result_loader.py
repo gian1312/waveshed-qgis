@@ -8,8 +8,11 @@ that produced the result.
 
 from __future__ import annotations
 
+import math
 import os
-from typing import Optional, Sequence, Tuple
+import threading
+from collections import OrderedDict
+from typing import List, Optional, Sequence, Tuple
 
 from qgis.core import (
     Qgis,
@@ -59,6 +62,46 @@ _SITE_PALETTE = [
 # Styling helpers (private)
 # ---------------------------------------------------------------------------
 
+def _pin_value_range(renderer, ramp, low: float, high: float) -> None:
+    """Pin the shader's min/max and the renderer's classification range.
+
+    QGIS defaults both to 0…255 / NaN.  The Layers-panel legend of an
+    interpolated ramp is drawn from the shader's min/max (so without this it
+    reads "255 / 0" over one solid colour), and Layer Properties → Symbology
+    reclassifies on open — replacing our stops — while the classification
+    range is NaN.
+    """
+    ramp.setMinimumValue(low)
+    ramp.setMaximumValue(high)
+    renderer.setClassificationMin(low)
+    renderer.setClassificationMax(high)
+
+
+def _set_legend_unit(ramp, suffix: str, keep_decimal: bool) -> None:
+    """Give the continuous (Layers-panel / print) legend its unit.
+
+    ``QgsColorRampLegendNodeSettings`` (QGIS 3.18+) prints the shader's
+    min/max through a numeric format; *keep_decimal* shows one decimal always
+    ("-140.0 dBm", like the stop labels), else only when there is one
+    ("300 m AGL", "12.5 m AGL").  Skipped where the class is missing (the
+    unit-test stubs) — the stops keep their own labels either way.
+    """
+    try:
+        from qgis.core import (
+            QgsBasicNumericFormat,
+            QgsColorRampLegendNodeSettings,
+        )
+    except ImportError:
+        return
+    number_format = QgsBasicNumericFormat()
+    number_format.setNumberDecimalPlaces(1)
+    number_format.setShowTrailingZeros(keep_decimal)
+    settings = QgsColorRampLegendNodeSettings()
+    settings.setSuffix(suffix)
+    settings.setNumericFormat(number_format)   # takes ownership
+    ramp.setLegendSettings(settings)            # takes ownership
+
+
 def _apply_los_style(layer: QgsRasterLayer) -> None:
     """Apply binary visible/not-visible pseudocolor to a LOS result.
 
@@ -82,31 +125,175 @@ def _apply_los_style(layer: QgsRasterLayer) -> None:
     renderer = QgsSingleBandPseudoColorRenderer(
         layer.dataProvider(), 1, shader,
     )
+    _pin_value_range(renderer, color_ramp, 0.0, 1.0)
     layer.setRenderer(renderer)
     layer.triggerRepaint()
 
 
-def _apply_signal_strength_style(layer: QgsRasterLayer) -> None:
-    """Apply a continuous signal-strength color ramp to a loss-model result.
+# ---------------------------------------------------------------------------
+# SIMPLE_LOSS / ITM (received power, dBm) styling
+# ---------------------------------------------------------------------------
 
-    Covers the range -140 dBm (red) through -70 dBm (yellow) to 0 dBm
-    (green).  Used for both SIMPLE_LOSS and ITM outputs.
+#: Ramp range when the raster's own cannot be read (MPT's fallback).
+DBM_FALLBACK_RANGE: Tuple[float, float] = (-140.0, -40.0)
+
+#: Raw 0 after the exporter's scale/offset (raw - 150): "below the engine's
+#: floor".  The only value hidden — as a SINGLE value, because Layer
+#: Properties → Transparency collapses a user no-data *range* to its minimum
+#: on OK.  The GeoTIFF's own nodata (raw 0) is switched off so that a 0 dBm
+#: pixel (raw 150) is drawn.
+DBM_NODATA: float = -150.0
+
+#: MPT's dynamic ramp (MPT_SIGMA_KADAS_Plugin/gui/symbology.py): fraction of
+#: [min, max] → RGBA.  Weak signal blue, strong red.
+_DBM_RAMP: Tuple[Tuple[float, Tuple[int, int, int, int]], ...] = (
+    (0.00, (0, 0, 255, 180)),
+    (0.25, (0, 255, 255, 180)),
+    (0.50, (0, 255, 0, 180)),
+    (0.75, (255, 255, 0, 200)),
+    (1.00, (255, 0, 0, 220)),
+)
+
+_DBM_RANGE_CACHE: "OrderedDict[tuple, Optional[Tuple[float, float]]]" = OrderedDict()
+_DBM_RANGE_LOCK = threading.Lock()
+_DBM_RANGE_CACHE_MAX = 64
+
+
+def _usable_dbm_range(
+    value_range: Optional[Tuple[float, float]],
+) -> Tuple[float, float]:
+    """*value_range* when it is a real, non-empty range, else the fallback."""
+    if value_range is None:
+        return DBM_FALLBACK_RANGE
+    try:
+        low, high = float(value_range[0]), float(value_range[1])
+    except (TypeError, ValueError, IndexError):
+        return DBM_FALLBACK_RANGE
+    if not (math.isfinite(low) and math.isfinite(high)) or low >= high:
+        return DBM_FALLBACK_RANGE
+    return (low, high)
+
+
+def dbm_ramp_stops(
+    value_range: Optional[Tuple[float, float]],
+) -> List[Tuple[float, Tuple[int, int, int, int], str]]:
+    """The five ``(dBm, rgba, label)`` stops of the received-power ramp.
+
+    Spread over *value_range* (the raster's own min/max), or over
+    :data:`DBM_FALLBACK_RANGE` when that is None, NaN or empty.  Every stop is
+    labelled: an empty label comes back from Layer Properties → Apply as the
+    bare number ("-115.250000").
     """
+    low, high = _usable_dbm_range(value_range)
+    span = high - low
+    stops = []
+    for fraction, rgba in _DBM_RAMP:
+        value = low + span * fraction
+        stops.append((value, rgba, f"{value:.1f} dBm"))
+    return stops
+
+
+def _compute_dbm_range(tif_path: str) -> Tuple[bool, Optional[Tuple[float, float]]]:
+    """``(definitive, range)`` — the exact band-1 min/max in dBm.
+
+    ``ComputeRasterMinMax(False)`` reads every pixel of the full-resolution
+    band and honours its nodata.  The approximate routes are wrong here: the
+    exporter's overview levels carry no GDAL_NODATA, so they count raw 0
+    (−150 dBm) as data.  *definitive* is False when the file could not be
+    read at all (worth trying again), True for a read that found no valid
+    pixel.
+    """
+    from osgeo import gdal
+
+    gdal.UseExceptions()   # as raster_tools / abt do
+    try:
+        ds = gdal.Open(tif_path)
+        band = ds.GetRasterBand(1)
+        scale = band.GetScale()
+        offset = band.GetOffset()
+    except Exception:  # noqa: BLE001 — unreadable now; not remembered
+        return (False, None)
+    try:
+        low_raw, high_raw = band.ComputeRasterMinMax(False)
+    except Exception:  # noqa: BLE001 — GDAL raises when no pixel is valid
+        return (True, None)
+    finally:
+        band = None
+        ds = None
+    scale = 1.0 if scale is None else float(scale)
+    offset = 0.0 if offset is None else float(offset)
+    low, high = low_raw * scale + offset, high_raw * scale + offset
+    if scale < 0:
+        low, high = high, low
+    if not (math.isfinite(low) and math.isfinite(high)):
+        return (True, None)
+    return (True, (float(low), float(high)))
+
+
+def dbm_range(tif_path: str) -> Optional[Tuple[float, float]]:
+    """Exact ``(min, max)`` received power of a SIMPLE_LOSS / ITM GeoTIFF, in
+    dBm (band 1, nodata honoured, scale/offset applied); None when it cannot
+    be read or holds no valid pixel.
+
+    Memoised in-process by ``(path, size, mtime_ns)`` and thread-safe: the
+    run's worker thread calls it right after export (seconds on a 20,000²
+    raster), so the loader's call on the GUI thread is a lookup.  A rewritten
+    file has a new size or mtime and is read again; an unreadable one is not
+    remembered.
+    """
+    try:
+        info = os.stat(tif_path)
+    except OSError:
+        return None
+    key = (os.path.normcase(os.path.abspath(tif_path)),
+           info.st_size, info.st_mtime_ns)
+    with _DBM_RANGE_LOCK:
+        if key in _DBM_RANGE_CACHE:
+            _DBM_RANGE_CACHE.move_to_end(key)
+            return _DBM_RANGE_CACHE[key]
+    # Computed outside the lock: one big raster must not hold up another's.
+    definitive, value = _compute_dbm_range(tif_path)
+    if definitive:
+        with _DBM_RANGE_LOCK:
+            _DBM_RANGE_CACHE[key] = value
+            _DBM_RANGE_CACHE.move_to_end(key)
+            while len(_DBM_RANGE_CACHE) > _DBM_RANGE_CACHE_MAX:
+                _DBM_RANGE_CACHE.popitem(last=False)
+    return value
+
+
+def _apply_signal_strength_style(
+    layer: QgsRasterLayer,
+    value_range: Optional[Tuple[float, float]] = None,
+) -> None:
+    """Apply the received-power ramp to a SIMPLE_LOSS / ITM result.
+
+    MPT's dynamic five-stop ramp (blue → cyan → green → yellow → red) over the
+    raster's own dBm range (see :func:`dbm_ramp_stops`), with the range pinned
+    on shader and renderer so the legend reads in dBm and Layer Properties
+    keeps the stops.  Only raw 0 (:data:`DBM_NODATA`) is transparent.
+    """
+    from qgis.core import QgsRasterRange
+
+    stops = dbm_ramp_stops(value_range)
     color_ramp = QgsColorRampShader()
     color_ramp.setColorRampType(QgsColorRampShader.Type.Interpolated)
-
     color_ramp.setColorRampItemList([
-        QgsColorRampShader.ColorRampItem(-140, QColor("#FF0000"), "-140 dBm"),
-        QgsColorRampShader.ColorRampItem(-70, QColor("#FFFF00"), "-70 dBm"),
-        QgsColorRampShader.ColorRampItem(0, QColor("#00FF00"), "0 dBm"),
+        QgsColorRampShader.ColorRampItem(value, QColor(*rgba), label)
+        for value, rgba, label in stops
     ])
+    _set_legend_unit(color_ramp, " dBm", keep_decimal=True)
 
     shader = QgsRasterShader()
     shader.setRasterShaderFunction(color_ramp)
 
-    renderer = QgsSingleBandPseudoColorRenderer(
-        layer.dataProvider(), 1, shader,
-    )
+    provider = layer.dataProvider()
+    renderer = QgsSingleBandPseudoColorRenderer(provider, 1, shader)
+    _pin_value_range(renderer, color_ramp, stops[0][0], stops[-1][0])
+
+    provider.setUseSourceNoDataValue(1, False)
+    provider.setUserNoDataValue(1, [QgsRasterRange(DBM_NODATA, DBM_NODATA)])
+
     layer.setRenderer(renderer)
     layer.triggerRepaint()
 
@@ -120,7 +307,8 @@ def estimate_altitude_range_m(
 ) -> Tuple[float, float]:
     """Return tidy ``(lowest, highest)`` altitudes for ramps/sliders over a
     MIN_ALT layer, derived from band statistics (which exclude the no-data
-    sentinel).
+    sentinel).  QGIS computes them on the scaled band, so they are metres
+    already (see :mod:`.min_alt`).
 
     The lower bound only matters above sea level: an AGL surface starts at 0,
     but an AMSL one starts at the valley floor, and a slider anchored at 0
@@ -134,18 +322,23 @@ def estimate_altitude_range_m(
         stats = provider.bandStatistics(
             band, QgsRasterBandStats.Stats.Min | QgsRasterBandStats.Stats.Max,
         )
-        max_raw = stats.maximumValue
-        min_raw = stats.minimumValue
+        max_m = float(stats.maximumValue)
+        min_m = float(stats.minimumValue)
     except Exception:
         return fallback
 
-    if max_raw is None or max_raw <= 0 or max_raw >= _ma.MIN_ALT_SENTINEL:
-        return fallback
-    highest = float(_ma.nice_ceiling(_ma.raw_to_altitude(int(max_raw))))
+    def _real(value_m: float) -> bool:
+        # A sentinel that slipped past the nodata tag scales to 32767.5 m.
+        return (math.isfinite(value_m)
+                and 0 < value_m <= _ma.MIN_ALT_MAX_ALTITUDE_M)
 
-    if min_raw is None or min_raw <= 0 or min_raw >= _ma.MIN_ALT_SENTINEL:
+    if not _real(max_m):
+        return fallback
+    highest = float(_ma.nice_ceiling(max_m))
+
+    if not _real(min_m):
         return (0.0, highest)
-    lowest = float(_ma.nice_floor(_ma.raw_to_altitude(int(min_raw))))
+    lowest = float(_ma.nice_floor(min_m))
     # A layer whose whole range rounds into one step would otherwise hand the
     # caller an empty slider.
     return (lowest, highest) if lowest < highest else (0.0, highest)
@@ -191,8 +384,11 @@ def build_min_alt_renderer(
 
     Notes
     -----
-    All ramp/threshold values are converted to **raw u16 units** because QGIS
-    classifies on the unscaled band value (see :mod:`.min_alt`).
+    Every stop is in **metres**: QGIS classifies the band's scaled value (see
+    :mod:`.min_alt`).  In threshold mode the transparent stop sits on the
+    first altitude the encoding holds above the threshold
+    (:func:`min_alt.quantized_above_m`), so a pixel at exactly the threshold
+    is drawn and the next 0.5 m step is not.
     """
     ramp = QgsColorRampShader()
     ramp.setColorRampType(QgsColorRampShader.Type.Interpolated)
@@ -220,16 +416,18 @@ def build_min_alt_renderer(
         return c
 
     items = []
-    seen_raw = set()
+    seen_steps = set()
     steps = 8
+    last_m = base_m
     for i in range(steps + 1):
         alt_m = base_m + (top_m - base_m) * i / steps
-        raw = _ma.altitude_to_raw(alt_m)
-        if raw in seen_raw:
+        step = _ma.quantized_floor_m(alt_m)
+        if step in seen_steps:
             continue  # avoid duplicate stops when top_m is tiny
-        seen_raw.add(raw)
+        seen_steps.add(step)
+        last_m = alt_m
         items.append(QgsColorRampShader.ColorRampItem(
-            raw, _color_for(alt_m),
+            alt_m, _color_for(alt_m),
             "Reachable" if not shade else f"{alt_m:.0f}{suffix}",
         ))
 
@@ -238,10 +436,10 @@ def build_min_alt_renderer(
         # renders transparent — this is what enforces the "reachable at ≤ X" mask
         # independently of the colour scale above.
         transparent = QColor(0, 0, 0, 0)
-        cutoff_raw = _ma.altitude_to_raw(threshold_m) + 1
-        if cutoff_raw not in seen_raw:
+        cutoff_m = _ma.quantized_above_m(threshold_m)
+        if cutoff_m > last_m:
             items.append(QgsColorRampShader.ColorRampItem(
-                cutoff_raw, transparent, "",
+                cutoff_m, transparent, "",
             ))
 
     ramp.setColorRampItemList(items)
@@ -249,10 +447,16 @@ def build_min_alt_renderer(
     # full-range mode — pixels above the ramp saturate at red; in threshold mode
     # the explicit transparent stop already hides everything above the cutoff.
     ramp.setClip(False)
+    _set_legend_unit(ramp, suffix, keep_decimal=False)
 
     shader = QgsRasterShader()
     shader.setRasterShaderFunction(ramp)
-    return QgsSingleBandPseudoColorRenderer(provider, band, shader)
+    renderer = QgsSingleBandPseudoColorRenderer(provider, band, shader)
+    # The legend bar spans the drawn range (to the threshold, not the
+    # transparent cutoff half a metre above it).
+    _pin_value_range(renderer, ramp, base_m,
+                     max(top_m, base_m + _ma.MIN_ALT_STEP_M))
+    return renderer
 
 
 def build_band_renderer(
@@ -281,21 +485,29 @@ def build_band_renderer(
     ramp.setColorRampType(QgsColorRampShader.Type.Discrete)
 
     items = []
-    for stop in _ma.band_stops(bands, reference, hidden_leave_gaps):
+    stops = _ma.band_stops(bands, reference, hidden_leave_gaps)
+    for stop in stops:
         if stop.color is None:
             color = QColor(0, 0, 0, 0)
         else:
             color = QColor(*stop.color)
             color.setAlphaF(alpha)
         items.append(QgsColorRampShader.ColorRampItem(
-            stop.raw, color, stop.label,
+            stop.value_m, color, stop.label,
         ))
 
     ramp.setColorRampItemList(items)
     ramp.setClip(False)
     shader = QgsRasterShader()
     shader.setRasterShaderFunction(ramp)
-    return QgsSingleBandPseudoColorRenderer(provider, band, shader)
+    renderer = QgsSingleBandPseudoColorRenderer(provider, band, shader)
+    # Metres from the ground (or sea level) up to the highest band — not the
+    # transparent sentinel tail.  A discrete legend lists the stops itself;
+    # this only keeps Layer Properties from reclassifying on open.
+    bounds = [stop.value_m for stop in stops[:-1]]
+    top_m = max(bounds) if bounds else _ma.DEFAULT_RAMP_MAX_M
+    _pin_value_range(renderer, ramp, 0.0, max(top_m, _ma.MIN_ALT_STEP_M))
+    return renderer
 
 
 def _apply_min_alt_style(layer: QgsRasterLayer) -> None:
@@ -655,6 +867,7 @@ def load_coverage_result(
     tif_path: str,
     model: str,
     display_name: Optional[str] = None,
+    value_range: Optional[Tuple[float, float]] = None,
 ) -> QgsRasterLayer:
     """Create a styled QgsRasterLayer from an AETHER coverage GeoTIFF.
 
@@ -670,6 +883,10 @@ def load_coverage_result(
     display_name:
         Human-readable name shown in the QGIS Layers panel.  Defaults to
         the filename stem when *None*.
+    value_range:
+        SIMPLE_LOSS / ITM only: the raster's ``(min, max)`` dBm when the
+        caller already has it.  Otherwise :func:`dbm_range` reads it — a
+        memo lookup when the run's worker called it after export.
 
     Returns
     -------
@@ -698,7 +915,9 @@ def load_coverage_result(
     if model_upper == "LOS":
         _apply_los_style(layer)
     elif model_upper in ("SIMPLE_LOSS", "ITM"):
-        _apply_signal_strength_style(layer)
+        if value_range is None:
+            value_range = dbm_range(tif_path)
+        _apply_signal_strength_style(layer, value_range)
     elif model_upper == _ma.MIN_ALT_MODEL:
         _apply_min_alt_style(layer)
     else:

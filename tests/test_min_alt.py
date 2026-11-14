@@ -457,11 +457,14 @@ class TestBandStops(unittest.TestCase):
     def test_one_band_is_a_bound_plus_a_transparent_tail(self):
         stops = ma.band_stops([self._band(100.0, (9, 8, 7))])
         self.assertEqual(len(stops), 2)
-        self.assertEqual(stops[0].raw, ma.altitude_to_raw(100.0))
+        # Metres: QGIS classifies the band's scaled value (100 m, not raw 200).
+        self.assertEqual(stops[0].value_m, 100.0)
         self.assertEqual(stops[0].color, (9, 8, 7))
         self.assertEqual(stops[0].label, "≤ 100 m AGL")
-        # Everything above the top band must be transparent, not the top colour.
-        self.assertEqual(stops[-1].raw, ma.MIN_ALT_SENTINEL)
+        # Everything above the top band must be transparent, not the top colour;
+        # the tail sits on the scaled sentinel (65535 × 0.5).
+        self.assertEqual(stops[-1].value_m, 32767.5)
+        self.assertEqual(stops[-1].value_m, ma.MIN_ALT_SENTINEL_M)
         self.assertIsNone(stops[-1].color)
 
     def test_bands_come_back_in_altitude_order_with_ring_labels(self):
@@ -470,8 +473,8 @@ class TestBandStops(unittest.TestCase):
             self._band(100.0, (1, 1, 1)),
             self._band(200.0, (2, 2, 2)),
         ])
-        self.assertEqual([s.raw for s in stops[:-1]],
-                         [ma.altitude_to_raw(m) for m in (100.0, 200.0, 300.0)])
+        self.assertEqual([s.value_m for s in stops[:-1]],
+                         [100.0, 200.0, 300.0])
         self.assertEqual([s.color for s in stops[:-1]],
                          [(1, 1, 1), (2, 2, 2), (3, 3, 3)])
         self.assertEqual([s.label for s in stops[:-1]], [
@@ -480,9 +483,9 @@ class TestBandStops(unittest.TestCase):
 
     def test_stops_ascend_so_a_discrete_ramp_can_bisect_them(self):
         stops = ma.band_stops([self._band(m) for m in (50.0, 125.0, 400.0)])
-        raws = [s.raw for s in stops]
-        self.assertEqual(raws, sorted(raws))
-        self.assertEqual(len(set(raws)), len(raws))
+        values = [s.value_m for s in stops]
+        self.assertEqual(values, sorted(values))
+        self.assertEqual(len(set(values)), len(values))
 
     def test_duplicate_altitudes_collapse(self):
         # A second band at the same altitude would own an empty ring, and a
@@ -493,9 +496,14 @@ class TestBandStops(unittest.TestCase):
         self.assertEqual(stops[0].color, (1, 1, 1))
 
     def test_altitudes_within_one_count_collapse(self):
-        # 100.0 and 100.2 m both quantise to raw 200 — one ring, not two.
+        # 100.0 and 100.2 m select the same pixels (the grid is 0.5 m) — one
+        # ring, not two.
         stops = ma.band_stops([self._band(100.0), self._band(100.2)])
         self.assertEqual(len(stops), 2)
+
+    def test_the_next_step_is_its_own_ring(self):
+        stops = ma.band_stops([self._band(100.0), self._band(100.5)])
+        self.assertEqual([s.value_m for s in stops[:-1]], [100.0, 100.5])
 
     def test_a_hidden_band_hands_its_area_to_the_next_shown_one(self):
         # Default: 3000 m covering everything must not leave 5000 m empty once
@@ -505,7 +513,7 @@ class TestBandStops(unittest.TestCase):
             self._band(5000.0, (2, 2, 2)),
         ])
         self.assertEqual(len(stops), 2)
-        self.assertEqual(stops[0].raw, ma.altitude_to_raw(5000.0))
+        self.assertEqual(stops[0].value_m, 5000.0)
         self.assertEqual(stops[0].color, (2, 2, 2))
         self.assertEqual(stops[0].label, "≤ 5000 m AGL")
 
@@ -513,7 +521,7 @@ class TestBandStops(unittest.TestCase):
         stops = ma.band_stops([self._band(100.0, visible=False)])
         self.assertEqual(len(stops), 1)
         self.assertIsNone(stops[0].color)
-        self.assertEqual(stops[0].raw, ma.MIN_ALT_SENTINEL)
+        self.assertEqual(stops[0].value_m, ma.MIN_ALT_SENTINEL_M)
 
     def test_gap_mode_hidden_band_still_bounds_the_one_above_it(self):
         # Optional: hiding "<= 100 m" leaves a hole, not its area to "<= 200 m".
@@ -521,7 +529,7 @@ class TestBandStops(unittest.TestCase):
             self._band(100.0, (1, 1, 1), visible=False),
             self._band(200.0, (2, 2, 2)),
         ], hidden_leave_gaps=True)
-        self.assertEqual(stops[0].raw, ma.altitude_to_raw(100.0))
+        self.assertEqual(stops[0].value_m, 100.0)
         self.assertIsNone(stops[0].color)
         self.assertEqual(stops[1].color, (2, 2, 2))
         self.assertEqual(stops[1].label, "100 – 200 m AGL")
@@ -534,6 +542,35 @@ class TestBandStops(unittest.TestCase):
     def test_labels_follow_the_reference(self):
         stops = ma.band_stops([self._band(1500.0)], ma.REF_AMSL)
         self.assertEqual(stops[0].label, "≤ 1500 m AMSL")
+
+
+class TestQuantizedMetres(unittest.TestCase):
+    """The 0.5 m grid the pixels live on, in metres (what QGIS classifies)."""
+
+    def test_floor_keeps_a_grid_value(self):
+        self.assertEqual(ma.quantized_floor_m(100.0), 100.0)
+        self.assertEqual(ma.quantized_floor_m(100.5), 100.5)
+
+    def test_floor_drops_to_the_grid(self):
+        self.assertEqual(ma.quantized_floor_m(100.2), 100.0)
+        self.assertEqual(ma.quantized_floor_m(100.49), 100.0)
+
+    def test_floor_of_a_hair_under_a_step_is_that_step(self):
+        self.assertEqual(ma.quantized_floor_m(100.5 - 1e-12), 100.5)
+
+    def test_floor_never_goes_below_zero(self):
+        self.assertEqual(ma.quantized_floor_m(-3.0), 0.0)
+
+    def test_above_is_the_next_step(self):
+        # A threshold mask hides from here up: 100.3 m keeps the 100 m pixels
+        # and hides 100.5 m (the old raw cutoff rounded 100.3 → 100.5 m, kept).
+        self.assertEqual(ma.quantized_above_m(100.0), 100.5)
+        self.assertEqual(ma.quantized_above_m(100.3), 100.5)
+        self.assertEqual(ma.quantized_above_m(0.0), 0.5)
+
+    def test_sentinel_in_metres(self):
+        self.assertEqual(ma.MIN_ALT_SENTINEL_M, 32767.5)
+        self.assertGreater(ma.MIN_ALT_SENTINEL_M, ma.MIN_ALT_MAX_ALTITUDE_M)
 
 
 class TestBandReference(unittest.TestCase):
@@ -646,35 +683,33 @@ class TestBandStopsOnASubset(unittest.TestCase):
         # "<= 2500", never "300 - 2500": the 300 went to the other raster.
         stops = ma.band_stops(self.grouped[ma.REF_AMSL], ma.REF_AMSL)
         self.assertEqual([s.label for s in stops[:-1]], ["≤ 2500 m AMSL"])
-        self.assertEqual(stops[0].raw, ma.altitude_to_raw(2500.0))
+        self.assertEqual(stops[0].value_m, 2500.0)
 
     def test_the_other_group_keeps_its_own_nesting(self):
         stops = ma.band_stops(self.grouped[ma.REF_AGL], ma.REF_AGL)
-        self.assertEqual([s.raw for s in stops[:-1]],
-                         [ma.altitude_to_raw(100.0), ma.altitude_to_raw(300.0)])
+        self.assertEqual([s.value_m for s in stops[:-1]], [100.0, 300.0])
         self.assertEqual([s.label for s in stops[:-1]],
                          ["≤ 100 m AGL", "100 – 300 m AGL"])
 
     def test_no_stop_of_the_other_reference_leaks_in(self):
-        # The altitudes are not comparable: raw 5000 (2500 m) on the
-        # above-ground raster would paint a ring nothing asked for.
+        # The altitudes are not comparable: 2500 m on the above-ground raster
+        # would paint a ring nothing asked for.
         for reference in ma.REFERENCES:
             with self.subTest(reference=reference):
                 stops = ma.band_stops(self.grouped[reference], reference)
-                mine = {ma.altitude_to_raw(b.altitude_m)
-                        for b in self.grouped[reference]}
+                mine = {b.altitude_m for b in self.grouped[reference]}
                 self.assertEqual(
-                    {s.raw for s in stops[:-1]}, mine,
+                    {s.value_m for s in stops[:-1]}, mine,
                 )
 
     def test_each_subset_still_ends_transparent_and_ascends(self):
         for reference in ma.REFERENCES:
             with self.subTest(reference=reference):
                 stops = ma.band_stops(self.grouped[reference], reference)
-                raws = [s.raw for s in stops]
-                self.assertEqual(raws, sorted(raws))
-                self.assertEqual(len(set(raws)), len(raws))
-                self.assertEqual(stops[-1].raw, ma.MIN_ALT_SENTINEL)
+                values = [s.value_m for s in stops]
+                self.assertEqual(values, sorted(values))
+                self.assertEqual(len(set(values)), len(values))
+                self.assertEqual(stops[-1].value_m, ma.MIN_ALT_SENTINEL_M)
                 self.assertIsNone(stops[-1].color)
 
 
