@@ -40,13 +40,14 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 from qgis.core import Qgis, QgsMessageLog, QgsProject, QgsRasterLayer
 from qgis.gui import QgsColorButton, QgsDockWidget, QgsMapLayerComboBox
-from qgis.PyQt.QtCore import QSize, Qt, QThread, pyqtSignal
+from qgis.PyQt.QtCore import QSize, Qt, QThread, QTimer, pyqtSignal
 from qgis.PyQt.QtGui import QColor, QIcon, QPixmap
 from qgis.PyQt.QtWidgets import (
     QButtonGroup,
     QCheckBox,
     QDialog,
     QDialogButtonBox,
+    QDockWidget,
     QFileDialog,
     QGroupBox,
     QHBoxLayout,
@@ -2157,26 +2158,106 @@ class AltitudeExplorerDock(QgsDockWidget):
 
 _INSTANCE: Optional[AltitudeExplorerDock] = None
 
+#: The dock never takes more than this share of the main window's width: the
+#: map beside it shows the layers it drives.
+_MAX_WIDTH_SHARE = 0.4
+#: Docked top or bottom, it shares the map's axis: at most this share of the
+#: window height there.
+_MAX_HEIGHT_SHARE_TOP_BOTTOM = 0.5
+
+
+def _add_as_raised_tab(iface, dock: "AltitudeExplorerDock") -> None:
+    """Dock on the right, as a raised tab over the docks already there.
+
+    ``addDockWidget`` alone put the explorer UNDER every dock already in the
+    right column (Processing Toolbox, Layer Styling, …): a third or less of
+    the height, its controls behind a scroll bar, and users did not drag it
+    up. Tabbed (QGIS >= 3.14 ``addTabifiedDockWidget``: the first dock there,
+    raised) it starts in front, the others one click away. An empty column
+    simply gets the dock.
+    """
+    area = Qt.DockWidgetArea.RightDockWidgetArea
+    add_tabified = getattr(iface, "addTabifiedDockWidget", None)
+    if callable(add_tabified):
+        add_tabified(area, dock, [], True)
+    else:
+        iface.addDockWidget(area, dock)
+
+
+def _open_large(iface, dock: "AltitudeExplorerDock") -> None:
+    """Give the dock as much room as its place allows.
+
+    Left / right column: its whole height (``resizeDocks`` leaves the other
+    docks of the column their minimum) and at least the width its content
+    asks for, up to :data:`_MAX_WIDTH_SHARE` of the window. Top / bottom: its
+    content's height, up to :data:`_MAX_HEIGHT_SHARE_TOP_BOTTOM` — the map
+    shares that axis. Floating: left as the user placed it.
+    """
+    with contextlib.suppress(Exception):  # sizing is a courtesy, never an error
+        from qgis.PyQt import sip
+
+        if sip.isdeleted(dock) or dock.isFloating() or not dock.isVisible():
+            return
+        win = iface.mainWindow()
+        area = win.dockWidgetArea(dock)
+        hint = dock.sizeHint()
+        if area in (Qt.DockWidgetArea.LeftDockWidgetArea,
+                    Qt.DockWidgetArea.RightDockWidgetArea):
+            # resizeDocks shares the space only among the docks it is given:
+            # the others of the column go in with a nominal 1 px, so they
+            # keep just their minimum height (still there, still draggable).
+            tabbed = set(win.tabifiedDockWidgets(dock))
+            column = [
+                other for other in win.findChildren(QDockWidget)
+                if other is not dock and other not in tabbed
+                and other.isVisible() and not other.isFloating()
+                and win.dockWidgetArea(other) == area
+            ]
+            win.resizeDocks([dock] + column,
+                            [max(win.height(), hint.height())] + [1] * len(column),
+                            Qt.Orientation.Vertical)
+            width = min(max(dock.width(), hint.width()),
+                        int(win.width() * _MAX_WIDTH_SHARE))
+            if width > dock.width():
+                win.resizeDocks([dock], [width], Qt.Orientation.Horizontal)
+        elif area in (Qt.DockWidgetArea.TopDockWidgetArea,
+                      Qt.DockWidgetArea.BottomDockWidgetArea):
+            height = min(hint.height(),
+                         int(win.height() * _MAX_HEIGHT_SHARE_TOP_BOTTOM))
+            if height > dock.height():
+                win.resizeDocks([dock], [height], Qt.Orientation.Vertical)
+
+
+def _open_large_soon(iface, dock: "AltitudeExplorerDock") -> None:
+    """:func:`_open_large` once the main window has laid out the new dock."""
+    QTimer.singleShot(0, lambda: _open_large(iface, dock))
+
 
 def show_altitude_explorer(iface) -> "AltitudeExplorerDock":
     """Create the Altitude Explorer dock (or reveal the existing one) and
-    return it."""
+    return it — in front and as large as its place allows."""
     global _INSTANCE
     from qgis.PyQt import sip
 
     if _INSTANCE is not None:
         with contextlib.suppress(Exception):
             if not sip.isdeleted(_INSTANCE):
+                was_hidden = not _INSTANCE.isVisible()
                 _INSTANCE.refresh_layers()
                 _INSTANCE.show()
                 _INSTANCE.raise_()
+                if was_hidden:
+                    # Closed earlier: reopen it large. A visible dock keeps
+                    # the size the user gave it.
+                    _open_large_soon(iface, _INSTANCE)
                 return _INSTANCE
         _INSTANCE = None
 
     _INSTANCE = AltitudeExplorerDock(iface, iface.mainWindow())
-    iface.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, _INSTANCE)
+    _add_as_raised_tab(iface, _INSTANCE)
     _INSTANCE.show()
     _INSTANCE.raise_()
+    _open_large_soon(iface, _INSTANCE)
     return _INSTANCE
 
 

@@ -301,6 +301,7 @@ _qtcore.Qt = type("Qt", (), {
     "CursorShape": _enum_scope("CursorShape", CrossCursor=2, WaitCursor=3),
     "DockWidgetArea": _enum_scope(
         "DockWidgetArea", LeftDockWidgetArea=1, RightDockWidgetArea=2,
+        TopDockWidgetArea=4, BottomDockWidgetArea=8,
     ),
     "ItemDataRole": _enum_scope("ItemDataRole", DisplayRole=0, UserRole=0x0100),
     "ConnectionType": _enum_scope(
@@ -346,6 +347,7 @@ _widget_names = [
     "QTextBrowser", "QTextEdit", "QProgressDialog", "QApplication",
     "QListWidget",
     "QListWidgetItem", "QScrollArea", "QStackedWidget", "QSlider", "QMenu",
+    "QDockWidget",
 ]
 for name in _widget_names:
     if name in ("QWidget",):

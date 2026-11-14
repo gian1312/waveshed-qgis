@@ -929,5 +929,210 @@ class TestAltitudeRange(_PatchMixin, unittest.TestCase):
         self.assertEqual(band.altitude_m, 1200.0)
 
 
+# ---------------------------------------------------------------------------
+# Opening the dock: in front and as large as its place allows (owner,
+# 2026-11-14: "it gets squeezed to the bottom and users might not pull it up")
+# ---------------------------------------------------------------------------
+
+class _Size:
+    def __init__(self, w, h):
+        self._w, self._h = w, h
+
+    def width(self):
+        return self._w
+
+    def height(self):
+        return self._h
+
+
+class _FakeDock:
+    def __init__(self, w=300, h=200, hint=(481, 527), floating=False,
+                 visible=True):
+        self._w, self._h, self._hint = w, h, hint
+        self.floating, self.visible = floating, visible
+
+    def width(self):
+        return self._w
+
+    def height(self):
+        return self._h
+
+    def sizeHint(self):
+        return _Size(*self._hint)
+
+    def isFloating(self):
+        return self.floating
+
+    def isVisible(self):
+        return self.visible
+
+
+class _FakeWindow:
+    def __init__(self, area, docks=(), tabbed=(), areas=None):
+        self.area, self.docks, self.tabbed = area, list(docks), list(tabbed)
+        self.areas = areas or {}
+        self.calls = []
+
+    def height(self):
+        return 1000
+
+    def width(self):
+        return 1600
+
+    def dockWidgetArea(self, dock):
+        return self.areas.get(id(dock), self.area)
+
+    def tabifiedDockWidgets(self, dock):
+        return self.tabbed
+
+    def findChildren(self, cls):
+        return self.docks
+
+    def resizeDocks(self, docks, sizes, orientation):
+        self.calls.append((list(docks), list(sizes), orientation))
+
+
+class _FakeIface:
+    def __init__(self, win, tabified=True):
+        self.win, self.added = win, []
+        if tabified:
+            self.addTabifiedDockWidget = (
+                lambda area, dock, names, raise_tab:
+                self.added.append(("tabified", area, dock, names, raise_tab)))
+
+    def mainWindow(self):
+        return self.win
+
+    def addDockWidget(self, area, dock):
+        self.added.append(("plain", area, dock))
+
+
+class TestOpenLarge(unittest.TestCase):
+    """``show_altitude_explorer``'s placement and sizing (fakes, no Qt)."""
+
+    def setUp(self):
+        sip = mock.MagicMock()
+        sip.isdeleted.return_value = False
+        self._sip = mock.patch.dict(sys.modules, {"qgis.PyQt.sip": sip})
+        self._sip.start()
+        self._attr = mock.patch.object(sys.modules["qgis.PyQt"], "sip", sip,
+                                       create=True)
+        self._attr.start()
+
+    def tearDown(self):
+        self._attr.stop()
+        self._sip.stop()
+
+    def test_added_as_a_raised_tab_over_the_right_column(self):
+        dock = _FakeDock()
+        iface = _FakeIface(_FakeWindow(Qt.DockWidgetArea.RightDockWidgetArea))
+        ae._add_as_raised_tab(iface, dock)
+        self.assertEqual(iface.added, [
+            ("tabified", Qt.DockWidgetArea.RightDockWidgetArea, dock, [], True)])
+
+    def test_without_tabify_support_it_is_added_plainly(self):
+        dock = _FakeDock()
+        iface = _FakeIface(_FakeWindow(Qt.DockWidgetArea.RightDockWidgetArea),
+                           tabified=False)
+        ae._add_as_raised_tab(iface, dock)
+        self.assertEqual(iface.added, [
+            ("plain", Qt.DockWidgetArea.RightDockWidgetArea, dock)])
+
+    def test_side_column_full_height_others_to_their_minimum(self):
+        dock = _FakeDock(w=300)
+        tabbed, below = _FakeDock(), _FakeDock()
+        floating, hidden = _FakeDock(floating=True), _FakeDock(visible=False)
+        on_the_left = _FakeDock()
+        win = _FakeWindow(
+            Qt.DockWidgetArea.RightDockWidgetArea,
+            docks=[dock, tabbed, below, floating, hidden, on_the_left],
+            tabbed=[tabbed],
+            areas={id(on_the_left): Qt.DockWidgetArea.LeftDockWidgetArea})
+        ae._open_large(_FakeIface(win), dock)
+        self.assertEqual(win.calls[0], (
+            [dock, below], [1000, 1], Qt.Orientation.Vertical))
+        # Widened to what its content asks for (481 < 40 % of 1600).
+        self.assertEqual(win.calls[1], ([dock], [481], Qt.Orientation.Horizontal))
+        self.assertEqual(len(win.calls), 2)
+
+    def test_width_is_capped_so_the_map_stays_usable(self):
+        dock = _FakeDock(w=300, hint=(900, 527))
+        win = _FakeWindow(Qt.DockWidgetArea.LeftDockWidgetArea, docks=[dock])
+        ae._open_large(_FakeIface(win), dock)
+        self.assertEqual(win.calls[-1], ([dock], [640], Qt.Orientation.Horizontal))
+
+    def test_a_wide_enough_column_keeps_its_width(self):
+        dock = _FakeDock(w=600)
+        win = _FakeWindow(Qt.DockWidgetArea.RightDockWidgetArea, docks=[dock])
+        ae._open_large(_FakeIface(win), dock)
+        self.assertEqual([c[2] for c in win.calls], [Qt.Orientation.Vertical])
+
+    def test_bottom_area_gets_its_content_height_not_the_map(self):
+        dock = _FakeDock(h=150, hint=(481, 527))
+        win = _FakeWindow(Qt.DockWidgetArea.BottomDockWidgetArea, docks=[dock])
+        ae._open_large(_FakeIface(win), dock)
+        self.assertEqual(win.calls, [([dock], [500], Qt.Orientation.Vertical)])
+
+    def test_floating_or_hidden_is_left_alone(self):
+        for dock in (_FakeDock(floating=True), _FakeDock(visible=False)):
+            win = _FakeWindow(Qt.DockWidgetArea.RightDockWidgetArea, docks=[dock])
+            ae._open_large(_FakeIface(win), dock)
+            self.assertEqual(win.calls, [])
+
+    def _shown(self, existing):
+        """show_altitude_explorer with the dock class and timer faked;
+        returns (dock, iface, scheduled sizing calls)."""
+        iface = _FakeIface(_FakeWindow(Qt.DockWidgetArea.RightDockWidgetArea))
+        scheduled = []
+        made = []
+
+        class Dock(_FakeDock):
+            def __init__(self, *_a):
+                super().__init__()
+                self.raised = 0
+                made.append(self)
+
+            def refresh_layers(self):
+                pass
+
+            def show(self):
+                self.visible = True
+
+            def raise_(self):
+                self.raised += 1
+
+        with mock.patch.object(ae, "AltitudeExplorerDock", Dock), \
+                mock.patch.object(ae, "_open_large_soon",
+                                  lambda i, d: scheduled.append(d)), \
+                mock.patch.object(ae, "_INSTANCE", existing):
+            if existing == "make":
+                ae._INSTANCE = None
+            dock = ae.show_altitude_explorer(iface)
+            ae._INSTANCE = None
+        return dock, iface, scheduled, made
+
+    def test_a_new_dock_opens_in_front_and_large(self):
+        dock, iface, scheduled, _ = self._shown(None)
+        self.assertEqual(iface.added[0][0], "tabified")
+        self.assertEqual(dock.raised, 1)
+        self.assertEqual(scheduled, [dock])
+
+    def test_a_visible_dock_keeps_the_size_the_user_gave_it(self):
+        existing = _FakeDock(visible=True)
+        existing.refresh_layers = lambda: None
+        existing.show = lambda: None
+        existing.raise_ = lambda: None
+        _, iface, scheduled, made = self._shown(existing)
+        self.assertEqual((iface.added, scheduled, made), ([], [], []))
+
+    def test_a_closed_dock_reopens_large(self):
+        existing = _FakeDock(visible=False)
+        existing.refresh_layers = lambda: None
+        existing.show = lambda: setattr(existing, "visible", True)
+        existing.raise_ = lambda: None
+        _, iface, scheduled, made = self._shown(existing)
+        self.assertEqual((iface.added, scheduled, made), ([], [existing], []))
+
+
 if __name__ == "__main__":
     unittest.main()

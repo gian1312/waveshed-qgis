@@ -1293,7 +1293,10 @@ _ALTITUDE_EXPLORER = """
 <b>Altitude Explorer</b> — the dock opened from <b>Plugins &rarr; Waveshed
 &rarr; Altitude Explorer</b>, from the toolbar, or from the prompt after a LOS
 Floor run — is how you read that answer. It only re-styles layers, so every
-change is instant: nothing is recomputed.</p>
+change is instant: nothing is recomputed. It opens on the right, in front of
+the panels already there (they stay one tab or one drag away), as tall as the
+window allows; once open it keeps the size you give it, and reopens large after
+you close it.</p>
 
 <h3>What the raster holds</h3>
 <p>One 16-bit value per pixel: the lowest altitude at which that location first
