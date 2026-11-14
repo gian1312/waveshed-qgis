@@ -88,7 +88,7 @@ class _Group:
 
 
 ITM_VALUES = {"eps": 25.0, "sgm": 0.02, "ens": 320.0, "climate": 6, "pol": 1,
-              "conf": 0.9, "rel": 0.7, "earth_radius": "ADVANCED"}
+              "conf": 0.9, "rel": 0.7}
 
 PAT = {"name": "Pat", "frequency_mhz": 868.0, "erp_watts": 5.0,
        "default_height_m": 77.0, "default_height_mode": "AGL",
@@ -118,6 +118,8 @@ def _tab(mode="LOSS", batch=False, asset="", itm=True):
         setattr(tab, name, _Spin(v))
     if itm:
         tab.itm_group = _Group(ITM_VALUES)
+    # Earth Radius Mode sits in the Analysis group (every mode), not in ITM.
+    tab.combo_earth_radius = _Combo("ADVANCED")
     return tab
 
 
@@ -126,6 +128,26 @@ class _AssetStore(unittest.TestCase):
         patcher = mock.patch.object(p2p_mod, "list_assets", return_value=ASSETS)
         patcher.start()
         self.addCleanup(patcher.stop)
+        # The batch input is switched off in the product (owner, 2026-11-14);
+        # these tests keep its code path honest for when it comes back.
+        switch = mock.patch.object(p2p_mod, "BATCH_INPUT_ENABLED", True)
+        switch.start()
+        self.addCleanup(switch.stop)
+
+
+class BatchInputSwitchedOff(unittest.TestCase):
+    """Owner, 2026-11-14: "disable and hide the p2p batch input"."""
+
+    def test_the_switch_is_off(self):
+        self.assertFalse(p2p_mod.BATCH_INPUT_ENABLED)
+
+    def test_a_batch_choice_is_never_a_batch_while_off(self):
+        self.assertFalse(_tab(batch=True)._is_batch())
+
+    def test_a_run_with_the_switch_off_builds_the_single_link(self):
+        with mock.patch.object(p2p_mod, "list_assets", return_value=ASSETS):
+            params = _tab(batch=True)._collect_params()
+        self.assertEqual((params.tx_lat, params.tx_lon), (46.8, 7.3))
 
 
 # ---------------------------------------------------------------------------
@@ -310,6 +332,10 @@ def dataclass_copy(params: P2PParams) -> P2PParams:
 
 
 class BatchResults(unittest.TestCase):
+    def setUp(self):
+        switch = mock.patch.object(p2p_mod, "BATCH_INPUT_ENABLED", True)
+        switch.start()
+        self.addCleanup(switch.stop)
 
     def test_every_link_is_listed(self):
         rows = [{"Source_ID": s, "Target_ID": t, "Signal_dBm": "-80.1",

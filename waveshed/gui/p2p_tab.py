@@ -102,7 +102,7 @@ from ..core.terrain_adapter import (
 )
 from .engine_notices import setup_title, show_run_error
 from .height_inputs import MIN_AMSL_M, bind_height_mode
-from .itm_params import ItmParamsGroup
+from .itm_params import EARTH_RADIUS_MODES, EARTH_RADIUS_TIP, ItmParamsGroup
 from .output_dir import P2P_OUTPUT_DIR_KEY, bind_output_dir, save_output_dir
 from .map_tools import activate_point_capture
 from .plotting import XYPlotWidget
@@ -285,6 +285,11 @@ def _parse_batch_csv(path: str) -> List[Tuple[str, str, float, float, float, str
 P2P_BATCH_CSV_KEY = "waveshed/p2p_batch_csv"
 
 #: The two "Links:" choices.
+#: The tab's batch CSV input ("Links: Single link / Batch CSV"). Hidden and
+#: disabled by the owner (2026-11-14: "disable and hide the p2p batch input");
+#: the code, its checks and tests stay. True shows the row again.
+BATCH_INPUT_ENABLED = False
+
 INPUT_SINGLE = "Single link"
 INPUT_BATCH = "Batch CSV"
 
@@ -1070,9 +1075,11 @@ class P2PTab(QWidget):
     _last_run_batch = False
 
     def _is_batch(self) -> bool:
-        """True while "Links:" is "Batch CSV"."""
+        """True while "Links:" is "Batch CSV" — never while the batch input
+        is switched off (:data:`BATCH_INPUT_ENABLED`)."""
         combo = self.combo_input
-        return combo is not None and combo.currentText() == INPUT_BATCH
+        return (BATCH_INPUT_ENABLED and combo is not None
+                and combo.currentText() == INPUT_BATCH)
 
     def _on_input_changed(self, *_args) -> None:
         """Single link ↔ batch CSV: the endpoints are disabled for a batch
@@ -1270,7 +1277,12 @@ class P2PTab(QWidget):
         main_layout = QVBoxLayout(self)
 
         # ---- Links: single link (Site A / Site B) or the user's batch CSV ----
-        main_layout.addLayout(self._build_input_row())
+        # Hidden and disabled (BATCH_INPUT_ENABLED, owner 2026-11-14); the
+        # code stays so the input can be switched back on.
+        self._links_row = QWidget()
+        self._links_row.setLayout(self._build_input_row())
+        self._links_row.setVisible(BATCH_INPUT_ENABLED)
+        main_layout.addWidget(self._links_row)
 
         # The two endpoints, disabled as a whole while a batch CSV is chosen.
         self._endpoints = QWidget()
@@ -1287,8 +1299,6 @@ class P2PTab(QWidget):
         # computed for other ground / climate than the 360° run.
         self.itm_group = ItmParamsGroup()
         self.itm_group.setVisible(False)
-        # Earth Radius Mode lives in the group now (only CPU ITM reads it).
-        self.combo_earth_radius = self.itm_group.combo_earth_radius
         main_layout.addWidget(self.itm_group)
 
         # ---- Analysis settings (DEM, resolution, backend, output dir) ----
@@ -1543,8 +1553,11 @@ class P2PTab(QWidget):
         backend_row.addWidget(self.btn_browse_dir)
         layout.addRow("Backend:", backend_row)
 
-        # Earth Radius Mode moved into the ITM group (itm_params): only the
-        # CPU ITM paths read it.
+        # Earth Radius Mode — every mode (LOS included), as in the 360° tab.
+        self.combo_earth_radius = QComboBox()
+        self.combo_earth_radius.addItems(list(EARTH_RADIUS_MODES))
+        self.combo_earth_radius.setToolTip(EARTH_RADIUS_TIP)
+        layout.addRow("Earth Radius Mode:", self.combo_earth_radius)
 
         return group
 
@@ -1781,6 +1794,12 @@ class P2PTab(QWidget):
     # Collect parameters from widgets
     # ------------------------------------------------------------------
 
+    def _earth_radius(self) -> str:
+        """Earth Radius Mode (the Analysis group's combo); the engine default
+        on a bare instance without it (tests)."""
+        combo = getattr(self, "combo_earth_radius", None)
+        return combo.currentText() if combo is not None else "FOUR_THIRDS"
+
     def _itm_values(self) -> dict:
         """The ITM group's ``P2PParams`` fields (eps … earth_radius); {} on a
         bare instance without the group (the dataclass defaults are the
@@ -1844,9 +1863,10 @@ class P2PTab(QWidget):
             model=model,
             resolution_m=int(self.combo_resolution.currentText()),
             backend=self.combo_backend.currentText(),
-            # ITM parameters + Earth Radius Mode: this tab's ITM group
-            # (before 2026-11-14 P2P ITM always ran the engine defaults).
+            # ITM parameters: this tab's ITM group (before 2026-11-14 P2P ITM
+            # always ran the engine defaults). Earth Radius Mode: every mode.
             **self._itm_values(),
+            earth_radius=self._earth_radius(),
             # Output
             output_name=f"p2p_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
         )

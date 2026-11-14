@@ -286,11 +286,12 @@ the job JSON, in the Processing dropdown and on the layer's stamp. In the user
 interface it is <b>LOS Floor</b>.</p>
 
 <h3>Earth Radius Mode</h3>
-<p><b>Earth Radius Mode:</b> sits in each tab's <b>ITM Parameters</b> group,
-shown in Propagation mode only, because only ITM on the CPU backend reads it
-(<b>Backend:</b> CPU, or AUTO on a machine without a usable GPU). The GPU
-backend, LOS and LOS Floor always use the standard 4/3 earth, whatever the
-setting:</p>
+<p>Both analysis tabs carry <b>Earth Radius Mode:</b> in every mode: the
+earth's curvature shapes the horizon of a plain LOS or LOS Floor run as much as
+an ITM one. What the engine does with it today: only ITM on the CPU backend
+reads it (<b>Backend:</b> CPU, or AUTO on a machine without a usable GPU); LOS,
+LOS Floor and every GPU run still compute with the standard 4/3 earth,
+whatever the setting.</p>
 <ul>
 <li><b>FOUR_THIRDS</b> (default, recommended) — standard refraction: the engine
 derives the effective curvature from the surface refractivity, which at
@@ -677,6 +678,9 @@ unchecked, no band gets buildings.</td></tr>
 <tr><td><b>Backend:</b></td><td><b>AUTO</b> (GPU when one is usable, else CPU),
 <b>GPU</b> or <b>CPU</b>. Forcing CPU is much slower but sidesteps a driver
 problem.</td></tr>
+<tr><td><b>Earth Radius Mode:</b></td><td><b>FOUR_THIRDS</b> or
+<b>ADVANCED</b>, in every mode — see <a href="#models">Modes and
+models</a>.</td></tr>
 <tr><td><b>Output Dir:</b></td><td>Where results are written, with
 <b>Browse...</b>. Defaults to <code>aether_output</code> in the system temp
 directory. The folder you choose (or type) is remembered for the next time the
@@ -689,9 +693,7 @@ tab, not from this tab.</p>
 <p>Shown only in <b>Propagation</b> mode with model <b>ITM</b>:
 <b>Ground Permittivity:</b>, <b>Ground Conductivity:</b>,
 <b>Surface Refractivity:</b>, <b>Radio Climate:</b>, <b>Polarization:</b>,
-<b>Confidence:</b>, <b>Reliability:</b> and <b>Earth Radius Mode:</b>
-(<b>FOUR_THIRDS</b> or <b>ADVANCED</b>; ITM on the CPU backend only — see
-<a href="#models">Modes and models</a>). Each is explained under
+<b>Confidence:</b> and <b>Reliability:</b>. Each is explained under
 <a href="#itm">ITM parameters</a>.</p>
 
 <h3>What happens when you press Run Analysis</h3>
@@ -815,9 +817,7 @@ sidecar.</td></tr>
 # ---------------------------------------------------------------------------
 
 _P2P = """
-<p>The <b>P2P Link</b> tab analyses one link between two points, or every link
-of a batch CSV (<b>Links:</b> above the endpoints: <b>Single link</b> or
-<b>Batch CSV</b>, see <a href="#p2p">Batch CSV</a>). In
+<p>The <b>P2P Link</b> tab analyses a single link between two points. In
 <b>Line of Sight (LOS)</b> mode the endpoints are labelled <b>Site A:</b> and
 <b>Site B:</b>; in <b>Propagation</b> mode they become
 <b>Transmitter:</b> and <b>Receiver:</b> and the <b>Parameters</b> group
@@ -851,15 +851,15 @@ antenna pattern, greyed out otherwise.</li>
 <p><b>DEM Layer:</b> with <b>Folder…</b> (the same list as in the 360&deg;
 tab: raster layers, the Settings <b>Local:</b> terrain folder and the folders
 picked with <b>Folder…</b> in either tab), <b>Resolution:</b>, <b>Backend:</b>,
-and <b>Output Dir:</b> with <b>Browse</b>. The same meanings as in the
-<a href="#site-analysis">360&deg; tab</a>; this tab remembers its own output
-folder, separately from the 360&deg; tab.</p>
+<b>Output Dir:</b> with <b>Browse</b>, and <b>Earth Radius Mode:</b> (every
+mode). The same meanings as in the <a href="#site-analysis">360&deg; tab</a>;
+this tab remembers its own output folder, separately from the 360&deg;
+tab.</p>
 
 <h3>ITM Parameters</h3>
 <p>The tab has its own <b>ITM Parameters</b> group — the same controls as the
-360&deg; tab's (including <b>Earth Radius Mode:</b>), with their own values —
-shown in <b>Propagation</b> mode with model <b>ITM</b>. See
-<a href="#itm">ITM parameters</a>.</p>
+360&deg; tab's, with their own values — shown in <b>Propagation</b> mode with
+model <b>ITM</b>. See <a href="#itm">ITM parameters</a>.</p>
 
 <h3>Running</h3>
 <p><b>Run Analysis</b> validates the inputs (both endpoints placed, a DEM
@@ -867,10 +867,7 @@ selected, an output directory, both antenna heights above their floor),
 warns about out-of-range model parameters and large terrain downloads, then
 writes a two-line batch CSV from the endpoints, prepares terrain over the pair,
 and runs <code>aether_core</code>. There is no export step — the engine writes
-its results directly. With <b>Batch CSV</b>, every line of the file is checked
-first (nothing runs on an error, which names its line), the endpoints are
-greyed out, and the engine is handed a clean copy of exactly the checked rows;
-the <b>Results</b> box then lists every link.</p>
+its results directly.</p>
 
 <h3>Outputs</h3>
 <table border="1" cellspacing="0" cellpadding="4">
@@ -888,8 +885,8 @@ bulge added.</td></tr>
 distance.</td></tr>
 </table>
 <p>The CSV and the report are shown in the <b>Results</b> box. When profile
-files exist — a single link only; a batch writes none — <b>View Plots</b>
-appears and opens <b>P2P Link Analysis Plots</b> with two tabs:</p>
+files exist, <b>View Plots</b> appears and opens <b>P2P Link Analysis
+Plots</b> with two tabs:</p>
 <ul>
 <li><b>Terrain Profile</b> — terrain elevation on the left axis and signal
 strength (ERP in dBm minus path loss) on the right.</li>
@@ -906,10 +903,10 @@ km, frequency in MHz and the radius in metres.</li>
 <b>Save Image...</b> to export a PNG.</p>
 
 <h3>Batch CSV</h3>
-<p>A batch runs from the tab (<b>Links:</b> <b>Batch CSV</b>, a file with
-<b>Browse…</b>; the last one is remembered) and from the Processing algorithm
-<b>Point-to-Point Link Analysis</b> (parameter <b>Batch CSV File</b>). The format
-is the same:</p>
+<p>The batch mode is exposed through the Processing algorithm
+<b>Point-to-Point Link Analysis</b> (parameter <b>Batch CSV File</b>); the tab
+itself always builds a two-line CSV from its own endpoints. The format is the
+same:</p>
 <pre>S,TX1,47.056300,8.484600,40.0,AGL
 R,RX1,47.500000,8.900000,10.0,AGL
 R,RX2,47.600000,8.700000,2.0,AMSL</pre>
@@ -1620,9 +1617,10 @@ signal.</td></tr>
 prediction holds. Same idea, applied to temporal variability. Both are
 validated for 0.01&ndash;0.99.</td></tr>
 <tr><td><b>Earth Radius Mode:</b></td><td><code>earth_radius_mode</code></td>
-<td>FOUR_THIRDS</td><td>Used by ITM on the CPU backend only (<b>Backend:</b>
-CPU, or AUTO without a usable GPU); the GPU backend always uses the 4/3 earth.
-See <a href="#models">Modes and models</a>.</td></tr>
+<td>FOUR_THIRDS</td><td>In the analysis section of both tabs, every mode. The
+engine currently applies it to ITM on the CPU backend only; LOS, LOS Floor and
+the GPU backend use the 4/3 earth. See <a href="#models">Modes and
+models</a>.</td></tr>
 </table>
 
 <h3>Validity — what the model is defined for</h3>

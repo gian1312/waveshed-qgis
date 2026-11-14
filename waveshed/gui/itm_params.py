@@ -5,11 +5,15 @@ so a P2P link can be computed for other ground or climate than the 360° run
 beside it. The widgets, ranges, defaults and labels live here once; the
 defaults are the engine's (``job_builder.CoverageParams`` / ``P2PParams``).
 
-**Earth Radius Mode** sits here too: aether_core reads
-``propagation.earth_radius_mode`` only in its CPU ITM paths
-(engines/cpu_coverage.rs, engines/p2p.rs ``run_p2p_cpu``). The GPU backend
-and every LOS / LOS Floor path use the fixed 4/3 earth, so the control is
-offered with the other ITM parameters — Propagation mode only — and says so.
+**Earth Radius Mode** is NOT in the group: the earth's curvature matters for
+LOS and LOS Floor as much as for ITM (owner, 2026-11-14), so each tab shows it
+in its Analysis section in every mode, from :data:`EARTH_RADIUS_MODES` and
+:data:`EARTH_RADIUS_TIP`.
+What this engine version does with it (READ, AETHER 0.5.1): only the CPU ITM
+paths read ``propagation.earth_radius_mode`` (engines/cpu_coverage.rs,
+engines/p2p.rs ``run_p2p_cpu``); LOS, LOS Floor and every GPU path compute
+with a fixed k = 4/3 (shader.wgsl), and there is no "real earth" (k = 1)
+mode yet. The tooltip says so.
 """
 
 from __future__ import annotations
@@ -28,13 +32,18 @@ from qgis.PyQt.QtWidgets import (
 RADIO_CLIMATE_DEFAULT = 5
 
 EARTH_RADIUS_TIP = (
-    "Earth-curvature model used by ITM on the CPU backend (Backend CPU, or "
-    "AUTO without a usable GPU):\n"
+    "Earth-curvature model (horizon and diffraction geometry):\n"
     "FOUR_THIRDS: standard 4/3-earth refraction (normal, recommended).\n"
     "ADVANCED: a k-factor per path from the surface refractivity and both "
     "endpoint heights.\n"
-    "The GPU backend, LOS and LOS Floor always use the 4/3 earth."
+    "This engine version applies it to ITM on the CPU backend only; LOS, "
+    "LOS Floor and the GPU backend still compute with the 4/3 earth."
 )
+
+
+#: The Earth Radius Mode items both tabs offer (each tab builds its own combo
+#: from them, in its Analysis section, every mode).
+EARTH_RADIUS_MODES = ("FOUR_THIRDS", "ADVANCED")
 
 
 class ItmParamsGroup(QGroupBox):
@@ -110,12 +119,6 @@ class ItmParamsGroup(QGroupBox):
         self.spin_rel.setSingleStep(0.05)
         layout.addRow("Reliability:", self.spin_rel)
 
-        # Earth Radius Mode — CPU ITM only (see the module note).
-        self.combo_earth_radius = QComboBox()
-        self.combo_earth_radius.addItems(["FOUR_THIRDS", "ADVANCED"])
-        self.combo_earth_radius.setToolTip(EARTH_RADIUS_TIP)
-        layout.addRow("Earth Radius Mode:", self.combo_earth_radius)
-
     def values(self) -> Dict[str, object]:
         """The group as ``CoverageParams`` / ``P2PParams`` keyword arguments."""
         return {
@@ -126,5 +129,4 @@ class ItmParamsGroup(QGroupBox):
             "pol": self.combo_pol.currentIndex(),
             "conf": self.spin_conf.value(),
             "rel": self.spin_rel.value(),
-            "earth_radius": self.combo_earth_radius.currentText(),
         }

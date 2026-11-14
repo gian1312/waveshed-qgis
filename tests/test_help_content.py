@@ -217,7 +217,7 @@ class TestCoversTheUI:
         source = (PLUGIN_ROOT / "waveshed" / "gui"
                   / "itm_params.py").read_text(encoding="utf-8")
         labels = _addrow_labels(source, "def _build", "def values")
-        assert len(labels) >= 8, (
+        assert len(labels) >= 7, (
             f"only found {labels} in ItmParamsGroup._build — the scraper is "
             f"broken, not the help")
         for label in labels:

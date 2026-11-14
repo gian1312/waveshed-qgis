@@ -120,7 +120,7 @@ from ..core import terrain_index
 from . import terrain_dirs
 from . import terrain_folder_scan
 from .engine_notices import setup_title, show_run_error
-from .itm_params import ItmParamsGroup
+from .itm_params import EARTH_RADIUS_MODES, EARTH_RADIUS_TIP, ItmParamsGroup
 from .height_inputs import MIN_AMSL_M, bind_height_mode
 from .output_dir import SITE_OUTPUT_DIR_KEY, bind_output_dir, save_output_dir
 from .map_tools import activate_point_capture
@@ -1237,6 +1237,14 @@ class SiteAnalysisTab(QWidget):
         self.combo_backend.addItems(["AUTO", "GPU", "CPU"])
         layout.addRow("Backend:", self.combo_backend)
 
+        # Earth Radius Mode — every mode: the curvature matters for LOS and
+        # LOS Floor as much as for ITM (gui/itm_params.py says what this
+        # engine version applies it to).
+        self.combo_earth_radius = QComboBox()
+        self.combo_earth_radius.addItems(list(EARTH_RADIUS_MODES))
+        self.combo_earth_radius.setToolTip(EARTH_RADIUS_TIP)
+        layout.addRow("Earth Radius Mode:", self.combo_earth_radius)
+
         # Output Directory
         dir_layout = QHBoxLayout()
         self.line_output_dir = QLineEdit()
@@ -1253,8 +1261,7 @@ class SiteAnalysisTab(QWidget):
 
     def _build_itm_section(self) -> QGroupBox:
         # The shared group (gui/itm_params.py); the P2P tab has its own
-        # instance. Earth Radius Mode lives in it: only ITM on the CPU backend
-        # reads it, so it is offered in Propagation mode only.
+        # instance.
         self.itm_group = ItmParamsGroup()
         self.itm_group.setVisible(False)
         # The names the run code (and its tests) address.
@@ -1265,7 +1272,6 @@ class SiteAnalysisTab(QWidget):
         self.combo_pol = self.itm_group.combo_pol
         self.spin_conf = self.itm_group.spin_conf
         self.spin_rel = self.itm_group.spin_rel
-        self.combo_earth_radius = self.itm_group.combo_earth_radius
         return self.itm_group
 
     # ==================================================================
