@@ -62,6 +62,84 @@ from ..core.asset_manager import (
 from .height_inputs import MIN_AMSL_M, bind_height_mode
 from .plotting import PolarPlotWidget
 
+#: Elevation tilt sign, said where it is typed (generator "Tilt" and the
+#: Generic "Global Tilt"): the lobe is centred at +tilt, + = above the horizon.
+TILT_LABEL = "Tilt (+ up):"
+GLOBAL_TILT_LABEL = "Global Tilt (+ up):"
+TILT_TIP = (
+    "Elevation of the beam centre in degrees: positive raises the beam above "
+    "the horizon, negative lowers it. A 5° downtilt is entered as −5. "
+    "The tilt is baked into the pattern data."
+)
+
+
+def parse_pattern_file(text: str, ext: str) -> dict:
+    """Parse a SPLAT!-style ``.az`` / ``.el`` file the way aether_core does.
+
+    Line 1 is ALWAYS the header (``.az``: rotation bearing; ``.el``:
+    mechanical tilt and its azimuth) — never a data point. Every line is cut
+    at its first ``;`` (comment); a line that does not start with two numbers
+    is skipped, as the engine skips it.
+
+    Returns ``{"data": [[angle, gain], ...], "rotation": float, "tilt":
+    float, "tilt_azimuth": float, "skipped": int}`` — the header numbers as
+    read (0.0 when absent), gains as written (not clamped).
+    """
+    lines = text.splitlines()
+    out = {"data": [], "rotation": 0.0, "tilt": 0.0, "tilt_azimuth": 0.0,
+           "skipped": 0}
+    if not lines:
+        return out
+    header = lines[0].split(";", 1)[0].split()
+
+    def _num(i: int) -> float:
+        try:
+            return float(header[i])
+        except (IndexError, ValueError):
+            return 0.0
+
+    if ext == "az":
+        out["rotation"] = _num(0)
+    else:
+        out["tilt"], out["tilt_azimuth"] = _num(0), _num(1)
+    for line in lines[1:]:
+        body = line.split(";", 1)[0].strip()
+        if not body:
+            continue
+        parts = body.split()
+        try:
+            angle, gain = float(parts[0]), float(parts[1])
+        except (IndexError, ValueError):
+            out["skipped"] += 1
+            continue
+        if not (math.isfinite(angle) and math.isfinite(gain)):
+            out["skipped"] += 1
+            continue
+        out["data"].append([angle, gain])
+    return out
+
+
+def pattern_header_note(parsed: dict, ext: str) -> str:
+    """What the user must be told about a loaded file's header ("" = nothing)."""
+    if ext == "az":
+        rot = parsed.get("rotation", 0.0)
+        if rot:
+            return (
+                f"The file's header turns the pattern to {rot:g}°. Waveshed "
+                "stores the pattern unrotated and does not apply it: set the "
+                f"site's AZ Rotation to {round(rot) % 360}° (360° tab "
+                "or P2P) to point the antenna there.")
+        return ""
+    tilt = parsed.get("tilt", 0.0)
+    if tilt:
+        return (
+            f"The file's header has a mechanical tilt of {tilt:g}° (toward "
+            f"bearing {parsed.get('tilt_azimuth', 0.0):g}°). It is NOT "
+            "applied: Waveshed patterns carry the tilt in the data. To tilt the "
+            "beam, use a pattern whose data is already tilted (Generate: "
+            "Tilt, + up).")
+    return ""
+
 
 # ---------------------------------------------------------------------------
 # Pattern Generator Dialog
@@ -302,7 +380,9 @@ class _PatternGeneratorDialog(QDialog):
         self.spin_el_tilt.setDecimals(1)
         self.spin_el_tilt.setValue(0.0)
         self.spin_el_tilt.setSuffix(" deg")
-        dir_form.addRow("Tilt:", self.spin_el_tilt)
+        self.spin_el_tilt.setToolTip(TILT_TIP)
+        dir_form.addRow(TILT_LABEL, self.spin_el_tilt)
+        dir_form.labelForField(self.spin_el_tilt).setToolTip(TILT_TIP)
         self.spin_el_sl = QDoubleSpinBox()
         self.spin_el_sl.setRange(-60.0, 0.0)
         self.spin_el_sl.setDecimals(1)
@@ -347,7 +427,9 @@ class _PatternGeneratorDialog(QDialog):
         self.spin_el_generic_tilt.setDecimals(1)
         self.spin_el_generic_tilt.setValue(0.0)
         self.spin_el_generic_tilt.setSuffix(" deg")
-        el_gen_form.addRow("Global Tilt:", self.spin_el_generic_tilt)
+        self.spin_el_generic_tilt.setToolTip(TILT_TIP)
+        el_gen_form.addRow(GLOBAL_TILT_LABEL, self.spin_el_generic_tilt)
+        el_gen_form.labelForField(self.spin_el_generic_tilt).setToolTip(TILT_TIP)
         self.spin_el_generic_sl = QDoubleSpinBox()
         self.spin_el_generic_sl.setRange(-60.0, 0.0)
         self.spin_el_generic_sl.setDecimals(1)
@@ -602,7 +684,7 @@ class _PatternGeneratorDialog(QDialog):
             else range(-90, 91)
         )
 
-        data: list[list[float]] = []
+        gains: list[tuple[float, float]] = []
         for angle in angle_range:
             max_gain = sidelobe_gain
             lookup = angle - global_tilt
@@ -612,8 +694,15 @@ class _PatternGeneratorDialog(QDialog):
                 )
                 if lobe > max_gain:
                     max_gain = lobe
-            data.append([float(angle), round(max_gain, 4)])
-        return data
+            gains.append((float(angle), max_gain))
+        # Peak 1, BEFORE the table clamps to 0..1: beams above 0 dB keep
+        # their levels relative to each other (job_builder.peak_normalized
+        # does the same for assets saved before this). Floored at 0.001
+        # (-60 dB, the table's last digit): a gain of 0 is a null to the
+        # engine (no signal there), never a quiet sidelobe.
+        peak = max((g for _, g in gains), default=1.0)
+        scale = peak if peak > 1.0 else 1.0
+        return [[a, max(round(g / scale, 4), 0.001)] for a, g in gains]
 
     # ---- Accept -----------------------------------------------------------
 
@@ -1214,9 +1303,10 @@ class AssetManagerTab(QWidget):
     def _on_load_pattern(self, ext: str, table: QTableWidget) -> None:
         """Load a SPLAT! antenna pattern file (.az or .el).
 
-        Skips header/comment lines containing ``;`` or ``#``, parses remaining
-        lines as whitespace-separated (angle, gain) float pairs.  Gain values
-        are validated to [0, 1].
+        Read as aether_core reads it (:func:`parse_pattern_file`): line 1 is
+        the header, ``;`` starts a comment, gains are clamped to [0, 1]. A
+        non-zero header rotation / tilt is not applied — the user is told
+        where it belongs instead of losing it silently.
         """
         label = "Azimuth" if ext == "az" else "Elevation"
         caption = f"Load {label} Pattern"
@@ -1225,30 +1315,33 @@ class AssetManagerTab(QWidget):
         if not path:
             return
 
-        data: list[list[float]] = []
         try:
-            with open(path, "r", encoding="utf-8") as f:
-                for line in f:
-                    line = line.strip()
-                    if not line or ";" in line or "#" in line:
-                        continue
-                    parts = line.split()
-                    if len(parts) < 2:
-                        continue
-                    angle = float(parts[0])
-                    gain = float(parts[1])
-                    gain = max(0.0, min(1.0, gain))
-                    data.append([angle, gain])
-        except (OSError, ValueError) as exc:
+            with open(path, "r", encoding="utf-8", errors="replace") as f:
+                parsed = parse_pattern_file(f.read(), ext)
+        except OSError as exc:
             QMessageBox.warning(
                 self,
                 "Load Failed",
                 f"Could not read pattern file:\n{exc}",
             )
             return
+        if not parsed["data"]:
+            QMessageBox.warning(
+                self, "Load Failed",
+                f"No [angle gain] data lines found after the header line of\n{path}",
+            )
+            return
 
+        data = [[a, max(0.0, min(1.0, g))] for a, g in parsed["data"]]
         self._set_pattern_data(table, data)
         self._mark_dirty()
+        notes = [n for n in (pattern_header_note(parsed, ext),) if n]
+        if parsed["skipped"]:
+            notes.append(f"{parsed['skipped']} line(s) that are not two numbers "
+                         "were skipped (the engine skips them too).")
+        if notes:
+            QMessageBox.information(
+                self, f"{label} pattern loaded", "\n\n".join(notes))
 
     def _on_save_pattern(self, ext: str, table: QTableWidget) -> None:
         """Save current pattern to a SPLAT!-format file (.az or .el).
@@ -1272,7 +1365,8 @@ class AssetManagerTab(QWidget):
                 else:
                     f.write("0.0 0.0\t; Mechanical Tilt, Tilt Axis\n")
                 for angle, gain in data:
-                    f.write(f"{angle:.0f}\t{gain:.6f}\n")
+                    # Fractional angles stay fractional (0.5° steps).
+                    f.write(f"{angle:.6g}\t{gain:.6f}\n")
         except OSError as exc:
             QMessageBox.warning(
                 self,

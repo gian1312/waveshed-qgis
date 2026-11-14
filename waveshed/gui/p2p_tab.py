@@ -16,6 +16,7 @@ P2P mode in aether_core produces output files directly (no aether_export):
 from __future__ import annotations
 
 import csv
+import dataclasses
 import math
 import os
 import re
@@ -66,16 +67,22 @@ from ..core.binary_manager import (
 from ..core import api_key
 from ..core import engine_log
 from ..core import terrain_adapter
-from ..core.asset_manager import compute_erp, list_assets, resolve_assets
+from ..core.asset_manager import (
+    compute_erp, get_assets_dir, list_assets, resolve_assets,
+)
 from ..core.job_builder import (
     INVALID,
     VALID_RESOLUTIONS,
     P2PParams,
+    PatternDataError,
+    asset_patterns,
     batch_max_range_km,
     build_p2p_job,
     format_model_warnings,
+    has_pattern_data,
     height_floor_error,
     model_warnings,
+    whole_degrees,
     write_job_file,
 )
 from ..core.layer_utils import dem_layer_warning, hide_from_dem_picker
@@ -582,7 +589,8 @@ class _P2PWorker(QThread):
             from ..core import binary_manager as bm
             from ..core.terrain_adapter import prepare_terrain
 
-            bm.check_engine_for_job(params.resolution_m)
+            bm.check_engine_for_job(params.resolution_m,
+                                    pattern_data=has_pattern_data(params))
             # Stop must reach the terrain step: the flag is polled per tile /
             # output line, and every engine process it starts (download,
             # ingest) is handed to cancel() to kill — the ingest prints
@@ -713,6 +721,27 @@ class _P2PWorker(QThread):
 
         except Exception as exc:
             self.finished_err.emit(str(exc))
+
+
+class P2PAssetError(ValueError):
+    """The selected asset cannot be used (gone, unreadable pattern);
+    ``title`` / message are shown as they are, nothing runs."""
+
+    def __init__(self, title: str, message: str) -> None:
+        super().__init__(message)
+        self.title = title
+
+
+#: The question a P2P run with a pattern on the CPU backend asks first
+#: (aether_core's CPU P2P path returns before its pattern table is loaded,
+#: engines/p2p.rs — the link is computed omnidirectional).
+CPU_PATTERN_QUESTION = (
+    "This asset has an antenna pattern, but the CPU backend ignores antenna "
+    "patterns in P2P: the link would be computed for an omnidirectional "
+    "antenna.\n\n"
+    "Run without the pattern? (No = stop here; choose Backend AUTO or GPU "
+    "to apply the pattern.)"
+)
 
 
 # ---------------------------------------------------------------------------
@@ -851,6 +880,38 @@ class P2PTab(QWidget):
                 float(asset.get("antenna_gain_dbi", 0.0)),
             )
         self.spin_erp.setValue(erp)
+
+    def _asset_pattern(self) -> Tuple[Optional[list], Optional[list]]:
+        """The selected asset's (azimuth, elevation) pattern for the job.
+
+        Blank Asset = no pattern (None, None). The name resolves through the
+        shared rule (``asset_manager.resolve_assets``), read from the store
+        now; a name that no longer resolves raises
+        :class:`P2PAssetError` — refused like the 360° tab, never run as an
+        omnidirectional antenna without a word.
+        """
+        name = self.combo_asset.currentText().strip()
+        if not name:
+            return None, None
+        try:
+            asset = resolve_assets(list_assets()).get(name)
+        except Exception as exc:  # noqa: BLE001 — reported as a refusal
+            raise P2PAssetError(
+                "Asset not found",
+                f'The asset "{name}" could not be read: {exc}') from None
+        if asset is None:
+            raise P2PAssetError(
+                "Asset not found",
+                f'The selected asset "{name}" is not in the assets folder '
+                f"(renamed or deleted).\n\nAssets folder: {get_assets_dir()}\n\n"
+                "Pick an asset (or leave the Asset blank to enter frequency "
+                "and ERP by hand, without an antenna pattern).")
+        try:
+            return asset_patterns(asset, name)
+        except PatternDataError as exc:
+            raise P2PAssetError(
+                "Antenna pattern unreadable",
+                f"{exc}\n\nFix the pattern in the Assets tab.") from None
 
     def set_mode(self, mode: str) -> None:
         """Switch between LOS and LOSS display modes.
@@ -1123,14 +1184,17 @@ class P2PTab(QWidget):
         self.spin_erp.setSuffix(" W")
         layout.addRow("ERP (Watts):", self.spin_erp)
 
+        # Whole degrees: the engine rounds the rotation (antenna.rs).
         self.spin_az_rotation = QDoubleSpinBox()
-        self.spin_az_rotation.setRange(0.0, 359.9)
-        self.spin_az_rotation.setDecimals(1)
+        self.spin_az_rotation.setRange(0.0, 359.0)
+        self.spin_az_rotation.setDecimals(0)
         self.spin_az_rotation.setValue(0.0)
+        self.spin_az_rotation.setWrapping(True)
         self.spin_az_rotation.setSuffix("°")
         self.spin_az_rotation.setToolTip(
-            "Bearing the antenna's pattern is rotated to, clockwise from "
-            "north. Only meaningful for a directional asset."
+            "Bearing the asset's azimuth pattern is turned to, in whole "
+            "degrees clockwise from north (the engine rounds to whole "
+            "degrees). Sent only with an asset that has an antenna pattern."
         )
         layout.addRow("AZ Rotation:", self.spin_az_rotation)
 
@@ -1422,19 +1486,21 @@ class P2PTab(QWidget):
         parent = self._parent_dialog
         analysis_mode = parent.get_mode() if hasattr(parent, "get_mode") else "LOS"
 
-        if analysis_mode == "LOS":
+        az_data = el_data = None
+        az_rotation = None
+        if analysis_mode != "LOSS":
             model = "LOS"
             freq = 0.0
             erp = 0.0
-            az_rotation = None
         else:
             model = parent.get_loss_model() if hasattr(parent, "get_loss_model") else "ITM"
             freq = self.spin_freq.value()
             erp = self.spin_erp.value()
-            # Only meaningful with a directional pattern; harmless otherwise,
-            # and omitted entirely at 0 so the job keeps its current shape.
-            rot = self.spin_az_rotation.value()
-            az_rotation = rot if rot else None
+            # The selected asset's antenna pattern (Propagation mode only);
+            # the rotation travels only with it (job_builder._build_tx).
+            az_data, el_data = self._asset_pattern()
+            if az_data or el_data:
+                az_rotation = whole_degrees(self.spin_az_rotation.value())
 
         return P2PParams(
             # Site A / Transmitter
@@ -1443,6 +1509,8 @@ class P2PTab(QWidget):
             tx_height=self.spin_a_height.value(),
             tx_mode=self.combo_a_mode.currentText(),
             az_rotation=az_rotation,
+            az_pattern_data=az_data,
+            el_pattern_data=el_data,
             freq_mhz=freq,
             erp_watts=erp,
             # Site B / Receiver
@@ -1594,6 +1662,28 @@ class P2PTab(QWidget):
 
         output_dir = self.line_output_dir.text().strip()
 
+        try:
+            params = self._collect_params()
+        except P2PAssetError as exc:
+            QMessageBox.warning(self, exc.title, str(exc))
+            return
+
+        # ---- The CPU backend computes P2P without the pattern ----
+        if has_pattern_data(params) and (params.backend or "").upper() == "CPU":
+            if QMessageBox.question(
+                self, "Antenna pattern ignored on CPU", CPU_PATTERN_QUESTION,
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            ) != QMessageBox.StandardButton.Yes:
+                return
+            # The job then says what is computed: no pattern, no rotation.
+            params = dataclasses.replace(
+                params, az_pattern_data=None, el_pattern_data=None,
+                az_rotation=None)
+            QgsMessageLog.logMessage(
+                "P2P: CPU backend — running without the asset's antenna "
+                "pattern (the user's choice)", TAG, Qgis.MessageLevel.Info)
+
         # Generate a temp 2-line batch CSV from the two endpoints.
         batch_file = _write_temp_batch_csv(
             tx_lat=self.spin_a_lat.value(),
@@ -1605,8 +1695,6 @@ class P2PTab(QWidget):
             rx_height=self.spin_b_height.value(),
             rx_mode=self.combo_b_mode.currentText(),
         )
-
-        params = self._collect_params()
 
         # ---- Confirm parameters that leave the model's validated range ----
         # ITM raises its own kwx indicator for these, but neither AETHER nor

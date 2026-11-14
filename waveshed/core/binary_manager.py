@@ -1456,6 +1456,12 @@ def _clear_quarantine(target_dir: str, files: list) -> None:
 #: GPU path (aether-tools docs/CONTRACT.md §1.5, capability gates).
 COARSE_RESOLUTION_MIN_ENGINE = "0.4.3"
 
+#: First aether_core that reads inline antenna patterns (``tx.az_pattern_data``
+#: / ``tx.el_pattern_data``; AETHER 6975e4e, first tag v0.4.3). Older engines
+#: have no ``deny_unknown_fields``: they drop both keys and run isotropic with
+#: exit code 0 and no warning — so a run carrying a pattern is refused there.
+PATTERN_DATA_MIN_ENGINE = "0.4.3"
+
 #: First aether_converter whose download job accepts ``repair_source_tiles``
 #: (patch only the listed source tiles into the EXISTING output .abt files).
 #: The field is additive: an older converter parses the job, ignores it and
@@ -1741,7 +1747,9 @@ def engine_supports_resolution(
     return float(resolution_m) in {float(r) for r in LEGACY_ENGINE_RESOLUTIONS}
 
 
-def check_engine_for_job(resolution_m: float, range_profile: bool = False) -> str:
+def check_engine_for_job(
+    resolution_m: float, range_profile: bool = False, pattern_data: bool = False,
+) -> str:
     """Pre-flight before any terrain is fetched: log the engine, gate the job.
 
     Logs the engine path and version on every run (so a stale local deploy
@@ -1753,6 +1761,10 @@ def check_engine_for_job(resolution_m: float, range_profile: bool = False) -> st
     With *range_profile* (an adaptive / custom resolution run) it also
     requires :data:`range_profile.RANGE_PROFILE_MIN_ENGINE`: an older engine
     ignores the profile and would compute the whole range at the coarse step.
+
+    With *pattern_data* (the job carries an asset's antenna pattern) it
+    requires :data:`PATTERN_DATA_MIN_ENGINE`: an older or unknown engine drops
+    the pattern silently and computes an omnidirectional antenna.
 
     Returns the version string that was logged (``"unknown"`` if the engine
     predates ``--version``), for callers that want to show it.
@@ -1791,6 +1803,19 @@ def check_engine_for_job(resolution_m: float, range_profile: bool = False) -> st
                 f"{RANGE_PROFILE_MIN_ENGINE} or newer is required.\n"
                 f"Engine: {exe}",
             ))
+    if pattern_data and (
+        not version or compare_versions(version, PATTERN_DATA_MIN_ENGINE) < 0
+    ):
+        raise EngineTooOldError(with_details(
+            "This asset's antenna pattern needs a newer Aether engine. "
+            "Nothing was downloaded.\n\n"
+            "What to do: click \"Update engine\" below (Settings → "
+            "Download binaries), or pick an asset without an antenna pattern.",
+            f"Installed: aether_core {shown} — it does not read inline "
+            f"antenna patterns and would compute an omnidirectional antenna "
+            f"without a warning; engine {PATTERN_DATA_MIN_ENGINE} or newer is "
+            f"required.\nEngine: {exe}",
+        ))
     return shown
 
 

@@ -593,9 +593,10 @@ looking at.</td></tr>
 Its minimum follows the column beside it — see
 <a href="#heights">Heights: AGL and AMSL</a>.</td></tr>
 <tr><td><b>Height Mode</b></td><td><b>AGL</b> or <b>AMSL</b>.</td></tr>
-<tr><td><b>AZ Rotation (deg)</b></td><td>Bearing the antenna pattern is rotated
-to, clockwise from north. Only meaningful for a directional asset; hidden in
-the geometric modes.</td></tr>
+<tr><td><b>AZ Rotation (deg)</b></td><td>Bearing the asset's azimuth pattern
+is turned to, in whole degrees clockwise from north. Sent only with an asset
+that has an antenna pattern, in Propagation mode; hidden in the geometric
+modes.</td></tr>
 <tr><td><b>AZ Start (deg)</b> / <b>AZ End (deg)</b></td><td>The azimuth sector
 to compute, clockwise from north, 0&ndash;360. The default 0&ndash;360 is the
 full circle; a narrow sector saves both terrain and computation, because only
@@ -834,8 +835,9 @@ carries.</li>
 in frequency and ERP. Leave it blank to type them by hand.</li>
 <li><b>Frequency (MHz):</b> — 1&ndash;3000 MHz, default 433.</li>
 <li><b>ERP (Watts):</b> — effective radiated power, default 10 W.</li>
-<li><b>AZ Rotation:</b> — bearing the antenna pattern is rotated to, clockwise
-from north; only meaningful for a directional asset.</li>
+<li><b>AZ Rotation:</b> — bearing the asset's azimuth pattern is turned to,
+in whole degrees clockwise from north; sent only with an asset that has an
+antenna pattern.</li>
 </ul>
 
 <h3>Analysis</h3>
@@ -988,9 +990,12 @@ Each table has <b>Add Row</b>, <b>Remove Row</b>, <b>Load .az</b> /
 <b>Visualize</b> and <b>Clear</b>.</p>
 <ul>
 <li><b>File format</b> — SPLAT! <code>.az</code> / <code>.el</code>: one
-whitespace-separated <i>angle gain</i> pair per line, header and comment lines
-containing <code>;</code> or <code>#</code> skipped, gains validated to
-0&ndash;1.</li>
+whitespace-separated <i>angle gain</i> pair per line. The first line is always
+the header (<code>.az</code>: rotation; <code>.el</code>: tilt and its
+azimuth) and is not applied — a non-zero value is reported (put the rotation in
+the site's <b>AZ Rotation</b>). Text after <code>;</code> is a comment; lines
+that are not two numbers are skipped. Gains are limited to 0&ndash;1; angles
+are saved with their decimals.</li>
 <li><b>Generate</b> opens <b>Generate Azimuth Pattern</b> /
 <b>Generate Elevation Pattern</b> with a <b>Pattern Type:</b> of
 <b>Omnidirectional</b>, <b>Sectoral</b>, <b>Directional</b>, <b>Multibeam</b>,
@@ -999,8 +1004,10 @@ containing <code>;</code> or <code>#</code> skipped, gains validated to
 <b>Generic (Multi-Beam)</b> for elevation. Parameters are the usual ones —
 <b>Beamwidth:</b>, <b>Sidelobe Level:</b>, <b>Front-to-Back Ratio:</b>,
 <b>Number of Beams:</b>, <b>Separation:</b>, <b>Global Heading:</b>,
-<b>Tilt:</b> — plus a beam table with <b>Add Beam</b> / <b>Remove Beam</b> for
-the generic types.</li>
+<b>Tilt (+ up):</b> (positive raises the beam; a 5&deg; downtilt is
+&minus;5) — plus a beam table with <b>Add Beam</b> / <b>Remove Beam</b> for the
+generic types. Generic beams above 0&nbsp;dB are scaled so the strongest is
+1.</li>
 <li><b>Visualize</b> draws the table as a polar plot (azimuth clockwise from
 north; elevation from -90&deg; to +90&deg;). Right-click the plot →
 <b>Save Image...</b> to export it.</li>
@@ -1016,11 +1023,15 @@ ERP from peak power and gain when the stored ERP is not positive), and
 pre-fills the site's <b>Height (m)</b> and <b>Height Mode</b>.</li>
 <li>The P2P tab copies frequency and ERP into its own boxes, which you can then
 edit.</li>
-<li><b>Antenna patterns stored in an asset are not yet sent to the engine.</b>
-The engine takes patterns as <code>.az</code>/<code>.el</code> <i>files</i>,
-and the plugin currently passes none, so a run is omnidirectional even when the
-asset has a pattern. <b>AZ Rotation</b> is passed through and only has an
-effect once a pattern is.</li>
+<li><b>Antenna patterns</b> are sent to the engine in Propagation mode, from
+the 360&deg; and P2P tabs (engine 0.4.3 or newer; an older engine is refused,
+because it would drop the pattern without a word). Gains are field (voltage)
+ratios, 1.0 in the main lobe, where the asset's ERP applies; a pattern whose
+peak is above 1 is divided by its peak. Elevation angles run from
+&minus;90&deg; to +90&deg;, positive above the horizon. LOS and LOS Floor use
+no pattern. P2P on the CPU backend ignores patterns: Waveshed asks before
+running without one. <b>AZ Rotation</b> turns the azimuth pattern clockwise
+from north, in whole degrees, and is sent only with a pattern.</li>
 <li>Polarization and the statistical fractions stored on an asset are
 documentation: the values a run uses come from the <b>ITM Parameters</b> group
 in the 360&deg; tab.</li>

@@ -75,9 +75,13 @@ from ..core.job_builder import (
     VALID_RESOLUTIONS,
     CoverageParams,
     antenna_height_error,
+    PatternDataError,
+    asset_patterns,
     build_coverage_job,
     format_model_warnings,
+    has_pattern_data,
     model_warnings,
+    whole_degrees,
     write_job_file,
 )
 from ..core.layer_utils import dem_layer_warning, hide_from_dem_picker
@@ -393,6 +397,13 @@ _COL_AZ_START = 5
 _COL_AZ_END = 6
 _COL_RANGE = 7
 
+#: Tooltip of the AZ Rotation column (and its spin boxes).
+AZ_ROTATION_TIP = (
+    "Bearing the asset's azimuth pattern is turned to, in whole degrees "
+    "clockwise from north (the engine rounds to whole degrees). Sent only "
+    "with an asset that has an antenna pattern, in Propagation mode."
+)
+
 # Widths for the widget-bearing columns. Wide enough for the widget plus its
 # header text — "AZ Rotation (deg)" is the long one, and a column narrower than
 # its own header reads as broken even when the widget inside still works.
@@ -498,9 +509,11 @@ class _SiteAnalysisWorker(QThread):
             # Pre-flight before any terrain is fetched, once per distinct
             # (resolution, profiled) combination in the run.
             from ..core import binary_manager as _bm
-            for res, profiled in sorted({(p.resolution_m, bool(p.range_profile))
-                                         for p, _ in self.jobs}):
-                _bm.check_engine_for_job(res, range_profile=profiled)
+            for res, profiled, patterned in sorted(
+                    {(p.resolution_m, bool(p.range_profile), has_pattern_data(p))
+                     for p, _ in self.jobs}):
+                _bm.check_engine_for_job(res, range_profile=profiled,
+                                         pattern_data=patterned)
 
             # Once per run: QGIS's own resident memory, beside the
             # converters' peak lines (owner's run 2026-11-07: 31 GB, the
@@ -991,6 +1004,9 @@ class SiteAnalysisTab(QWidget):
         """Configure sites table columns (same for all modes)."""
         self.sites_table.setColumnCount(len(_SITE_COLUMNS))
         self.sites_table.setHorizontalHeaderLabels(_SITE_COLUMNS)
+        with contextlib.suppress(Exception):  # a tooltip is informative only
+            self.sites_table.horizontalHeaderItem(_COL_AZ_ROTATION).setToolTip(
+                AZ_ROTATION_TIP)
         header = self.sites_table.horizontalHeader()
 
         # Every data column holds a *cell widget* (combo/spin), not item data.
@@ -1483,11 +1499,14 @@ class SiteAnalysisTab(QWidget):
         bind_height_mode(spin_height, combo_mode)
 
         # -- Column 4: AZ Rotation (deg) --
+        # Whole degrees: the engine rounds the rotation (antenna.rs).
         spin_az_rot = QDoubleSpinBox()
-        spin_az_rot.setRange(0.0, 360.0)
+        spin_az_rot.setRange(0.0, 359.0)
+        spin_az_rot.setDecimals(0)
         spin_az_rot.setValue(0.0)
-        spin_az_rot.setDecimals(1)
+        spin_az_rot.setWrapping(True)
         spin_az_rot.setSuffix("\u00b0")
+        spin_az_rot.setToolTip(AZ_ROTATION_TIP)
         self.sites_table.setCellWidget(row, _COL_AZ_ROTATION, spin_az_rot)
 
         # -- Column 5: AZ Start (deg) --
@@ -2037,8 +2056,8 @@ class SiteAnalysisTab(QWidget):
             # Extract RF parameters from asset (with sensible fallbacks).
             freq_mhz = 433.0
             erp_watts = 10.0
-            az_pattern = None
-            el_pattern = None
+            az_data = None
+            el_data = None
 
             if asset:
                 freq_mhz = asset.get("frequency_mhz", 433.0)
@@ -2048,10 +2067,16 @@ class SiteAnalysisTab(QWidget):
                         asset.get("peak_power_watts", 10.0),
                         asset.get("antenna_gain_dbi", 0.0),
                     )
-                # Inline patterns are not file paths — aether_core needs
-                # .az/.el files. Leave as None for now (omnidirectional).
-                az_pattern = None
-                el_pattern = None
+                if mode == "LOSS":
+                    # The asset's pattern goes to the engine inline
+                    # (tx.az_pattern_data / el_pattern_data, peak 1);
+                    # Propagation mode only — LOS / LOS Floor send none.
+                    az_data, el_data = asset_patterns(asset, asset_name)
+            # The rotation only travels with a pattern (job_builder._build_tx).
+            az_rotation = (
+                whole_degrees(site.get("az_rotation", 0.0))
+                if (az_data or el_data) else None
+            )
 
             for alt_idx, (rx_alt, rx_ref) in enumerate(altitudes):
                 output_name = (
@@ -2077,9 +2102,9 @@ class SiteAnalysisTab(QWidget):
                     tx_mode=site.get("height_mode", "AGL"),
                     freq_mhz=freq_mhz,
                     erp_watts=erp_watts,
-                    az_pattern=az_pattern,
-                    el_pattern=el_pattern,
-                    az_rotation=site.get("az_rotation", 0.0),
+                    az_pattern_data=az_data,
+                    el_pattern_data=el_data,
+                    az_rotation=az_rotation,
                     rx_height=rx_alt,
                     rx_mode=rx_ref,
                     model=model,
@@ -2205,6 +2230,11 @@ class SiteAnalysisTab(QWidget):
             # A row whose asset was renamed or deleted must not run on the
             # 433 MHz / 10 W fallback without a word.
             QMessageBox.warning(self, "Asset not found", str(exc))
+            return
+        except PatternDataError as exc:
+            # An asset whose pattern data is not [angle, gain] numbers.
+            QMessageBox.warning(self, "Antenna pattern unreadable",
+                                f"{exc}\n\nFix the pattern in the Assets tab.")
             return
         if not jobs:
             QMessageBox.warning(

@@ -139,6 +139,13 @@ class CoverageParams:
     az_pattern: Optional[str] = None
     el_pattern: Optional[str] = None
     az_rotation: Optional[float] = None
+    #: Inline antenna pattern from the asset: ``[[angle_deg, gain], ...]``,
+    #: field gain 0..1. Azimuth 0..360 clockwise from the antenna's boresight,
+    #: elevation -90..+90 with + = up (tilt baked into the data). Sent as
+    #: ``tx.az_pattern_data`` / ``tx.el_pattern_data`` (engine >= 0.4.3,
+    #: ``binary_manager.PATTERN_DATA_MIN_ENGINE``). See ``_build_tx``.
+    az_pattern_data: Optional[list] = None
+    el_pattern_data: Optional[list] = None
 
     # Receiver
     rx_height: float = 1.5
@@ -198,6 +205,9 @@ class P2PParams:
     az_pattern: Optional[str] = None
     el_pattern: Optional[str] = None
     az_rotation: Optional[float] = None
+    #: Inline antenna pattern, as in :class:`CoverageParams`.
+    az_pattern_data: Optional[list] = None
+    el_pattern_data: Optional[list] = None
 
     # Receiver
     rx_height: float = 1.5
@@ -523,8 +533,111 @@ def _validate_antenna_heights(params: "CoverageParams | P2PParams") -> None:
         raise ValueError(message)
 
 
+# ---------------------------------------------------------------------------
+# Antenna patterns (asset → job)
+# ---------------------------------------------------------------------------
+
+#: Models whose result is pure geometry: no antenna pattern, no rotation is
+#: sent for them (LOS, LOS Floor). The engine would honour a pattern's nulls
+#: in coverage LOS and ignore it in MIN_ALT; Waveshed sends none in either.
+GEOMETRIC_MODELS = ("LOS", "MIN_ALT")
+
+
+class PatternDataError(ValueError):
+    """An asset's antenna pattern is not a list of ``[angle, gain]`` numbers
+    (:func:`asset_patterns`); the message names the asset and the point."""
+
+
+def pattern_points(data) -> List[List[float]]:
+    """An asset pattern (``[[angle, gain], ...]``) as float pairs, unchanged.
+
+    No sign flip, no wrap, no resampling: the asset already uses the engine's
+    conventions (azimuth 0..360 clockwise, elevation -90..+90, + = up, field
+    gain). Raises ValueError on a point that is not two numbers.
+    """
+    points: List[List[float]] = []
+    for i, pair in enumerate(data or ()):
+        try:
+            angle, gain = float(pair[0]), float(pair[1])
+        except (TypeError, ValueError, IndexError):
+            raise ValueError(
+                f"pattern point {i + 1} is not [angle, gain]: {pair!r}") from None
+        if not (math.isfinite(angle) and math.isfinite(gain)):
+            raise ValueError(f"pattern point {i + 1} is not finite: {pair!r}")
+        points.append([angle, gain])
+    return points
+
+
+def peak_normalized(points: List[List[float]]) -> Tuple[List[List[float]], float]:
+    """*points* with the largest gain scaled to 1 when it exceeds 1.
+
+    Returns ``(points, peak)``; *peak* is the largest gain before scaling.
+    The engine clamps every gain to 0..1, so a pattern above 1 (a Generic
+    beam table with "Peak Gain (dB)" > 0) would otherwise lose its relative
+    levels; the asset's ERP stays the power in the boresight (peak 1).
+    """
+    if not points:
+        return points, 0.0
+    peak = max(g for _, g in points)
+    if peak > 1.0:
+        return [[a, g / peak] for a, g in points], peak
+    return points, peak
+
+
+def _log_info(message: str) -> None:
+    with contextlib.suppress(Exception):  # no QGIS available (unit tests)
+        from qgis.core import Qgis, QgsMessageLog
+        QgsMessageLog.logMessage(message, "Waveshed", Qgis.MessageLevel.Info)
+
+
+def asset_patterns(asset: Optional[dict], name: str = "") -> Tuple[Optional[list], Optional[list]]:
+    """The asset's azimuth / elevation pattern ready for the job, or None each.
+
+    Empty data → None (no pattern: the engine runs isotropic on that axis).
+    A pattern peaking above 1 is divided by its peak (each axis on its own)
+    with one log line naming the asset. Raises :class:`PatternDataError`
+    (asset named) on malformed data.
+    """
+    if not asset:
+        return None, None
+    label = name or str(asset.get("name") or "asset")
+    out: List[Optional[list]] = []
+    for key, axis in (("azimuth_pattern", "azimuth"), ("elevation_pattern", "elevation")):
+        block = asset.get(key) or {}
+        data = block.get("data") if isinstance(block, dict) else None
+        try:
+            points = pattern_points(data)
+        except ValueError as exc:
+            raise PatternDataError(f'Asset "{label}": {axis} {exc}') from None
+        points, peak = peak_normalized(points)
+        if peak > 1.0:
+            _log_info(
+                f'asset "{label}": {axis} pattern peaks at {peak:.4g} '
+                f'({20.0 * math.log10(peak):+.2f} dB) — divided by its peak so the '
+                f'engine (gains 0..1) keeps the relative levels')
+        out.append(points or None)
+    return out[0], out[1]
+
+
+def whole_degrees(rotation: float) -> float:
+    """AZ rotation as the engine applies it: whole degrees, 0..359."""
+    return float(int(round(float(rotation))) % 360)
+
+
+def has_pattern_data(params: "CoverageParams | P2PParams") -> bool:
+    """True when the job built from *params* carries an inline pattern."""
+    if (params.model or "").upper() in GEOMETRIC_MODELS:
+        return False
+    return bool(params.az_pattern_data or params.el_pattern_data)
+
+
 def _build_tx(params: "CoverageParams | P2PParams") -> dict:
-    """Build the tx section of the job config."""
+    """Build the tx section of the job config.
+
+    Inline patterns go out as ``az_pattern_data`` / ``el_pattern_data``
+    (floats, peak 1) only when non-empty and never for a geometric model;
+    ``az_rotation`` only together with a pattern, in whole degrees.
+    """
     tx = {
         "lat": params.tx_lat,
         "lon": params.tx_lon,
@@ -537,8 +650,16 @@ def _build_tx(params: "CoverageParams | P2PParams") -> dict:
         tx["az_pattern_file"] = params.az_pattern
     if params.el_pattern:
         tx["el_pattern_file"] = params.el_pattern
-    if params.az_rotation is not None:
-        tx["az_rotation"] = params.az_rotation
+    if has_pattern_data(params):
+        for field, data in (("az_pattern_data", params.az_pattern_data),
+                            ("el_pattern_data", params.el_pattern_data)):
+            points, _peak = peak_normalized(pattern_points(data))
+            if points:
+                tx[field] = points
+    with_pattern = bool(params.az_pattern or params.el_pattern
+                        or "az_pattern_data" in tx or "el_pattern_data" in tx)
+    if with_pattern and params.az_rotation is not None:
+        tx["az_rotation"] = whole_degrees(params.az_rotation)
     return tx
 
 
