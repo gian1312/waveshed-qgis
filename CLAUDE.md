@@ -1396,6 +1396,22 @@ OpenFreeMap): sites share pool tiles, each gets its own view; pinned by
   aether_core's CPU P2P ignores patterns (p2p.rs returns before the LUT load):
   the P2P tab asks first. `.az`/`.el` import: line 1 is the header, as the
   engine reads it. `tests/test_patterns_engine.py`.
+- **ITM parameters: one group, one instance per tab** (`gui/itm_params.py`
+  `ItmParamsGroup`, 360° and P2P, each its own values; Propagation + ITM only).
+  Earth Radius Mode is in it: aether_core reads `earth_radius_mode` in its CPU
+  ITM paths only (GPU, LOS, LOS Floor: fixed 4/3) — a GPU change needs the
+  owner's yes ("not yet", 2026-11-14). Radio climate 1–7. A spin box rounds
+  to its CURRENT decimals: set decimals before the value (0.005 at 2 decimals
+  became 0.01 — every ITM job sent wet-ground conductivity until be1fb51);
+  `tests/test_spinbox_decimals.py` scans for it.
+- **P2P batch.** Tab: Links: Single link / Batch CSV; Processing: Batch CSV
+  File. `job.tx` = the batch's first S row (`job_builder.batch_reference_source`:
+  GPU ITM reads ONE system elevation under job.tx for every link). The engine
+  always reads `job_builder.write_engine_batch_csv` — a clean copy of exactly
+  the rows the plugin checked: it splits on `,` and needs an exact `S`, so a
+  byte-order mark (Excel "CSV UTF-8") or a lower-case `s` silently made a
+  source a receiver (measured: 4 links instead of 6). The user's file is never
+  modified. `tests/test_p2p_batch_input.py`, `tests/test_processing_p2p.py`.
 
 ## Sensitive Files (DO NOT commit)
 
