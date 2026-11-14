@@ -6,6 +6,7 @@ Site Analysis, P2P Link, Assets, and Settings.
 
 from __future__ import annotations
 
+import time
 from typing import Optional
 
 from qgis.PyQt.QtCore import QByteArray, Qt
@@ -21,8 +22,9 @@ from qgis.PyQt.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
-from qgis.core import QgsSettings
+from qgis.core import Qgis, QgsMessageLog, QgsSettings
 
+from ..core.asset_manager import assets_signature
 from .help_tab import HelpTab
 from .site_analysis_tab import SiteAnalysisTab
 from .p2p_tab import P2PTab
@@ -253,6 +255,13 @@ class AetherMainDialog(QDialog):
         # dropdown/path/status stayed stale until the dialog was reopened.
         self._settings_widget.settings_changed.connect(
             self._on_settings_changed)
+        # The Assets tab's changes reach the run tabs at once (they list the
+        # store at construction only otherwise).
+        self.asset_tab.asset_renamed.connect(self._on_asset_renamed)
+        self.asset_tab.assets_changed.connect(self._on_assets_changed)
+        # The run tabs listed the store while they were built: that is the
+        # state they show.
+        self._mark_assets_seen()
         # Apply the rule to whichever tab opens first, rather than waiting for
         # the user to switch tabs once.
         self._on_tab_changed(self.tabs.currentIndex())
@@ -333,6 +342,7 @@ class AetherMainDialog(QDialog):
                 self.tabs.blockSignals(False)
                 return
         self._last_tab_index = index
+        self._refresh_assets_if_changed(self.tabs.widget(index))
         on_p2p = index == self.tabs.indexOf(self.p2p_tab)
         self.radio_min_alt.setEnabled(not on_p2p)
         self.radio_min_alt.setToolTip(
@@ -379,6 +389,73 @@ class AetherMainDialog(QDialog):
             refresh = getattr(tab, "refresh_settings", None)
             if callable(refresh):
                 refresh()
+        # refresh_settings re-read the asset store in both run tabs.
+        self._mark_assets_seen()
+
+    # ------------------------------------------------------------------
+    # Assets: the Assets tab's changes reach the 360° and P2P tabs
+    # ------------------------------------------------------------------
+
+    def _asset_run_tabs(self) -> tuple:
+        return tuple(
+            tab for tab in (getattr(self, "site_tab", None),
+                            getattr(self, "p2p_tab", None))
+            if tab is not None
+        )
+
+    def _on_asset_renamed(self, old: str, new: str) -> None:
+        """Rows / combos showing *old* select *new* (``assets_changed``
+        follows and re-reads the store)."""
+        for tab in self._asset_run_tabs():
+            rename = getattr(tab, "rename_asset", None)
+            if callable(rename):
+                rename(old, new)
+
+    def _on_assets_changed(self) -> None:
+        """The Assets tab persisted a change: both run tabs re-read."""
+        for tab in self._asset_run_tabs():
+            refresh = getattr(tab, "refresh_assets", None)
+            if callable(refresh):
+                refresh()
+        self._mark_assets_seen()
+
+    def _mark_assets_seen(self, tabs: Optional[tuple] = None) -> None:
+        """Record the store signature the run tabs (or *tabs*) now show."""
+        try:
+            signature = assets_signature()
+        except OSError:
+            signature = None
+        seen = getattr(self, "_assets_seen", None)
+        if seen is None:
+            seen = self._assets_seen = {}
+        for tab in (tabs if tabs is not None else self._asset_run_tabs()):
+            seen[id(tab)] = signature
+
+    def _refresh_assets_if_changed(self, tab) -> None:
+        """A run tab comes to the front: re-read its assets only when the
+        store changed on disk since it last read them (files copied in,
+        edited or deleted outside the plugin, or by another QGIS)."""
+        if tab is None or tab not in self._asset_run_tabs():
+            return
+        refresh = getattr(tab, "refresh_assets", None)
+        if not callable(refresh):
+            return
+        t0 = time.perf_counter()
+        try:
+            signature = assets_signature()
+        except OSError:
+            return
+        check_ms = (time.perf_counter() - t0) * 1000.0
+        seen = getattr(self, "_assets_seen", None) or {}
+        if seen.get(id(tab)) == signature:
+            return
+        refresh()
+        self._mark_assets_seen((tab,))
+        QgsMessageLog.logMessage(
+            f"assets: the assets folder changed on disk — "
+            f"{type(tab).__name__} re-read it (check {check_ms:.1f} ms)",
+            "Waveshed", Qgis.MessageLevel.Info,
+        )
 
     def _on_loss_model_changed(self) -> None:
         # Propagate to tabs that care (site analysis ITM section)

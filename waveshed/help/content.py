@@ -579,8 +579,10 @@ row is present at start-up. Columns:</p>
 <tr><th>Column</th><th>Meaning</th></tr>
 <tr><td><b>Asset</b></td><td>An emitter definition from the <b>Assets</b> tab.
 It supplies the frequency and ERP, and pre-fills the height and height mode
-from the asset's defaults. Hidden in LOS and LOS Floor modes, which have no
-frequency or power.</td></tr>
+from the asset's defaults. Left blank, the site runs at 433 MHz / 10 W ERP. An
+asset renamed or deleted outside this row stays shown under its old name, and a
+Propagation run refuses that site until another asset (or blank) is picked.
+Hidden in LOS and LOS Floor modes, which have no frequency or power.</td></tr>
 <tr><td><b>Location</b></td><td><b>Lat</b> and <b>Lon</b> in decimal degrees
 (six decimals, WGS84) plus <b>Pick</b>, which minimises the dialog and lets you
 click the site on the map canvas. Placed sites are drawn on the canvas as cyan
@@ -923,7 +925,12 @@ _ASSETS = """
 antenna gain, antenna patterns and default mounting height. Each asset is a
 JSON file in the assets directory (<code>waveshed/assets_dir</code>, default
 <code>~/.aether/assets</code>), so they are shared between projects and easy to
-copy between machines.</p>
+copy between machines. The line <b>Stored in:</b> under the buttons shows the
+folder (full path in its tooltip); <b>Open folder</b> shows it in the file
+manager, <b>Change…</b> picks another one (assets in the old folder stay
+there). The 360&deg; and P2P tabs list only the assets in this folder and
+follow every New, Save, Save As, Delete, Reload and folder change at once —
+and re-read it when you switch to them after files changed on disk.</p>
 
 <h3>Managing assets</h3>
 <p>The list along the top, with <b>Reload</b>, <b>New</b>, <b>Save</b>,
@@ -931,6 +938,14 @@ copy between machines.</p>
 has two sub-tabs: <b>Parameters</b> and <b>Antenna Patterns</b>. Unsaved
 changes are tracked and you are asked before they are lost. A file that is not
 valid JSON is skipped silently rather than breaking the list.</p>
+<p>Renaming an asset and saving moves its file to one named after the new
+name; a file is never overwritten (<code>name.json</code>,
+<code>name_2.json</code>, …). Two assets cannot share a name: <b>Save</b>,
+<b>Save As</b> into the folder and renaming refuse a name another asset already
+has. If two files carry one name anyway, the first by file name is used and the
+log says which. <b>Save As</b> starts in the assets folder; a copy saved
+elsewhere is listed here until the next <b>Reload</b>, but not in the 360&deg;
+or P2P tabs.</p>
 
 <h3>Parameters</h3>
 <ul>
@@ -1246,11 +1261,11 @@ behalf — see <a href="#attribution">Data attribution</a>.</p>
 <code>binary_dir</code>, <code>installed_engine_version</code>,
 <code>api_key</code>, <code>terrain_dir</code>, <code>cache_dir</code>,
 <code>max_ram_gb</code>, <code>max_vram_gb</code>,
-<code>download_connections</code> and the main dialog's geometry. Two more keys
-exist without a control in this dialog: <code>assets_dir</code> (where emitter
-JSON files live, default <code>~/.aether/assets</code>) and
-<code>download_max_passes</code> (terrain download attempts including retries,
-default 4; set it to 1 to disable retries). Binary discovery also honours the
+<code>download_connections</code> and the main dialog's geometry. <code>assets_dir</code>
+(where emitter JSON files live, default <code>~/.aether/assets</code>) is set
+from the <b>Assets</b> tab (<b>Change…</b>); <code>download_max_passes</code>
+(terrain download attempts including retries, default 4; set it to 1 to disable
+retries) has no control. Binary discovery also honours the
 <code>AETHER_BIN_DIR</code> environment variable.</p>
 """
 

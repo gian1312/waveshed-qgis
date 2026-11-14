@@ -13,9 +13,12 @@ automatic ERP computation, SPLAT! .az/.el file I/O, and full dirty tracking.
 from __future__ import annotations
 
 import math
+import os
 from typing import Optional
 
-from qgis.PyQt.QtCore import Qt
+from qgis.core import QgsSettings
+from qgis.PyQt.QtCore import Qt, QUrl, pyqtSignal
+from qgis.PyQt.QtGui import QDesktopServices
 from qgis.PyQt.QtWidgets import (
     QAbstractItemView,
     QComboBox,
@@ -49,9 +52,12 @@ from ..core.asset_manager import (
     create_default_asset,
     delete_asset,
     get_assets_dir,
+    is_in_store,
     list_assets,
     load_asset,
     save_asset,
+    save_renamed_asset,
+    unique_asset_path,
 )
 from .height_inputs import MIN_AMSL_M, bind_height_mode
 from .plotting import PolarPlotWidget
@@ -713,6 +719,12 @@ class _PatternVisualizerDialog(QDialog):
 # ---------------------------------------------------------------------------
 
 
+def _same_file(a: str, b: str) -> bool:
+    """Path equality as the file system sees it (case-blind on Windows)."""
+    return (os.path.normcase(os.path.abspath(a))
+            == os.path.normcase(os.path.abspath(b)))
+
+
 class AssetManagerTab(QWidget):
     """Tab widget for managing emitter asset definitions.
 
@@ -724,7 +736,17 @@ class AssetManagerTab(QWidget):
         Top bar  -- horizontal asset list + action buttons
                     [Reload] [New] [Save] [Save As] [Delete]
         Below    -- QTabWidget with 2 subtabs: Parameters, Antenna Patterns
+
+    Signals:
+        assets_changed -- emitted after every change persisted to the store
+            (New, Save, Save As into the store, Delete, Reload, folder
+            change); the 360° and P2P tabs re-read their asset lists on it.
+        asset_renamed(old, new) -- emitted on a Save that changed the name,
+            before ``assets_changed``, so rows showing *old* follow the asset.
     """
+
+    assets_changed = pyqtSignal()
+    asset_renamed = pyqtSignal(str, str)
 
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
@@ -788,7 +810,38 @@ class AssetManagerTab(QWidget):
         btn_row.addStretch()
         layout.addLayout(btn_row)
 
+        # Where the assets live: the 360° and P2P tabs list only this folder.
+        store_row = QHBoxLayout()
+        self.lbl_store = QLabel()
+        self.lbl_store.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.btn_open_store = QPushButton("Open folder")
+        self.btn_open_store.setToolTip(
+            "Show the assets folder in the file manager.")
+        self.btn_change_store = QPushButton("Change…")
+        self.btn_change_store.setToolTip(
+            "Use another folder for assets. Assets in the current folder "
+            "stay where they are.")
+        store_row.addWidget(self.lbl_store, 1)
+        store_row.addWidget(self.btn_open_store)
+        store_row.addWidget(self.btn_change_store)
+        layout.addLayout(store_row)
+        self._update_store_label()
+
         return panel
+
+    _STORE_LABEL_WIDTH_PX = 520
+
+    def _update_store_label(self) -> None:
+        """``Stored in: <dir>``, the path elided in the middle, full in the
+        tooltip."""
+        store = get_assets_dir()
+        shown = self.lbl_store.fontMetrics().elidedText(
+            store, Qt.TextElideMode.ElideMiddle, self._STORE_LABEL_WIDTH_PX)
+        self.lbl_store.setText(f"Stored in: {shown}")
+        self.lbl_store.setToolTip(
+            f"{store}\n\nThe 360° and P2P tabs list the assets stored "
+            "in this folder.")
 
     # -- Subtab 1: Parameters ----------------------------------------------
 
@@ -989,6 +1042,8 @@ class AssetManagerTab(QWidget):
         self.btn_save.clicked.connect(self._on_save)
         self.btn_save_as.clicked.connect(self._on_save_as)
         self.btn_delete.clicked.connect(self._on_delete)
+        self.btn_open_store.clicked.connect(self._on_open_store)
+        self.btn_change_store.clicked.connect(self._on_change_store)
 
         # -- ERP auto-compute ----------------------------------------------
         self.spin_peak_power.valueChanged.connect(self._update_erp)
@@ -1281,6 +1336,7 @@ class AssetManagerTab(QWidget):
         """Reload the asset list from disk and repopulate the QListWidget."""
         self._assets = list_assets()
         self._rebuild_list()
+        self._update_store_label()
 
     # ------------------------------------------------------------------
     # List helpers
@@ -1412,8 +1468,8 @@ class AssetManagerTab(QWidget):
             QMessageBox.StandardButton.Cancel,
         )
         if answer == QMessageBox.StandardButton.Save:
-            self._on_save()
-            return True
+            # A refused or failed save keeps the edits — do not go on.
+            return self._on_save()
         if answer == QMessageBox.StandardButton.Discard:
             self._dirty = False
             return True
@@ -1443,8 +1499,10 @@ class AssetManagerTab(QWidget):
 
         asset = create_default_asset()
 
-        # Ensure uniqueness.
+        # A name no asset has — in this list or in the store on disk — and
+        # (save_asset without a path) a file no other asset has.
         existing_names = {a.get("name") for a in self._assets}
+        existing_names.update(self._store_names())
         base_name = asset["name"]
         counter = 1
         while asset["name"] in existing_names:
@@ -1452,7 +1510,12 @@ class AssetManagerTab(QWidget):
             asset["name"] = f"{base_name} {counter}"
 
         # Save immediately so it has a file on disk.
-        path = save_asset(asset)
+        try:
+            path = save_asset(asset)
+        except OSError as exc:
+            QMessageBox.warning(
+                self, "New Asset", f"Could not create the asset file:\n{exc}")
+            return
         asset["_path"] = path
 
         self._assets.append(asset)
@@ -1461,21 +1524,73 @@ class AssetManagerTab(QWidget):
         # Select the newly created asset.
         new_row = len(self._assets) - 1
         self.asset_list.setCurrentRow(new_row)
+        self.assets_changed.emit()
 
-    def _on_save(self) -> None:
-        """Save current editor state to the existing asset file."""
+    def _store_names(self) -> set:
+        """Names of the assets stored on disk (the store, not this list)."""
+        return {a.get("name") for a in list_assets()}
+
+    def _name_taken_in_store(self, name: str, own_path: Optional[str]) -> Optional[str]:
+        """Path of another asset in the store already called *name*, or None.
+
+        *own_path* (the file being written) does not count: overwriting it
+        leaves one asset of that name.
+        """
+        for asset in list_assets():
+            if asset.get("name") != name:
+                continue
+            path = asset.get("_path") or ""
+            if own_path and _same_file(path, own_path):
+                continue
+            return path
+        return None
+
+    def _refuse_taken_name(self, name: str, other_path: str) -> None:
+        QMessageBox.warning(
+            self, "Name already used",
+            f'Another asset in the assets folder is already called "{name}" '
+            f"({os.path.basename(other_path)}).\n\n"
+            "The 360° and P2P tabs pick assets by name, so two assets "
+            "must not share one. Choose another name.",
+        )
+
+    def _on_save(self) -> bool:
+        """Save current editor state to the asset's file.
+
+        A changed name moves the file to one derived from the new name
+        (store only; ``save_renamed_asset``). Returns True when saved.
+        """
         if self._current_index < 0 or self._current_index >= len(self._assets):
-            return
+            return False
 
         data = self._collect_from_editor()
         if not data["name"]:
             QMessageBox.warning(self, "Validation", "Asset name cannot be empty.")
-            return
+            return False
 
         existing = self._assets[self._current_index]
         path = existing.get("_path")
+        old_name = existing.get("name") or ""
+        renamed = data["name"] != old_name
 
-        saved_path = save_asset(data, path=path)
+        if renamed:
+            other = self._name_taken_in_store(data["name"], path)
+            if other:
+                self._refuse_taken_name(data["name"], other)
+                return False
+
+        try:
+            if renamed and path:
+                saved_path = save_renamed_asset(data, path)
+            else:
+                saved_path = save_asset(data, path=path)
+        except OSError as exc:
+            QMessageBox.warning(
+                self, "Save Failed",
+                f"Could not save the asset:\n{exc}\n\nThe file on disk is "
+                "unchanged.",
+            )
+            return False
         data["_path"] = saved_path
 
         self._assets[self._current_index] = data
@@ -1486,8 +1601,13 @@ class AssetManagerTab(QWidget):
         if item:
             item.setText(data["name"])
 
+        if renamed and old_name:
+            self.asset_renamed.emit(old_name, data["name"])
+        self.assets_changed.emit()
+        return True
+
     def _on_save_as(self) -> None:
-        """Save a copy under a new file name."""
+        """Save a copy under a new file name (the dialog starts in the store)."""
         if self._current_index < 0:
             return
 
@@ -1496,24 +1616,55 @@ class AssetManagerTab(QWidget):
             QMessageBox.warning(self, "Validation", "Asset name cannot be empty.")
             return
 
+        store = get_assets_dir()
         path, _ = QFileDialog.getSaveFileName(
             self,
             "Save Asset As",
-            "",
+            unique_asset_path(data["name"], assets_dir=store),
             "Asset JSON Files (*.json);;All Files (*)",
         )
         if not path:
             return
+        if not os.path.splitext(path)[1]:
+            path += ".json"
 
-        saved_path = save_asset(data, path=path)
+        in_store = is_in_store(path, assets_dir=store)
+        if in_store:
+            other = self._name_taken_in_store(data["name"], path)
+            if other:
+                self._refuse_taken_name(data["name"], other)
+                return
+
+        try:
+            saved_path = save_asset(data, path=path)
+        except OSError as exc:
+            QMessageBox.warning(
+                self, "Save Failed", f"Could not save the asset:\n{exc}")
+            return
         data["_path"] = saved_path
 
+        # Overwriting a listed file replaces its entry instead of listing it
+        # twice.
+        self._assets = [
+            a for a in self._assets
+            if not (a.get("_path") and _same_file(a["_path"], saved_path))
+        ]
         self._assets.append(data)
+        self._dirty = False  # before the rebuild: it selects a row
         self._rebuild_list()
 
         new_row = len(self._assets) - 1
         self.asset_list.setCurrentRow(new_row)
-        self._dirty = False
+
+        if in_store:
+            self.assets_changed.emit()
+        else:
+            QMessageBox.warning(
+                self, "Saved outside the assets folder",
+                f"Saved to:\n{saved_path}\n\nThe 360° and P2P tabs list "
+                f"only assets stored in:\n{store}\n\nThis copy is listed here "
+                "until the next Reload.",
+            )
 
     def _on_delete(self) -> None:
         if self._current_index < 0 or self._current_index >= len(self._assets):
@@ -1551,6 +1702,30 @@ class AssetManagerTab(QWidget):
         self._assets.pop(self._current_index)
         self._current_index = -1
         self._rebuild_list()
+        self.assets_changed.emit()
+
+    def _on_open_store(self) -> None:
+        """Show the assets folder in the system file manager."""
+        QDesktopServices.openUrl(QUrl.fromLocalFile(get_assets_dir()))
+
+    def _on_change_store(self) -> None:
+        """Pick another assets folder; the list and the run tabs follow it.
+
+        Assets in the old folder stay where they are. Unsaved edits are asked
+        about first (Save writes to the asset's own file in the old folder).
+        """
+        current = get_assets_dir()
+        chosen = QFileDialog.getExistingDirectory(
+            self, "Assets folder", current)
+        if not chosen or _same_file(chosen, current):
+            return
+        if not self._check_unsaved_changes():
+            return
+        QgsSettings().setValue("waveshed/assets_dir", os.path.abspath(chosen))
+        self._dirty = False
+        self._current_index = -1
+        self.refresh()
+        self.assets_changed.emit()
 
     def _on_reload(self) -> None:
         """Reload all assets from disk, discarding unsaved changes."""
@@ -1568,3 +1743,6 @@ class AssetManagerTab(QWidget):
         self._dirty = False
         self._current_index = -1
         self.refresh()
+        # Files edited, added or removed outside the plugin reach the run
+        # tabs too.
+        self.assets_changed.emit()

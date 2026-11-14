@@ -66,7 +66,7 @@ from ..core.binary_manager import (
 from ..core import api_key
 from ..core import engine_log
 from ..core import terrain_adapter
-from ..core.asset_manager import compute_erp, list_assets
+from ..core.asset_manager import compute_erp, list_assets, resolve_assets
 from ..core.job_builder import (
     INVALID,
     VALID_RESOLUTIONS,
@@ -771,10 +771,8 @@ class P2PTab(QWidget):
         """Names of the stored emitter definitions, sorted."""
         names = []
         try:
-            for asset in list_assets():
-                name = asset.get("name", "")
-                if name:
-                    names.append(name)
+            # One entry per name — the rule the 360° tab uses too.
+            names = list(resolve_assets(list_assets()))
         except Exception as exc:  # noqa: BLE001
             # A bad asset file must not stop the tab from being built.
             QgsMessageLog.logMessage(
@@ -791,6 +789,28 @@ class P2PTab(QWidget):
         discovery and the cache dir are read per run, never cached.
         """
         self._refresh_assets()
+
+    def refresh_assets(self) -> None:
+        """Re-read the asset store (the Assets tab changed it); the current
+        choice is kept while the asset exists. The frequency and ERP boxes
+        are not touched."""
+        self._refresh_assets()
+
+    def rename_asset(self, old: str, new: str) -> None:
+        """The Assets tab renamed *old* to *new*: the dropdown follows.
+
+        Relabelled in place with signals blocked, so the frequency/ERP boxes
+        keep their values; the ``assets_changed`` that follows re-reads the
+        store.
+        """
+        if not old or old == new:
+            return
+        idx = self.combo_asset.findText(old)
+        if idx < 0:
+            return
+        blocked = self.combo_asset.blockSignals(True)
+        self.combo_asset.setItemText(idx, new)
+        self.combo_asset.blockSignals(blocked)
 
     def _refresh_assets(self) -> None:
         """Re-read the asset list, keeping the current selection if it lives."""
@@ -814,10 +834,7 @@ class P2PTab(QWidget):
             return
         asset = None
         try:
-            for candidate in list_assets():
-                if candidate.get("name") == name:
-                    asset = candidate
-                    break
+            asset = resolve_assets(list_assets()).get(name)
         except Exception as exc:  # noqa: BLE001
             QgsMessageLog.logMessage(
                 f"Could not load asset '{name}': {exc}", TAG,

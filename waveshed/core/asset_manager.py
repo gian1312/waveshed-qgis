@@ -112,12 +112,118 @@ def get_assets_dir() -> str:
     The path is read from ``QgsSettings("waveshed/assets_dir")``.  When no
     setting has been stored, ``~/.aether/assets/`` is used as the default.
     """
-    settings = QgsSettings()
-    assets_dir = settings.value("waveshed/assets_dir", _DEFAULT_ASSETS_DIR)
-    if not assets_dir:
-        assets_dir = _DEFAULT_ASSETS_DIR
+    assets_dir = _assets_dir_setting()
     os.makedirs(assets_dir, exist_ok=True)
     return assets_dir
+
+
+def _assets_dir_setting() -> str:
+    """The configured assets directory (not created)."""
+    assets_dir = QgsSettings().value("waveshed/assets_dir", _DEFAULT_ASSETS_DIR)
+    return str(assets_dir) if assets_dir else _DEFAULT_ASSETS_DIR
+
+
+def is_in_store(path: str, assets_dir: Optional[str] = None) -> bool:
+    """True when *path* is a file directly inside the assets directory.
+
+    Only those files are listed by :func:`list_assets` (the store is not
+    scanned recursively), so only they reach the 360° and P2P tabs.
+    """
+    store = assets_dir or get_assets_dir()
+    parent = os.path.dirname(os.path.abspath(path))
+    return _same_path(parent, store)
+
+
+def assets_signature(assets_dir: Optional[str] = None) -> tuple:
+    """Cheap fingerprint of the store: its path + (name, size, mtime_ns) of
+    every ``*.json`` in it.
+
+    One ``os.scandir`` and no file read (the stat is free on Windows), so a
+    tab can ask "did the store change?" when it is shown and re-read the
+    assets only when it did. A missing or unreadable directory gives
+    ``(dir, None)``; nothing is created.
+    """
+    store = assets_dir or _assets_dir_setting()
+    entries = []
+    try:
+        with os.scandir(store) as it:
+            for entry in it:
+                if not entry.name.lower().endswith(".json"):
+                    continue
+                with contextlib.suppress(OSError):  # vanished while listing
+                    if entry.is_file():
+                        st = entry.stat()
+                        entries.append((entry.name, st.st_size, st.st_mtime_ns))
+    except OSError:
+        return (store, None)
+    return (store, tuple(sorted(entries)))
+
+
+# Duplicate names already reported, so a refresh on every tab switch does not
+# repeat the same warning: (name, paths) pairs.
+_DUPLICATES_LOGGED: set = set()
+
+
+def resolve_assets(assets: Optional[list[dict]] = None) -> dict[str, dict]:
+    """THE name → asset rule shared by the 360° and P2P tabs.
+
+    Assets are taken in file-path order and the FIRST file with a name wins;
+    a later file carrying the same name is ignored (logged once per set of
+    files). Unnamed assets are left out. Without *assets*, the store is
+    listed.
+    """
+    if assets is None:
+        assets = list_assets()
+    by_name: dict[str, dict] = {}
+    duplicates: dict[str, list[str]] = {}
+    ordered = sorted(
+        assets, key=lambda a: os.path.normcase(str(a.get("_path") or "")))
+    for asset in ordered:
+        name = asset.get("name") or ""
+        if not name:
+            continue
+        if name in by_name:
+            duplicates.setdefault(
+                name, [str(by_name[name].get("_path") or "")],
+            ).append(str(asset.get("_path") or ""))
+            continue
+        by_name[name] = asset
+    for name, paths in duplicates.items():
+        key = (name, tuple(paths))
+        if key in _DUPLICATES_LOGGED:
+            continue
+        _DUPLICATES_LOGGED.add(key)
+        _log(
+            f"assets: {len(paths)} files carry the name \"{name}\" — "
+            f"{paths[0]} is used, ignored: {', '.join(paths[1:])}. "
+            "Rename or delete the extra file(s) in the Assets tab.",
+        )
+    return by_name
+
+
+def unique_asset_path(
+    name: str,
+    assets_dir: Optional[str] = None,
+    keep: Optional[str] = None,
+) -> str:
+    """A path in the store for an asset called *name* that overwrites nothing.
+
+    ``<stem>.json``, else ``<stem>_2.json``, ``<stem>_3.json``, … where
+    ``<stem>`` is the sanitized name. *keep* (an existing file of the asset
+    being saved) counts as free, so re-saving under a name that maps to its
+    own file stays in place.
+    """
+    store = assets_dir or get_assets_dir()
+    stem = _sanitize_filename(name)
+    counter = 1
+    while True:
+        filename = f"{stem}.json" if counter == 1 else f"{stem}_{counter}.json"
+        path = os.path.join(store, filename)
+        if keep and _same_path(path, keep):
+            return os.path.abspath(keep)
+        if not os.path.lexists(path):
+            return os.path.abspath(path)
+        counter += 1
 
 
 def list_assets() -> list[dict]:
@@ -223,26 +329,55 @@ def save_asset(asset: dict, path: Optional[str] = None) -> str:
 
     Args:
         asset: The asset dictionary to persist.
-        path:  Target file path.  When *None*, a path is generated from the
-               asset's ``"name"`` field inside the assets directory.
+        path:  Target file path, written (replaced) as given.  When *None*,
+               a path is derived from the asset's ``"name"`` inside the
+               assets directory that never overwrites an existing file
+               (:func:`unique_asset_path`).
 
     Returns:
         The absolute path of the written file.
+
+    The file is written to a temporary file beside the target and renamed
+    over it, so a failed write leaves the previous file as it was.
     """
     if path is None:
-        name = asset.get("name", "asset")
-        filename = _sanitize_filename(name) + ".json"
-        path = os.path.join(get_assets_dir(), filename)
+        path = unique_asset_path(asset.get("name") or "asset")
 
-    os.makedirs(os.path.dirname(path), exist_ok=True)
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
 
     # Strip the internal bookkeeping key before writing.
     data = {k: v for k, v in asset.items() if k != "_path"}
 
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2)
-
+    _write_json_atomic(path, data)
     return os.path.abspath(path)
+
+
+def save_renamed_asset(asset: dict, old_path: str) -> str:
+    """Save an asset whose name changed: the file follows the name.
+
+    A file inside the store is written to a fresh path derived from the new
+    name (:func:`unique_asset_path`; its own path counts as free, so a name
+    that maps to the same file is saved in place), and only then is the old
+    file removed — write first, delete second, so a failure keeps the old
+    file. A file outside the store is saved in place.
+
+    Returns:
+        The absolute path the asset now lives at.
+    """
+    if not is_in_store(old_path):
+        return save_asset(asset, path=old_path)
+    new_path = unique_asset_path(asset.get("name") or "asset", keep=old_path)
+    saved = save_asset(asset, path=new_path)
+    if not _same_path(saved, old_path):
+        try:
+            with contextlib.suppress(FileNotFoundError):  # already gone
+                os.remove(old_path)
+        except OSError as exc:
+            _log(
+                f"assets: renamed asset saved to {saved}, but the old file "
+                f"{old_path} could not be removed ({exc}).",
+            )
+    return saved
 
 
 def delete_asset(path: str) -> None:
@@ -276,6 +411,35 @@ def create_default_asset(name: str = "New Asset") -> dict:
 
 
 # -- Helpers ------------------------------------------------------------------
+
+
+def _same_path(a: str, b: str) -> bool:
+    """Path equality the way the file system sees it (case on Windows)."""
+    return (os.path.normcase(os.path.abspath(a))
+            == os.path.normcase(os.path.abspath(b)))
+
+
+def _write_json_atomic(path: str, data: dict) -> None:
+    """Write *data* to a temp file beside *path*, then rename it over *path*.
+
+    The temp name does not end in ``.json``, so a half-written file is never
+    listed as an asset; it is removed when anything fails.
+    """
+    tmp = f"{path}.{os.getpid()}.tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+        os.replace(tmp, path)
+    except BaseException:
+        with contextlib.suppress(OSError):  # nothing written, or already gone
+            os.remove(tmp)
+        raise
+
+
+def _log(message: str) -> None:
+    with contextlib.suppress(Exception):  # no QGIS available (unit tests)
+        from qgis.core import Qgis, QgsMessageLog
+        QgsMessageLog.logMessage(message, "Waveshed", Qgis.MessageLevel.Warning)
 
 
 def _sanitize_filename(name: str) -> str:

@@ -99,6 +99,17 @@ class _FakeCombo(QtWidgets.QComboBox):
     def setCurrentIndex(self, idx):
         self.current = self.items[idx] if 0 <= idx < len(self.items) else ""
 
+    def count(self):
+        return len(self.items)
+
+    def itemText(self, idx):
+        return self.items[idx]
+
+    def setItemText(self, idx, text):
+        if self.items[idx] == self.current:
+            self.current = text
+        self.items[idx] = text
+
 
 class _FakeCheck:
     def __init__(self, checked=True):
@@ -240,7 +251,10 @@ class TestSiteTabRefresh(unittest.TestCase):
         self.assertEqual(combo.current, "Kept", "user's row choice was lost")
         self.assertFalse(combo.blocked, "signals left blocked")
 
-    def test_vanished_asset_falls_back_to_blank_visibly(self):
+    def test_vanished_asset_stays_selected_under_its_name(self):
+        # Falling back to the blank entry would make a Propagation run use
+        # 433 MHz / 10 W without a word; kept, the run refuses the row
+        # naming it (_unresolved_asset_problem).
         tab = self._tab()
         tab._asset_cache = {"Other": {}}
         combo = _FakeCombo(items=["", "Gone"], current="Gone")
@@ -254,6 +268,25 @@ class TestSiteTabRefresh(unittest.TestCase):
 
         tab.sites_table = _Table()
         tab._refresh_asset_combos()
+        self.assertEqual(combo.items, ["", "Other", "Gone"])
+        self.assertEqual(combo.current, "Gone")
+        self.assertIsNone(tab._get_asset("Gone"))
+
+    def test_blank_row_stays_blank(self):
+        tab = self._tab()
+        tab._asset_cache = {"Other": {}}
+        combo = _FakeCombo(items=["", "Other"], current="")
+
+        class _Table:
+            def rowCount(self):
+                return 1
+
+            def cellWidget(self, row, col):
+                return combo if col == _COL_ASSET else None
+
+        tab.sites_table = _Table()
+        tab._refresh_asset_combos()
+        self.assertEqual(combo.items, ["", "Other"])
         self.assertEqual(combo.current, "")
 
 

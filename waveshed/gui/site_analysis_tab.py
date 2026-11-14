@@ -57,7 +57,9 @@ from qgis.core import (
 from qgis.gui import QgsRubberBand
 from qgis.PyQt.QtGui import QColor
 
-from ..core.asset_manager import compute_erp, list_assets, load_asset
+from ..core.asset_manager import (
+    compute_erp, get_assets_dir, list_assets, load_asset, resolve_assets,
+)
 from ..core.attribution import source_credit
 from ..core.binary_manager import engine_error_hint, find_binary
 from ..core import api_key
@@ -722,6 +724,11 @@ class _SiteAnalysisWorker(QThread):
             self.terrain_prep = None
 
 
+class UnresolvedAssetError(ValueError):
+    """A Propagation run's site row names an asset the store no longer has
+    (``_build_jobs``); the message names the rows and assets."""
+
+
 # ---------------------------------------------------------------------------
 # Site Analysis Tab
 # ---------------------------------------------------------------------------
@@ -798,19 +805,55 @@ class SiteAnalysisTab(QWidget):
     # Asset helpers
     # ==================================================================
 
+    def refresh_assets(self) -> None:
+        """Re-read the asset store and every row's Asset dropdown.
+
+        Called by the main dialog when the Assets tab changed the store (and
+        when this tab is shown after the store changed on disk). Each row
+        keeps its choice; see ``_refresh_asset_combos``.
+        """
+        self._refresh_asset_cache()
+        self._refresh_asset_combos()
+
+    def rename_asset(self, old: str, new: str) -> None:
+        """Rows showing *old* show *new* (the Assets tab renamed it).
+
+        Relabels in place, no disk read and no auto-fill (signals blocked:
+        the height a user typed stays); the ``assets_changed`` that follows
+        re-reads the store. Every other row keeps its choice.
+        """
+        if not old or old == new:
+            return
+        if old in self._asset_cache:
+            self._asset_cache[new] = self._asset_cache.pop(old)
+        for row in range(self.sites_table.rowCount()):
+            combo = self.sites_table.cellWidget(row, _COL_ASSET)
+            if not isinstance(combo, QComboBox):
+                continue
+            idx = combo.findText(old)
+            if idx < 0:
+                continue
+            blocked = combo.blockSignals(True)
+            combo.setItemText(idx, new)
+            combo.blockSignals(blocked)
+
     def _refresh_asset_cache(self) -> None:
-        """Reload assets from disk and rebuild the name-keyed cache."""
+        """Reload assets from disk and rebuild the name-keyed cache.
+
+        Names resolve through ``asset_manager.resolve_assets`` — the rule
+        the P2P tab uses too (file-path order, first file wins).
+        """
         self._asset_cache.clear()
-        for asset in list_assets():
-            name = asset.get("name", "")
-            if name:
-                self._asset_cache[name] = asset
+        self._asset_cache.update(resolve_assets(list_assets()))
 
     def _refresh_asset_combos(self) -> None:
         """Repopulate every site row's asset dropdown from the cache.
 
-        Preserves each row's current choice (an asset that vanished from the
-        store falls back to the blank entry — visibly, not silently).
+        Preserves each row's current choice. An asset that vanished from the
+        store stays selected under its name (listed after the store's
+        assets): a Propagation run then refuses that row, naming it, instead
+        of quietly running 433 MHz / 10 W — which a silent fall back to the
+        blank entry would do.
         """
         names = self._asset_names()
         for row in range(self.sites_table.rowCount()):
@@ -823,9 +866,41 @@ class SiteAnalysisTab(QWidget):
             combo.addItem("")  # blank default
             combo.addItems(names)
             idx = combo.findText(current)
+            if idx < 0 and current:
+                combo.addItem(current)
+                idx = combo.count() - 1
             if idx >= 0:
                 combo.setCurrentIndex(idx)
             combo.blockSignals(blocked)
+
+    def _unresolved_asset_problem(
+        self, mode: str, sites: List[Dict],
+    ) -> Optional[str]:
+        """Why a Propagation run must not start: rows whose Asset no longer
+        resolves, or None.
+
+        Only Propagation mode ('LOSS') reads assets — LOS and LOS Floor
+        ignore them. A blank Asset is allowed (433 MHz / 10 W, documented).
+        Rows without a location are skipped by the run, so not judged.
+        """
+        if mode != "LOSS":
+            return None
+        missing = []
+        for site_idx, site in enumerate(sites):
+            name = (site.get("asset_name") or "").strip()
+            if not name or site.get("coords") is None:
+                continue
+            if self._get_asset(name) is None:
+                missing.append(f'Site {site_idx + 1}: "{name}"')
+        if not missing:
+            return None
+        return (
+            "These sites use an asset that is not in the assets folder "
+            "any more (renamed or deleted):\n\n" + "\n".join(missing)
+            + f"\n\nAssets folder: {get_assets_dir()}\n\n"
+            "Pick an asset for each of these sites (or leave the Asset blank "
+            "for 433 MHz / 10 W) and run again."
+        )
 
     def _asset_names(self) -> List[str]:
         """Return sorted list of cached asset names."""
@@ -1918,6 +1993,11 @@ class SiteAnalysisTab(QWidget):
         climate_value = self.combo_climate.currentIndex() + 1
 
         sites = self._read_sites()
+        # A non-blank Asset that no longer resolves is refused, never run on
+        # the 433 MHz / 10 W fallback below (_on_run shows the message).
+        asset_problem = self._unresolved_asset_problem(mode, sites)
+        if asset_problem:
+            raise UnresolvedAssetError(asset_problem)
         # MIN_ALT sweeps every altitude internally (the result is independent of
         # the receiver height), so one job per site suffices — using the whole
         # altitude table would just recompute identical rasters.
@@ -2110,7 +2190,13 @@ class SiteAnalysisTab(QWidget):
         # Refresh asset cache before building jobs so latest data is used.
         self._refresh_asset_cache()
 
-        jobs = self._build_jobs()
+        try:
+            jobs = self._build_jobs()
+        except UnresolvedAssetError as exc:
+            # A row whose asset was renamed or deleted must not run on the
+            # 433 MHz / 10 W fallback without a word.
+            QMessageBox.warning(self, "Asset not found", str(exc))
+            return
         if not jobs:
             QMessageBox.warning(
                 self, "No Jobs",
