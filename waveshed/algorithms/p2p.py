@@ -35,6 +35,7 @@ from ..core.job_builder import (
     batch_max_range_km,
     batch_reference_source,
     build_p2p_job,
+    write_engine_batch_csv,
     height_floor_error,
     write_job_file,
 )
@@ -332,6 +333,14 @@ class P2PAlgorithm(QgsProcessingAlgorithm):
         feedback.setProgress(5)
 
         entries = self._parse_csv(batch_file)
+        if is_batch:
+            # The engine reads a clean copy of exactly the rows parsed above:
+            # a UTF-8 byte-order mark ("CSV UTF-8" from Excel) or a lower-case
+            # 's' in the user's file would make a source a receiver there.
+            try:
+                batch_file = write_engine_batch_csv(entries)
+            except (OSError, ValueError) as exc:
+                raise QgsProcessingException(f"Batch CSV: {exc}") from exc
         (centre_lat, centre_lon,
          terrain_radius_km) = self._compute_terrain_extent(entries)
 

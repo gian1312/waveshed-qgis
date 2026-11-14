@@ -815,7 +815,9 @@ sidecar.</td></tr>
 # ---------------------------------------------------------------------------
 
 _P2P = """
-<p>The <b>P2P Link</b> tab analyses a single link between two points. In
+<p>The <b>P2P Link</b> tab analyses one link between two points, or every link
+of a batch CSV (<b>Links:</b> above the endpoints: <b>Single link</b> or
+<b>Batch CSV</b>, see <a href="#p2p">Batch CSV</a>). In
 <b>Line of Sight (LOS)</b> mode the endpoints are labelled <b>Site A:</b> and
 <b>Site B:</b>; in <b>Propagation</b> mode they become
 <b>Transmitter:</b> and <b>Receiver:</b> and the <b>Parameters</b> group
@@ -836,21 +838,28 @@ carries.</li>
 <h3>Parameters (Propagation only)</h3>
 <ul>
 <li><b>Asset:</b> — an emitter from the <b>Assets</b> tab; selecting one fills
-in frequency and ERP. Leave it blank to type them by hand.</li>
+in frequency and ERP and, for a single link, Site A's height and height mode
+from the asset's defaults. Leave it blank to type them by hand.</li>
 <li><b>Frequency (MHz):</b> — 1&ndash;3000 MHz, default 433.</li>
 <li><b>ERP (Watts):</b> — effective radiated power, default 10 W.</li>
 <li><b>AZ Rotation:</b> — bearing the asset's azimuth pattern is turned to,
 in whole degrees clockwise from north; sent only with an asset that has an
-antenna pattern.</li>
+antenna pattern, greyed out otherwise.</li>
 </ul>
 
 <h3>Analysis</h3>
 <p><b>DEM Layer:</b> with <b>Folder…</b> (the same list as in the 360&deg;
 tab: raster layers, the Settings <b>Local:</b> terrain folder and the folders
 picked with <b>Folder…</b> in either tab), <b>Resolution:</b>, <b>Backend:</b>,
-<b>Output Dir:</b> with <b>Browse</b>, and <b>Earth Radius Mode:</b>. The same
-meanings as in the <a href="#site-analysis">360&deg; tab</a>; this tab remembers
-its own output folder, separately from the 360&deg; tab.</p>
+and <b>Output Dir:</b> with <b>Browse</b>. The same meanings as in the
+<a href="#site-analysis">360&deg; tab</a>; this tab remembers its own output
+folder, separately from the 360&deg; tab.</p>
+
+<h3>ITM Parameters</h3>
+<p>The tab has its own <b>ITM Parameters</b> group — the same controls as the
+360&deg; tab's (including <b>Earth Radius Mode:</b>), with their own values —
+shown in <b>Propagation</b> mode with model <b>ITM</b>. See
+<a href="#itm">ITM parameters</a>.</p>
 
 <h3>Running</h3>
 <p><b>Run Analysis</b> validates the inputs (both endpoints placed, a DEM
@@ -858,7 +867,10 @@ selected, an output directory, both antenna heights above their floor),
 warns about out-of-range model parameters and large terrain downloads, then
 writes a two-line batch CSV from the endpoints, prepares terrain over the pair,
 and runs <code>aether_core</code>. There is no export step — the engine writes
-its results directly.</p>
+its results directly. With <b>Batch CSV</b>, every line of the file is checked
+first (nothing runs on an error, which names its line), the endpoints are
+greyed out, and the engine is handed a clean copy of exactly the checked rows;
+the <b>Results</b> box then lists every link.</p>
 
 <h3>Outputs</h3>
 <table border="1" cellspacing="0" cellpadding="4">
@@ -876,8 +888,8 @@ bulge added.</td></tr>
 distance.</td></tr>
 </table>
 <p>The CSV and the report are shown in the <b>Results</b> box. When profile
-files exist, <b>View Plots</b> appears and opens <b>P2P Link Analysis
-Plots</b> with two tabs:</p>
+files exist — a single link only; a batch writes none — <b>View Plots</b>
+appears and opens <b>P2P Link Analysis Plots</b> with two tabs:</p>
 <ul>
 <li><b>Terrain Profile</b> — terrain elevation on the left axis and signal
 strength (ERP in dBm minus path loss) on the right.</li>
@@ -894,10 +906,10 @@ km, frequency in MHz and the radius in metres.</li>
 <b>Save Image...</b> to export a PNG.</p>
 
 <h3>Batch CSV</h3>
-<p>The batch mode is exposed through the Processing algorithm
-<b>Point-to-Point Link Analysis</b> (parameter <b>Batch CSV File</b>); the tab
-itself always builds a two-line CSV from its own endpoints. The format is the
-same:</p>
+<p>A batch runs from the tab (<b>Links:</b> <b>Batch CSV</b>, a file with
+<b>Browse…</b>; the last one is remembered) and from the Processing algorithm
+<b>Point-to-Point Link Analysis</b> (parameter <b>Batch CSV File</b>). The format
+is the same:</p>
 <pre>S,TX1,47.056300,8.484600,40.0,AGL
 R,RX1,47.500000,8.900000,10.0,AGL
 R,RX2,47.600000,8.700000,2.0,AMSL</pre>
@@ -907,12 +919,17 @@ R,RX2,47.600000,8.700000,2.0,AMSL</pre>
 <b>altitude in metres</b>, <b>mode</b> (<code>AGL</code> or
 <code>AMSL</code>).</li>
 <li>Blank lines and lines starting with <code>#</code> are ignored; a UTF-8
-byte-order mark is tolerated.</li>
+byte-order mark (Excel's "CSV UTF-8") and a lower-case <code>s</code> /
+<code>r</code> are fine — the engine is handed a clean copy of the checked rows
+(read raw, the engine would have taken a source behind a byte-order mark for a
+receiver).</li>
 <li>Every violation names its line number: too few fields, a type that is not
 S or R, a mode that is not AGL/AMSL, a non-numeric altitude, or an AGL altitude
 below the 1 m floor.</li>
 <li>A batch is computed as the <b>full cross product</b> of the S rows with the
-R rows — 3 sources and 10 receivers are 30 links.</li>
+R rows — 3 sources and 10 receivers are 30 links. Each link takes its endpoints
+and heights from the file; the job's own transmitter is the first S row (GPU
+ITM takes one system elevation under it for every link).</li>
 </ul>
 <p><b>Terrain</b> for a batch is prepared over the centroid of all points with
 a radius of half the bounding-box diagonal plus 5 km (at least 10 km).</p>
@@ -1026,7 +1043,8 @@ asset (falling back to 433 MHz / 10 W when no asset is chosen, and computing
 ERP from peak power and gain when the stored ERP is not positive), and
 pre-fills the site's <b>Height (m)</b> and <b>Height Mode</b>.</li>
 <li>The P2P tab copies frequency and ERP into its own boxes, which you can then
-edit.</li>
+edit, and — for a single link — the default height and height mode into Site
+A.</li>
 <li><b>Antenna patterns</b> are sent to the engine in Propagation mode, from
 the 360&deg; and P2P tabs (engine 0.4.3 or newer; an older engine is refused,
 because it would drop the pattern without a word). Gains are field (voltage)
@@ -1038,7 +1056,7 @@ running without one. <b>AZ Rotation</b> turns the azimuth pattern clockwise
 from north, in whole degrees, and is sent only with a pattern.</li>
 <li>Polarization and the statistical fractions stored on an asset are
 documentation: the values a run uses come from the <b>ITM Parameters</b> group
-in the 360&deg; tab.</li>
+of the tab that runs it (360&deg; or P2P).</li>
 </ul>
 """
 
@@ -1559,7 +1577,8 @@ _ITM = """
 <p>ITM (the Irregular Terrain Model, "Longley-Rice") predicts median
 transmission loss over irregular terrain from the terrain profile plus a handful
 of electrical and statistical parameters. These are the controls in the
-<b>ITM Parameters</b> group of the 360&deg; tab; the engine defaults are used
+<b>ITM Parameters</b> group of the 360&deg; tab and of the P2P tab (each its
+own values); the engine defaults are used
 wherever the parameter is not exposed.</p>
 
 <table border="1" cellspacing="0" cellpadding="4">

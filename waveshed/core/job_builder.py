@@ -8,6 +8,7 @@ import dataclasses
 import json
 import math
 import os
+import tempfile
 from typing import List, Optional, Sequence, Tuple
 
 # Resolution values (metres) the plugin offers throughout the UI. aether_core
@@ -115,6 +116,43 @@ def batch_reference_source(
         if str(entry[0]).upper() == "S":
             return float(entry[2]), float(entry[3]), float(entry[4]), str(entry[5])
     raise ValueError("The batch has no source (S) row.")
+
+
+def write_engine_batch_csv(
+    entries: Sequence[BatchEntry], path: Optional[str] = None,
+) -> str:
+    """Write *entries* — a batch CSV as the plugin validated it — as the plain
+    file aether_core reads, and return its path (a new temp file by default).
+
+    The engine (engines/p2p.rs) splits each line on ``,`` and takes a row as a
+    source only when its first field is exactly ``S``. A user's file that the
+    plugin's parser accepts can therefore read differently there: Excel's "CSV
+    UTF-8" puts a byte-order mark before the first row (measured: that source
+    became a receiver, 4 links instead of 6), a lower-case ``s`` is a
+    receiver, and quoting or comment lines are not the engine's. The engine
+    gets this copy instead — one ``S|R,id,lat,lon,height,AGL|AMSL`` line per
+    validated row, UTF-8 without a byte-order mark, numbers as the parser read
+    them — so it computes exactly the rows the plugin checked. The user's file
+    is never modified.
+
+    Raises ValueError for an id the engine cannot read back (``,``, a quote
+    or a line break in it).
+    """
+    if path is None:
+        fd, path = tempfile.mkstemp(prefix="aether_p2p_batch_", suffix=".csv")
+        os.close(fd)
+    lines = []
+    for row_type, row_id, lat, lon, height, mode in entries:
+        if any(ch in row_id for ch in (",", '"', "\n", "\r")):
+            raise ValueError(
+                f"Batch row id {row_id!r} contains a comma, quote or line "
+                "break, which aether_core cannot read back. Rename it.")
+        lines.append(
+            f"{str(row_type).upper()},{row_id},{float(lat)!r},{float(lon)!r},"
+            f"{float(height)!r},{str(mode).upper()}")
+    with open(path, "w", encoding="utf-8", newline="\n") as fh:
+        fh.write("\n".join(lines) + "\n")
+    return path
 
 
 def _processing_setting(key: str, default: int) -> int:

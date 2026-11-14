@@ -1,9 +1,11 @@
 """P2P Link Analysis tab widget -- embedded in the main dialog.
 
-QWidget providing single-link P2P analysis.  Supports LOS and LOSS
-modes with dynamic label and field visibility.  Generates a temporary
-2-line batch CSV from the two endpoints, then runs the P2P pipeline
-(terrain_adapter -> job_builder -> aether_core) in a background QThread.
+QWidget providing P2P link analysis.  Supports LOS and LOSS modes with
+dynamic label and field visibility.  "Links:" picks the input: a single link
+(Site A / Site B — a temporary 2-line batch CSV is written from the two
+endpoints) or the user's own batch CSV (every S row paired with every R row).
+Either way the P2P pipeline (terrain_adapter -> job_builder -> aether_core)
+runs as BATCH_P2P in a background QThread.
 
 P2P mode in aether_core produces output files directly (no aether_export):
   - {output_name}.csv        -- Source_ID, Target_ID, Signal_dBm, Path_Loss_dB
@@ -54,6 +56,7 @@ from qgis.core import (
     QgsPointXY,
     QgsProject,
     QgsRasterLayer,
+    QgsSettings,
     QgsWkbTypes,
 )
 from qgis.gui import QgsRubberBand
@@ -77,12 +80,14 @@ from ..core.job_builder import (
     PatternDataError,
     asset_patterns,
     batch_max_range_km,
+    batch_reference_source,
     build_p2p_job,
     format_model_warnings,
     has_pattern_data,
     height_floor_error,
     model_warnings,
     whole_degrees,
+    write_engine_batch_csv,
     write_job_file,
 )
 from ..core.layer_utils import dem_layer_warning, hide_from_dem_picker
@@ -97,6 +102,7 @@ from ..core.terrain_adapter import (
 )
 from .engine_notices import setup_title, show_run_error
 from .height_inputs import MIN_AMSL_M, bind_height_mode
+from .itm_params import ItmParamsGroup
 from .output_dir import P2P_OUTPUT_DIR_KEY, bind_output_dir, save_output_dir
 from .map_tools import activate_point_capture
 from .plotting import XYPlotWidget
@@ -255,15 +261,132 @@ def _parse_batch_csv(path: str) -> List[Tuple[str, str, float, float, float, str
             )
             if floor_error is not None:
                 raise ValueError(floor_error)
+            coords = []
+            for field, text in (("lat", row[2]), ("lon", row[3])):
+                try:
+                    coords.append(float(text.strip()))
+                except ValueError:
+                    raise ValueError(
+                        f"Line {line_no}: {field} is not a number, "
+                        f"got '{text.strip()}'"
+                    ) from None
             entries.append((
                 row_type,
                 row[1].strip(),
-                float(row[2].strip()),
-                float(row[3].strip()),
+                coords[0],
+                coords[1],
                 altitude,
                 mode,
             ))
     return entries
+
+
+#: QgsSettings key of the last batch CSV the P2P tab used.
+P2P_BATCH_CSV_KEY = "waveshed/p2p_batch_csv"
+
+#: The two "Links:" choices.
+INPUT_SINGLE = "Single link"
+INPUT_BATCH = "Batch CSV"
+
+#: The batch CSV format, as the tooltip of the field and its Browse button.
+BATCH_FORMAT_TIP = (
+    "A batch CSV, one site per line (no header; '#' lines are comments):\n"
+    "  S|R, id, lat, lon, height_m, AGL|AMSL\n"
+    "S = source (transmitter), R = receiver. Every S row is paired with "
+    "every R row: 2 S × 3 R = 6 links.\n"
+    "Example:\n"
+    "  S, BERN, 46.948, 7.4474, 30, AGL\n"
+    "  R, THUN, 46.758, 7.628, 2, AGL"
+)
+
+VIEW_PLOTS_BATCH_TIP = (
+    "The plots show one link. A batch run computes many: its links are "
+    "listed in the results and in the result CSV."
+)
+
+AZ_ROTATION_TIP = (
+    "Bearing the asset's azimuth pattern is turned to, in whole degrees "
+    "clockwise from north (the engine rounds to whole degrees). Sent only "
+    "with an asset that has an antenna pattern."
+)
+AZ_ROTATION_OFF_BLANK = (
+    "No asset selected: there is no antenna pattern to rotate (the link is "
+    "computed for an omnidirectional antenna)."
+)
+AZ_ROTATION_OFF_NO_PATTERN = (
+    'The asset "{name}" has no antenna pattern: there is nothing to rotate '
+    "(the link is computed for an omnidirectional antenna)."
+)
+AZ_ROTATION_OFF_MISSING = (
+    'The asset "{name}" is not in the assets folder (renamed or deleted).'
+)
+
+
+def asset_has_pattern(asset: Optional[dict]) -> bool:
+    """True when *asset* carries azimuth or elevation pattern data — the
+    rule ``_collect_params`` sends ``az_rotation`` by (no peak scaling, no
+    log line: this runs on every asset change)."""
+    if not asset:
+        return False
+    for key in ("azimuth_pattern", "elevation_pattern"):
+        block = asset.get(key)
+        if isinstance(block, dict) and block.get("data"):
+            return True
+    return False
+
+
+def az_rotation_state(name: str, asset: Optional[dict]) -> Tuple[bool, str]:
+    """``(enabled, tooltip)`` of AZ Rotation for the asset *name* (``asset``
+    = what it resolves to, None when it does not)."""
+    if not name:
+        return False, AZ_ROTATION_OFF_BLANK
+    if asset is None:
+        return False, AZ_ROTATION_OFF_MISSING.format(name=name)
+    if not asset_has_pattern(asset):
+        return False, AZ_ROTATION_OFF_NO_PATTERN.format(name=name)
+    return True, AZ_ROTATION_TIP
+
+
+def read_batch_links(path: str) -> List[Tuple[str, str, float, float, float, str]]:
+    """The user's batch CSV, checked before anything runs.
+
+    Raises ValueError with a message for the user: no path, no file, a
+    malformed line (``_parse_batch_csv``: "Line n: …"), or no link (no S or
+    no R row — aether_core would stop with "No P2P links generated").
+    """
+    path = (path or "").strip()
+    if not path:
+        raise ValueError("Choose a batch CSV file (Links: Batch CSV).")
+    if not os.path.isfile(path):
+        raise ValueError(f"The batch CSV does not exist:\n{path}")
+    try:
+        entries = _parse_batch_csv(path)
+    except UnicodeDecodeError as exc:
+        raise ValueError(f"The batch CSV is not UTF-8 text: {exc}") from None
+    n_src = sum(1 for e in entries if e[0] == "S")
+    n_rx = len(entries) - n_src
+    if not n_src or not n_rx:
+        raise ValueError(
+            f"The batch CSV has {n_src} source (S) and {n_rx} receiver (R) "
+            "row(s): at least one of each is needed for a link.")
+    return entries
+
+
+def batch_link_count(entries: List[Tuple[str, str, float, float, float, str]]) -> int:
+    """Links aether_core computes for *entries*: every S with every R."""
+    n_src = sum(1 for e in entries if e[0] == "S")
+    return n_src * (len(entries) - n_src)
+
+
+def format_batch_results(rows: List[dict]) -> str:
+    """The result area's list of a batch run: one line per link."""
+    lines = ["", f"P2P Batch Results — {len(rows)} link(s)", "=" * 35,
+             "Source_ID, Target_ID, Signal_dBm, Path_Loss_dB"]
+    for row in rows:
+        lines.append(", ".join(
+            str(row.get(k, "")) for k in
+            ("Source_ID", "Target_ID", "Signal_dBm", "Path_Loss_dB")))
+    return "\n".join(lines)
 
 
 def _compute_bbox_for_entries(
@@ -765,6 +888,8 @@ class P2PTab(QWidget):
         self._pick_tool = None  # reference kept to prevent GC
         self._last_output_dir: Optional[str] = None
         self._last_output_name: Optional[str] = None
+        #: The last run was a batch (View Plots shows one link only).
+        self._last_run_batch = False
 
         # Rubber bands for map visualisation
         canvas = self.iface.mapCanvas()
@@ -782,6 +907,11 @@ class P2PTab(QWidget):
 
         self._build_ui()
         self._connect_signals()
+        # The dialog's Model combo notifies only the 360° tab; the ITM group
+        # here follows it directly.
+        loss_combo = getattr(parent, "combo_loss_model", None)
+        if loss_combo is not None:
+            loss_combo.currentIndexChanged.connect(self._update_itm_visibility)
         self._populate_raster_layers()
         # Keep the DEM combo in sync as project layers are added/removed.
         _proj = QgsProject.instance()
@@ -840,6 +970,7 @@ class P2PTab(QWidget):
         blocked = self.combo_asset.blockSignals(True)
         self.combo_asset.setItemText(idx, new)
         self.combo_asset.blockSignals(blocked)
+        self._update_az_rotation()
 
     def _refresh_assets(self) -> None:
         """Re-read the asset list, keeping the current selection if it lives."""
@@ -852,25 +983,51 @@ class P2PTab(QWidget):
         if idx >= 0:
             self.combo_asset.setCurrentIndex(idx)
         self.combo_asset.blockSignals(blocked)
+        # The asset may have gained or lost its pattern (or be gone).
+        self._update_az_rotation()
 
-    def _on_asset_changed(self, name: str) -> None:
-        """Fill frequency and ERP from the selected asset.
-
-        Blank selection leaves the current values alone, so clearing the combo
-        does not silently reset a link the user typed by hand.
-        """
+    def _lookup_asset(self, name: str) -> Optional[dict]:
+        """The stored asset *name* (the shared ``resolve_assets`` rule), or
+        None — also when the store cannot be read (logged)."""
         if not name:
-            return
-        asset = None
+            return None
         try:
-            asset = resolve_assets(list_assets()).get(name)
+            return resolve_assets(list_assets()).get(name)
         except Exception as exc:  # noqa: BLE001
             QgsMessageLog.logMessage(
                 f"Could not load asset '{name}': {exc}", TAG,
                 Qgis.MessageLevel.Warning)
+            return None
+
+    def _update_az_rotation(self, asset: Any = False) -> None:
+        """AZ Rotation enabled only while the selected asset has an antenna
+        pattern; the tooltip says why it is not. *asset*: the resolved
+        asset when the caller already has it (False = look it up)."""
+        spin = getattr(self, "spin_az_rotation", None)
+        combo = getattr(self, "combo_asset", None)
+        if spin is None or combo is None:
             return
+        name = combo.currentText().strip()
+        if asset is False:
+            asset = self._lookup_asset(name)
+        enabled, tip = az_rotation_state(name, asset)
+        spin.setEnabled(enabled)
+        spin.setToolTip(tip)
+
+    def _on_asset_changed(self, name: str) -> None:
+        """Fill frequency and ERP (and, for a single link, Site A's height
+        and height mode) from the selected asset; AZ Rotation follows.
+
+        Blank selection leaves the current values alone, so clearing the combo
+        does not silently reset a link the user typed by hand.
+        """
+        asset = self._lookup_asset(name)
+        self._update_az_rotation(asset)
         if not asset:
             return
+
+        if not self._is_batch():
+            self._fill_site_a_height(asset)
 
         self.spin_freq.setValue(float(asset.get("frequency_mhz", 433.0)))
         erp = float(asset.get("erp_watts", 0.0) or 0.0)
@@ -880,6 +1037,78 @@ class P2PTab(QWidget):
                 float(asset.get("antenna_gain_dbi", 0.0)),
             )
         self.spin_erp.setValue(erp)
+
+    def _fill_site_a_height(self, asset: dict) -> None:
+        """Site A's height + height mode from the asset's defaults, as the
+        360° tab fills its row (``SiteAnalysisTab._on_asset_changed``).
+
+        Mode first: it sets the height box's minimum (1 m AGL, below sea
+        level AMSL), so filling the height first would clamp an AMSL asset's
+        negative elevation to the AGL floor.
+        """
+        spin = getattr(self, "spin_a_height", None)
+        combo = getattr(self, "combo_a_mode", None)
+        if spin is None or combo is None:
+            return
+        idx = combo.findText(str(asset.get("default_height_mode", "AGL")))
+        if idx >= 0:
+            combo.setCurrentIndex(idx)
+        try:
+            spin.setValue(float(asset.get("default_height_m", 30.0)))
+        except (TypeError, ValueError):
+            QgsMessageLog.logMessage(
+                f"asset default height not a number: "
+                f"{asset.get('default_height_m')!r}", TAG,
+                Qgis.MessageLevel.Warning)
+
+    # ------------------------------------------------------------------
+    # Links: single link or batch CSV
+    # ------------------------------------------------------------------
+
+    #: Built in ``_build_input_row``; None on a bare instance (tests).
+    combo_input = None
+    _last_run_batch = False
+
+    def _is_batch(self) -> bool:
+        """True while "Links:" is "Batch CSV"."""
+        combo = self.combo_input
+        return combo is not None and combo.currentText() == INPUT_BATCH
+
+    def _on_input_changed(self, *_args) -> None:
+        """Single link ↔ batch CSV: the endpoints are disabled for a batch
+        (the CSV has every endpoint), the CSV row shows for a batch only,
+        the map markers belong to the single link."""
+        batch = self._is_batch()
+        self._endpoints.setEnabled(not batch)
+        self._endpoints.setToolTip(
+            "Not used: the batch CSV gives every link's endpoints and heights."
+            if batch else "")
+        self._batch_row.setVisible(batch)
+        if batch:
+            self._reset_rubber_bands()
+        else:
+            self._update_visuals()
+        self._update_view_plots()
+
+    def _update_view_plots(self) -> None:
+        """View Plots is for one link: disabled (with the reason) while the
+        input or the last run is a batch."""
+        batch = self._is_batch() or self._last_run_batch
+        self.btn_view_plots.setEnabled(not batch)
+        self.btn_view_plots.setToolTip(VIEW_PLOTS_BATCH_TIP if batch else "")
+
+    def _save_batch_csv(self) -> None:
+        path = self.line_batch_csv.text().strip()
+        if path:
+            QgsSettings().setValue(P2P_BATCH_CSV_KEY, path)
+
+    def _on_browse_batch(self) -> None:
+        start = self.line_batch_csv.text().strip()
+        path, _filter = QFileDialog.getOpenFileName(
+            self, "Batch CSV", start, "CSV files (*.csv);;All files (*)")
+        if path:
+            self.line_batch_csv.setText(path)
+            self._save_batch_csv()
 
     def _asset_pattern(self) -> Tuple[Optional[list], Optional[list]]:
         """The selected asset's (azimuth, elevation) pattern for the job.
@@ -934,6 +1163,26 @@ class P2PTab(QWidget):
             self._lbl_site_b.setText("Site B:")
 
         self._params_group.setVisible(is_loss)
+        self._is_loss_mode = is_loss
+        self._update_itm_visibility()
+
+    #: Set by :meth:`set_mode` (the dialog calls it on every mode change).
+    _is_loss_mode = False
+
+    def itm_visible_for(self, is_loss: bool) -> bool:
+        """The ITM group shows in Propagation mode with model ITM only (as
+        the 360° tab's ``_update_itm_visibility``)."""
+        if not is_loss:
+            return False
+        parent = self._parent_dialog
+        model = parent.get_loss_model() if hasattr(parent, "get_loss_model") else "ITM"
+        return model == "ITM"
+
+    def _update_itm_visibility(self, *_args) -> None:
+        """Show/hide the ITM group for the current mode and loss model; also
+        the slot of the dialog's Model combo (which notifies only the 360°
+        tab itself)."""
+        self.itm_group.setVisible(self.itm_visible_for(self._is_loss_mode))
 
     def refresh_layers(self) -> None:
         """Re-populate the DEM layer combo from the current project."""
@@ -1020,6 +1269,94 @@ class P2PTab(QWidget):
     def _build_ui(self) -> None:
         main_layout = QVBoxLayout(self)
 
+        # ---- Links: single link (Site A / Site B) or the user's batch CSV ----
+        main_layout.addLayout(self._build_input_row())
+
+        # The two endpoints, disabled as a whole while a batch CSV is chosen.
+        self._endpoints = QWidget()
+        endpoints_layout = QVBoxLayout(self._endpoints)
+        endpoints_layout.setContentsMargins(0, 0, 0, 0)
+        main_layout.addWidget(self._endpoints)
+        self._build_endpoints(endpoints_layout)
+
+        # ---- Parameters group (frequency / ERP, visible in LOSS mode only) ----
+        main_layout.addWidget(self._build_params_group())
+
+        # ---- ITM parameters (Propagation mode with model ITM only) ----
+        # This tab's own instance (owner, 2026-11-14): the link can be
+        # computed for other ground / climate than the 360° run.
+        self.itm_group = ItmParamsGroup()
+        self.itm_group.setVisible(False)
+        # Earth Radius Mode lives in the group now (only CPU ITM reads it).
+        self.combo_earth_radius = self.itm_group.combo_earth_radius
+        main_layout.addWidget(self.itm_group)
+
+        # ---- Analysis settings (DEM, resolution, backend, output dir) ----
+        main_layout.addWidget(self._build_analysis_group())
+
+        # ---- Results area ----
+        results_group = QGroupBox("Results")
+        results_layout = QVBoxLayout(results_group)
+        self.result_area = QTextEdit()
+        self.result_area.setReadOnly(True)
+        results_layout.addWidget(self.result_area)
+        main_layout.addWidget(results_group)
+
+        # ---- Progress bar + Run / View Plots buttons ----
+        bottom_layout = QHBoxLayout()
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setVisible(False)
+        bottom_layout.addWidget(self.progress_bar, stretch=1)
+
+        self.btn_view_plots = QPushButton("View Plots")
+        self.btn_view_plots.setVisible(False)
+        bottom_layout.addWidget(self.btn_view_plots)
+
+        self.btn_stop = QPushButton("Stop")
+        self.btn_stop.setVisible(False)
+        bottom_layout.addWidget(self.btn_stop)
+        self.btn_run = QPushButton("Run Analysis")
+        bottom_layout.addWidget(self.btn_run)
+        main_layout.addLayout(bottom_layout)
+
+        self._on_input_changed()
+        self._update_az_rotation()
+
+    def _build_input_row(self) -> QHBoxLayout:
+        """"Links: [Single link | Batch CSV]  [path] [Browse…]"."""
+        row = QHBoxLayout()
+        row.addWidget(QLabel("Links:"))
+        self.combo_input = QComboBox()
+        self.combo_input.addItems([INPUT_SINGLE, INPUT_BATCH])
+        self.combo_input.setToolTip(
+            "Single link: Site A to Site B below.\n"
+            "Batch CSV: every source (S) row of a CSV file paired with every "
+            "receiver (R) row; Site A / Site B are not used.")
+        row.addWidget(self.combo_input)
+
+        self._batch_row = QWidget()
+        batch_layout = QHBoxLayout(self._batch_row)
+        batch_layout.setContentsMargins(0, 0, 0, 0)
+        self.line_batch_csv = QLineEdit()
+        self.line_batch_csv.setPlaceholderText("batch CSV file")
+        self.line_batch_csv.setToolTip(BATCH_FORMAT_TIP)
+        # Remembered across dialog opens, like the output folder.
+        self.line_batch_csv.setText(
+            str(QgsSettings().value(P2P_BATCH_CSV_KEY, "") or ""))
+        self.line_batch_csv.editingFinished.connect(self._save_batch_csv)
+        batch_layout.addWidget(self.line_batch_csv, stretch=1)
+        self.btn_browse_batch = QPushButton("Browse…")
+        self.btn_browse_batch.setToolTip(BATCH_FORMAT_TIP)
+        batch_layout.addWidget(self.btn_browse_batch)
+        row.addWidget(self._batch_row, stretch=1)
+        row.addStretch()
+
+        self.combo_input.currentIndexChanged.connect(self._on_input_changed)
+        self.btn_browse_batch.clicked.connect(self._on_browse_batch)
+        return row
+
+    def _build_endpoints(self, main_layout: QVBoxLayout) -> None:
+        """Site A / Transmitter and Site B / Receiver into *main_layout*."""
         # ---- Site A / Transmitter ----
         self._lbl_site_a = QLabel("Site A:")
         self._lbl_site_a.setStyleSheet("font-weight: bold;")
@@ -1120,37 +1457,6 @@ class P2PTab(QWidget):
 
         main_layout.addLayout(site_b_form)
 
-        # ---- Parameters group (frequency / ERP, visible in LOSS mode only) ----
-        main_layout.addWidget(self._build_params_group())
-
-        # ---- Analysis settings (DEM, resolution, backend, output dir) ----
-        main_layout.addWidget(self._build_analysis_group())
-
-        # ---- Results area ----
-        results_group = QGroupBox("Results")
-        results_layout = QVBoxLayout(results_group)
-        self.result_area = QTextEdit()
-        self.result_area.setReadOnly(True)
-        results_layout.addWidget(self.result_area)
-        main_layout.addWidget(results_group)
-
-        # ---- Progress bar + Run / View Plots buttons ----
-        bottom_layout = QHBoxLayout()
-        self.progress_bar = QProgressBar()
-        self.progress_bar.setVisible(False)
-        bottom_layout.addWidget(self.progress_bar, stretch=1)
-
-        self.btn_view_plots = QPushButton("View Plots")
-        self.btn_view_plots.setVisible(False)
-        bottom_layout.addWidget(self.btn_view_plots)
-
-        self.btn_stop = QPushButton("Stop")
-        self.btn_stop.setVisible(False)
-        bottom_layout.addWidget(self.btn_stop)
-        self.btn_run = QPushButton("Run Analysis")
-        bottom_layout.addWidget(self.btn_run)
-        main_layout.addLayout(bottom_layout)
-
     # -- Parameters group (frequency / ERP, visible in LOSS mode only) -----
 
     def _build_params_group(self) -> QGroupBox:
@@ -1166,7 +1472,8 @@ class P2PTab(QWidget):
         self.combo_asset.addItems(self._asset_names())
         self.combo_asset.setToolTip(
             "Emitter definition from the Assets tab. Selecting one fills in "
-            "frequency and ERP below; leave blank to enter them by hand."
+            "frequency and ERP below and, for a single link, Site A's height "
+            "and height mode; leave blank to enter them by hand."
         )
         self.combo_asset.currentTextChanged.connect(self._on_asset_changed)
         layout.addRow("Asset:", self.combo_asset)
@@ -1191,11 +1498,9 @@ class P2PTab(QWidget):
         self.spin_az_rotation.setValue(0.0)
         self.spin_az_rotation.setWrapping(True)
         self.spin_az_rotation.setSuffix("°")
-        self.spin_az_rotation.setToolTip(
-            "Bearing the asset's azimuth pattern is turned to, in whole "
-            "degrees clockwise from north (the engine rounds to whole "
-            "degrees). Sent only with an asset that has an antenna pattern."
-        )
+        # Enabled only while the selected asset has a pattern
+        # (_update_az_rotation; the tooltip says why when it is not).
+        self.spin_az_rotation.setToolTip(AZ_ROTATION_TIP)
         layout.addRow("AZ Rotation:", self.spin_az_rotation)
 
         # Hidden by default (LOS mode).
@@ -1238,15 +1543,8 @@ class P2PTab(QWidget):
         backend_row.addWidget(self.btn_browse_dir)
         layout.addRow("Backend:", backend_row)
 
-        # Earth Radius Mode — applies to LOS and ITM alike (horizon geometry).
-        self.combo_earth_radius = QComboBox()
-        self.combo_earth_radius.addItems(["FOUR_THIRDS", "ADVANCED"])
-        self.combo_earth_radius.setToolTip(
-            "Earth-curvature model for horizon/diffraction geometry.\n"
-            "FOUR_THIRDS: standard 4/3-earth refraction (normal, recommended).\n"
-            "ADVANCED: derive effective radius from surface refractivity."
-        )
-        layout.addRow("Earth Radius Mode:", self.combo_earth_radius)
+        # Earth Radius Mode moved into the ITM group (itm_params): only the
+        # CPU ITM paths read it.
 
         return group
 
@@ -1439,7 +1737,9 @@ class P2PTab(QWidget):
     # ------------------------------------------------------------------
 
     def _on_view_plots(self) -> None:
-        """Open the P2P result viewer dialog."""
+        """Open the P2P result viewer dialog (a single link's run only)."""
+        if self._last_run_batch:
+            return
         if not self._last_output_dir or not self._last_output_name:
             QMessageBox.information(
                 self, "No Results", "Run an analysis first to generate plots."
@@ -1481,8 +1781,32 @@ class P2PTab(QWidget):
     # Collect parameters from widgets
     # ------------------------------------------------------------------
 
-    def _collect_params(self) -> P2PParams:
-        """Read all widget values into a P2PParams dataclass."""
+    def _itm_values(self) -> dict:
+        """The ITM group's ``P2PParams`` fields (eps … earth_radius); {} on a
+        bare instance without the group (the dataclass defaults are the
+        group's defaults)."""
+        group = getattr(self, "itm_group", None)
+        return group.values() if group is not None else {}
+
+    def _collect_params(self, batch_entries: Optional[list] = None) -> P2PParams:
+        """Read all widget values into a P2PParams dataclass.
+
+        *batch_entries* (the user's batch CSV, ``read_batch_links``): the job's
+        ``tx`` is the batch's first source row (``batch_reference_source``),
+        its ``rx`` height/mode the first receiver row's — the endpoint boxes
+        are not used.
+        """
+        params = self._collect_link_params()
+        if batch_entries:
+            lat, lon, height, mode = batch_reference_source(batch_entries)
+            rx = next(e for e in batch_entries if e[0] != "S")
+            params = dataclasses.replace(
+                params, tx_lat=lat, tx_lon=lon, tx_height=height, tx_mode=mode,
+                rx_height=float(rx[4]), rx_mode=str(rx[5]))
+        return params
+
+    def _collect_link_params(self) -> P2PParams:
+        """The widgets as a single link's P2PParams."""
         parent = self._parent_dialog
         analysis_mode = parent.get_mode() if hasattr(parent, "get_mode") else "LOS"
 
@@ -1520,7 +1844,9 @@ class P2PTab(QWidget):
             model=model,
             resolution_m=int(self.combo_resolution.currentText()),
             backend=self.combo_backend.currentText(),
-            earth_radius=self.combo_earth_radius.currentText(),
+            # ITM parameters + Earth Radius Mode: this tab's ITM group
+            # (before 2026-11-14 P2P ITM always ran the engine defaults).
+            **self._itm_values(),
             # Output
             output_name=f"p2p_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
         )
@@ -1596,6 +1922,10 @@ class P2PTab(QWidget):
         if not output_dir:
             return "Please specify an output directory."
 
+        if self._is_batch():
+            # The batch CSV is checked by _read_user_batch (every line).
+            return None
+
         a_lat = self.spin_a_lat.value()
         a_lon = self.spin_a_lon.value()
         b_lat = self.spin_b_lat.value()
@@ -1639,6 +1969,19 @@ class P2PTab(QWidget):
         # The folder this run uses is the one the next dialog opens with.
         save_output_dir(P2P_OUTPUT_DIR_KEY, self.line_output_dir.text())
 
+        # A batch: the user's CSV, every line checked before anything runs.
+        batch_entries = None
+        if self._is_batch():
+            batch_csv = self.line_batch_csv.text().strip()
+            try:
+                batch_entries = read_batch_links(batch_csv)
+            except (OSError, ValueError) as exc:
+                QMessageBox.warning(
+                    self, "Batch CSV refused",
+                    f"{exc}\n\nFile: {batch_csv}\n\nFormat:\n{BATCH_FORMAT_TIP}")
+                return
+            self._save_batch_csv()
+
         # The engine has to be there. Terrain preparation falls back to the
         # slow QGIS raster path when aether_converter is missing, so without
         # this the user waits out the whole extract before hitting the error.
@@ -1663,7 +2006,7 @@ class P2PTab(QWidget):
         output_dir = self.line_output_dir.text().strip()
 
         try:
-            params = self._collect_params()
+            params = self._collect_params(batch_entries)
         except P2PAssetError as exc:
             QMessageBox.warning(self, exc.title, str(exc))
             return
@@ -1684,17 +2027,35 @@ class P2PTab(QWidget):
                 "P2P: CPU backend — running without the asset's antenna "
                 "pattern (the user's choice)", TAG, Qgis.MessageLevel.Info)
 
-        # Generate a temp 2-line batch CSV from the two endpoints.
-        batch_file = _write_temp_batch_csv(
-            tx_lat=self.spin_a_lat.value(),
-            tx_lon=self.spin_a_lon.value(),
-            tx_height=self.spin_a_height.value(),
-            tx_mode=self.combo_a_mode.currentText(),
-            rx_lat=self.spin_b_lat.value(),
-            rx_lon=self.spin_b_lon.value(),
-            rx_height=self.spin_b_height.value(),
-            rx_mode=self.combo_b_mode.currentText(),
-        )
+        if batch_entries is not None:
+            # The engine reads a clean copy of exactly the rows checked
+            # above (job_builder.write_engine_batch_csv): Excel's "CSV UTF-8"
+            # byte-order mark or a lower-case 's' in the user's file would
+            # otherwise turn a source into a receiver there, silently.
+            user_csv = self.line_batch_csv.text().strip()
+            try:
+                batch_file = write_engine_batch_csv(batch_entries)
+            except (OSError, ValueError) as exc:
+                QMessageBox.warning(
+                    self, "Batch CSV refused", f"{exc}\n\nFile: {user_csv}")
+                return
+            QgsMessageLog.logMessage(
+                f"P2P batch: {user_csv} — {len(batch_entries)} site(s), "
+                f"{batch_link_count(batch_entries)} link(s); job.tx = the "
+                f"first source row; the engine reads the checked rows from "
+                f"{batch_file}", TAG, Qgis.MessageLevel.Info)
+        else:
+            # Generate a temp 2-line batch CSV from the two endpoints.
+            batch_file = _write_temp_batch_csv(
+                tx_lat=self.spin_a_lat.value(),
+                tx_lon=self.spin_a_lon.value(),
+                tx_height=self.spin_a_height.value(),
+                tx_mode=self.combo_a_mode.currentText(),
+                rx_lat=self.spin_b_lat.value(),
+                rx_lon=self.spin_b_lon.value(),
+                rx_height=self.spin_b_height.value(),
+                rx_mode=self.combo_b_mode.currentText(),
+            )
 
         # ---- Confirm parameters that leave the model's validated range ----
         # ITM raises its own kwx indicator for these, but neither AETHER nor
@@ -1747,13 +2108,16 @@ class P2PTab(QWidget):
                 return
 
         self._launch_worker(params, dem_layer, output_dir, batch_file,
-                            terrain_dir)
+                            terrain_dir, batch=batch_entries is not None)
 
     def _launch_worker(
         self, params: P2PParams, dem_layer: Optional[QgsRasterLayer],
         output_dir: str, batch_file: str, terrain_dir: str,
+        batch: bool = False,
     ) -> None:
-        """Put the tab in run mode and start the worker."""
+        """Put the tab in run mode and start the worker (*batch*: the run is
+        the user's batch CSV — its result is listed link by link)."""
+        self._last_run_batch = batch
         # Switch to running state.
         self.btn_run.setEnabled(False)
         self.btn_stop.setEnabled(True)
@@ -1827,7 +2191,9 @@ class P2PTab(QWidget):
             os.path.isfile(os.path.join(output_dir, name))
             for name in ("terrain_profile.gp", "height_profile.gp", "path_profile.gp")
         )
+        # A batch shows it too, disabled with the reason (one link only).
         self.btn_view_plots.setVisible(has_gp)
+        self._update_view_plots()
 
     def _display_results(self, output_dir: str) -> None:
         """Parse the result CSV and report file, show key metrics."""
@@ -1842,6 +2208,13 @@ class P2PTab(QWidget):
 
             if not rows:
                 self.result_area.append("\nNo results found in output file.")
+            elif self._last_run_batch:
+                # Every link, one line each; the CSV is the result (as the
+                # Processing P2P tool returns it — no layer).
+                self.result_area.append(format_batch_results(rows))
+                self.result_area.append(f"\nResult CSV: {csv_path}")
+                # p2p_report.txt and the .gp profiles describe one link.
+                return
             else:
                 lines = ["", "P2P Link Analysis Results", "=" * 35]
                 for row in rows:
