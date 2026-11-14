@@ -598,7 +598,8 @@ Its minimum follows the column beside it — see
 <tr><td><b>Height Mode</b></td><td><b>AGL</b> or <b>AMSL</b>.</td></tr>
 <tr><td><b>AZ Rotation (deg)</b></td><td>Bearing the asset's azimuth pattern
 is turned to, in whole degrees clockwise from north. Sent only with an asset
-that has an antenna pattern, in Propagation mode; hidden in the geometric
+that has an antenna pattern, in Propagation mode: the box is greyed out while
+the row's asset is blank or has no pattern, and hidden in the geometric
 modes.</td></tr>
 <tr><td><b>AZ Start (deg)</b> / <b>AZ End (deg)</b></td><td>The azimuth sector
 to compute, clockwise from north, 0&ndash;360. The default 0&ndash;360 is the
@@ -1259,7 +1260,8 @@ that is the GPU memory macOS allows). A number is sent with coverage jobs as
 ~3.86 GB single-allocation ceiling for the terrain atlas.</td></tr>
 <tr><td><b>Max RAM budget (GB):</b></td><td>Auto (range 1&ndash;256)</td>
 <td>Auto sends nothing and the engine chooses. A number is sent with coverage
-jobs as <code>processing.max_ram_usage_gb</code>. Values saved by an earlier
+jobs as <code>processing.max_ram_usage_gb</code>; point-to-point links ignore
+it (the engine reads it in coverage runs only). Values saved by an earlier
 version stay as they are; set the box back to Auto to hand the choice to the
 engine.</td></tr>
 <tr><td><b>Download connections:</b></td><td>256 (range 16&ndash;1024)</td>
@@ -1421,8 +1423,10 @@ error instead of a question.</p>
 <tr><td><b>TX Longitude</b></td><td>-180 &ndash; 180</td><td>0</td></tr>
 <tr><td><b>TX Height (m AGL)</b></td><td>1 &ndash; 10000; AGL only</td>
 <td>30</td></tr>
-<tr><td><b>Frequency (MHz)</b></td><td>1 &ndash; 3000</td><td>433</td></tr>
-<tr><td><b>ERP (Watts)</b></td><td>0.001 &ndash; 1000000</td><td>10</td></tr>
+<tr><td><b>Frequency (MHz)</b></td><td>1 &ndash; 3000; ITM only (LOS and
+MIN_ALT ignore it)</td><td>433</td></tr>
+<tr><td><b>ERP (Watts)</b></td><td>0.001 &ndash; 1000000; ITM only (LOS and
+MIN_ALT ignore it)</td><td>10</td></tr>
 <tr><td><b>Propagation Model</b></td><td><b>LOS</b>, <b>ITM</b>,
 <b>MIN_ALT</b></td><td>LOS</td></tr>
 <tr><td><b>Resolution (m)</b></td><td>2, 5, 10, 30, 90, 250</td><td>10</td></tr>
@@ -1450,18 +1454,23 @@ confidence and reliability 0.50, FOUR_THIRDS).</p>
 <td>0 / 0</td></tr>
 <tr><td><b>RX Height (m AGL)</b></td><td>1 &ndash; 10000; AGL only</td>
 <td>1.5</td></tr>
+<tr><td><b>Frequency (MHz)</b></td><td>1 &ndash; 3000; ITM only (LOS ignores
+it)</td><td>433</td></tr>
+<tr><td><b>ERP (Watts)</b></td><td>0.001 &ndash; 1000000; ITM only (LOS
+ignores it)</td><td>10</td></tr>
 <tr><td><b>Propagation Model</b></td><td><b>LOS</b>, <b>ITM</b></td>
 <td>LOS</td></tr>
 <tr><td><b>Resolution (m)</b></td><td>2, 5, 10, 30, 90, 250</td><td>10</td></tr>
 <tr><td><b>Compute Backend</b></td><td>AUTO, GPU, CPU</td><td>AUTO</td></tr>
 <tr><td><b>Output Directory</b></td><td>Folder</td><td>&mdash;</td></tr>
 </table>
-<p>When a <b>Batch CSV File</b> is given the TX/RX coordinate parameters are
-ignored entirely and the CSV drives every link; the CSV rows are then the only
-thing validated (line by line, including the AGL floor). Without one, a
-temporary two-line CSV is written from the parameters. The algorithm returns the
-path of the result CSV. Frequency and ERP are fixed at 433 MHz / 10 W on this
-path.</p>
+<p>When a <b>Batch CSV File</b> is given the TX/RX location and height
+parameters are ignored entirely and the CSV drives every link; the CSV rows are
+then the only thing validated (line by line, including the AGL floor). The
+job's transmitter is then the CSV's first S row (GPU ITM takes one system
+elevation under it for every link). Without a batch, a temporary two-line CSV
+is written from the parameters. The algorithm returns the path of the result
+CSV. Frequency and ERP come from their parameters.</p>
 
 <h3>Things to know</h3>
 <ul>
