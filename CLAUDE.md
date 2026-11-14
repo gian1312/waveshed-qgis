@@ -1398,14 +1398,18 @@ OpenFreeMap): sites share pool tiles, each gets its own view; pinned by
   engine reads it. `tests/test_patterns_engine.py`.
 - **ITM parameters: one group, one instance per tab** (`gui/itm_params.py`
   `ItmParamsGroup`, 360° and P2P, each its own values; Propagation + ITM only).
-  Earth Radius Mode is in it: aether_core reads `earth_radius_mode` in its CPU
-  ITM paths only (GPU, LOS, LOS Floor: fixed 4/3) — a GPU change needs the
-  owner's yes ("not yet", 2026-11-14). Radio climate 1–7. A spin box rounds
+  Radio climate 1–7. **Earth Radius Mode is NOT in it**: each tab's Analysis
+  section shows it in every mode (owner: the curvature matters for LOS too;
+  the wanted set is Real / 4/3 / Advanced). Today aether_core reads
+  `earth_radius_mode` in its CPU ITM paths only (GPU, LOS, LOS Floor: fixed
+  k = 4/3 in shader.wgsl / cpu_coverage.rs; no k = 1 mode) — making it real is
+  an engine change that needs the owner's yes. A spin box rounds
   to its CURRENT decimals: set decimals before the value (0.005 at 2 decimals
   became 0.01 — every ITM job sent wet-ground conductivity until be1fb51);
   `tests/test_spinbox_decimals.py` scans for it.
-- **P2P batch.** Tab: Links: Single link / Batch CSV; Processing: Batch CSV
-  File. `job.tx` = the batch's first S row (`job_builder.batch_reference_source`:
+- **P2P batch.** Processing: Batch CSV File. The tab's own batch input
+  (Links: Single link / Batch CSV) exists but is hidden and disabled
+  (`p2p_tab.BATCH_INPUT_ENABLED = False`, owner 2026-11-14). `job.tx` = the batch's first S row (`job_builder.batch_reference_source`:
   GPU ITM reads ONE system elevation under job.tx for every link). The engine
   always reads `job_builder.write_engine_batch_csv` — a clean copy of exactly
   the rows the plugin checked: it splits on `,` and needs an exact `S`, so a
