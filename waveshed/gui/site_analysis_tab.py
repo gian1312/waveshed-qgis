@@ -120,6 +120,7 @@ from ..core import terrain_index
 from . import terrain_dirs
 from . import terrain_folder_scan
 from .engine_notices import setup_title, show_run_error
+from .itm_params import ItmParamsGroup
 from .height_inputs import MIN_AMSL_M, bind_height_mode
 from .output_dir import SITE_OUTPUT_DIR_KEY, bind_output_dir, save_output_dir
 from .map_tools import activate_point_capture
@@ -1183,18 +1184,6 @@ class SiteAnalysisTab(QWidget):
         self.combo_backend.addItems(["AUTO", "GPU", "CPU"])
         layout.addRow("Backend:", self.combo_backend)
 
-        # Earth Radius Mode — applies to all propagation models (LOS included),
-        # not just ITM. FOUR_THIRDS (normal) is the default; ADVANCED enables
-        # the refractivity-based effective-radius model.
-        self.combo_earth_radius = QComboBox()
-        self.combo_earth_radius.addItems(["FOUR_THIRDS", "ADVANCED"])
-        self.combo_earth_radius.setToolTip(
-            "Earth-curvature model for horizon/diffraction geometry.\n"
-            "FOUR_THIRDS: standard 4/3-earth refraction (normal, recommended).\n"
-            "ADVANCED: derive effective radius from surface refractivity."
-        )
-        layout.addRow("Earth Radius Mode:", self.combo_earth_radius)
-
         # Output Directory
         dir_layout = QHBoxLayout()
         self.line_output_dir = QLineEdit()
@@ -1210,65 +1199,20 @@ class SiteAnalysisTab(QWidget):
     # -- ITM parameters ----------------------------------------------------
 
     def _build_itm_section(self) -> QGroupBox:
-        self.itm_group = QGroupBox("ITM Parameters")
+        # The shared group (gui/itm_params.py); the P2P tab has its own
+        # instance. Earth Radius Mode lives in it: only ITM on the CPU backend
+        # reads it, so it is offered in Propagation mode only.
+        self.itm_group = ItmParamsGroup()
         self.itm_group.setVisible(False)
-        layout = QFormLayout(self.itm_group)
-
-        # Ground Permittivity
-        self.spin_eps = QDoubleSpinBox()
-        self.spin_eps.setRange(0.0, 100.0)
-        self.spin_eps.setValue(15.0)
-        self.spin_eps.setDecimals(2)
-        layout.addRow("Ground Permittivity:", self.spin_eps)
-
-        # Ground Conductivity
-        self.spin_sgm = QDoubleSpinBox()
-        self.spin_sgm.setRange(0.0001, 10.0)
-        self.spin_sgm.setValue(0.005)
-        self.spin_sgm.setDecimals(4)
-        layout.addRow("Ground Conductivity:", self.spin_sgm)
-
-        # Surface Refractivity
-        self.spin_ens = QDoubleSpinBox()
-        self.spin_ens.setRange(200.0, 450.0)
-        self.spin_ens.setValue(301.0)
-        self.spin_ens.setDecimals(1)
-        layout.addRow("Surface Refractivity:", self.spin_ens)
-
-        # Radio Climate
-        self.combo_climate = QComboBox()
-        self.combo_climate.addItems([
-            "Equatorial (1)",
-            "Continental Subtropical (2)",
-            "Maritime Subtropical (3)",
-            "Desert (4)",
-            "Continental Temperate (5)",
-            "Maritime Temperate (6)",
-        ])
-        self.combo_climate.setCurrentIndex(4)  # Continental Temperate
-        layout.addRow("Radio Climate:", self.combo_climate)
-
-        # Polarization
-        self.combo_pol = QComboBox()
-        self.combo_pol.addItems(["Horizontal (0)", "Vertical (1)"])
-        layout.addRow("Polarization:", self.combo_pol)
-
-        # Confidence
-        self.spin_conf = QDoubleSpinBox()
-        self.spin_conf.setRange(0.01, 0.99)
-        self.spin_conf.setValue(0.50)
-        self.spin_conf.setDecimals(2)
-        self.spin_conf.setSingleStep(0.05)
-        layout.addRow("Confidence:", self.spin_conf)
-
-        # Reliability
-        self.spin_rel = QDoubleSpinBox()
-        self.spin_rel.setRange(0.01, 0.99)
-        self.spin_rel.setValue(0.50)
-        self.spin_rel.setDecimals(2)
-        self.spin_rel.setSingleStep(0.05)
-        layout.addRow("Reliability:", self.spin_rel)
-
+        # The names the run code (and its tests) address.
+        self.spin_eps = self.itm_group.spin_eps
+        self.spin_sgm = self.itm_group.spin_sgm
+        self.spin_ens = self.itm_group.spin_ens
+        self.combo_climate = self.itm_group.combo_climate
+        self.combo_pol = self.itm_group.combo_pol
+        self.spin_conf = self.itm_group.spin_conf
+        self.spin_rel = self.itm_group.spin_rel
+        self.combo_earth_radius = self.itm_group.combo_earth_radius
         return self.itm_group
 
     # ==================================================================

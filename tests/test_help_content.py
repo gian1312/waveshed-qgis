@@ -213,12 +213,12 @@ class TestCoversTheUI:
             assert column in HTML, f"altitude column {column!r} undocumented"
 
     def test_itm_parameter_labels_are_documented(self):
+        # The group both analysis tabs build (gui/itm_params.py).
         source = (PLUGIN_ROOT / "waveshed" / "gui"
-                  / "site_analysis_tab.py").read_text(encoding="utf-8")
-        labels = _addrow_labels(source, "def _build_itm_section",
-                                "def _connect_signals")
-        assert len(labels) >= 7, (
-            f"only found {labels} in _build_itm_section — the scraper is "
+                  / "itm_params.py").read_text(encoding="utf-8")
+        labels = _addrow_labels(source, "def _build", "def values")
+        assert len(labels) >= 8, (
+            f"only found {labels} in ItmParamsGroup._build — the scraper is "
             f"broken, not the help")
         for label in labels:
             assert label in HTML, f"ITM control {label!r} undocumented"
@@ -236,10 +236,11 @@ class TestCoversTheUI:
 
     def test_radio_climates_are_documented(self):
         source = (PLUGIN_ROOT / "waveshed" / "gui"
-                  / "site_analysis_tab.py").read_text(encoding="utf-8")
+                  / "itm_params.py").read_text(encoding="utf-8")
         climates = _combo_items(source, "self.combo_climate = QComboBox()",
                                 "Radio Climate:")
-        assert len(climates) == 6, f"scraper found {climates}"
+        # aether_core accepts 1–7 (config.rs); all seven are offered.
+        assert len(climates) == 7, f"scraper found {climates}"
         for climate in climates:
             assert climate in HTML, f"radio climate {climate!r} undocumented"
 

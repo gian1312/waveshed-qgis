@@ -286,8 +286,11 @@ the job JSON, in the Processing dropdown and on the layer's stamp. In the user
 interface it is <b>LOS Floor</b>.</p>
 
 <h3>Earth Radius Mode</h3>
-<p>Both analysis tabs carry <b>Earth Radius Mode:</b>, and it applies to every
-model including plain LOS, because it is the horizon geometry itself:</p>
+<p><b>Earth Radius Mode:</b> sits in each tab's <b>ITM Parameters</b> group,
+shown in Propagation mode only, because only ITM on the CPU backend reads it
+(<b>Backend:</b> CPU, or AUTO on a machine without a usable GPU). The GPU
+backend, LOS and LOS Floor always use the standard 4/3 earth, whatever the
+setting:</p>
 <ul>
 <li><b>FOUR_THIRDS</b> (default, recommended) — standard refraction: the engine
 derives the effective curvature from the surface refractivity, which at
@@ -673,8 +676,6 @@ unchecked, no band gets buildings.</td></tr>
 <tr><td><b>Backend:</b></td><td><b>AUTO</b> (GPU when one is usable, else CPU),
 <b>GPU</b> or <b>CPU</b>. Forcing CPU is much slower but sidesteps a driver
 problem.</td></tr>
-<tr><td><b>Earth Radius Mode:</b></td><td><b>FOUR_THIRDS</b> or
-<b>ADVANCED</b> — see <a href="#models">Modes and models</a>.</td></tr>
 <tr><td><b>Output Dir:</b></td><td>Where results are written, with
 <b>Browse...</b>. Defaults to <code>aether_output</code> in the system temp
 directory. The folder you choose (or type) is remembered for the next time the
@@ -687,7 +688,9 @@ tab, not from this tab.</p>
 <p>Shown only in <b>Propagation</b> mode with model <b>ITM</b>:
 <b>Ground Permittivity:</b>, <b>Ground Conductivity:</b>,
 <b>Surface Refractivity:</b>, <b>Radio Climate:</b>, <b>Polarization:</b>,
-<b>Confidence:</b> and <b>Reliability:</b>. Each is explained under
+<b>Confidence:</b>, <b>Reliability:</b> and <b>Earth Radius Mode:</b>
+(<b>FOUR_THIRDS</b> or <b>ADVANCED</b>; ITM on the CPU backend only — see
+<a href="#models">Modes and models</a>). Each is explained under
 <a href="#itm">ITM parameters</a>.</p>
 
 <h3>What happens when you press Run Analysis</h3>
@@ -1573,8 +1576,8 @@ k-factor.</td></tr>
 variability model uses: <b>Equatorial (1)</b>,
 <b>Continental Subtropical (2)</b>, <b>Maritime Subtropical (3)</b>,
 <b>Desert (4)</b>, <b>Continental Temperate (5)</b>,
-<b>Maritime Temperate (6)</b>. (ITM also defines 7, maritime temperate over
-sea; the engine accepts 1&ndash;7 and substitutes 5 for anything else.)</td></tr>
+<b>Maritime Temperate, Over Land (6)</b>,
+<b>Maritime Temperate, Over Sea (7)</b>.</td></tr>
 <tr><td><b>Polarization:</b></td><td><code>pol</code></td>
 <td>Horizontal (0)</td><td><b>Horizontal (0)</b> or <b>Vertical (1)</b>.
 Affects the ground-reflection coefficient; vertical polarization typically
@@ -1589,8 +1592,9 @@ signal.</td></tr>
 prediction holds. Same idea, applied to temporal variability. Both are
 validated for 0.01&ndash;0.99.</td></tr>
 <tr><td><b>Earth Radius Mode:</b></td><td><code>earth_radius_mode</code></td>
-<td>FOUR_THIRDS</td><td>See <a href="#models">Modes and models</a> and
-<a href="#physics">Physics notes</a>.</td></tr>
+<td>FOUR_THIRDS</td><td>Used by ITM on the CPU backend only (<b>Backend:</b>
+CPU, or AUTO without a usable GPU); the GPU backend always uses the 4/3 earth.
+See <a href="#models">Modes and models</a>.</td></tr>
 </table>
 
 <h3>Validity — what the model is defined for</h3>
