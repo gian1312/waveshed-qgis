@@ -54,22 +54,25 @@ class ItmParamsGroup(QGroupBox):
         # Ground Permittivity
         self.spin_eps = QDoubleSpinBox()
         self.spin_eps.setRange(0.0, 100.0)
-        self.spin_eps.setValue(15.0)
         self.spin_eps.setDecimals(2)
+        self.spin_eps.setValue(15.0)
         layout.addRow("Ground Permittivity:", self.spin_eps)
 
         # Ground Conductivity
         self.spin_sgm = QDoubleSpinBox()
         self.spin_sgm.setRange(0.0001, 10.0)
-        self.spin_sgm.setValue(0.005)
+        # Decimals BEFORE the value: a spin box rounds to its current
+        # decimals (2 by default), and 0.005 set first came out as 0.01 —
+        # every ITM job sent wet-ground conductivity instead of the default.
         self.spin_sgm.setDecimals(4)
+        self.spin_sgm.setValue(0.005)
         layout.addRow("Ground Conductivity:", self.spin_sgm)
 
         # Surface Refractivity
         self.spin_ens = QDoubleSpinBox()
         self.spin_ens.setRange(200.0, 450.0)
-        self.spin_ens.setValue(301.0)
         self.spin_ens.setDecimals(1)
+        self.spin_ens.setValue(301.0)
         layout.addRow("Surface Refractivity:", self.spin_ens)
 
         # Radio Climate — index + 1 is the ITM number (1–7).
@@ -94,16 +97,16 @@ class ItmParamsGroup(QGroupBox):
         # Confidence
         self.spin_conf = QDoubleSpinBox()
         self.spin_conf.setRange(0.01, 0.99)
-        self.spin_conf.setValue(0.50)
         self.spin_conf.setDecimals(2)
+        self.spin_conf.setValue(0.50)
         self.spin_conf.setSingleStep(0.05)
         layout.addRow("Confidence:", self.spin_conf)
 
         # Reliability
         self.spin_rel = QDoubleSpinBox()
         self.spin_rel.setRange(0.01, 0.99)
-        self.spin_rel.setValue(0.50)
         self.spin_rel.setDecimals(2)
+        self.spin_rel.setValue(0.50)
         self.spin_rel.setSingleStep(0.05)
         layout.addRow("Reliability:", self.spin_rel)
 
