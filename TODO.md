@@ -4,6 +4,15 @@ Running list of follow-up work. Keep items short; link to the code site.
 
 ## High priority
 
+- [ ] **Earth Radius Mode: un-grey Real / Advanced once the engine applies them
+  everywhere** (noted 2026-11-14, owner: high priority). The engine reads
+  `earth_radius_mode` only in CPU ITM today; LOS, LOS Floor and GPU use a fixed
+  4/3 and there is no k = 1 mode (engine item in `AETHER/TODO.md`). Then:
+  gate `gui/itm_params.earth_radius_unavailable` on the engine version that
+  adds it (as `PATTERN_DATA_MIN_ENGINE` does), drop the "not yet" texts in the
+  tooltip and help (`help/content.py` Earth Radius Mode), and A/B a LOS run
+  per mode.
+
 - [ ] **Deduplicate the XYZ tile-mosaic assembly — the WASM copy still carries
   the 2026-08-26 download defects.** The tiles→`.abt` assembly exists three
   times in aether-tools: `run_download_async` and `run_download_mem` in

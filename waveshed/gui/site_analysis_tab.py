@@ -120,7 +120,12 @@ from ..core import terrain_index
 from . import terrain_dirs
 from . import terrain_folder_scan
 from .engine_notices import setup_title, show_run_error
-from .itm_params import EARTH_RADIUS_MODES, EARTH_RADIUS_TIP, ItmParamsGroup
+from .itm_params import (
+    ItmParamsGroup,
+    apply_earth_radius_availability,
+    earth_radius_value,
+    setup_earth_radius_combo,
+)
 from .height_inputs import MIN_AMSL_M, bind_height_mode
 from .output_dir import SITE_OUTPUT_DIR_KEY, bind_output_dir, save_output_dir
 from .map_tools import activate_point_capture
@@ -1240,10 +1245,12 @@ class SiteAnalysisTab(QWidget):
         # Earth Radius Mode — every mode: the curvature matters for LOS and
         # LOS Floor as much as for ITM (gui/itm_params.py says what this
         # engine version applies it to).
+        # Real / 4/3 / Advanced; what this engine version cannot apply in the
+        # current mode / backend is greyed out (_update_earth_radius).
         self.combo_earth_radius = QComboBox()
-        self.combo_earth_radius.addItems(list(EARTH_RADIUS_MODES))
-        self.combo_earth_radius.setToolTip(EARTH_RADIUS_TIP)
+        setup_earth_radius_combo(self.combo_earth_radius)
         layout.addRow("Earth Radius Mode:", self.combo_earth_radius)
+        self.combo_backend.currentTextChanged.connect(self._update_earth_radius)
 
         # Output Directory
         dir_layout = QHBoxLayout()
@@ -1427,6 +1434,18 @@ class SiteAnalysisTab(QWidget):
             self.itm_group.setVisible(loss_model == "ITM")
         else:
             self.itm_group.setVisible(False)
+        self._update_earth_radius()
+
+    def _update_earth_radius(self, *_args) -> None:
+        """Grey out the Earth Radius Modes the engine cannot apply in this
+        mode / model / backend (gui/itm_params.earth_radius_unavailable)."""
+        combo = getattr(self, "combo_earth_radius", None)
+        if combo is None:
+            return
+        mode = self._current_mode
+        loss_model = self._dialog.get_loss_model() if mode == "LOSS" else ""
+        apply_earth_radius_availability(
+            combo, mode, loss_model, self.combo_backend.currentText())
 
     # ==================================================================
     # Sites table management
@@ -2130,7 +2149,7 @@ class SiteAnalysisTab(QWidget):
                     pol=self.combo_pol.currentIndex(),
                     conf=self.spin_conf.value(),
                     rel=self.spin_rel.value(),
-                    earth_radius=self.combo_earth_radius.currentText(),
+                    earth_radius=earth_radius_value(self.combo_earth_radius),
                     add_to_map=True,
                 )
                 bands = self._bands_for(resolution, float(params.max_range_km))

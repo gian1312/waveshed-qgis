@@ -102,7 +102,12 @@ from ..core.terrain_adapter import (
 )
 from .engine_notices import setup_title, show_run_error
 from .height_inputs import MIN_AMSL_M, bind_height_mode
-from .itm_params import EARTH_RADIUS_MODES, EARTH_RADIUS_TIP, ItmParamsGroup
+from .itm_params import (
+    ItmParamsGroup,
+    apply_earth_radius_availability,
+    earth_radius_value,
+    setup_earth_radius_combo,
+)
 from .output_dir import P2P_OUTPUT_DIR_KEY, bind_output_dir, save_output_dir
 from .map_tools import activate_point_capture
 from .plotting import XYPlotWidget
@@ -1043,9 +1048,23 @@ class P2PTab(QWidget):
             )
         self.spin_erp.setValue(erp)
 
+    #: True once the user edited Site A's height or mode: from then on an
+    #: asset no longer fills them (typed height wins, owner 2026-11-14).
+    _site_a_height_touched = False
+    #: Set while ``_fill_site_a_height`` writes them (not the user's edit).
+    _filling_site_a = False
+
+    def _on_site_a_height_edited(self, *_args) -> None:
+        """Site A's height or mode changed — by the user unless the asset
+        fill is writing them."""
+        if not self._filling_site_a:
+            self._site_a_height_touched = True
+
     def _fill_site_a_height(self, asset: dict) -> None:
         """Site A's height + height mode from the asset's defaults, as the
-        360° tab fills its row (``SiteAnalysisTab._on_asset_changed``).
+        360° tab fills its row (``SiteAnalysisTab._on_asset_changed``) — but
+        only while the user has not set them: a height the user typed wins
+        (owner, 2026-11-14), the asset's default goes into the tooltip.
 
         Mode first: it sets the height box's minimum (1 m AGL, below sea
         level AMSL), so filling the height first would clamp an AMSL asset's
@@ -1055,16 +1074,32 @@ class P2PTab(QWidget):
         combo = getattr(self, "combo_a_mode", None)
         if spin is None or combo is None:
             return
-        idx = combo.findText(str(asset.get("default_height_mode", "AGL")))
-        if idx >= 0:
-            combo.setCurrentIndex(idx)
+        mode = str(asset.get("default_height_mode", "AGL"))
         try:
-            spin.setValue(float(asset.get("default_height_m", 30.0)))
+            height = float(asset.get("default_height_m", 30.0))
         except (TypeError, ValueError):
             QgsMessageLog.logMessage(
                 f"asset default height not a number: "
                 f"{asset.get('default_height_m')!r}", TAG,
                 Qgis.MessageLevel.Warning)
+            return
+        if self._site_a_height_touched:
+            spin.setToolTip(
+                f"Your height is kept. The asset's default is {height:g} m "
+                f"{mode}.")
+            QgsMessageLog.logMessage(
+                f"P2P: Site A height kept as typed ({spin.value():g} m "
+                f"{combo.currentText()}); the asset's default is {height:g} m "
+                f"{mode}", TAG, Qgis.MessageLevel.Info)
+            return
+        self._filling_site_a = True
+        try:
+            idx = combo.findText(mode)
+            if idx >= 0:
+                combo.setCurrentIndex(idx)
+            spin.setValue(height)
+        finally:
+            self._filling_site_a = False
 
     # ------------------------------------------------------------------
     # Links: single link or batch CSV
@@ -1190,6 +1225,22 @@ class P2PTab(QWidget):
         the slot of the dialog's Model combo (which notifies only the 360°
         tab itself)."""
         self.itm_group.setVisible(self.itm_visible_for(self._is_loss_mode))
+        self._update_earth_radius()
+
+    def _update_earth_radius(self, *_args) -> None:
+        """Grey out the Earth Radius Modes the engine cannot apply in this
+        mode / model / backend (gui/itm_params.earth_radius_unavailable)."""
+        combo = getattr(self, "combo_earth_radius", None)
+        backend = getattr(self, "combo_backend", None)
+        if combo is None or backend is None:
+            return
+        parent = getattr(self, "_parent_dialog", None)
+        loss_model = (parent.get_loss_model()
+                      if self._is_loss_mode and hasattr(parent, "get_loss_model")
+                      else "")
+        apply_earth_radius_availability(
+            combo, "LOSS" if self._is_loss_mode else "LOS", loss_model,
+            backend.currentText())
 
     def refresh_layers(self) -> None:
         """Re-populate the DEM layer combo from the current project."""
@@ -1415,6 +1466,11 @@ class P2PTab(QWidget):
 
         # 1 m floor while the mode is AGL, below sea level once it is AMSL.
         bind_height_mode(self.spin_a_height, self.combo_a_mode)
+        # Typed height wins (owner, 2026-11-14): once the user edits Site A's
+        # height or mode, picking an asset no longer overwrites them.
+        self.spin_a_height.valueChanged.connect(self._on_site_a_height_edited)
+        self.combo_a_mode.currentIndexChanged.connect(
+            self._on_site_a_height_edited)
 
         main_layout.addLayout(site_a_form)
 
@@ -1554,10 +1610,11 @@ class P2PTab(QWidget):
         layout.addRow("Backend:", backend_row)
 
         # Earth Radius Mode — every mode (LOS included), as in the 360° tab.
+        # Real / 4/3 / Advanced, greyed out where the engine cannot apply it.
         self.combo_earth_radius = QComboBox()
-        self.combo_earth_radius.addItems(list(EARTH_RADIUS_MODES))
-        self.combo_earth_radius.setToolTip(EARTH_RADIUS_TIP)
+        setup_earth_radius_combo(self.combo_earth_radius)
         layout.addRow("Earth Radius Mode:", self.combo_earth_radius)
+        self.combo_backend.currentTextChanged.connect(self._update_earth_radius)
 
         return group
 
@@ -1798,7 +1855,7 @@ class P2PTab(QWidget):
         """Earth Radius Mode (the Analysis group's combo); the engine default
         on a bare instance without it (tests)."""
         combo = getattr(self, "combo_earth_radius", None)
-        return combo.currentText() if combo is not None else "FOUR_THIRDS"
+        return earth_radius_value(combo) if combo is not None else "FOUR_THIRDS"
 
     def _itm_values(self) -> dict:
         """The ITM group's ``P2PParams`` fields (eps … earth_radius); {} on a

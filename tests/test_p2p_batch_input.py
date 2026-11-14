@@ -509,5 +509,29 @@ class AssetFillsSiteA(_AssetStore):
         self.assertEqual(tab.spin_freq.value(), 868.0)   # frequency as today
 
 
+class TypedHeightWins(_AssetStore):
+    """Owner, 2026-11-14: "in p2p allow overriding the heights" → once the
+    user set Site A's height or mode, an asset no longer overwrites them."""
+
+    def test_a_typed_height_is_kept_when_an_asset_is_picked(self):
+        tab = _tab()
+        tab.spin_a_height.setValue(55.0)
+        tab._on_site_a_height_edited()          # the user's edit
+        tab._on_asset_changed("Pat")             # default 77 m AGL
+        self.assertEqual(tab.spin_a_height.value(), 55.0)
+        self.assertEqual(tab.spin_freq.value(), 868.0)   # radio values still fill
+
+    def test_the_fill_itself_is_not_a_user_edit(self):
+        tab = _tab()
+        tab._on_asset_changed("Pat")
+        # A spin box's valueChanged during the fill must not count as typed.
+        tab._filling_site_a = True
+        tab._on_site_a_height_edited()
+        tab._filling_site_a = False
+        self.assertFalse(tab._site_a_height_touched)
+        tab._on_asset_changed("Hill")            # untouched: filled again
+        self.assertEqual(tab.spin_a_height.value(), -12.0)
+
+
 if __name__ == "__main__":
     unittest.main()

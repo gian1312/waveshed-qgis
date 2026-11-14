@@ -288,17 +288,20 @@ interface it is <b>LOS Floor</b>.</p>
 <h3>Earth Radius Mode</h3>
 <p>Both analysis tabs carry <b>Earth Radius Mode:</b> in every mode: the
 earth's curvature shapes the horizon of a plain LOS or LOS Floor run as much as
-an ITM one. What the engine does with it today: only ITM on the CPU backend
-reads it (<b>Backend:</b> CPU, or AUTO on a machine without a usable GPU); LOS,
-LOS Floor and every GPU run still compute with the standard 4/3 earth,
-whatever the setting.</p>
+an ITM one. Choices the engine cannot apply in the current mode and backend are
+greyed out, with the reason in their tooltip; a pick that gets greyed out falls
+back to 4/3 and comes back when it is available again:</p>
 <ul>
-<li><b>FOUR_THIRDS</b> (default, recommended) — standard refraction: the engine
+<li><b>Real (k = 1)</b> — the geometric earth, no refraction. Greyed out for
+now: no engine version computes it yet.</li>
+<li><b>4/3 earth</b> (default, recommended) — standard refraction: the engine
 derives the effective curvature from the surface refractivity, which at
-N = 301 gives the familiar k &asymp; 4/3 earth.</li>
-<li><b>ADVANCED</b> — the Sandia/Doerry adaptive method: the k-factor is
-computed per path from the refractivity and the two endpoint altitudes, and
-clamped to 0.1&ndash;10.</li>
+N = 301 gives the familiar k &asymp; 4/3 earth. What every LOS, LOS Floor and
+GPU run uses today.</li>
+<li><b>Advanced (per path)</b> — the Sandia/Doerry adaptive method: the
+k-factor is computed per path from the refractivity and the two endpoint
+altitudes, and clamped to 0.1&ndash;10. Available for ITM (Propagation mode)
+with <b>Backend:</b> CPU, the only engine path that applies it today.</li>
 </ul>
 <p>See <a href="#physics">Physics notes</a> for what that curvature does to a
 long path, and <a href="#itm">ITM parameters</a> for everything in the
@@ -678,8 +681,9 @@ unchecked, no band gets buildings.</td></tr>
 <tr><td><b>Backend:</b></td><td><b>AUTO</b> (GPU when one is usable, else CPU),
 <b>GPU</b> or <b>CPU</b>. Forcing CPU is much slower but sidesteps a driver
 problem.</td></tr>
-<tr><td><b>Earth Radius Mode:</b></td><td><b>FOUR_THIRDS</b> or
-<b>ADVANCED</b>, in every mode — see <a href="#models">Modes and
+<tr><td><b>Earth Radius Mode:</b></td><td><b>Real (k = 1)</b>,
+<b>4/3 earth</b> or <b>Advanced (per path)</b>, in every mode; what the engine
+cannot apply here is greyed out — see <a href="#models">Modes and
 models</a>.</td></tr>
 <tr><td><b>Output Dir:</b></td><td>Where results are written, with
 <b>Browse...</b>. Defaults to <code>aether_output</code> in the system temp
@@ -838,8 +842,10 @@ carries.</li>
 <h3>Parameters (Propagation only)</h3>
 <ul>
 <li><b>Asset:</b> — an emitter from the <b>Assets</b> tab; selecting one fills
-in frequency and ERP and, for a single link, Site A's height and height mode
-from the asset's defaults. Leave it blank to type them by hand.</li>
+in frequency and ERP and Site A's height and height mode from the asset's
+defaults — until you type a height or pick a mode yourself: from then on your
+values win and the asset's default is only shown in the height's tooltip.
+Leave it blank to type them by hand.</li>
 <li><b>Frequency (MHz):</b> — 1&ndash;3000 MHz, default 433.</li>
 <li><b>ERP (Watts):</b> — effective radiated power, default 10 W.</li>
 <li><b>AZ Rotation:</b> — bearing the asset's azimuth pattern is turned to,
@@ -1617,9 +1623,9 @@ signal.</td></tr>
 prediction holds. Same idea, applied to temporal variability. Both are
 validated for 0.01&ndash;0.99.</td></tr>
 <tr><td><b>Earth Radius Mode:</b></td><td><code>earth_radius_mode</code></td>
-<td>FOUR_THIRDS</td><td>In the analysis section of both tabs, every mode. The
-engine currently applies it to ITM on the CPU backend only; LOS, LOS Floor and
-the GPU backend use the 4/3 earth. See <a href="#models">Modes and
+<td>FOUR_THIRDS (4/3 earth)</td><td>In the analysis section of both tabs, every
+mode; choices the engine cannot apply there are greyed out (today Advanced only
+for ITM on the CPU backend, Real not yet). See <a href="#models">Modes and
 models</a>.</td></tr>
 </table>
 
