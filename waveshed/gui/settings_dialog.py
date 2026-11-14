@@ -459,11 +459,21 @@ class SettingsDialog(QDialog):
 
         # RAM budget
         row3 = QHBoxLayout()
-        row3.addWidget(QLabel("Max RAM budget (GB):"))
+        lbl_ram = QLabel("Max RAM budget (GB):")
+        row3.addWidget(lbl_ram)
         self._ram_spin = QSpinBox()
         self._ram_spin.setRange(0, 256)
         self._ram_spin.setSpecialValueText("Auto")
         self._ram_spin.setValue(0)
+        # aether_core reads processing.max_ram_usage_gb in its coverage
+        # engines only; engines/p2p.rs never reads it.
+        ram_tip = (
+            "System RAM the engine may use. Applied to coverage runs (360° "
+            "and the Processing coverage tool); point-to-point links ignore "
+            "it. Auto = the engine decides."
+        )
+        lbl_ram.setToolTip(ram_tip)
+        self._ram_spin.setToolTip(ram_tip)
         row3.addWidget(self._ram_spin)
         row3.addStretch()
         vbox.addLayout(row3)

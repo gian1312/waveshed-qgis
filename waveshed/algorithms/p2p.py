@@ -33,6 +33,7 @@ from ..core.job_builder import (
     VALID_RESOLUTIONS,
     P2PParams,
     batch_max_range_km,
+    batch_reference_source,
     build_p2p_job,
     height_floor_error,
     write_job_file,
@@ -63,6 +64,8 @@ class P2PAlgorithm(QgsProcessingAlgorithm):
     RX_LAT = "RX_LAT"
     RX_LON = "RX_LON"
     RX_HEIGHT = "RX_HEIGHT"
+    FREQ_MHZ = "FREQ_MHZ"
+    ERP_WATTS = "ERP_WATTS"
     MODEL = "MODEL"
     RESOLUTION = "RESOLUTION"
     BACKEND = "BACKEND"
@@ -88,8 +91,10 @@ class P2PAlgorithm(QgsProcessingAlgorithm):
             "Supports two modes:\n"
             "  - Single link: Provide TX/RX coordinates directly.\n"
             "  - Batch: Provide a CSV file with multiple S/R entries.\n\n"
-            "When a batch CSV is provided, the TX/RX coordinate parameters are "
-            "ignored and the CSV drives the analysis.\n\n"
+            "When a batch CSV is provided, the TX/RX location and height "
+            "parameters are ignored and the CSV drives the analysis.\n\n"
+            "Frequency and ERP apply to the Propagation model (ITM) only — "
+            "LOS ignores them.\n\n"
             "Batch CSV format:\n"
             "  S,TX1,47.0563,8.4846,40.0,AGL\n"
             "  R,RX1,47.5000,8.9000,10.0,AGL\n\n"
@@ -125,7 +130,7 @@ class P2PAlgorithm(QgsProcessingAlgorithm):
         self.addParameter(
             QgsProcessingParameterNumber(
                 self.TX_LAT,
-                "TX Latitude",
+                "TX Latitude (ignored when a batch file is given)",
                 type=QgsProcessingParameterNumber.Type.Double,
                 defaultValue=0.0,
                 minValue=-90.0,
@@ -136,7 +141,7 @@ class P2PAlgorithm(QgsProcessingAlgorithm):
         self.addParameter(
             QgsProcessingParameterNumber(
                 self.TX_LON,
-                "TX Longitude",
+                "TX Longitude (ignored when a batch file is given)",
                 type=QgsProcessingParameterNumber.Type.Double,
                 defaultValue=0.0,
                 minValue=-180.0,
@@ -154,7 +159,7 @@ class P2PAlgorithm(QgsProcessingAlgorithm):
         self.addParameter(
             QgsProcessingParameterNumber(
                 self.TX_HEIGHT,
-                "TX Height (m AGL)",
+                "TX Height (m AGL) (ignored when a batch file is given)",
                 type=QgsProcessingParameterNumber.Type.Double,
                 defaultValue=30.0,
                 minValue=MIN_ANTENNA_AGL_M,
@@ -167,7 +172,7 @@ class P2PAlgorithm(QgsProcessingAlgorithm):
         self.addParameter(
             QgsProcessingParameterNumber(
                 self.RX_LAT,
-                "RX Latitude",
+                "RX Latitude (ignored when a batch file is given)",
                 type=QgsProcessingParameterNumber.Type.Double,
                 defaultValue=0.0,
                 minValue=-90.0,
@@ -178,7 +183,7 @@ class P2PAlgorithm(QgsProcessingAlgorithm):
         self.addParameter(
             QgsProcessingParameterNumber(
                 self.RX_LON,
-                "RX Longitude",
+                "RX Longitude (ignored when a batch file is given)",
                 type=QgsProcessingParameterNumber.Type.Double,
                 defaultValue=0.0,
                 minValue=-180.0,
@@ -190,12 +195,35 @@ class P2PAlgorithm(QgsProcessingAlgorithm):
         self.addParameter(
             QgsProcessingParameterNumber(
                 self.RX_HEIGHT,
-                "RX Height (m AGL)",
+                "RX Height (m AGL) (ignored when a batch file is given)",
                 type=QgsProcessingParameterNumber.Type.Double,
                 defaultValue=1.5,
                 minValue=MIN_ANTENNA_AGL_M,
                 maxValue=10000.0,
                 optional=True,
+            )
+        )
+
+        # Radio parameters — the coverage tool's names, ranges and defaults.
+        # Read by the Propagation model (ITM) only; LOS ignores them.
+        self.addParameter(
+            QgsProcessingParameterNumber(
+                self.FREQ_MHZ,
+                "Frequency (MHz) (Propagation models only — LOS ignores it)",
+                type=QgsProcessingParameterNumber.Type.Double,
+                minValue=1.0,
+                maxValue=3000.0,
+                defaultValue=433.0,
+            )
+        )
+        self.addParameter(
+            QgsProcessingParameterNumber(
+                self.ERP_WATTS,
+                "ERP (Watts) (Propagation models only — LOS ignores it)",
+                type=QgsProcessingParameterNumber.Type.Double,
+                minValue=0.001,
+                maxValue=1000000.0,
+                defaultValue=10.0,
             )
         )
 
@@ -273,6 +301,8 @@ class P2PAlgorithm(QgsProcessingAlgorithm):
         rx_lat: float = self.parameterAsDouble(parameters, self.RX_LAT, context)
         rx_lon: float = self.parameterAsDouble(parameters, self.RX_LON, context)
         rx_height: float = self.parameterAsDouble(parameters, self.RX_HEIGHT, context)
+        freq_mhz: float = self.parameterAsDouble(parameters, self.FREQ_MHZ, context)
+        erp_watts: float = self.parameterAsDouble(parameters, self.ERP_WATTS, context)
 
         model_idx: int = self.parameterAsEnum(parameters, self.MODEL, context)
         resolution_idx: int = self.parameterAsEnum(parameters, self.RESOLUTION, context)
@@ -343,8 +373,9 @@ class P2PAlgorithm(QgsProcessingAlgorithm):
 
         output_name = f"p2p_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
 
-        # NOTE: in batch mode (is_batch) the CSV drives every link and these
-        # tx/rx heights are inert fallbacks that aether_core does not use, so
+        # NOTE: in batch mode (is_batch) the CSV drives every link and the
+        # tx/rx heights below are the job's defaults only (tx = the first S
+        # row, rx = the RX_HEIGHT parameter), not what a link uses, so
         # the model-validity pass build_p2p_job runs on them (log_model_warnings)
         # describes a link that is not being computed. The per-row limits that
         # actually matter — the AGL floor and the AGL/AMSL mode — are enforced in
@@ -353,13 +384,26 @@ class P2PAlgorithm(QgsProcessingAlgorithm):
         # frequency/range/refractivity warnings once per site in the log for no
         # extra information. If per-row ITM height warnings are ever wanted, add
         # them in _parse_csv where the row values live, not here.
+        #
+        # job.tx in batch mode: the batch's first S row, never the (ignored)
+        # TX parameters. GPU ITM reads ONE system elevation — the terrain
+        # under job.tx — for every link (engines/p2p.rs, zsys), so job.tx
+        # must lie in the batch. Single link: the generated CSV's S row is
+        # the TX parameters, so this is the same point either way.
+        tx_mode = "AGL"
+        if is_batch:
+            try:
+                tx_lat, tx_lon, tx_height, tx_mode = batch_reference_source(entries)
+            except ValueError as exc:
+                raise QgsProcessingException(
+                    f"Batch CSV {batch_file}: {exc}") from exc
         params = P2PParams(
             tx_lat=tx_lat,
             tx_lon=tx_lon,
             tx_height=tx_height,
-            tx_mode="AGL",
-            freq_mhz=433.0,
-            erp_watts=10.0,
+            tx_mode=tx_mode,
+            freq_mhz=freq_mhz,
+            erp_watts=erp_watts,
             rx_height=rx_height,
             rx_mode="AGL",
             model=model,

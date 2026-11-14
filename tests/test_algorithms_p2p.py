@@ -86,6 +86,7 @@ class _StubbedP2P(alg.P2PAlgorithm):
     _DOUBLES = {
         "TX_LAT": 47.0, "TX_LON": 8.0, "TX_HEIGHT": 20.0,
         "RX_LAT": 47.05, "RX_LON": 8.05, "RX_HEIGHT": 10.0,
+        "FREQ_MHZ": 433.0, "ERP_WATTS": 10.0,
     }
 
     def __init__(self, output_dir):

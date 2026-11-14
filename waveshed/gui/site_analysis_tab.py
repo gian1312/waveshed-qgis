@@ -405,6 +405,32 @@ AZ_ROTATION_TIP = (
     "with an asset that has an antenna pattern, in Propagation mode."
 )
 
+#: Tooltip of a row's AZ Rotation spin box while it is disabled: the row's
+#: asset carries no pattern, so the rotation would not reach the engine
+#: (job_builder._build_tx sends ``az_rotation`` only with a pattern).
+AZ_ROTATION_OFF_TIP = (
+    "Disabled: this row's asset has no antenna pattern (or no asset is "
+    "chosen), so there is nothing to rotate — the engine runs isotropic "
+    "and ignores the rotation. Pick an asset with an azimuth or elevation "
+    "pattern to set it."
+)
+
+
+def asset_has_pattern(asset: Optional[dict]) -> bool:
+    """True when *asset* carries azimuth or elevation pattern data.
+
+    The same test as the run (``job_builder.asset_patterns``: a non-empty
+    ``data`` list on either axis) without normalising or logging. Malformed
+    data counts as a pattern — the run names it (``PatternDataError``).
+    """
+    if not asset:
+        return False
+    for key in ("azimuth_pattern", "elevation_pattern"):
+        block = asset.get(key) or {}
+        if isinstance(block, dict) and block.get("data"):
+            return True
+    return False
+
 # Widths for the widget-bearing columns. Wide enough for the widget plus its
 # header text — "AZ Rotation (deg)" is the long one, and a column narrower than
 # its own header reads as broken even when the widget inside still works.
@@ -823,6 +849,7 @@ class SiteAnalysisTab(QWidget):
         self._populate_raster_layers()
         self._refresh_asset_cache()
         self._refresh_asset_combos()
+        self._update_az_rotation_states()
 
     # ==================================================================
     # Asset helpers
@@ -837,6 +864,7 @@ class SiteAnalysisTab(QWidget):
         """
         self._refresh_asset_cache()
         self._refresh_asset_combos()
+        self._update_az_rotation_states()
 
     def rename_asset(self, old: str, new: str) -> None:
         """Rows showing *old* show *new* (the Assets tab renamed it).
@@ -859,6 +887,31 @@ class SiteAnalysisTab(QWidget):
             blocked = combo.blockSignals(True)
             combo.setItemText(idx, new)
             combo.blockSignals(blocked)
+        self._update_az_rotation_states()
+
+    def _update_az_rotation_state(self, row: int) -> None:
+        """Enable *row*'s AZ Rotation only when its asset has a pattern.
+
+        A blank asset, an asset without pattern data, one that no longer
+        resolves, and the geometric modes (LOS / LOS Floor: no assets) leave
+        it disabled, with a tooltip saying why. The value is kept.
+        """
+        spin = self.sites_table.cellWidget(row, _COL_AZ_ROTATION)
+        if spin is None:
+            return
+        combo = self.sites_table.cellWidget(row, _COL_ASSET)
+        name = combo.currentText() if isinstance(combo, QComboBox) else ""
+        enabled = (
+            self._current_mode not in ("LOS", "MIN_ALT")
+            and asset_has_pattern(self._get_asset(name))
+        )
+        spin.setEnabled(enabled)
+        spin.setToolTip(AZ_ROTATION_TIP if enabled else AZ_ROTATION_OFF_TIP)
+
+    def _update_az_rotation_states(self) -> None:
+        """``_update_az_rotation_state`` for every row."""
+        for row in range(self.sites_table.rowCount()):
+            self._update_az_rotation_state(row)
 
     def _refresh_asset_cache(self) -> None:
         """Reload assets from disk and rebuild the name-keyed cache.
@@ -1357,6 +1410,7 @@ class SiteAnalysisTab(QWidget):
         self.btn_add_alt.setVisible(not is_min_alt)
         self.btn_remove_alt.setVisible(not is_min_alt)
         self.lbl_alt_min_alt_note.setVisible(is_min_alt)
+        self._update_az_rotation_states()
         self._update_itm_visibility()
 
     def _update_itm_visibility(self) -> None:
@@ -1452,6 +1506,8 @@ class SiteAnalysisTab(QWidget):
         spin_az_rot.setSuffix("\u00b0")
         spin_az_rot.setToolTip(AZ_ROTATION_TIP)
         self.sites_table.setCellWidget(row, _COL_AZ_ROTATION, spin_az_rot)
+        # Blank asset at first: no pattern, nothing to rotate.
+        self._update_az_rotation_state(row)
 
         # -- Column 5: AZ Start (deg) --
         spin_az_start = QDoubleSpinBox()
@@ -1479,7 +1535,9 @@ class SiteAnalysisTab(QWidget):
         return row
 
     def _on_asset_changed(self, row: int, asset_name: str) -> None:
-        """Auto-fill height and height mode from the selected asset."""
+        """Auto-fill height and height mode from the selected asset; enable
+        the row's AZ Rotation only for an asset with a pattern."""
+        self._update_az_rotation_state(row)
         asset = self._get_asset(asset_name)
         if asset is None:
             return

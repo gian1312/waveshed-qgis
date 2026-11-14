@@ -146,7 +146,7 @@ class CoverageAlgorithm(QgsProcessingAlgorithm):
         self.addParameter(
             QgsProcessingParameterNumber(
                 self.FREQ_MHZ,
-                "Frequency (MHz)",
+                "Frequency (MHz) (Propagation models only — LOS and MIN_ALT ignore it)",
                 type=QgsProcessingParameterNumber.Type.Double,
                 minValue=1.0,
                 maxValue=3000.0,
@@ -157,7 +157,7 @@ class CoverageAlgorithm(QgsProcessingAlgorithm):
         self.addParameter(
             QgsProcessingParameterNumber(
                 self.ERP_WATTS,
-                "ERP (Watts)",
+                "ERP (Watts) (Propagation models only — LOS and MIN_ALT ignore it)",
                 type=QgsProcessingParameterNumber.Type.Double,
                 minValue=0.001,
                 maxValue=1000000.0,

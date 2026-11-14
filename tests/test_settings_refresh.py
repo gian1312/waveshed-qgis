@@ -230,8 +230,10 @@ class TestSiteTabRefresh(unittest.TestCase):
         tab._populate_raster_layers = lambda: calls.append("dem")
         tab._refresh_asset_cache = lambda: calls.append("assets")
         tab._refresh_asset_combos = lambda: calls.append("combos")
+        # A row's AZ Rotation follows its (re-read) asset's pattern.
+        tab._update_az_rotation_states = lambda: calls.append("az_rotation")
         tab.refresh_settings()
-        self.assertEqual(calls, ["dem", "assets", "combos"])
+        self.assertEqual(calls, ["dem", "assets", "combos", "az_rotation"])
 
     def test_asset_combos_repopulate_and_keep_the_row_choice(self):
         tab = self._tab()
