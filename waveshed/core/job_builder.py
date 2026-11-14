@@ -96,6 +96,27 @@ def batch_max_range_km(entries: Sequence[BatchEntry],
     return int(max(math.ceil(terrain_radius_km), needed))
 
 
+def batch_reference_source(
+    entries: Sequence[BatchEntry],
+) -> Tuple[float, float, float, str]:
+    """``(lat, lon, height_m, mode)`` of the job's ``tx`` for a BATCH_P2P run:
+    the batch's first source (S) row.
+
+    Every link takes its endpoints and heights from the batch CSV itself
+    (aether_core pairs every S row with every R row). ``job.tx`` is read only
+    as the job's defaults and, in GPU ITM, for ONE system elevation — the
+    terrain under ``job.tx`` adjusts the surface refractivity for every link
+    (engines/p2p.rs, ``zsys``). Taking the batch's own first transmitter keeps
+    that point inside the batch instead of wherever an unrelated input was.
+
+    Raises ValueError when the batch has no S row.
+    """
+    for entry in entries:
+        if str(entry[0]).upper() == "S":
+            return float(entry[2]), float(entry[3]), float(entry[4]), str(entry[5])
+    raise ValueError("The batch has no source (S) row.")
+
+
 def _processing_setting(key: str, default: int) -> int:
     """Read a processing budget (GB) from QgsSettings, falling back to default.
 

@@ -92,6 +92,26 @@ class TestLinkDistance(unittest.TestCase):
         self.assertGreater(cap, longest)
 
 
+class TestBatchReferenceSource(unittest.TestCase):
+    """job.tx of a batch run = the batch's first source row (GPU ITM reads
+    one system elevation under job.tx for every link)."""
+
+    def test_first_source_row_wins_wherever_it_sits(self):
+        from waveshed.core.job_builder import batch_reference_source
+        entries = [
+            ("R", "B", 46.96, 7.46, 2.0, "AGL"),
+            ("S", "A", 46.95, 7.45, 30.0, "AGL"),
+            ("S", "C", 47.10, 7.60, 1200.0, "AMSL"),
+        ]
+        self.assertEqual(batch_reference_source(entries),
+                         (46.95, 7.45, 30.0, "AGL"))
+
+    def test_a_batch_without_a_source_is_refused(self):
+        from waveshed.core.job_builder import batch_reference_source
+        with self.assertRaises(ValueError):
+            batch_reference_source([("R", "B", 46.96, 7.46, 2.0, "AGL")])
+
+
 class TestBatchJobRange(unittest.TestCase):
     """End to end through the worker: what lands in the job file."""
 
