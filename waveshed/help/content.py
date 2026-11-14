@@ -63,7 +63,7 @@ CSV, with signal strength, path loss and terrain profiles.</li>
 <b>Waveshed Help</b> (this text). The first two also sit on the
 <b>Waveshed</b> toolbar.</li>
 <li>The main dialog has an <b>Analysis Mode:</b> row at the top
-(<b>Line of Sight (LOS)</b>, <b>Propagation Loss</b>, <b>LOS Floor</b>) and the
+(<b>Line of Sight (LOS)</b>, <b>Propagation</b>, <b>LOS Floor</b>) and the
 tabs <b>360&deg;</b>, <b>P2P Link</b>, <b>Assets</b>, <b>Map Converter</b>,
 <b>Settings</b> and <b>Help</b>. The mode row applies to both analysis
 tabs.</li>
@@ -82,7 +82,7 @@ file or folder, or a rendered elevation service
 <li><b>Open Waveshed Analysis</b>, pick a mode, go to the <b>360&deg;</b> tab
 and press <b>Pick</b> on the site row to place the transmitter on the map.</li>
 <li>Set <b>Height (m)</b> / <b>Height Mode</b>, <b>Range (km)</b>,
-<b>Resolution (m)</b> and (for Propagation Loss) an <b>Asset</b>.</li>
+<b>Resolution (m)</b> and (for Propagation) an <b>Asset</b>.</li>
 <li>Press <b>Run Analysis</b>. Terrain is downloaded or built first, then
 <code>aether_core</code> runs, then <code>aether_export</code> writes the
 GeoTIFF and the layer appears under <b>Waveshed &rarr; Coverage</b>.</li>
@@ -251,7 +251,7 @@ pattern — so the <b>Asset</b> and <b>AZ Rotation (deg)</b> columns are hidden
 in the 360&deg; tab, and the P2P tab labels its endpoints <b>Site A:</b> /
 <b>Site B:</b>. The result is a two-value raster: visible / not visible.</p>
 
-<h3>Propagation Loss</h3>
+<h3>Propagation</h3>
 <p>Signal strength from the transmitter's ERP through the <b>ITM</b>
 (Longley-Rice / Irregular Terrain Model) point-to-point mode. Selecting it
 reveals the <b>Model:</b> dropdown — which offers <b>ITM</b> only — the
@@ -681,7 +681,7 @@ dialog opens. Each job gets its own sub-directory.</td></tr>
 tab, not from this tab.</p>
 
 <h3>ITM Parameters</h3>
-<p>Shown only in <b>Propagation Loss</b> mode with model <b>ITM</b>:
+<p>Shown only in <b>Propagation</b> mode with model <b>ITM</b>:
 <b>Ground Permittivity:</b>, <b>Ground Conductivity:</b>,
 <b>Surface Refractivity:</b>, <b>Radio Climate:</b>, <b>Polarization:</b>,
 <b>Confidence:</b> and <b>Reliability:</b>. Each is explained under
@@ -763,7 +763,7 @@ layers.</td></tr>
 <ul>
 <li><b>LOS</b> — exact two-value ramp: 0 is transparent (<i>No Data</i>),
 1 is green at 70&nbsp;% opacity (<i>Visible</i>).</li>
-<li><b>Propagation Loss (ITM)</b> — interpolated signal-strength ramp from
+<li><b>Propagation (ITM)</b> — interpolated signal-strength ramp from
 -140 dBm (red) through -70 dBm (yellow) to 0 dBm (green). The band holds
 received power in dBm.</li>
 <li><b>LOS Floor</b> — a continuous blue-to-red ramp over the altitude actually
@@ -806,7 +806,7 @@ sidecar.</td></tr>
 _P2P = """
 <p>The <b>P2P Link</b> tab analyses a single link between two points. In
 <b>Line of Sight (LOS)</b> mode the endpoints are labelled <b>Site A:</b> and
-<b>Site B:</b>; in <b>Propagation Loss</b> mode they become
+<b>Site B:</b>; in <b>Propagation</b> mode they become
 <b>Transmitter:</b> and <b>Receiver:</b> and the <b>Parameters</b> group
 appears. The tab is disabled in <b>LOS Floor</b> mode — a single link has no
 minimum-altitude surface.</p>
@@ -822,7 +822,7 @@ decimal is kept, because that is all the batch CSV the run is built from
 carries.</li>
 </ul>
 
-<h3>Parameters (Propagation Loss only)</h3>
+<h3>Parameters (Propagation only)</h3>
 <ul>
 <li><b>Asset:</b> — an emitter from the <b>Assets</b> tab; selecting one fills
 in frequency and ERP. Leave it blank to type them by hand.</li>
@@ -1875,7 +1875,7 @@ TOPICS: List[Topic] = [
           ("download", "binaries", "eula", "fingerprint", "update",
            "licence", "license", "aether_core")),
     Topic("models", "Analysis modes and propagation models", _MODELS,
-          ("LOS", "ITM", "MIN_ALT", "loss", "mode", "earth radius")),
+          ("LOS", "ITM", "MIN_ALT", "loss", "propagation", "mode", "earth radius")),
     Topic("heights", "Heights: AGL and AMSL", _HEIGHTS,
           ("altitude", "floor", "minimum", "antenna height")),
     Topic("terrain", "Terrain: sources, tiles and the cache", _TERRAIN,

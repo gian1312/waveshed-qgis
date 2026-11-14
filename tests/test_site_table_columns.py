@@ -2,7 +2,7 @@
 
 Every data column holds a *cell widget*, which `ResizeToContents` measures as
 empty — so the widths must be declared explicitly or the columns collapse. That
-showed up as Asset and AZ Rotation being unusable in Propagation Loss mode,
+showed up as Asset and AZ Rotation being unusable in Propagation mode,
 which is the only mode that shows them.
 """
 
@@ -39,7 +39,7 @@ class TestColumnWidths:
         """The dialog must be able to show the table without squeezing.
 
         This is the coupling that broke: the table needs ~785 px of fixed
-        columns in Propagation Loss mode and the dialog minimum was 640.
+        columns in Propagation mode and the dialog minimum was 640.
         """
         from waveshed.gui import main_dialog
 

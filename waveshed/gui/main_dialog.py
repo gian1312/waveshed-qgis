@@ -1,6 +1,6 @@
 """Main AETHER analysis dialog — single entry point combining all analysis modes.
 
-Top-level mode selector (LOS vs Propagation Loss) with tabs for
+Top-level mode selector (LOS vs Propagation) with tabs for
 Site Analysis, P2P Link, Assets, and Settings.
 """
 
@@ -55,7 +55,7 @@ class AetherMainDialog(QDialog):
         self.iface = iface
 
         self.setWindowTitle("Waveshed")
-        # Wide enough for the sites table in Propagation Loss mode, which shows
+        # Wide enough for the sites table in Propagation mode, which shows
         # two more columns than LOS (Asset, AZ Rotation) and totals ~785 px of
         # fixed columns before Location gets any. At the old 640 the table was
         # narrower than its own contents in the mode that needs it most.
@@ -155,7 +155,7 @@ class AetherMainDialog(QDialog):
         mode_row.addWidget(QLabel("Analysis Mode:"))
 
         self.radio_los = QRadioButton("Line of Sight (LOS)")
-        self.radio_loss = QRadioButton("Propagation Loss")
+        self.radio_loss = QRadioButton("Propagation")
         self.radio_min_alt = QRadioButton("LOS Floor")
         self.radio_min_alt.setToolTip(_MIN_ALT_TOOLTIP)
         self.radio_los.setChecked(True)

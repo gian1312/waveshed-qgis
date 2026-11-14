@@ -245,7 +245,7 @@ class TestCoversTheUI:
 
     @pytest.mark.parametrize("label", [
         # Main dialog
-        "Analysis Mode:", "Line of Sight (LOS)", "Propagation Loss",
+        "Analysis Mode:", "Line of Sight (LOS)", "<b>Propagation</b>",
         "LOS Floor", "P2P Link", "Assets", "Map Converter", "Settings",
         # Site analysis
         "Run Analysis", "Include buildings (OpenFreeMap)",

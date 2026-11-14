@@ -912,7 +912,7 @@ class SiteAnalysisTab(QWidget):
         # Every data column holds a *cell widget* (combo/spin), not item data.
         # `ResizeToContents` measures item data, which those columns do not
         # have, so it collapses them to near-nothing — which is why Asset and
-        # AZ Rotation were unusable the moment Propagation Loss unhid them.
+        # AZ Rotation were unusable the moment Propagation mode unhid them.
         # Size them explicitly and let Location absorb the slack instead.
         header.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
         header.setMinimumSectionSize(_COL_MIN_WIDTH)
