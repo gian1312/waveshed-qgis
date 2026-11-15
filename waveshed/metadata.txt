@@ -14,7 +14,35 @@ license=GPL-2.0-or-later
 tags=rf,propagation,radio,coverage,p2p,gpu,terrain,ITM,LOS,line of sight,viewshed,waveshed
 category=Analysis
 icon=resources/icon.png
-changelog=0.4.3
+changelog=0.4.4
+    - Needs Aether engine 0.4.3 or newer; the earth radius choice "Real"
+      needs engine 0.5.2; the Map Converter's seam filter and fast building
+      preparation need the converter of engine 0.5.0.
+    - Propagation (RF) hotfix: results were drawn in one colour with a
+      "255 / 0" legend; they are now coloured over their real dBm range,
+      every legend entry is in dBm and 0 dBm is no longer transparent. The
+      ITM ground conductivity default is 0.005 S/m again (360° ITM runs
+      were sent 0.01). The antenna patterns of an asset (azimuth, elevation,
+      AZ Rotation) reach the engine (they were never sent). A site whose
+      asset is missing is refused instead of run with 433 MHz / 10 W.
+    - Point-to-Point: its own ITM parameters (ITM links always ran the
+      engine defaults); picking an asset fills Site A's height unless one
+      was typed; the Processing tool has frequency and ERP inputs (it
+      always used 433 MHz / 10 W).
+    - Earth Radius Mode in every mode: Real (k = 1) or 4/3 earth. LOS and
+      LOS Floor start on Real, Propagation on 4/3; the Processing tools
+      offer the same choice. An engine older than 0.5.2 computes with the
+      4/3 earth.
+    - LOS Floor: legend and thresholds are in metres (they showed half the
+      altitude).
+    - The Propagation Loss mode is called Propagation; radio climate 7
+      (Maritime Temperate, Over Sea); asset changes reach the run tabs at
+      once and saving never overwrites another asset; the Altitude Explorer
+      opens in front at full height.
+    - A job is checked before it reaches the engine: a fractional range is
+      rounded up, an empty or invalid number is refused with its field
+      named.
+    0.4.3
     - Needs Aether engine 0.4.3 or newer; the Map Converter's seam filter and
       fast building preparation need the converter of engine 0.5.0.
     - Setup: opening the plugin without the engine or a valid API key shows a
