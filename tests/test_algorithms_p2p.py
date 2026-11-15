@@ -40,6 +40,10 @@ class _FakeFeedback:
 
     def __init__(self):
         self.texts = []
+        self.warnings = []
+
+    def pushWarning(self, msg):
+        self.warnings.append(msg)
 
     def setProgressText(self, text):
         self.texts.append(text)

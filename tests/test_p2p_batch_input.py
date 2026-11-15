@@ -119,7 +119,7 @@ def _tab(mode="LOSS", batch=False, asset="", itm=True):
     if itm:
         tab.itm_group = _Group(ITM_VALUES)
     # Earth Radius Mode sits in the Analysis group (every mode), not in ITM.
-    tab.combo_earth_radius = _Combo("ADVANCED")
+    tab.combo_earth_radius = _Combo("REAL")
     return tab
 
 
@@ -409,12 +409,12 @@ class ItmGroup(unittest.TestCase):
         self.assertEqual(prop, {
             "eps_dielect": 25.0, "sgm_conductivity": 0.02, "eno_ns_surfref": 320.0,
             "radio_climate": 6, "pol": 1, "conf": 0.9, "rel": 0.7,
-            "earth_radius_mode": "ADVANCED"})
+            "earth_radius_mode": "REAL"})
 
     def test_values_go_in_los_mode_too_as_the_360_tab_does(self):
         params = _tab(mode="LOS")._collect_params()
         self.assertEqual(params.climate, 6)
-        self.assertEqual(params.earth_radius, "ADVANCED")
+        self.assertEqual(params.earth_radius, "REAL")
 
 
 # ---------------------------------------------------------------------------

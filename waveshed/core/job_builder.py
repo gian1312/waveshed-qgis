@@ -601,6 +601,32 @@ def _validate_antenna_heights(params: "CoverageParams | P2PParams") -> None:
 #: in coverage LOS and ignore it in MIN_ALT; Waveshed sends none in either.
 GEOMETRIC_MODELS = ("LOS", "MIN_ALT")
 
+#: ``propagation.earth_radius_mode`` values the plugin sends: Real (k = 1,
+#: aether_core >= ``binary_manager.EARTH_REAL_MIN_ENGINE``) and 4/3.
+EARTH_REAL = "REAL"
+EARTH_FOUR_THIRDS = "FOUR_THIRDS"
+
+#: The Processing tools' "Earth radius" options (index = value).
+EARTH_RADIUS_OPTIONS = ["Default (LOS: Real, Propagation: 4/3)",
+                        "Real (k = 1)", "4/3 earth"]
+
+
+def earth_radius_default(mode: str) -> str:
+    """Default Earth Radius Mode (owner, 2026-11-15): Real for LOS and LOS
+    Floor (*mode* / model "LOS", "MIN_ALT"), 4/3 for Propagation ("LOSS",
+    "SIMPLE_LOSS", "ITM")."""
+    return (EARTH_REAL if str(mode).upper() in GEOMETRIC_MODELS
+            else EARTH_FOUR_THIRDS)
+
+
+def earth_radius_from_option(index: int, model: str) -> str:
+    """Engine value of :data:`EARTH_RADIUS_OPTIONS` [*index*] for *model*."""
+    if index == 1:
+        return EARTH_REAL
+    if index == 2:
+        return EARTH_FOUR_THIRDS
+    return earth_radius_default(model)
+
 
 class PatternDataError(ValueError):
     """An asset's antenna pattern is not a list of ``[angle, gain]`` numbers

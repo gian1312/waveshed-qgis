@@ -66,6 +66,7 @@ from ..core.binary_manager import (
     engine_error_hint,
     engine_failure_message,
     find_binary,
+    read_engine_version,
 )
 from ..core import api_key
 from ..core import engine_log
@@ -1228,8 +1229,9 @@ class P2PTab(QWidget):
         self._update_earth_radius()
 
     def _update_earth_radius(self, *_args) -> None:
-        """Grey out the Earth Radius Modes the engine cannot apply in this
-        mode / model / backend (gui/itm_params.earth_radius_unavailable)."""
+        """Select the Earth Radius Mode for this model's family (LOS: Real,
+        SIMPLE_LOSS / ITM: 4/3) and grey out what the engine cannot apply
+        (gui/itm_params.earth_radius_unavailable)."""
         combo = getattr(self, "combo_earth_radius", None)
         backend = getattr(self, "combo_backend", None)
         if combo is None or backend is None:
@@ -1240,7 +1242,7 @@ class P2PTab(QWidget):
                       else "")
         apply_earth_radius_availability(
             combo, "LOSS" if self._is_loss_mode else "LOS", loss_model,
-            backend.currentText())
+            backend.currentText(), read_engine_version())
 
     def refresh_layers(self) -> None:
         """Re-populate the DEM layer combo from the current project."""
@@ -1610,7 +1612,7 @@ class P2PTab(QWidget):
         layout.addRow("Backend:", backend_row)
 
         # Earth Radius Mode — every mode (LOS included), as in the 360° tab.
-        # Real / 4/3 / Advanced, greyed out where the engine cannot apply it.
+        # Real / 4/3, default by model; Real greyed out on an older engine.
         self.combo_earth_radius = QComboBox()
         setup_earth_radius_combo(self.combo_earth_radius)
         layout.addRow("Earth Radius Mode:", self.combo_earth_radius)

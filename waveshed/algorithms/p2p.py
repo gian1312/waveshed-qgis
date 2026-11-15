@@ -29,6 +29,7 @@ from qgis.core import (
 
 from ..core.binary_manager import find_binary
 from ..core.job_builder import (
+    EARTH_RADIUS_OPTIONS,
     MIN_ANTENNA_AGL_M,
     VALID_RESOLUTIONS,
     P2PParams,
@@ -37,6 +38,7 @@ from ..core.job_builder import (
     build_p2p_job,
     write_engine_batch_csv,
     height_floor_error,
+    earth_radius_from_option,
     write_job_file,
 )
 from ..core import terrain_adapter
@@ -68,6 +70,7 @@ class P2PAlgorithm(QgsProcessingAlgorithm):
     FREQ_MHZ = "FREQ_MHZ"
     ERP_WATTS = "ERP_WATTS"
     MODEL = "MODEL"
+    EARTH_RADIUS = "EARTH_RADIUS"
     RESOLUTION = "RESOLUTION"
     BACKEND = "BACKEND"
     OUTPUT_DIR = "OUTPUT_DIR"
@@ -96,6 +99,9 @@ class P2PAlgorithm(QgsProcessingAlgorithm):
             "parameters are ignored and the CSV drives the analysis.\n\n"
             "Frequency and ERP apply to the Propagation model (ITM) only — "
             "LOS ignores them.\n\n"
+            "Earth radius: Default = the real earth (k = 1) for LOS and the "
+            "4/3 earth for ITM. Real needs aether_core 0.5.2 or newer; an older "
+            "engine runs the 4/3 earth, with a warning.\n\n"
             "Batch CSV format:\n"
             "  S,TX1,47.0563,8.4846,40.0,AGL\n"
             "  R,RX1,47.5000,8.9000,10.0,AGL\n\n"
@@ -239,6 +245,15 @@ class P2PAlgorithm(QgsProcessingAlgorithm):
         )
         self.addParameter(
             QgsProcessingParameterEnum(
+                self.EARTH_RADIUS,
+                "Earth radius",
+                options=EARTH_RADIUS_OPTIONS,
+                defaultValue=0,  # LOS: Real (k = 1), Propagation: 4/3
+                optional=True,
+            )
+        )
+        self.addParameter(
+            QgsProcessingParameterEnum(
                 self.RESOLUTION,
                 "Resolution (m)",
                 options=_RESOLUTIONS,
@@ -306,6 +321,7 @@ class P2PAlgorithm(QgsProcessingAlgorithm):
         erp_watts: float = self.parameterAsDouble(parameters, self.ERP_WATTS, context)
 
         model_idx: int = self.parameterAsEnum(parameters, self.MODEL, context)
+        earth_idx: int = self.parameterAsEnum(parameters, self.EARTH_RADIUS, context)
         resolution_idx: int = self.parameterAsEnum(parameters, self.RESOLUTION, context)
         backend_idx: int = self.parameterAsEnum(parameters, self.BACKEND, context)
 
@@ -355,6 +371,13 @@ class P2PAlgorithm(QgsProcessingAlgorithm):
             bm.check_engine_for_job(resolution_m)
         except bm.EngineTooOldError as exc:
             raise QgsProcessingException(str(exc)) from exc
+
+        # Earth radius: the option, else the model's default (LOS: Real,
+        # Propagation: 4/3); Real only on an engine that applies it.
+        earth_radius, earth_warning = bm.earth_radius_for_engine(
+            earth_radius_from_option(earth_idx, model), bm.read_engine_version())
+        if earth_warning:
+            feedback.pushWarning(earth_warning)
 
         try:
             abt_dir = prepare_terrain(
@@ -423,6 +446,7 @@ class P2PAlgorithm(QgsProcessingAlgorithm):
             max_range_km=batch_max_range_km(entries, terrain_radius_km),
             backend=backend,
             output_name=output_name,
+            earth_radius=earth_radius,
         )
 
         job_config = build_p2p_job(params, abt_dir, output_dir, batch_file=batch_file)

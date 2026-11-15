@@ -1462,6 +1462,12 @@ COARSE_RESOLUTION_MIN_ENGINE = "0.4.3"
 #: exit code 0 and no warning — so a run carrying a pattern is refused there.
 PATTERN_DATA_MIN_ENGINE = "0.4.3"
 
+#: First aether_core that applies ``propagation.earth_radius_mode: "REAL"``
+#: (k = 1) in LOS, LOS Floor, SIMPLE_LOSS and ITM, on GPU and CPU. Older
+#: engines run REAL as 4/3 without a warning, so the tabs grey Real out there
+#: (``gui/itm_params.earth_radius_unavailable``) and select 4/3.
+EARTH_REAL_MIN_ENGINE = "0.5.2"
+
 #: First aether_converter whose download job accepts ``repair_source_tiles``
 #: (patch only the listed source tiles into the EXISTING output .abt files).
 #: The field is additive: an older converter parses the job, ignores it and
@@ -1745,6 +1751,28 @@ def engine_supports_resolution(
     ) >= 0:
         return True
     return float(resolution_m) in {float(r) for r in LEGACY_ENGINE_RESOLUTIONS}
+
+
+def engine_supports_real_earth(version: Optional[str]) -> bool:
+    """Whether aether_core *version* applies Earth Radius Mode REAL
+    (>= :data:`EARTH_REAL_MIN_ENGINE`). Unknown (``None``) is the oldest
+    build: False."""
+    return (bool(version)
+            and compare_versions(version, EARTH_REAL_MIN_ENGINE) >= 0)
+
+
+def earth_radius_for_engine(value: str, version: Optional[str]) -> Tuple[str, str]:
+    """``(value to send, warning)``: REAL on an engine older than
+    :data:`EARTH_REAL_MIN_ENGINE` (or unknown) becomes FOUR_THIRDS — that
+    engine would run REAL as 4/3 without a word — with a warning naming the
+    needed version; anything else goes unchanged with an empty warning."""
+    if value != "REAL" or engine_supports_real_earth(version):
+        return value, ""
+    return "FOUR_THIRDS", (
+        f"Earth radius Real (k = 1) needs aether_core {EARTH_REAL_MIN_ENGINE} "
+        f"or newer (installed: {version or 'unknown'}); this run uses the "
+        "4/3 earth. Update the engine in Waveshed → Settings → Download "
+        "binaries.")
 
 
 def check_engine_for_job(

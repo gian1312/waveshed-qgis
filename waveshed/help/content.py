@@ -246,7 +246,8 @@ controls the tabs show.</p>
 <h3>Line of Sight (LOS)</h3>
 <p>Pure geometry: can a receiver at the given altitude see the transmitter's
 antenna over the terrain surface (buildings included when you asked for them),
-bending rays with the effective-earth model? No frequency, no power, no antenna
+over the earth's curvature that <b>Earth Radius Mode</b> sets (Real, k = 1, by
+default)? No frequency, no power, no antenna
 pattern — so the <b>Asset</b> and <b>AZ Rotation (deg)</b> columns are hidden
 in the 360&deg; tab, and the P2P tab labels its endpoints <b>Site A:</b> /
 <b>Site B:</b>. The result is a two-value raster: visible / not visible.</p>
@@ -288,21 +289,18 @@ interface it is <b>LOS Floor</b>.</p>
 <h3>Earth Radius Mode</h3>
 <p>Both analysis tabs carry <b>Earth Radius Mode:</b> in every mode: the
 earth's curvature shapes the horizon of a plain LOS or LOS Floor run as much as
-an ITM one. Choices the engine cannot apply in the current mode and backend are
-greyed out, with the reason in their tooltip; a pick that gets greyed out falls
-back to 4/3 and comes back when it is available again:</p>
+an ITM one. Two choices:</p>
 <ul>
-<li><b>Real (k = 1)</b> — the geometric earth, no refraction. Greyed out for
-now: no engine version computes it yet.</li>
-<li><b>4/3 earth</b> (default, recommended) — standard refraction: the engine
-derives the effective curvature from the surface refractivity, which at
-N = 301 gives the familiar k &asymp; 4/3 earth. What every LOS, LOS Floor and
-GPU run uses today.</li>
-<li><b>Advanced (per path)</b> — the Sandia/Doerry adaptive method: the
-k-factor is computed per path from the refractivity and the two endpoint
-altitudes, and clamped to 0.1&ndash;10. Available for ITM (Propagation mode)
-with <b>Backend:</b> CPU, the only engine path that applies it today.</li>
+<li><b>Real (k = 1)</b> — the geometric earth, no refraction. The default for
+LOS and LOS Floor.</li>
+<li><b>4/3 earth</b> — standard refraction: the engine derives the effective
+curvature from the surface refractivity, which at N = 301 gives the familiar
+k &asymp; 4/3 earth. The default for Propagation (SIMPLE_LOSS and ITM).</li>
 </ul>
+<p>Your pick is kept separately for LOS / LOS Floor and for Propagation while
+the dialog is open: switching modes shows that mode's last pick, or its
+default. Real needs aether_core 0.5.2 or newer; with an older engine it is
+greyed out (the tooltip says why) and 4/3 is used.</p>
 <p>See <a href="#physics">Physics notes</a> for what that curvature does to a
 long path, and <a href="#itm">ITM parameters</a> for everything in the
 <b>ITM Parameters</b> group.</p>
@@ -681,10 +679,9 @@ unchecked, no band gets buildings.</td></tr>
 <tr><td><b>Backend:</b></td><td><b>AUTO</b> (GPU when one is usable, else CPU),
 <b>GPU</b> or <b>CPU</b>. Forcing CPU is much slower but sidesteps a driver
 problem.</td></tr>
-<tr><td><b>Earth Radius Mode:</b></td><td><b>Real (k = 1)</b>,
-<b>4/3 earth</b> or <b>Advanced (per path)</b>, in every mode; what the engine
-cannot apply here is greyed out — see <a href="#models">Modes and
-models</a>.</td></tr>
+<tr><td><b>Earth Radius Mode:</b></td><td><b>Real (k = 1)</b> or
+<b>4/3 earth</b>, in every mode; LOS and LOS Floor default to Real, Propagation
+to 4/3 — see <a href="#models">Modes and models</a>.</td></tr>
 <tr><td><b>Output Dir:</b></td><td>Where results are written, with
 <b>Browse...</b>. Defaults to <code>aether_output</code> in the system temp
 directory. The folder you choose (or type) is remembered for the next time the
@@ -1514,8 +1511,9 @@ acquisition drives the first 10&ndash;20 % of the progress bar.</li>
 _PHYSICS = """
 <h3>What "line of sight" means here</h3>
 <p>A location is visible when a straight ray from the transmitting antenna to
-the receiving point clears every terrain sample along the way — over the
-<i>effective</i> earth, not the geometric one. The surface tested is the
+the receiving point clears every terrain sample along the way — over the earth
+<b>Earth Radius Mode</b> sets: the geometric one (Real, k = 1, the LOS default)
+or the 4/3 effective earth. The surface tested is the
 <code>.abt</code> terrain, so it includes buildings when you asked for them and
 excludes vegetation always. There is no Fresnel-clearance requirement in the
 LOS answer: it is a geometric yes/no, which is why a path can be "visible" and
@@ -1545,6 +1543,9 @@ d &asymp; &radic;(2 k R h): a <b>5000 m AMSL</b> aircraft sees about
 <b>291 km</b> over a smooth earth. So at 300 km an airborne receiver is already
 past its own smooth-earth horizon, and whether it sees the transmitter depends
 entirely on the terrain in between.</p>
+<p>With <b>Real (k = 1)</b> (no refraction, the LOS and LOS Floor default) the
+bulge is 4/3 of the values above and the same aircraft's smooth-earth horizon
+is about <b>252 km</b>.</p>
 <p><b>This is why distant massifs shadow far-field coverage.</b> At 300 km the
 line of sight is more than 5 km above the local ground at mid-path; a 4000 m
 range 150 km away still sits above it and cuts a shadow across everything
@@ -1553,10 +1554,6 @@ range, or requiring thousands of metres of altitude behind one, is correct
 physics — not an AGL/AMSL mix-up and not a terrain bug. A quick sanity check:
 switch the Altitude Explorer band to AMSL and compare the required altitude
 against the blocking ridge's elevation; they should be consistent.</p>
-<p><b>ADVANCED</b> earth-radius mode replaces the fixed 4/3 with a per-path
-k computed from the refractivity and the endpoint altitudes (Sandia/Doerry),
-clamped between 0.1 and 10 — useful for high platforms or unusual atmospheres,
-but not the default because 4/3 is what published link budgets assume.</p>
 
 <h3>Free space, and why loss is never better than it</h3>
 <p>Free-space path loss is the floor of any propagation result: no terrain
@@ -1600,8 +1597,7 @@ water.</td></tr>
 <td>301.0</td><td>Sea-level surface refractivity N<sub>0</sub> in N-units,
 valid 250&ndash;400. 301 is the global average; ~360 for humid coastal air,
 ~280&ndash;300 for dry continental air. It sets the effective earth curvature
-in FOUR_THIRDS mode (N = 301 gives k &asymp; 1.333) and feeds the ADVANCED
-k-factor.</td></tr>
+in FOUR_THIRDS mode (N = 301 gives k &asymp; 1.333).</td></tr>
 <tr><td><b>Radio Climate:</b></td><td><code>radio_climate</code></td>
 <td>Continental Temperate (5)</td><td>The climate zone whose statistics the
 variability model uses: <b>Equatorial (1)</b>,
@@ -1623,10 +1619,9 @@ signal.</td></tr>
 prediction holds. Same idea, applied to temporal variability. Both are
 validated for 0.01&ndash;0.99.</td></tr>
 <tr><td><b>Earth Radius Mode:</b></td><td><code>earth_radius_mode</code></td>
-<td>FOUR_THIRDS (4/3 earth)</td><td>In the analysis section of both tabs, every
-mode; choices the engine cannot apply there are greyed out (today Advanced only
-for ITM on the CPU backend, Real not yet). See <a href="#models">Modes and
-models</a>.</td></tr>
+<td>FOUR_THIRDS (4/3 earth) in Propagation, REAL (k = 1) in LOS and LOS
+Floor</td><td>In the analysis section of both tabs, every mode. See
+<a href="#models">Modes and models</a>.</td></tr>
 </table>
 
 <h3>Validity — what the model is defined for</h3>

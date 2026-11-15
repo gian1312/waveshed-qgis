@@ -7,13 +7,15 @@ defaults are the engine's (``job_builder.CoverageParams`` / ``P2PParams``).
 
 **Earth Radius Mode** is NOT in the group: the earth's curvature matters for
 LOS and LOS Floor as much as for ITM (owner, 2026-11-14), so each tab shows it
-in its Analysis section in every mode (:func:`setup_earth_radius_combo`), with
-what the engine cannot apply greyed out (:func:`apply_earth_radius_availability`).
-What this engine version does with it (READ, AETHER 0.5.1): only the CPU ITM
-paths read ``propagation.earth_radius_mode`` (engines/cpu_coverage.rs,
-engines/p2p.rs ``run_p2p_cpu``); LOS, LOS Floor and every GPU path compute
-with a fixed k = 4/3 (shader.wgsl), and there is no "real earth" (k = 1)
-mode yet. The tooltip says so.
+in its Analysis section in every mode (:func:`setup_earth_radius_combo`):
+Real (k = 1) or 4/3 earth (owner, 2026-11-15). The default depends on the
+mode family: LOS and LOS Floor start on Real, Propagation (SIMPLE_LOSS, ITM)
+on 4/3; the user's pick is kept per family for the session
+(:func:`apply_earth_radius_availability`). aether_core
+``binary_manager.EARTH_REAL_MIN_ENGINE`` (0.5.2) and newer apply REAL in every
+mode, backend and task; an older engine runs it as 4/3 without a word, so
+there Real is greyed out and the selection is 4/3. ADVANCED (Doerry, CPU ITM
+only) stays in the code behind :data:`EARTH_RADIUS_ADVANCED_ENABLED`.
 """
 
 from __future__ import annotations
@@ -29,49 +31,80 @@ from qgis.PyQt.QtWidgets import (
     QWidget,
 )
 
+from ..core.job_builder import EARTH_REAL, earth_radius_default
+
 #: Radio climates as aether_core numbers them (config.rs validates 1–7).
 RADIO_CLIMATE_DEFAULT = 5
 
 EARTH_RADIUS_TIP = (
     "Earth-curvature model (horizon and diffraction geometry):\n"
     "Real (k = 1): the geometric earth, no refraction.\n"
-    "4/3 earth: standard refraction (normal, recommended).\n"
-    "Advanced (per path): a k-factor per path from the surface refractivity "
-    "and both endpoint heights.\n"
-    "Greyed-out choices are what this engine version cannot apply here yet."
+    "4/3 earth: standard refraction.\n"
+    "LOS and LOS Floor start on Real, Propagation on 4/3; your pick is kept "
+    "for each."
 )
 
-#: ``(label, engine value)`` of every Earth Radius Mode the tabs show
-#: (owner, 2026-11-14: "Real vs 4/3 vs advanced"; the ones the engine cannot
-#: apply in the current mode / backend are greyed out, see
-#: :func:`earth_radius_unavailable`).
+#: The "Advanced (per path)" choice (Doerry k per path, CPU ITM only) is off
+#: (owner, 2026-11-15: Real and 4/3 only for now): with ``False`` the combo
+#: does not offer it and no job carries ADVANCED.
+EARTH_RADIUS_ADVANCED_ENABLED = False
+
+_ADVANCED_CHOICE = ("Advanced (per path)", "ADVANCED")
+_ADVANCED_TIP = ("\nAdvanced (per path): a k-factor per path from the surface "
+                 "refractivity and both endpoint heights.")
+
+#: ``(label, engine value)`` of the Earth Radius Modes the tabs show (owner,
+#: 2026-11-15: "select between the two"); see :func:`earth_radius_choices`.
 EARTH_RADIUS_CHOICES = (
     ("Real (k = 1)", "REAL"),
     ("4/3 earth", "FOUR_THIRDS"),
-    ("Advanced (per path)", "ADVANCED"),
 )
+#: The engine's own default, and the fallback when Real cannot be applied.
 EARTH_RADIUS_DEFAULT = "FOUR_THIRDS"
-_EARTH_RADIUS_BY_LABEL = {label: value for label, value in EARTH_RADIUS_CHOICES}
+_EARTH_RADIUS_BY_LABEL = {label: value for label, value
+                          in EARTH_RADIUS_CHOICES + (_ADVANCED_CHOICE,)}
 
-_NO_REAL = ("Needs an engine update (planned): no aether_core version computes "
-            "with the real earth radius (k = 1) yet.")
 _ADVANCED_GEOMETRIC = ("LOS and LOS Floor are computed with the 4/3 earth "
-                       "whatever is chosen (engine update planned).")
+                       "whatever is chosen.")
 _ADVANCED_GPU = ("Applied by ITM on the CPU backend only: set Backend to CPU. "
                  "The GPU (also AUTO with a usable GPU) uses the 4/3 earth.")
 
 
-def earth_radius_unavailable(mode: str, loss_model: str, backend: str) -> Dict[str, str]:
+def earth_radius_choices() -> tuple:
+    """The ``(label, value)`` pairs the combo offers (ADVANCED only with
+    :data:`EARTH_RADIUS_ADVANCED_ENABLED`)."""
+    if EARTH_RADIUS_ADVANCED_ENABLED:
+        return EARTH_RADIUS_CHOICES + (_ADVANCED_CHOICE,)
+    return EARTH_RADIUS_CHOICES
+
+
+def earth_radius_family(mode: str) -> str:
+    """``"LOS"`` for LOS and LOS Floor (``"LOS"``, ``"MIN_ALT"``), ``"RF"``
+    for Propagation (``"LOSS"``: SIMPLE_LOSS and ITM)."""
+    return "LOS" if earth_radius_default(mode) == EARTH_REAL else "RF"
+
+
+def _no_real_tip(version: Optional[str]) -> str:
+    from ..core.binary_manager import EARTH_REAL_MIN_ENGINE
+    return (f"Needs aether_core {EARTH_REAL_MIN_ENGINE} or newer (installed: "
+            f"{version or 'unknown'}): update the engine in Settings → "
+            "Download binaries.")
+
+
+def earth_radius_unavailable(mode: str, loss_model: str, backend: str,
+                             engine_version: Optional[str] = None) -> Dict[str, str]:
     """``{engine value: why it is greyed out}`` for this tab's context.
 
-    What aether_core 0.5.1 applies (READ: config.rs, cpu_coverage.rs,
-    engines/p2p.rs, shader.wgsl): ``earth_radius_mode`` is read only by ITM on
-    the CPU backend, where ADVANCED is per path; every LOS / LOS Floor path and
-    every GPU path uses a fixed k = 4/3; no path knows k = 1. 4/3 is always
-    available. *mode*: "LOS" / "LOSS" / "MIN_ALT"; *backend*: "AUTO" / "GPU" /
-    "CPU" (AUTO usually means the GPU).
+    REAL needs aether_core ``EARTH_REAL_MIN_ENGINE`` (*engine_version*;
+    ``None`` = unknown = the oldest build): older engines run it as 4/3
+    without a word. ADVANCED (when enabled) is read by ITM on the CPU backend
+    only. 4/3 is always available. *mode*: "LOS" / "LOSS" / "MIN_ALT";
+    *backend*: "AUTO" / "GPU" / "CPU" (AUTO usually means the GPU).
     """
-    out = {"REAL": _NO_REAL}
+    from ..core.binary_manager import engine_supports_real_earth
+    out = {}
+    if not engine_supports_real_earth(engine_version):
+        out["REAL"] = _no_real_tip(engine_version)
     if mode != "LOSS":
         out["ADVANCED"] = _ADVANCED_GEOMETRIC
     elif str(loss_model).upper() != "ITM" or str(backend).upper() != "CPU":
@@ -79,51 +112,76 @@ def earth_radius_unavailable(mode: str, loss_model: str, backend: str) -> Dict[s
     return out
 
 
+def _wanted_key(family: str) -> str:
+    return f"waveshed_wanted_{family}"
+
+
 def setup_earth_radius_combo(combo) -> None:
-    """Fill a tab's Earth Radius Mode combo: labels + engine values, 4/3."""
-    for label, value in EARTH_RADIUS_CHOICES:
+    """Fill a tab's Earth Radius Mode combo: labels + engine values; the
+    selection follows the tab's mode (:func:`apply_earth_radius_availability`),
+    LOS until the tab sets one."""
+    for label, value in earth_radius_choices():
         combo.addItem(label, value)
-    combo.setToolTip(EARTH_RADIUS_TIP)
+    combo.setToolTip(EARTH_RADIUS_TIP + (
+        _ADVANCED_TIP if EARTH_RADIUS_ADVANCED_ENABLED else ""))
+    combo.setProperty("waveshed_family", "LOS")
     combo.setCurrentIndex(
-        [v for _, v in EARTH_RADIUS_CHOICES].index(EARTH_RADIUS_DEFAULT))
-    # The user's own pick, kept while the context greys it out.
-    combo.setProperty("waveshed_wanted", EARTH_RADIUS_DEFAULT)
+        [v for _, v in earth_radius_choices()].index(EARTH_RADIUS_DEFAULT))
+    # The user's own pick, per mode family, kept while another family is
+    # shown or the engine greys it out.
     combo.activated.connect(
-        lambda _i, c=combo: c.setProperty("waveshed_wanted", earth_radius_value(c)))
+        lambda _i, c=combo: c.setProperty(
+            _wanted_key(c.property("waveshed_family") or "LOS"),
+            earth_radius_value(c)))
 
 
 def earth_radius_value(combo) -> str:
-    """The engine value of the combo's current choice."""
+    """The engine value of the combo's current choice (never ADVANCED while
+    :data:`EARTH_RADIUS_ADVANCED_ENABLED` is off: then the default of the
+    combo's mode family)."""
+    value = ""
     data = getattr(combo, "currentData", None)
     if callable(data):
         value = data()
-        if isinstance(value, str) and value:
-            return value
-    text = combo.currentText()
-    return _EARTH_RADIUS_BY_LABEL.get(text, text)
+    if not (isinstance(value, str) and value):
+        text = combo.currentText()
+        value = _EARTH_RADIUS_BY_LABEL.get(text, text)
+    if value == "ADVANCED" and not EARTH_RADIUS_ADVANCED_ENABLED:
+        family = getattr(combo, "property", None)
+        family = family("waveshed_family") if callable(family) else None
+        return "FOUR_THIRDS" if family == "RF" else "REAL"
+    return value
 
 
 def apply_earth_radius_availability(combo, mode: str, loss_model: str,
-                                    backend: str) -> None:
-    """Grey out what the engine cannot apply here (tooltip says why) and keep
-    the selection on an available choice: the user's own pick when it is
-    available again, else 4/3. Silent on a combo without an item model (the
-    unit-test stand-ins)."""
+                                    backend: str,
+                                    engine_version: Optional[str] = None) -> None:
+    """Grey out what the engine cannot apply here (tooltip says why) and set
+    the selection for *mode*'s family: the user's own pick there when it is
+    available, else the family's default (:func:`earth_radius_default`), else
+    4/3. Silent on a combo without an item model (the unit-test stand-ins)."""
     model = getattr(combo, "model", None)
     if not callable(model):
         return
-    unavailable = earth_radius_unavailable(mode, loss_model, backend)
+    unavailable = earth_radius_unavailable(mode, loss_model, backend,
+                                           engine_version)
     items = model()
-    for index, (_label, value) in enumerate(EARTH_RADIUS_CHOICES):
+    for index in range(combo.count()):
         item = items.item(index) if hasattr(items, "item") else None
         if item is None:
             continue
-        why = unavailable.get(value, "")
+        why = unavailable.get(combo.itemData(index), "")
         item.setEnabled(not why)
         combo.setItemData(index, why or EARTH_RADIUS_TIP,
                           Qt.ItemDataRole.ToolTipRole)
-    wanted = combo.property("waveshed_wanted") or EARTH_RADIUS_DEFAULT
-    target = wanted if wanted not in unavailable else EARTH_RADIUS_DEFAULT
+    family = earth_radius_family(mode)
+    combo.setProperty("waveshed_family", family)
+    target = EARTH_RADIUS_DEFAULT
+    for value in (combo.property(_wanted_key(family)),
+                  earth_radius_default(mode)):
+        if value and value not in unavailable and combo.findData(value) >= 0:
+            target = value
+            break
     index = combo.findData(target)
     if index >= 0 and index != combo.currentIndex():
         combo.setCurrentIndex(index)

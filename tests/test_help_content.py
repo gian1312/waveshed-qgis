@@ -250,7 +250,7 @@ class TestCoversTheUI:
         "LOS Floor", "P2P Link", "Assets", "Map Converter", "Settings",
         # Site analysis
         "Run Analysis", "Include buildings (OpenFreeMap)",
-        "Earth Radius Mode:", "FOUR_THIRDS", "ADVANCED", "AUTO", "GPU", "CPU",
+        "Earth Radius Mode:", "FOUR_THIRDS", "REAL", "AUTO", "GPU", "CPU",
         # P2P
         "Pick from Map", "View Plots", "Curved Earth Profile",
         "Source_ID", "Signal_dBm", "Path_Loss_dB",

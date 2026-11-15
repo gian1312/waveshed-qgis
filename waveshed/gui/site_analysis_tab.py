@@ -61,7 +61,11 @@ from ..core.asset_manager import (
     compute_erp, get_assets_dir, list_assets, load_asset, resolve_assets,
 )
 from ..core.attribution import source_credit
-from ..core.binary_manager import engine_error_hint, find_binary
+from ..core.binary_manager import (
+    engine_error_hint,
+    find_binary,
+    read_engine_version,
+)
 from ..core import api_key
 from ..core import engine_log
 from ..core import terrain_adapter
@@ -1245,8 +1249,8 @@ class SiteAnalysisTab(QWidget):
         # Earth Radius Mode — every mode: the curvature matters for LOS and
         # LOS Floor as much as for ITM (gui/itm_params.py says what this
         # engine version applies it to).
-        # Real / 4/3 / Advanced; what this engine version cannot apply in the
-        # current mode / backend is greyed out (_update_earth_radius).
+        # Real / 4/3, default by mode family; Real is greyed out on an engine
+        # that cannot apply it (_update_earth_radius).
         self.combo_earth_radius = QComboBox()
         setup_earth_radius_combo(self.combo_earth_radius)
         layout.addRow("Earth Radius Mode:", self.combo_earth_radius)
@@ -1437,15 +1441,16 @@ class SiteAnalysisTab(QWidget):
         self._update_earth_radius()
 
     def _update_earth_radius(self, *_args) -> None:
-        """Grey out the Earth Radius Modes the engine cannot apply in this
-        mode / model / backend (gui/itm_params.earth_radius_unavailable)."""
+        """Select the Earth Radius Mode for this mode family and grey out
+        what the engine cannot apply (gui/itm_params.earth_radius_unavailable)."""
         combo = getattr(self, "combo_earth_radius", None)
         if combo is None:
             return
         mode = self._current_mode
         loss_model = self._dialog.get_loss_model() if mode == "LOSS" else ""
         apply_earth_radius_availability(
-            combo, mode, loss_model, self.combo_backend.currentText())
+            combo, mode, loss_model, self.combo_backend.currentText(),
+            read_engine_version())
 
     # ==================================================================
     # Sites table management
