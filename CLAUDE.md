@@ -49,7 +49,7 @@ Defined in `rust/aether_core/src/config.rs`. Sections: tx, rx, analysis, output,
 - `analysis.compute_backend`: "AUTO", "GPU", "CPU"
 - `tx.mode` / `rx.mode`: "AGL" or "AMSL"
 - `propagation.radio_climate`: integer 1-6 (ITM spec)
-- `propagation.earth_radius_mode`: "FOUR_THIRDS" or "ADVANCED"
+- `propagation.earth_radius_mode`: "REAL" (k = 1, aether_core ≥ 0.5.2) or "FOUR_THIRDS" ("ADVANCED" exists in the engine but the plugin does not send it)
 
 ## Converter Ingest Job JSON Structure
 
@@ -1400,13 +1400,27 @@ OpenFreeMap): sites share pool tiles, each gets its own view; pinned by
   `ItmParamsGroup`, 360° and P2P, each its own values; Propagation + ITM only).
   Radio climate 1–7. **Earth Radius Mode is NOT in it**: each tab's Analysis
   section shows it in every mode (owner: the curvature matters for LOS too):
-  Real (k = 1) / 4/3 earth / Advanced, with what this engine version cannot
-  apply greyed out (`itm_params.earth_radius_unavailable` +
+  Real (k = 1) / 4/3 earth (owner, 2026-11-15). Default by family: LOS and
+  LOS Floor → REAL, Propagation (SIMPLE_LOSS, ITM; P2P likewise by its model)
+  → FOUR_THIRDS; the user's pick is kept per family for the session (combo
+  properties `waveshed_wanted_LOS` / `_RF`, set on `activated`;
   `apply_earth_radius_availability`, re-run on mode / model / backend
-  changes; a greyed pick falls back to 4/3 and returns). Today aether_core
-  reads `earth_radius_mode` in its CPU ITM paths only (GPU, LOS, LOS Floor:
-  fixed k = 4/3; no k = 1 mode) — the engine work is HIGH PRIORITY in
-  `AETHER/TODO.md` and needs the owner's go-ahead.
+  changes). aether_core ≥ `binary_manager.EARTH_REAL_MIN_ENGINE` (0.5.2)
+  applies REAL everywhere (LOS, LOS Floor, SIMPLE, ITM; GPU and CPU); older
+  engines run it as 4/3 silently, so there Real is greyed out (tooltip names
+  the version) and 4/3 is selected — the tabs read the cached
+  `read_engine_version()`. ADVANCED (Doerry, CPU ITM only, k ≈ 1 today) is
+  kept behind `itm_params.EARTH_RADIUS_ADVANCED_ENABLED = False`: not offered,
+  never sent (`earth_radius_value` maps it to the family default). The rule
+  lives in core (`job_builder.earth_radius_default`, `EARTH_REAL` /
+  `EARTH_FOUR_THIRDS`; the GUI imports it). Both Processing algorithms take
+  an optional `EARTH_RADIUS` enum "Earth radius" (`job_builder.
+  EARTH_RADIUS_OPTIONS`: "Default (LOS: Real, Propagation: 4/3)" (default),
+  "Real (k = 1)", "4/3 earth"; `earth_radius_from_option`); after
+  `check_engine_for_job`, `bm.earth_radius_for_engine` turns REAL into
+  FOUR_THIRDS on an engine < 0.5.2 or unknown and the tool says so with
+  `feedback.pushWarning`. `tests/test_earth_radius.py`,
+  `tests/test_processing_earth_radius.py`.
 - **P2P: typed height wins.** An asset fills Site A's height and mode only
   until the user sets them (`_site_a_height_touched`); then its default goes
   into the tooltip (owner, 2026-11-14). A spin box rounds
